@@ -83,6 +83,7 @@ impl FromStr for RepoId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ObjectKind {
+    Repository,
     Blob,
     Tree,
     Artifact,
@@ -102,6 +103,7 @@ pub enum ObjectKind {
 impl ObjectKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Repository => "repository",
             Self::Blob => "blob",
             Self::Tree => "tree",
             Self::Artifact => "artifact",
@@ -131,6 +133,7 @@ impl FromStr for ObjectKind {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "repository" => Ok(Self::Repository),
             "blob" => Ok(Self::Blob),
             "tree" => Ok(Self::Tree),
             "artifact" => Ok(Self::Artifact),

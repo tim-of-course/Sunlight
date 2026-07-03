@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 28 tests, `git diff --check`, and scratchpad length guard after CLI contract integration.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 37 tests, `git diff --check`, and scratchpad length guard after mutation and CLI envelope integration.
 
 ## Active Work
 
@@ -60,8 +60,9 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `artifact-io-foundation`: integrated as `3f37390`; formatting checkpoint `0248474`.
 - Completed slice `operation-transaction-contract`: integrated as `9bce817`.
 - Completed slice `cli-envelope-spec`: integrated as `cfc0f69`.
-- Active slice `mutation-foundation`: WSL clone `/home/timothycard/code/Sunlight-2-mutation-foundation`, branch `dm/mutation-foundation`, logs under `C:\tmp\sunlight-manager\20260703-161356`.
-- Active slice `cli-envelope-skeleton`: WSL clone `/home/timothycard/code/Sunlight-2-cli-envelope-skeleton-20260703-164733`, branch `dm/cli-envelope-skeleton`, logs under `C:\tmp\sunlight-manager\20260703-164733`.
+- Completed slice `mutation-foundation`: integrated as `d3b5254`; formatting checkpoint `a9a46b2`.
+- Completed slice `cli-envelope-skeleton`: integrated as `3c421fd`; formatting checkpoint `a9a46b2`.
+- No active WSL slices are currently tracked.
 - Next heartbeat should inspect active slice logs, verify commits, integrate acceptable work, then launch the next one or two slices.
 
 ## Candidate First Slices

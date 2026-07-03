@@ -40,21 +40,22 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 
 - Date started as development manager: 2026-07-03.
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
-- Repo state at setup: clean, docs-only checkout.
+- Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available.
+- Verification: `cargo test`, `git diff --check HEAD~2..HEAD`, and scratchpad length guard passed after first slice integration.
 
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active WSL slice `bootstrap-core`: worktree `/home/timothycard/code/Sunlight-2-bootstrap`, branch `dm/bootstrap-core`, process log root `C:\tmp\sunlight-manager\20260703-124241`.
-- Active WSL slice `implementation-backlog`: worktree `/home/timothycard/code/Sunlight-2-backlog`, branch `dm/implementation-backlog`, process log root `C:\tmp\sunlight-manager\20260703-124241`.
-- Next heartbeat should inspect both logs, verify commits, merge or cherry-pick acceptable work back to the integration branch, then launch the next one or two slices.
+- Completed slice `bootstrap-core`: integrated as `7a297c2`; follow-up lockfile/ignore checkpoint `f11e305`.
+- Completed slice `implementation-backlog`: integrated as `e4a3cb7`.
+- Next heartbeat should inspect newly active slice logs, verify commits, integrate acceptable work, then launch the next one or two slices.
 
 ## Candidate First Slices
 
-- Slice A: repo/bootstrap plan and Rust CLI skeleton aligned to architecture.
-- Slice B: object schema and canonical hashing design/implementation.
-- Slice C: Phase 1 artifact IO command surface tests/specs.
+- Slice B: object identity and canonical hashing implementation.
+- Slice C: canonical schema contracts and examples.
+- Slice D: topic/session command surface tests/specs.
 
 ## Decisions
 

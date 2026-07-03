@@ -51,6 +51,8 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `implementation-backlog`: integrated as `e4a3cb7`.
 - Completed slice `core-identity-hashing`: integrated as `7ba1435`; formatting checkpoint `e6307ee`.
 - Completed slice `schema-contracts`: integrated as `d58857d`.
+- Active WSL slice `canonical-records`: clone `/home/timothycard/code/Sunlight-2-records`, branch `dm/canonical-records`, process log root `C:\tmp\sunlight-manager\20260703-135348`.
+- Active WSL slice `native-io-spec`: clone `/home/timothycard/code/Sunlight-2-native-io-spec`, branch `dm/native-io-spec`, process log root `C:\tmp\sunlight-manager\20260703-135348`.
 - Next heartbeat should inspect active slice logs, verify commits, integrate acceptable work, then launch the next one or two slices.
 
 ## Candidate First Slices

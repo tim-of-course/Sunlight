@@ -767,10 +767,8 @@ impl InMemoryArtifactStore {
             });
         }
 
-        let before_text =
-            std::str::from_utf8(&before_blob.bytes).map_err(|_| ArtifactIoError::NonUtf8Content {
-                path: path.clone(),
-            })?;
+        let before_text = std::str::from_utf8(&before_blob.bytes)
+            .map_err(|_| ArtifactIoError::NonUtf8Content { path: path.clone() })?;
         let (after_text, hunk_count) =
             apply_fixture_patch(before_text, &request.patch).map_err(|failed_hunk| {
                 ArtifactIoError::PatchApplyFailed {
@@ -820,7 +818,8 @@ impl InMemoryArtifactStore {
             .find(|entry| entry.path == path && !entry.tombstone)
             .cloned();
 
-        let (artifact_id, before_hash, write_mode) = match (&request.expected_hash, existing_entry) {
+        let (artifact_id, before_hash, write_mode) = match (&request.expected_hash, existing_entry)
+        {
             (ExpectedHash::New, Some(entry)) => {
                 return Err(ArtifactIoError::PreconditionFailed {
                     failed_precondition: "expected_hash".to_string(),
@@ -832,11 +831,9 @@ impl InMemoryArtifactStore {
                     resolved_view_id: self.view.resolved_view_id.clone(),
                 });
             }
-            (ExpectedHash::New, None) => (
-                fixture_artifact_id_for_path(&path),
-                None,
-                WriteMode::Create,
-            ),
+            (ExpectedHash::New, None) => {
+                (fixture_artifact_id_for_path(&path), None, WriteMode::Create)
+            }
             (ExpectedHash::Existing(expected), Some(entry)) if entry.content_ref == *expected => (
                 entry.artifact_id,
                 Some(expected.clone()),
@@ -917,9 +914,9 @@ impl InMemoryArtifactStore {
         let tree_hash = fixture_tree_hash(&mutation.kind, next_revision_number);
         let resolved_view_id = fixture_resolved_view_id(&mutation.kind, next_revision_number);
         let session_generation_id = format!("gen_agent_a_{:04}", self.generation_number + 1);
-        let operation_id = fixture_operation_id(&mutation.kind, &mutation.path, next_revision_number);
-        let topic_revision_id =
-            format!("rev_auth_nullability_{next_revision_number:04}");
+        let operation_id =
+            fixture_operation_id(&mutation.kind, &mutation.path, next_revision_number);
+        let topic_revision_id = format!("rev_auth_nullability_{next_revision_number:04}");
 
         let after_tree_identity = TreeIdentityView {
             kind: "SingleRepoTree".to_string(),
@@ -927,7 +924,10 @@ impl InMemoryArtifactStore {
             tree_hash: tree_hash.clone(),
         };
         let before_ref = MutationArtifactRef {
-            artifact_id: mutation.before_hash.as_ref().map(|_| mutation.artifact_id.clone()),
+            artifact_id: mutation
+                .before_hash
+                .as_ref()
+                .map(|_| mutation.artifact_id.clone()),
             path: mutation.path.clone(),
             path_state: if mutation.before_hash.is_some() {
                 "active".to_string()
@@ -936,7 +936,10 @@ impl InMemoryArtifactStore {
             },
             content_hash: mutation.before_hash.clone(),
             executable: mutation.before_hash.as_ref().map(|_| mutation.executable),
-            classification: mutation.before_hash.as_ref().map(|_| mutation.classification.clone()),
+            classification: mutation
+                .before_hash
+                .as_ref()
+                .map(|_| mutation.classification.clone()),
         };
         let after_ref = MutationArtifactRef {
             artifact_id: Some(mutation.artifact_id.clone()),
@@ -1072,7 +1075,9 @@ impl InMemoryArtifactStore {
                 tombstone: false,
             }),
         }
-        self.tree.entries.sort_by(|left, right| left.path.cmp(&right.path));
+        self.tree
+            .entries
+            .sort_by(|left, right| left.path.cmp(&right.path));
         self.tree.tree_hash = tree_hash.clone();
         self.tree.id = tree_hash;
         self.view = SessionView {
@@ -1544,10 +1549,7 @@ mod tests {
 
         assert_eq!(response.command, "artifact.patch");
         assert_eq!(response.artifact.artifact_id, "artifact_src_auth_ts");
-        assert_eq!(
-            response.operation.id,
-            "op_auth_trim_guard_0001".to_string()
-        );
+        assert_eq!(response.operation.id, "op_auth_trim_guard_0001".to_string());
         assert_eq!(
             response.topic_revision.id,
             "rev_auth_nullability_0001".to_string()
@@ -1577,7 +1579,10 @@ mod tests {
             response.operation.after_refs.artifacts[0].content_hash,
             Some("sha256:auth_trim_guard".to_string())
         );
-        assert_eq!(response.operation.write_set[0].mutation, MutationKind::Patch);
+        assert_eq!(
+            response.operation.write_set[0].mutation,
+            MutationKind::Patch
+        );
         assert_eq!(store.operations().len(), 1);
         assert_eq!(store.topic_revisions().len(), 1);
         assert_eq!(store.session_generations().len(), 1);
@@ -1617,7 +1622,10 @@ mod tests {
             response.operation.after_refs.artifacts[0].content_hash,
             Some("sha256:session_new".to_string())
         );
-        assert_eq!(response.operation.write_set[0].mutation, MutationKind::Write);
+        assert_eq!(
+            response.operation.write_set[0].mutation,
+            MutationKind::Write
+        );
         assert!(matches!(
             response.operation.mutation_payload,
             MutationPayload::Write {

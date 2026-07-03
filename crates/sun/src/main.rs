@@ -3,7 +3,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use sunlight_core::repository::{init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION};
+use sunlight_core::repository::{
+    init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -78,16 +80,18 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         [command, ..] if command == "init" => {
             Err(invalid_request("usage: sun init [--repo <path>]"))
         }
-        [scope, command, ..] if scope == "topic" && command == "create" => Err(unimplemented_command(
-            "topic.create",
-            "sun topic create is parsed, but topic records are not persisted yet",
-        )),
-        [scope, command, ..] if scope == "session" && command == "start" => Err(
-            unimplemented_command(
+        [scope, command, ..] if scope == "topic" && command == "create" => {
+            Err(unimplemented_command(
+                "topic.create",
+                "sun topic create is parsed, but topic records are not persisted yet",
+            ))
+        }
+        [scope, command, ..] if scope == "session" && command == "start" => {
+            Err(unimplemented_command(
                 "session.start",
                 "sun session start is parsed, but session records are not persisted yet",
-            ),
-        ),
+            ))
+        }
         [command] if command == "status" => status(&ctx),
         [command, flag, _] if command == "status" && (flag == "--session" || flag == "--topic") => {
             status(&ctx)

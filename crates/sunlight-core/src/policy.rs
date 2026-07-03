@@ -275,10 +275,7 @@ fn has_prefix(parts: &[&str], prefix: &[&str]) -> bool {
 }
 
 fn has_execution_component(parts: &[&str], component: &str) -> bool {
-    parts.len() >= 4
-        && parts[0] == ".sunlight"
-        && parts[1] == "executions"
-        && parts[3] == component
+    parts.len() >= 4 && parts[0] == ".sunlight" && parts[1] == "executions" && parts[3] == component
 }
 
 #[cfg(test)]
@@ -300,8 +297,7 @@ mod tests {
 
     #[test]
     fn missing_required_ignore_entry_reports_structured_code() {
-        let gitignore =
-            format!("{MANAGED_IGNORE_BEGIN}\n.sunlight/local/\n{MANAGED_IGNORE_END}\n");
+        let gitignore = format!("{MANAGED_IGNORE_BEGIN}\n.sunlight/local/\n{MANAGED_IGNORE_END}\n");
         let report = validate_managed_ignore_block(&gitignore);
 
         assert!(!report.ok);

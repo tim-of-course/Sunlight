@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/sunlight-core",
+    "crates/sun",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"

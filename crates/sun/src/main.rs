@@ -25,16 +25,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         [command] if command == "init" => init(PathBuf::from(".")),
-        [command, flag, path] if command == "init" && flag == "--repo" => {
-            init(PathBuf::from(path))
-        }
+        [command, flag, path] if command == "init" && flag == "--repo" => init(PathBuf::from(path)),
         [command, flag] if command == "init" && flag == "--help" => {
             print_init_help();
             Ok(())
         }
-        [command, ..] if command == "init" => {
-            Err("usage: sun init [--repo <path>]".to_string())
-        }
+        [command, ..] if command == "init" => Err("usage: sun init [--repo <path>]".to_string()),
         [command, ..] => Err(format!("unknown command `{command}`")),
     }
 }

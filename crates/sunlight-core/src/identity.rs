@@ -203,16 +203,14 @@ impl FromStr for ObjectHash {
 
         let mut bytes = [0_u8; HASH_BYTES];
         for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-            let pair = std::str::from_utf8(chunk).map_err(|_| {
-                IdentityParseError::InvalidDigestHex {
+            let pair =
+                std::str::from_utf8(chunk).map_err(|_| IdentityParseError::InvalidDigestHex {
                     value: value.to_string(),
-                }
-            })?;
-            bytes[index] = u8::from_str_radix(pair, 16).map_err(|_| {
-                IdentityParseError::InvalidDigestHex {
+                })?;
+            bytes[index] =
+                u8::from_str_radix(pair, 16).map_err(|_| IdentityParseError::InvalidDigestHex {
                     value: value.to_string(),
-                }
-            })?;
+                })?;
         }
 
         Ok(Self(bytes))
@@ -418,10 +416,8 @@ mod tests {
         let tree_a = ObjectHash::canonical(ObjectKind::Tree, 1, b"tree-a");
         let tree_b = ObjectHash::canonical(ObjectKind::Tree, 1, b"tree-b");
 
-        let first = TreeIdentity::repo_tree_map([
-            (repo_b.clone(), tree_b),
-            (repo_a.clone(), tree_a),
-        ]);
+        let first =
+            TreeIdentity::repo_tree_map([(repo_b.clone(), tree_b), (repo_a.clone(), tree_a)]);
         let second = TreeIdentity::repo_tree_map([(repo_a, tree_a), (repo_b, tree_b)]);
 
         assert_eq!(first, second);

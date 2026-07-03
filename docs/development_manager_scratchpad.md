@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 17 tests, `git diff --check`, and scratchpad length guard.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 23 tests, `git diff --check`, and scratchpad length guard.
 
 ## Active Work
 
@@ -55,8 +55,8 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `native-io-spec`: integrated as `4ca842d`.
 - Completed slice `topic-session-skeleton`: integrated as `cef729c`; formatting checkpoint `b646faf`.
 - Completed slice `policy-validation-spec`: integrated as `8f5b72d`.
-- Active WSL slice `policy-validator-foundation`: clone `/home/timothycard/code/Sunlight-2-policy-validator`, branch `dm/policy-validator-foundation`, process log root `C:\tmp\sunlight-manager\20260703-150600`.
-- Active WSL slice `artifact-io-fixtures`: clone `/home/timothycard/code/Sunlight-2-artifact-io-spec`, branch `dm/artifact-io-fixtures`, process log root `C:\tmp\sunlight-manager\20260703-150600`.
+- Completed slice `policy-validator-foundation`: integrated as `ba4e807`; formatting checkpoint `f6ec7ea`.
+- Completed slice `artifact-io-fixtures`: integrated as `f26af68`.
 - Next heartbeat should inspect active slice logs, verify commits, integrate acceptable work, then launch the next one or two slices.
 
 ## Candidate First Slices
@@ -64,8 +64,9 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Slice D: canonical record envelope and canonicalization helpers.
 - Slice E: topic/session data model and command skeleton.
 - Slice F: `.sunlight` commit/export policy validator foundation.
-- Slice G: artifact store/read/list/search fixture design.
-- Slice H: topic/session CLI JSON response envelope once persistence boundary is clearer.
+- Slice G: artifact store/read/list/search foundation.
+- Slice H: operation transaction and patch/write fixture contract.
+- Slice I: topic/session CLI JSON response envelope once persistence boundary is clearer.
 
 ## Decisions
 

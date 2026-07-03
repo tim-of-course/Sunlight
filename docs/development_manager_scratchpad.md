@@ -41,23 +41,23 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Date started as development manager: 2026-07-03.
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
-- WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available.
-- Verification: `cargo test`, `git diff --check HEAD~2..HEAD`, and scratchpad length guard passed after first slice integration.
+- WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test`, `git diff --check`, and scratchpad length guard.
 
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
 - Completed slice `bootstrap-core`: integrated as `7a297c2`; follow-up lockfile/ignore checkpoint `f11e305`.
 - Completed slice `implementation-backlog`: integrated as `e4a3cb7`.
-- Active WSL slice `core-identity-hashing`: clone `/home/timothycard/code/Sunlight-2-identity`, branch `dm/core-identity-hashing`, process log root `C:\tmp\sunlight-manager\20260703-131957`.
-- Active WSL slice `schema-contracts`: clone `/home/timothycard/code/Sunlight-2-schema`, branch `dm/schema-contracts`, process log root `C:\tmp\sunlight-manager\20260703-131957`.
+- Completed slice `core-identity-hashing`: integrated as `7ba1435`; formatting checkpoint `e6307ee`.
+- Completed slice `schema-contracts`: integrated as `d58857d`.
 - Next heartbeat should inspect active slice logs, verify commits, integrate acceptable work, then launch the next one or two slices.
 
 ## Candidate First Slices
 
-- Slice B: object identity and canonical hashing implementation.
-- Slice C: canonical schema contracts and examples.
-- Slice D: topic/session command surface tests/specs.
+- Slice D: canonical record envelope and canonicalization helpers.
+- Slice E: Phase 1 topic/session/native IO command surface tests/specs.
+- Slice F: `.sunlight` commit/export policy validation plan or first validator.
 
 ## Decisions
 

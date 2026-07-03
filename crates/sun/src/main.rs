@@ -31,6 +31,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         [command, ..] if command == "init" => Err("usage: sun init [--repo <path>]".to_string()),
+        [scope, command, ..] if scope == "topic" && command == "create" => {
+            Err("sun topic create is parsed, but topic records are not persisted yet".to_string())
+        }
+        [scope, command, ..] if scope == "session" && command == "start" => {
+            Err(
+                "sun session start is parsed, but session records are not persisted yet"
+                    .to_string(),
+            )
+        }
         [command, ..] => Err(format!("unknown command `{command}`")),
     }
 }
@@ -56,9 +65,13 @@ sun
 
 Usage:
   sun init [--repo <path>]
+  sun topic create <slug> --display-name <name> --json
+  sun session start --topic <topic> --view <view-selector> --actor <actor-id> --json
 
 Commands:
-  init    Create the conservative local .sunlight repository layout
+  init       Create the conservative local .sunlight repository layout
+  topic      Parse Phase 1 topic commands; persistence is not implemented yet
+  session    Parse Phase 1 session commands; persistence is not implemented yet
 "
     );
 }

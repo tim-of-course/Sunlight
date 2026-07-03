@@ -214,6 +214,198 @@ fn read_json_fixture_basic_app_missing_path_returns_path_not_found() {
     assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0001\""));
 }
 
+#[test]
+fn patch_json_fixture_basic_app_returns_mutation_success_envelope() {
+    let repo = TestRepo::new("patch-fixture");
+    let patch_file = repo.write_file("auth.patch", auth_trim_guard_patch());
+
+    let output = sun()
+        .arg("patch")
+        .arg("src/auth.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--expect-hash")
+        .arg("sha256:auth_base")
+        .arg("--patch-file")
+        .arg(&patch_file)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun patch should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"artifact.patch\""));
+    assert!(stdout.contains("\"repository_id\":\"repo_fixture_basic_app\""));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_auth_trim_guard_0001\""));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_0001\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_patch_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
+    assert!(stdout.contains("\"tree_hash\":\"tree_after_auth_patch_0001\""));
+    assert!(stdout.contains("\"before_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"after_hash\":\"sha256:auth_trim_guard\""));
+    assert!(stdout.contains("\"operation\":{"));
+    assert!(stdout.contains("\"topic_id\":\"topic_auth_nullability\""));
+    assert!(stdout.contains("\"mutation\":\"patch\""));
+    assert!(stdout.contains("\"expected_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"payload\":{\"kind\":\"patch\""));
+    assert!(stdout.contains("\"topic_revision\":{"));
+    assert!(stdout.contains("\"session_generation\":{"));
+    assert!(stdout.contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_0001\"}"));
+}
+
+#[test]
+fn write_json_fixture_basic_app_new_file_returns_mutation_success_envelope() {
+    let repo = TestRepo::new("write-fixture");
+    let content_file = repo.write_file(
+        "session.ts",
+        "export const sessionLabel = \"SessionStore\";\n",
+    );
+
+    let output = sun()
+        .arg("write")
+        .arg("src/session.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--expect-hash")
+        .arg("new")
+        .arg("--content-file")
+        .arg(&content_file)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun write should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"artifact.write\""));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_write_session_ts_0001\""));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_0001\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_write_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_session_ts\""));
+    assert!(stdout.contains("\"path\":\"src/session.ts\""));
+    assert!(stdout.contains("\"before_hash\":null"));
+    assert!(stdout.contains("\"after_hash\":\"sha256:session_new\""));
+    assert!(stdout.contains("\"mutation\":\"write\""));
+    assert!(stdout.contains("\"expected_hash\":\"new\""));
+    assert!(stdout.contains("\"payload\":{\"kind\":\"write\",\"write_mode\":\"create\""));
+    assert!(stdout.contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_0001\"}"));
+}
+
+#[test]
+fn patch_json_fixture_basic_app_stale_hash_returns_precondition_failure() {
+    let repo = TestRepo::new("patch-stale-fixture");
+    let patch_file = repo.write_file("auth.patch", auth_trim_guard_patch());
+
+    let output = sun()
+        .arg("patch")
+        .arg("src/auth.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--expect-hash")
+        .arg("sha256:stale_auth")
+        .arg("--patch-file")
+        .arg(&patch_file)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun patch should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"precondition_failed\""));
+    assert!(stdout.contains("\"failed_precondition\":\"expected_hash\""));
+    assert!(stdout.contains("\"expected\":\"sha256:stale_auth\""));
+    assert!(stdout.contains("\"actual\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0001\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_base_0001\""));
+    assert!(!stdout.contains("operation_transaction_id"));
+    assert!(!stdout.contains("topic_revision_id"));
+}
+
+#[test]
+fn patch_json_fixture_basic_app_bad_hunk_returns_patch_apply_failure() {
+    let repo = TestRepo::new("patch-bad-hunk-fixture");
+    let patch_file = repo.write_file("bad-auth.patch", bad_auth_patch());
+
+    let output = sun()
+        .arg("patch")
+        .arg("src/auth.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--expect-hash")
+        .arg("sha256:auth_base")
+        .arg("--patch-file")
+        .arg(&patch_file)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun patch should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"patch_apply_failed\""));
+    assert!(stdout.contains("\"message\":\"patch did not apply to expected content at `src/auth.ts`\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
+    assert!(stdout.contains("\"content_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"failed_hunk\":\"1\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0001\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_base_0001\""));
+    assert!(!stdout.contains("operation_transaction_id"));
+    assert!(!stdout.contains("topic_revision_id"));
+}
+
+#[test]
+fn write_json_fixture_basic_app_existing_with_new_returns_precondition_failure() {
+    let repo = TestRepo::new("write-existing-new-fixture");
+    let content_file = repo.write_file("replacement.ts", "export const replacement = true;\n");
+
+    let output = sun()
+        .arg("write")
+        .arg("src/auth.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--expect-hash")
+        .arg("new")
+        .arg("--content-file")
+        .arg(&content_file)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun write should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"precondition_failed\""));
+    assert!(stdout.contains("\"failed_precondition\":\"expected_hash\""));
+    assert!(stdout.contains("\"expected\":\"new\""));
+    assert!(stdout.contains("\"actual\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0001\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_base_0001\""));
+    assert!(!stdout.contains("operation_transaction_id"));
+    assert!(!stdout.contains("topic_revision_id"));
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -263,10 +455,24 @@ impl TestRepo {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    fn write_file(&self, name: &str, body: &str) -> PathBuf {
+        let path = self.path.join(name);
+        fs::write(&path, body).unwrap();
+        path
+    }
 }
 
 impl Drop for TestRepo {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+fn auth_trim_guard_patch() -> &'static str {
+    "--- a/src/auth.ts\n+++ b/src/auth.ts\n@@ -1,3 +1,4 @@\n export function login(email: string) {\n-  return email.trim().toLowerCase();\n+  const normalized = email.trim().toLowerCase();\n+  return normalized;\n }\n"
+}
+
+fn bad_auth_patch() -> &'static str {
+    "--- a/src/auth.ts\n+++ b/src/auth.ts\n@@ -1,3 +1,3 @@\n export function login(email: string) {\n-  return email.toUpperCase();\n+  return email.trim().toLowerCase();\n }\n"
 }

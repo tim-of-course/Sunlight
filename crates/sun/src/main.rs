@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use sunlight_core::artifacts::{
-    ArtifactIoError, InMemoryArtifactStore, ListResponse, ReadResponse, SearchResponse,
-    SessionView, SessionVisibleArtifactView,
+    ArtifactIoError, ExpectedHash, InMemoryArtifactStore, ListResponse, MutationArtifactView,
+    MutationPayload, MutationRefs, MutationResponse, PatchRequest, ReadResponse, SearchResponse,
+    SessionView, SessionVisibleArtifactView, TreeIdentityView, WriteMode, WriteRequest,
 };
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
@@ -99,6 +100,8 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         [command, ..] if command == "read" => artifact_read(&ctx),
         [command, ..] if command == "list" => artifact_list(&ctx),
         [command, ..] if command == "search" => artifact_search(&ctx),
+        [command, ..] if command == "patch" => artifact_patch(&ctx),
+        [command, ..] if command == "write" => artifact_write(&ctx),
         [command] if command == "status" => status(&ctx),
         [command, flag, _] if command == "status" && (flag == "--session" || flag == "--topic") => {
             status(&ctx)
@@ -195,6 +198,84 @@ fn artifact_search(ctx: &CommandContext) -> Result<(), CliError> {
     Ok(())
 }
 
+fn artifact_patch(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_mutation_options(ctx, "patch", 1)?;
+    let expect_hash = options
+        .expect_hash
+        .ok_or_else(|| invalid_request("usage: sun patch requires --expect-hash <hash>"))?;
+    let patch_file = options
+        .patch_file
+        .ok_or_else(|| invalid_request("usage: sun patch requires --patch-file <file>"))?;
+    let patch = fs::read_to_string(&patch_file).map_err(|error| {
+        invalid_request(format!("failed to read patch file `{patch_file}`"))
+            .with_detail("source", error.to_string())
+    })?;
+    let mut store = fixture_store(&options.fixture)?;
+    let response = store
+        .patch(PatchRequest {
+            session_id: options.session_id,
+            path: options.operands[0].clone(),
+            expected_hash: expect_hash,
+            patch,
+        })
+        .map_err(artifact_error)?;
+
+    if ctx.json {
+        println!("{}", mutation_success_envelope(&response));
+    } else {
+        println!(
+            "patched {} {} -> {}",
+            response.artifact.path,
+            response.artifact.before_hash.as_deref().unwrap_or("new"),
+            response.artifact.after_hash
+        );
+    }
+
+    Ok(())
+}
+
+fn artifact_write(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_mutation_options(ctx, "write", 1)?;
+    let expect_hash = options.expect_hash.ok_or_else(|| {
+        invalid_request("usage: sun write requires --expect-hash <hash-or-new>")
+    })?;
+    let content_file = options
+        .content_file
+        .ok_or_else(|| invalid_request("usage: sun write requires --content-file <file>"))?;
+    let classification = options
+        .classification
+        .ok_or_else(|| invalid_request("usage: sun write requires --classification <class>"))?;
+    let content = fs::read(&content_file).map_err(|error| {
+        invalid_request(format!("failed to read content file `{content_file}`"))
+            .with_detail("source", error.to_string())
+    })?;
+    let expected_hash = if expect_hash == "new" {
+        ExpectedHash::New
+    } else {
+        ExpectedHash::Existing(expect_hash)
+    };
+    let mut store = fixture_store(&options.fixture)?;
+    let response = store
+        .write(WriteRequest {
+            session_id: options.session_id,
+            path: options.operands[0].clone(),
+            expected_hash,
+            content,
+            classification,
+            executable: false,
+            media_type: "text/plain; charset=utf-8".to_string(),
+        })
+        .map_err(artifact_error)?;
+
+    if ctx.json {
+        println!("{}", mutation_success_envelope(&response));
+    } else {
+        println!("wrote {} {}", response.artifact.path, response.artifact.after_hash);
+    }
+
+    Ok(())
+}
+
 fn status(ctx: &CommandContext) -> Result<(), CliError> {
     let config = require_repository_config(".")?;
     let command = match ctx.args.as_slice() {
@@ -258,6 +339,17 @@ struct ArtifactCommandOptions {
     operands: Vec<String>,
 }
 
+#[derive(Debug)]
+struct MutationCommandOptions {
+    session_id: String,
+    fixture: String,
+    operands: Vec<String>,
+    expect_hash: Option<String>,
+    patch_file: Option<String>,
+    content_file: Option<String>,
+    classification: Option<String>,
+}
+
 fn parse_artifact_options(
     ctx: &CommandContext,
     command: &'static str,
@@ -315,9 +407,100 @@ fn artifact_usage(command: &str) -> String {
         "read" => "usage: sun read <path-or-artifact-id> --session <session> --fixture basic-app",
         "list" => "usage: sun list [path-prefix] --session <session> --fixture basic-app",
         "search" => "usage: sun search <query> --session <session> --fixture basic-app",
+        "patch" => {
+            "usage: sun patch <path> --session <session> --fixture basic-app --expect-hash <hash> --patch-file <file>"
+        }
+        "write" => {
+            "usage: sun write <path> --session <session> --fixture basic-app --expect-hash <hash-or-new> --content-file <file> --classification <class>"
+        }
         _ => "usage: sun <artifact-command> --session <session> --fixture basic-app",
     }
     .to_string()
+}
+
+fn parse_mutation_options(
+    ctx: &CommandContext,
+    command: &'static str,
+    operand_count: usize,
+) -> Result<MutationCommandOptions, CliError> {
+    let mut session_id = None;
+    let mut fixture = None;
+    let mut expect_hash = None;
+    let mut patch_file = None;
+    let mut content_file = None;
+    let mut classification = None;
+    let mut operands = Vec::new();
+    let mut args = ctx.args.iter().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--session" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(format!("usage: sun {command} requires --session <session>"))
+                })?;
+                session_id = Some(value.clone());
+            }
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(format!("usage: sun {command} requires --fixture basic-app"))
+                })?;
+                fixture = Some(value.clone());
+            }
+            "--expect-hash" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(format!(
+                        "usage: sun {command} requires --expect-hash <hash-or-new>"
+                    ))
+                })?;
+                expect_hash = Some(value.clone());
+            }
+            "--patch-file" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| invalid_request("usage: sun patch requires --patch-file <file>"))?;
+                patch_file = Some(value.clone());
+            }
+            "--content-file" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun write requires --content-file <file>")
+                })?;
+                content_file = Some(value.clone());
+            }
+            "--classification" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun write requires --classification <class>")
+                })?;
+                classification = Some(value.clone());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun {command}"
+                )));
+            }
+            value => operands.push(value.to_string()),
+        }
+    }
+
+    if operands.len() != operand_count {
+        return Err(invalid_request(artifact_usage(command)));
+    }
+
+    let session_id = session_id.ok_or_else(|| {
+        invalid_request(format!("usage: sun {command} requires --session <session>"))
+    })?;
+    let fixture = fixture.ok_or_else(|| {
+        invalid_request(format!("usage: sun {command} requires --fixture basic-app"))
+    })?;
+
+    Ok(MutationCommandOptions {
+        session_id,
+        fixture,
+        operands,
+        expect_hash,
+        patch_file,
+        content_file,
+        classification,
+    })
 }
 
 fn fixture_store(fixture: &str) -> Result<InMemoryArtifactStore, CliError> {
@@ -554,6 +737,250 @@ fn search_success_envelope(response: &SearchResponse) -> String {
     )
 }
 
+fn mutation_success_envelope(response: &MutationResponse) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"session_id\":\"{}\",",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"topic_revision_id\":\"{}\"",
+            "}},",
+            "\"view\":{},",
+            "\"artifacts\":[{}],",
+            "\"operation\":{},",
+            "\"topic_revision\":{},",
+            "\"session_generation\":{}",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(response.command),
+        json_escape(&response.repository_id),
+        json_escape(&response.session_id),
+        json_escape(&response.operation.id),
+        json_escape(&response.topic_revision.id),
+        view_json(&response.view),
+        mutation_artifact_json(&response.artifact),
+        operation_json(response),
+        topic_revision_json(response),
+        session_generation_json(response),
+    )
+}
+
+fn operation_json(response: &MutationResponse) -> String {
+    let operation = &response.operation;
+    let payload = mutation_payload_json(&operation.mutation_payload);
+    format!(
+        concat!(
+            "{{",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"topic_id\":\"{}\",",
+            "\"session_id\":\"{}\",",
+            "\"actor_id\":\"{}\",",
+            "\"authored_context_id\":\"{}\",",
+            "\"mutation\":\"{}\",",
+            "\"preconditions\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"write_topic_id\":\"{}\",",
+            "\"parent_topic_revision_id\":{},",
+            "\"path_policy_id\":\"{}\",",
+            "\"operation_semantics_version\":\"{}\",",
+            "\"expected_path\":\"{}\",",
+            "\"expected_hash\":\"{}\"",
+            "}},",
+            "\"write_set\":[{}],",
+            "\"payload\":{},",
+            "\"before_refs\":{},",
+            "\"after_refs\":{}",
+            "}}"
+        ),
+        json_escape(&operation.id),
+        json_escape(&operation.topic_id),
+        json_escape(&operation.session_id),
+        json_escape(&operation.actor_id),
+        json_escape(&operation.authored_context_id),
+        operation.write_set[0].mutation.as_str(),
+        json_escape(&operation.preconditions.resolved_view_id),
+        json_escape(&operation.preconditions.session_generation_id),
+        json_escape(&operation.preconditions.write_topic_id),
+        optional_string_json(operation.preconditions.parent_topic_revision_id.as_deref()),
+        json_escape(&operation.preconditions.path_policy_id),
+        json_escape(&operation.preconditions.operation_semantics_version),
+        json_escape(&operation.preconditions.expected_path),
+        json_escape(operation.preconditions.expected_hash.as_str()),
+        operation
+            .write_set
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{{\"artifact_id\":\"{}\",\"path\":\"{}\",\"mutation\":\"{}\"}}",
+                    json_escape(&entry.artifact_id),
+                    json_escape(&entry.path),
+                    entry.mutation.as_str(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        payload,
+        refs_json(&operation.before_refs),
+        refs_json(&operation.after_refs),
+    )
+}
+
+fn mutation_payload_json(payload: &MutationPayload) -> String {
+    match payload {
+        MutationPayload::Patch {
+            patch_digest,
+            base_content_hash,
+            result_content_hash,
+            hunk_count,
+            byte_delta,
+            ..
+        } => format!(
+            concat!(
+                "{{",
+                "\"kind\":\"patch\",",
+                "\"patch_digest\":\"{}\",",
+                "\"base_content_hash\":\"{}\",",
+                "\"result_content_hash\":\"{}\",",
+                "\"hunk_count\":{},",
+                "\"byte_delta\":{}",
+                "}}"
+            ),
+            json_escape(patch_digest),
+            json_escape(base_content_hash),
+            json_escape(result_content_hash),
+            hunk_count,
+            byte_delta,
+        ),
+        MutationPayload::Write {
+            write_mode,
+            content_hash,
+            byte_length,
+            media_type,
+            executable,
+            classification,
+        } => format!(
+            concat!(
+                "{{",
+                "\"kind\":\"write\",",
+                "\"write_mode\":\"{}\",",
+                "\"content_hash\":\"{}\",",
+                "\"byte_length\":{},",
+                "\"media_type\":\"{}\",",
+                "\"executable\":{},",
+                "\"classification\":\"{}\"",
+                "}}"
+            ),
+            write_mode_json(write_mode),
+            json_escape(content_hash),
+            byte_length,
+            json_escape(media_type),
+            executable,
+            json_escape(classification),
+        ),
+    }
+}
+
+fn topic_revision_json(response: &MutationResponse) -> String {
+    let revision = &response.topic_revision;
+    format!(
+        concat!(
+            "{{",
+            "\"topic_revision_id\":\"{}\",",
+            "\"topic_id\":\"{}\",",
+            "\"revision_number\":{},",
+            "\"parent_revision_id\":{},",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"tree_delta_ref\":\"{}\",",
+            "\"dependency_revision_ids\":[]",
+            "}}"
+        ),
+        json_escape(&revision.id),
+        json_escape(&revision.topic_id),
+        revision.revision_number,
+        optional_string_json(revision.parent_revision_id.as_deref()),
+        json_escape(&revision.operation_transaction_id),
+        json_escape(&revision.tree_delta_ref),
+    )
+}
+
+fn session_generation_json(response: &MutationResponse) -> String {
+    let generation = &response.session_generation;
+    let topic_frontier = generation
+        .topic_frontier
+        .iter()
+        .map(|(topic_id, revision_id)| {
+            format!(
+                "\"{}\":\"{}\"",
+                json_escape(topic_id),
+                json_escape(revision_id)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        concat!(
+            "{{",
+            "\"session_generation_id\":\"{}\",",
+            "\"session_id\":\"{}\",",
+            "\"write_topic_id\":\"{}\",",
+            "\"base_resolved_view_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"topic_frontier\":{{{}}},",
+            "\"generation_number\":{},",
+            "\"refresh_policy\":\"{}\",",
+            "\"created_by_operation_id\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&generation.id),
+        json_escape(&generation.session_id),
+        json_escape(&generation.write_topic_id),
+        json_escape(&generation.base_resolved_view_id),
+        json_escape(&generation.resolved_view_id),
+        topic_frontier,
+        generation.generation_number,
+        json_escape(&generation.refresh_policy),
+        json_escape(&generation.created_by_operation_id),
+    )
+}
+
+fn refs_json(refs: &MutationRefs) -> String {
+    format!(
+        "{{\"artifacts\":[{}],\"tree_identity\":{}}}",
+        refs.artifacts
+            .iter()
+            .map(|artifact| {
+                format!(
+                    concat!(
+                        "{{",
+                        "\"artifact_id\":{},",
+                        "\"path\":\"{}\",",
+                        "\"path_state\":\"{}\",",
+                        "\"content_hash\":{},",
+                        "\"executable\":{},",
+                        "\"classification\":{}",
+                        "}}"
+                    ),
+                    optional_string_json(artifact.artifact_id.as_deref()),
+                    json_escape(&artifact.path),
+                    json_escape(&artifact.path_state),
+                    optional_string_json(artifact.content_hash.as_deref()),
+                    optional_bool_json(artifact.executable),
+                    optional_string_json(artifact.classification.as_deref()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        tree_identity_json(&refs.tree_identity),
+    )
+}
+
 fn view_json(view: &SessionView) -> String {
     format!(
         concat!(
@@ -572,6 +999,21 @@ fn view_json(view: &SessionView) -> String {
         json_escape(&view.tree_identity.kind),
         json_escape(&view.tree_identity.repository_id),
         json_escape(&view.tree_identity.tree_hash),
+    )
+}
+
+fn tree_identity_json(tree_identity: &TreeIdentityView) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"kind\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"tree_hash\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&tree_identity.kind),
+        json_escape(&tree_identity.repository_id),
+        json_escape(&tree_identity.tree_hash),
     )
 }
 
@@ -598,6 +1040,49 @@ fn artifact_json(artifact: &SessionVisibleArtifactView) -> String {
         artifact.executable,
         artifact.tombstone,
     )
+}
+
+fn mutation_artifact_json(artifact: &MutationArtifactView) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"artifact_id\":\"{}\",",
+            "\"path\":\"{}\",",
+            "\"kind\":\"{}\",",
+            "\"before_hash\":{},",
+            "\"after_hash\":\"{}\",",
+            "\"classification\":\"{}\",",
+            "\"executable\":{}",
+            "}}"
+        ),
+        json_escape(&artifact.artifact_id),
+        json_escape(&artifact.path),
+        artifact.kind.as_str(),
+        optional_string_json(artifact.before_hash.as_deref()),
+        json_escape(&artifact.after_hash),
+        json_escape(&artifact.classification),
+        artifact.executable,
+    )
+}
+
+fn optional_string_json(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn optional_bool_json(value: Option<bool>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn write_mode_json(write_mode: &WriteMode) -> &'static str {
+    if matches!(write_mode, WriteMode::Create) {
+        "create"
+    } else {
+        "replace"
+    }
 }
 
 fn failure_envelope(error: &CliError) -> String {
@@ -651,6 +1136,8 @@ Usage:
   sun read <path> --session <session> --fixture basic-app [--json]
   sun list [path-prefix] --session <session> --fixture basic-app [--json]
   sun search <query> --session <session> --fixture basic-app [--json]
+  sun patch <path> --session <session> --fixture basic-app --expect-hash <hash> --patch-file <file> [--json]
+  sun write <path> --session <session> --fixture basic-app --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]
 
 Commands:
   init       Create the conservative local .sunlight repository layout
@@ -659,6 +1146,8 @@ Commands:
   read       Read a fixture artifact by repository-relative path
   list       List fixture artifacts by optional path prefix
   search     Search fixture artifact text literally
+  patch      Apply a fixture-only unified diff to one artifact
+  write      Write fixture-only content to one artifact path
 "
     );
 }

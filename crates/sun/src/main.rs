@@ -296,10 +296,12 @@ fn parse_artifact_options(
         return Err(invalid_request(artifact_usage(command)));
     }
 
-    let session_id = session_id
-        .ok_or_else(|| invalid_request(format!("usage: sun {command} requires --session <session>")))?;
-    let fixture = fixture
-        .ok_or_else(|| invalid_request(format!("usage: sun {command} requires --fixture basic-app")))?;
+    let session_id = session_id.ok_or_else(|| {
+        invalid_request(format!("usage: sun {command} requires --session <session>"))
+    })?;
+    let fixture = fixture.ok_or_else(|| {
+        invalid_request(format!("usage: sun {command} requires --fixture basic-app"))
+    })?;
 
     Ok(ArtifactCommandOptions {
         session_id,

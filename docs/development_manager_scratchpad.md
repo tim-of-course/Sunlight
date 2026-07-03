@@ -45,9 +45,10 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 
 ## Active Work
 
-- Manager setup is in progress.
-- Need identify or create WSL repo location under `/home/timothycard/code`.
-- Need launch first delegated slices after confirming repo placement.
+- WSL base clone: `/home/timothycard/code/Sunlight-2`.
+- Active WSL slice `bootstrap-core`: worktree `/home/timothycard/code/Sunlight-2-bootstrap`, branch `dm/bootstrap-core`, process log root `C:\tmp\sunlight-manager\20260703-124241`.
+- Active WSL slice `implementation-backlog`: worktree `/home/timothycard/code/Sunlight-2-backlog`, branch `dm/implementation-backlog`, process log root `C:\tmp\sunlight-manager\20260703-124241`.
+- Next heartbeat should inspect both logs, verify commits, merge or cherry-pick acceptable work back to the integration branch, then launch the next one or two slices.
 
 ## Candidate First Slices
 

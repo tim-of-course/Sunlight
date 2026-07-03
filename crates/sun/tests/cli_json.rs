@@ -253,7 +253,8 @@ fn patch_json_fixture_basic_app_returns_mutation_success_envelope() {
     assert!(stdout.contains("\"payload\":{\"kind\":\"patch\""));
     assert!(stdout.contains("\"topic_revision\":{"));
     assert!(stdout.contains("\"session_generation\":{"));
-    assert!(stdout.contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_0001\"}"));
+    assert!(stdout
+        .contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_0001\"}"));
 }
 
 #[test]
@@ -296,7 +297,8 @@ fn write_json_fixture_basic_app_new_file_returns_mutation_success_envelope() {
     assert!(stdout.contains("\"mutation\":\"write\""));
     assert!(stdout.contains("\"expected_hash\":\"new\""));
     assert!(stdout.contains("\"payload\":{\"kind\":\"write\",\"write_mode\":\"create\""));
-    assert!(stdout.contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_0001\"}"));
+    assert!(stdout
+        .contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_0001\"}"));
 }
 
 #[test]
@@ -359,7 +361,9 @@ fn patch_json_fixture_basic_app_bad_hunk_returns_patch_apply_failure() {
     let stdout = stdout(&output);
     assert!(stdout.contains("\"ok\":false"));
     assert!(stdout.contains("\"code\":\"patch_apply_failed\""));
-    assert!(stdout.contains("\"message\":\"patch did not apply to expected content at `src/auth.ts`\""));
+    assert!(
+        stdout.contains("\"message\":\"patch did not apply to expected content at `src/auth.ts`\"")
+    );
     assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
     assert!(stdout.contains("\"content_hash\":\"sha256:auth_base\""));
     assert!(stdout.contains("\"failed_hunk\":\"1\""));

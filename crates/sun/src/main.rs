@@ -236,9 +236,9 @@ fn artifact_patch(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn artifact_write(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_mutation_options(ctx, "write", 1)?;
-    let expect_hash = options.expect_hash.ok_or_else(|| {
-        invalid_request("usage: sun write requires --expect-hash <hash-or-new>")
-    })?;
+    let expect_hash = options
+        .expect_hash
+        .ok_or_else(|| invalid_request("usage: sun write requires --expect-hash <hash-or-new>"))?;
     let content_file = options
         .content_file
         .ok_or_else(|| invalid_request("usage: sun write requires --content-file <file>"))?;
@@ -270,7 +270,10 @@ fn artifact_write(ctx: &CommandContext) -> Result<(), CliError> {
     if ctx.json {
         println!("{}", mutation_success_envelope(&response));
     } else {
-        println!("wrote {} {}", response.artifact.path, response.artifact.after_hash);
+        println!(
+            "wrote {} {}",
+            response.artifact.path, response.artifact.after_hash
+        );
     }
 
     Ok(())
@@ -455,9 +458,9 @@ fn parse_mutation_options(
                 expect_hash = Some(value.clone());
             }
             "--patch-file" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| invalid_request("usage: sun patch requires --patch-file <file>"))?;
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun patch requires --patch-file <file>")
+                })?;
                 patch_file = Some(value.clone());
             }
             "--content-file" => {

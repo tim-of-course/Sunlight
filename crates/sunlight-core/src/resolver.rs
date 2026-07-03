@@ -105,7 +105,10 @@ impl ResolverRecordKind {
     }
 
     pub fn is_conflict(self) -> bool {
-        matches!(self, Self::SameArtifactConflict | Self::FrontierInconsistent)
+        matches!(
+            self,
+            Self::SameArtifactConflict | Self::FrontierInconsistent
+        )
     }
 
     pub fn is_staleness(self) -> bool {
@@ -552,7 +555,10 @@ fn missing_dependency_record(
         resolved_view_id: resolved_view_id.to_string(),
         artifact_ids: Vec::new(),
         path_refs: Vec::new(),
-        operation_ids: vec![dependent_revision.operation.operation_transaction_id.clone()],
+        operation_ids: vec![dependent_revision
+            .operation
+            .operation_transaction_id
+            .clone()],
         authored_context_ids: vec![dependent_revision.operation.authored_context_id.clone()],
         policy_reason: "required dependency revision is not selected in the frontier".to_string(),
         candidate_refs,
@@ -589,7 +595,10 @@ fn stale_dependency_record(
         resolved_view_id: resolved_view_id.to_string(),
         artifact_ids: Vec::new(),
         path_refs: Vec::new(),
-        operation_ids: vec![dependent_revision.operation.operation_transaction_id.clone()],
+        operation_ids: vec![dependent_revision
+            .operation
+            .operation_transaction_id
+            .clone()],
         authored_context_ids: vec![dependent_revision.operation.authored_context_id.clone()],
         policy_reason: "selected dependency revision is older than the required revision"
             .to_string(),
@@ -614,13 +623,12 @@ fn resolved_view_id(input: &ResolverInputFrontier, frontier: &BTreeMap<String, S
 }
 
 fn tree_hash(repository_id: &str, entries: &BTreeMap<String, TreeEntryState>) -> String {
-    if entries
-        .values()
-        .all(|entry| matches!(
+    if entries.values().all(|entry| {
+        matches!(
             entry.content_hash.as_str(),
             "sha256:auth_base" | "sha256:routes_base" | "sha256:package_base"
-        ))
-    {
+        )
+    }) {
         return FIXTURE_TREE_HASH.to_string();
     }
 
@@ -699,7 +707,10 @@ mod tests {
             "sha256:profile_new"
         );
         assert_eq!(
-            result.tree_identity.as_ref().map(|tree| tree.repository_id.as_str()),
+            result
+                .tree_identity
+                .as_ref()
+                .map(|tree| tree.repository_id.as_str()),
             Some(FIXTURE_REPOSITORY_ID)
         );
     }

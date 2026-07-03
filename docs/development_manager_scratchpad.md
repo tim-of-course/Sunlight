@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 41 tests, `git diff --check`, and scratchpad length guard after artifact CLI and resolver fixture integration.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 50 tests, `git diff --check`, and scratchpad length guard after CLI mutation and resolver foundation integration.
 
 ## Active Work
 
@@ -64,8 +64,9 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `cli-envelope-skeleton`: integrated as `3c421fd`; formatting checkpoint `a9a46b2`.
 - Completed slice `cli-artifact-fixture`: integrated as `50ba1b1`; formatting checkpoint `168f73b`.
 - Completed slice `resolver-conflict-fixtures`: integrated as `ffbc014`.
-- Active slice `cli-mutation-fixture`: WSL clone `/home/timothycard/code/Sunlight-2-cli-mutation-fixture-20260703-175905`, branch `dm/cli-mutation-fixture`, logs under `C:\tmp\sunlight-manager\20260703-175905`.
-- Active slice `resolver-foundation`: WSL clone `/home/timothycard/code/Sunlight-2-resolver-foundation-20260703-175905`, branch `dm/resolver-foundation`, logs under `C:\tmp\sunlight-manager\20260703-175905`.
+- Completed slice `cli-mutation-fixture`: integrated as `6df0fa8`; formatting checkpoint `dde1d62`.
+- Completed slice `resolver-foundation`: integrated as `37c837a`; formatting checkpoint `dde1d62`.
+- No active WSL slices are currently tracked.
 - Next heartbeat should inspect active slice logs, verify commits, integrate acceptable work, then launch the next one or two slices.
 
 ## Candidate First Slices

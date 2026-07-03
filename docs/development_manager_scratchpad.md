@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 11 tests, `git diff --check`, and scratchpad length guard.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 17 tests, `git diff --check`, and scratchpad length guard.
 
 ## Active Work
 
@@ -53,16 +53,17 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `schema-contracts`: integrated as `d58857d`.
 - Completed slice `canonical-records`: integrated as `2b9893e`; formatting checkpoint `22ad52e`.
 - Completed slice `native-io-spec`: integrated as `4ca842d`.
-- Active WSL slice `topic-session-skeleton`: clone `/home/timothycard/code/Sunlight-2-topic-session`, branch `dm/topic-session-skeleton`, process log root `C:\tmp\sunlight-manager\20260703-142813`.
-- Active WSL slice `policy-validation-spec`: clone `/home/timothycard/code/Sunlight-2-policy-validation`, branch `dm/policy-validation`, process log root `C:\tmp\sunlight-manager\20260703-142813`.
+- Completed slice `topic-session-skeleton`: integrated as `cef729c`; formatting checkpoint `b646faf`.
+- Completed slice `policy-validation-spec`: integrated as `8f5b72d`.
 - Next heartbeat should inspect active slice logs, verify commits, integrate acceptable work, then launch the next one or two slices.
 
 ## Candidate First Slices
 
 - Slice D: canonical record envelope and canonicalization helpers.
 - Slice E: topic/session data model and command skeleton.
-- Slice F: `.sunlight` commit/export policy validation plan or first validator.
+- Slice F: `.sunlight` commit/export policy validator foundation.
 - Slice G: artifact store/read/list/search fixture design.
+- Slice H: topic/session CLI JSON response envelope once persistence boundary is clearer.
 
 ## Decisions
 

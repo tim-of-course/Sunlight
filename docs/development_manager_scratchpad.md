@@ -59,6 +59,8 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `artifact-io-fixtures`: integrated as `f26af68`.
 - Completed slice `artifact-io-foundation`: integrated as `3f37390`; formatting checkpoint `0248474`.
 - Completed slice `operation-transaction-contract`: integrated as `9bce817`.
+- Active slice `mutation-foundation`: WSL clone `/home/timothycard/code/Sunlight-2-mutation-foundation`, branch `dm/mutation-foundation`, logs under `C:\tmp\sunlight-manager\20260703-161356`.
+- Active slice `cli-envelope-spec`: WSL clone `/home/timothycard/code/Sunlight-2-cli-envelope-spec`, branch `dm/cli-envelope-spec`, logs under `C:\tmp\sunlight-manager\20260703-161356`.
 - Next heartbeat should inspect active slice logs, verify commits, integrate acceptable work, then launch the next one or two slices.
 
 ## Candidate First Slices

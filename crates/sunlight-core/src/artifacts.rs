@@ -266,7 +266,9 @@ impl Display for ArtifactIoError {
                 reason.as_str()
             ),
             Self::PathNotFound { path, .. } => write!(f, "path `{path}` was not found"),
-            Self::SessionNotFound { session_id } => write!(f, "session `{session_id}` was not found"),
+            Self::SessionNotFound { session_id } => {
+                write!(f, "session `{session_id}` was not found")
+            }
             Self::MissingContent { content_ref } => {
                 write!(f, "content blob `{content_ref}` was not found")
             }
@@ -434,9 +436,8 @@ impl InMemoryArtifactStore {
         let entry = self.entry_for_path(&path)?;
         let artifact = self.artifact_view(entry)?;
         let blob = self.blob_for_entry(entry)?;
-        let bytes = std::str::from_utf8(&blob.bytes).map_err(|_| ArtifactIoError::NonUtf8Content {
-            path: path.clone(),
-        })?;
+        let bytes = std::str::from_utf8(&blob.bytes)
+            .map_err(|_| ArtifactIoError::NonUtf8Content { path: path.clone() })?;
 
         Ok(ReadResponse {
             command: "artifact.read",
@@ -476,11 +477,7 @@ impl InMemoryArtifactStore {
         })
     }
 
-    pub fn search(
-        &self,
-        session_id: &str,
-        query: &str,
-    ) -> Result<SearchResponse, ArtifactIoError> {
+    pub fn search(&self, session_id: &str, query: &str) -> Result<SearchResponse, ArtifactIoError> {
         self.ensure_session(session_id)?;
         let mut matches = Vec::new();
 
@@ -490,10 +487,11 @@ impl InMemoryArtifactStore {
                     continue;
                 }
                 let blob = self.blob_for_entry(entry)?;
-                let text =
-                    std::str::from_utf8(&blob.bytes).map_err(|_| ArtifactIoError::NonUtf8Content {
+                let text = std::str::from_utf8(&blob.bytes).map_err(|_| {
+                    ArtifactIoError::NonUtf8Content {
                         path: entry.path.clone(),
-                    })?;
+                    }
+                })?;
                 for (line_index, line) in text.lines().enumerate() {
                     if line.contains(query) {
                         matches.push(SearchMatch {
@@ -747,8 +745,14 @@ mod tests {
             ("../README.md", PathPolicyViolationReason::EscapesRepository),
             ("/tmp/README.md", PathPolicyViolationReason::AbsolutePath),
             ("src//auth.ts", PathPolicyViolationReason::NonNormalizedPath),
-            ("./src/auth.ts", PathPolicyViolationReason::NonNormalizedPath),
-            ("src/../README.md", PathPolicyViolationReason::NonNormalizedPath),
+            (
+                "./src/auth.ts",
+                PathPolicyViolationReason::NonNormalizedPath,
+            ),
+            (
+                "src/../README.md",
+                PathPolicyViolationReason::NonNormalizedPath,
+            ),
             (
                 "src\\auth.ts",
                 PathPolicyViolationReason::PlatformInvalidSeparator,
@@ -781,7 +785,9 @@ mod tests {
     fn missing_path_is_not_a_policy_violation() {
         let store = InMemoryArtifactStore::fixture_basic_app();
 
-        let error = store.read(FIXTURE_SESSION_ID, "src/missing.ts").unwrap_err();
+        let error = store
+            .read(FIXTURE_SESSION_ID, "src/missing.ts")
+            .unwrap_err();
 
         assert_eq!(error.code(), "path_not_found");
         assert_eq!(

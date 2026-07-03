@@ -3,6 +3,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use sunlight_core::artifacts::{
+    ArtifactIoError, InMemoryArtifactStore, ListResponse, ReadResponse, SearchResponse,
+    SessionView, SessionVisibleArtifactView,
+};
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
 };
@@ -92,6 +96,9 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
                 "sun session start is parsed, but session records are not persisted yet",
             ))
         }
+        [command, ..] if command == "read" => artifact_read(&ctx),
+        [command, ..] if command == "list" => artifact_list(&ctx),
+        [command, ..] if command == "search" => artifact_search(&ctx),
         [command] if command == "status" => status(&ctx),
         [command, flag, _] if command == "status" && (flag == "--session" || flag == "--topic") => {
             status(&ctx)
@@ -130,6 +137,59 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
         println!("created_config = {}", report.created_config);
         println!("created_gitignore = {}", report.created_gitignore);
         println!("created_directories = {}", report.created_directories.len());
+    }
+
+    Ok(())
+}
+
+fn artifact_read(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_artifact_options(ctx, "read", 1, 1)?;
+    let store = fixture_store(&options.fixture)?;
+    let response = store
+        .read(&options.session_id, &options.operands[0])
+        .map_err(artifact_error)?;
+
+    if ctx.json {
+        println!("{}", read_success_envelope(&response));
+    } else {
+        print!("{}", response.content.bytes);
+    }
+
+    Ok(())
+}
+
+fn artifact_list(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_artifact_options(ctx, "list", 0, 1)?;
+    let prefix = options.operands.first().map(String::as_str).unwrap_or("");
+    let store = fixture_store(&options.fixture)?;
+    let response = store
+        .list(&options.session_id, prefix)
+        .map_err(artifact_error)?;
+
+    if ctx.json {
+        println!("{}", list_success_envelope(&response));
+    } else {
+        for artifact in response.artifacts {
+            println!("{}", artifact.path);
+        }
+    }
+
+    Ok(())
+}
+
+fn artifact_search(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_artifact_options(ctx, "search", 1, 1)?;
+    let store = fixture_store(&options.fixture)?;
+    let response = store
+        .search(&options.session_id, &options.operands[0])
+        .map_err(artifact_error)?;
+
+    if ctx.json {
+        println!("{}", search_success_envelope(&response));
+    } else {
+        for item in response.matches {
+            println!("{}:{}:{}", item.path, item.line, item.snippet);
+        }
     }
 
     Ok(())
@@ -191,6 +251,166 @@ fn unimplemented_command(command: &'static str, message: impl Into<String>) -> C
     CliError::new("invalid_request", message).with_detail("command", command)
 }
 
+#[derive(Debug)]
+struct ArtifactCommandOptions {
+    session_id: String,
+    fixture: String,
+    operands: Vec<String>,
+}
+
+fn parse_artifact_options(
+    ctx: &CommandContext,
+    command: &'static str,
+    min_operands: usize,
+    max_operands: usize,
+) -> Result<ArtifactCommandOptions, CliError> {
+    let mut session_id = None;
+    let mut fixture = None;
+    let mut operands = Vec::new();
+    let mut args = ctx.args.iter().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--session" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(format!("usage: sun {command} requires --session <session>"))
+                })?;
+                session_id = Some(value.clone());
+            }
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(format!("usage: sun {command} requires --fixture basic-app"))
+                })?;
+                fixture = Some(value.clone());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun {command}"
+                )));
+            }
+            value => operands.push(value.to_string()),
+        }
+    }
+
+    if operands.len() < min_operands || operands.len() > max_operands {
+        return Err(invalid_request(artifact_usage(command)));
+    }
+
+    let session_id = session_id
+        .ok_or_else(|| invalid_request(format!("usage: sun {command} requires --session <session>")))?;
+    let fixture = fixture
+        .ok_or_else(|| invalid_request(format!("usage: sun {command} requires --fixture basic-app")))?;
+
+    Ok(ArtifactCommandOptions {
+        session_id,
+        fixture,
+        operands,
+    })
+}
+
+fn artifact_usage(command: &str) -> String {
+    match command {
+        "read" => "usage: sun read <path-or-artifact-id> --session <session> --fixture basic-app",
+        "list" => "usage: sun list [path-prefix] --session <session> --fixture basic-app",
+        "search" => "usage: sun search <query> --session <session> --fixture basic-app",
+        _ => "usage: sun <artifact-command> --session <session> --fixture basic-app",
+    }
+    .to_string()
+}
+
+fn fixture_store(fixture: &str) -> Result<InMemoryArtifactStore, CliError> {
+    match fixture {
+        "basic-app" => Ok(InMemoryArtifactStore::fixture_basic_app()),
+        _ => Err(invalid_request(format!("unknown fixture `{fixture}`"))
+            .with_detail("fixture", fixture.to_string())),
+    }
+}
+
+fn artifact_error(error: ArtifactIoError) -> CliError {
+    let message = match &error {
+        ArtifactIoError::PathPolicyViolation { .. } => {
+            "path is rejected by repository path policy".to_string()
+        }
+        ArtifactIoError::PathNotFound { path, .. } => format!("path `{path}` was not found"),
+        ArtifactIoError::SessionNotFound { session_id } => {
+            format!("session `{session_id}` was not found")
+        }
+        _ => error.to_string(),
+    };
+
+    let mut cli_error = CliError::new(error.code(), message);
+    match error {
+        ArtifactIoError::PathPolicyViolation {
+            path,
+            policy_id,
+            reason,
+            session_generation_id,
+        } => {
+            cli_error = cli_error
+                .with_detail("path", path)
+                .with_detail("policy_id", policy_id)
+                .with_detail("reason", reason.as_str())
+                .with_detail("session_generation_id", session_generation_id);
+        }
+        ArtifactIoError::PathNotFound {
+            path,
+            session_generation_id,
+        } => {
+            cli_error = cli_error
+                .with_detail("path", path)
+                .with_detail("session_generation_id", session_generation_id);
+        }
+        ArtifactIoError::SessionNotFound { session_id } => {
+            cli_error = cli_error.with_detail("session_id", session_id);
+        }
+        ArtifactIoError::MissingContent { content_ref } => {
+            cli_error = cli_error.with_detail("content_ref", content_ref);
+        }
+        ArtifactIoError::NonUtf8Content { path } => {
+            cli_error = cli_error.with_detail("path", path);
+        }
+        ArtifactIoError::PreconditionFailed {
+            failed_precondition,
+            path,
+            artifact_id,
+            expected,
+            actual,
+            session_generation_id,
+            resolved_view_id,
+        } => {
+            cli_error = cli_error
+                .with_detail("failed_precondition", failed_precondition)
+                .with_detail("path", path)
+                .with_detail("expected", expected)
+                .with_detail("session_generation_id", session_generation_id)
+                .with_detail("resolved_view_id", resolved_view_id);
+            if let Some(artifact_id) = artifact_id {
+                cli_error = cli_error.with_detail("artifact_id", artifact_id);
+            }
+            if let Some(actual) = actual {
+                cli_error = cli_error.with_detail("actual", actual);
+            }
+        }
+        ArtifactIoError::PatchApplyFailed {
+            path,
+            artifact_id,
+            content_hash,
+            failed_hunk,
+            session_generation_id,
+            resolved_view_id,
+        } => {
+            cli_error = cli_error
+                .with_detail("path", path)
+                .with_detail("artifact_id", artifact_id)
+                .with_detail("content_hash", content_hash)
+                .with_detail("failed_hunk", failed_hunk.to_string())
+                .with_detail("session_generation_id", session_generation_id)
+                .with_detail("resolved_view_id", resolved_view_id);
+        }
+    }
+    cli_error
+}
+
 fn init_success_envelope(
     repository_id: &str,
     repo_root: &str,
@@ -233,6 +453,148 @@ fn init_success_envelope(
         created_config,
         created_gitignore,
         created_directories,
+    )
+}
+
+fn read_success_envelope(response: &ReadResponse) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"session_id\":\"{}\"}},",
+            "\"view\":{},",
+            "\"artifacts\":[{}],",
+            "\"content\":{{\"encoding\":\"{}\",\"bytes\":\"{}\"}}",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(response.command),
+        json_escape(&response.repository_id),
+        json_escape(&response.session_id),
+        view_json(&response.view),
+        artifact_json(&response.artifact),
+        json_escape(&response.content.encoding),
+        json_escape(&response.content.bytes),
+    )
+}
+
+fn list_success_envelope(response: &ListResponse) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"session_id\":\"{}\"}},",
+            "\"view\":{},",
+            "\"artifacts\":[{}]",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(response.command),
+        json_escape(&response.repository_id),
+        json_escape(&response.session_id),
+        view_json(&response.view),
+        response
+            .artifacts
+            .iter()
+            .map(artifact_json)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn search_success_envelope(response: &SearchResponse) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"session_id\":\"{}\"}},",
+            "\"view\":{},",
+            "\"matches\":[{}]",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(response.command),
+        json_escape(&response.repository_id),
+        json_escape(&response.session_id),
+        view_json(&response.view),
+        response
+            .matches
+            .iter()
+            .map(|item| {
+                format!(
+                    concat!(
+                        "{{",
+                        "\"artifact_id\":\"{}\",",
+                        "\"path\":\"{}\",",
+                        "\"content_hash\":\"{}\",",
+                        "\"line\":{},",
+                        "\"snippet\":\"{}\"",
+                        "}}"
+                    ),
+                    json_escape(&item.artifact_id),
+                    json_escape(&item.path),
+                    json_escape(&item.content_hash),
+                    item.line,
+                    json_escape(&item.snippet),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn view_json(view: &SessionView) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"tree_identity\":{{",
+            "\"kind\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"tree_hash\":\"{}\"",
+            "}}",
+            "}}"
+        ),
+        json_escape(&view.resolved_view_id),
+        json_escape(&view.session_generation_id),
+        json_escape(&view.tree_identity.kind),
+        json_escape(&view.tree_identity.repository_id),
+        json_escape(&view.tree_identity.tree_hash),
+    )
+}
+
+fn artifact_json(artifact: &SessionVisibleArtifactView) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"artifact_id\":\"{}\",",
+            "\"path\":\"{}\",",
+            "\"kind\":\"{}\",",
+            "\"content_hash\":\"{}\",",
+            "\"byte_length\":{},",
+            "\"classification\":\"{}\",",
+            "\"executable\":{},",
+            "\"tombstone\":{}",
+            "}}"
+        ),
+        json_escape(&artifact.artifact_id),
+        json_escape(&artifact.path),
+        artifact.kind.as_str(),
+        json_escape(&artifact.content_hash),
+        artifact.byte_length,
+        json_escape(&artifact.classification),
+        artifact.executable,
+        artifact.tombstone,
     )
 }
 
@@ -284,11 +646,17 @@ Usage:
   sun init [--repo <path>]
   sun topic create <slug> --display-name <name> --json
   sun session start --topic <topic> --view <view-selector> --actor <actor-id> --json
+  sun read <path> --session <session> --fixture basic-app [--json]
+  sun list [path-prefix] --session <session> --fixture basic-app [--json]
+  sun search <query> --session <session> --fixture basic-app [--json]
 
 Commands:
   init       Create the conservative local .sunlight repository layout
   topic      Parse Phase 1 topic commands; persistence is not implemented yet
   session    Parse Phase 1 session commands; persistence is not implemented yet
+  read       Read a fixture artifact by repository-relative path
+  list       List fixture artifacts by optional path prefix
+  search     Search fixture artifact text literally
 "
     );
 }

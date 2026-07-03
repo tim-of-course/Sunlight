@@ -272,7 +272,11 @@ pub fn canonical_record_id(
     kind: RecordKind,
     record: &JsonValue,
 ) -> Result<ObjectId, RecordError> {
-    Ok(ObjectId::new(repo_id, kind.object_kind(), canonical_record_hash(kind, record)?))
+    Ok(ObjectId::new(
+        repo_id,
+        kind.object_kind(),
+        canonical_record_hash(kind, record)?,
+    ))
 }
 
 fn required_string(value: &JsonValue, field: &'static str) -> Result<String, RecordError> {

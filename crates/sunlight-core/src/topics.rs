@@ -320,9 +320,7 @@ fn is_valid_topic_slug(value: &str) -> bool {
         && !value.contains("--")
 }
 
-fn exactly_one_write_topic(
-    frontier: &[TopicFrontierEntry],
-) -> Result<ObjectId, TopicSessionError> {
+fn exactly_one_write_topic(frontier: &[TopicFrontierEntry]) -> Result<ObjectId, TopicSessionError> {
     let write_topics: Vec<ObjectId> = frontier
         .iter()
         .filter(|entry| entry.mode == TopicBindingMode::Write)
@@ -342,14 +340,23 @@ fn topic_record_json(input: &TopicCreateInput) -> JsonValue {
     object([
         ("schema_version", number(RECORD_SCHEMA_VERSION)),
         ("record_type", string(RecordKind::Topic.as_str())),
-        ("id", string(topic_logical_id(&input.repository_id, &input.slug))),
+        (
+            "id",
+            string(topic_logical_id(&input.repository_id, &input.slug)),
+        ),
         ("repository_id", string(input.repository_id.as_str())),
         ("created_at", string(&input.created_at)),
-        ("privacy_class", string(PrivacyClass::CommitDefault.as_str())),
+        (
+            "privacy_class",
+            string(PrivacyClass::CommitDefault.as_str()),
+        ),
         ("slug", string(input.slug.as_str())),
         ("display_name", string(&input.display_name)),
         ("owner_actor_id", string(&input.owner_actor_id)),
-        ("base_checkpoint_id", string(input.base_checkpoint_id.to_string())),
+        (
+            "base_checkpoint_id",
+            string(input.base_checkpoint_id.to_string()),
+        ),
         ("visibility", string(input.visibility.as_str())),
         ("status", string(TopicStatus::Open.as_str())),
         ("head_revision_id", JsonValue::Null),
@@ -385,7 +392,10 @@ fn session_generation_record_json(
 ) -> JsonValue {
     object([
         ("schema_version", number(RECORD_SCHEMA_VERSION)),
-        ("record_type", string(RecordKind::SessionGeneration.as_str())),
+        (
+            "record_type",
+            string(RecordKind::SessionGeneration.as_str()),
+        ),
         ("id", string(generation_logical_id(input))),
         ("repository_id", string(input.repository_id.as_str())),
         ("created_at", string(&input.created_at)),
@@ -396,7 +406,10 @@ fn session_generation_record_json(
             "base_resolved_view_id",
             string(input.base_resolved_view_id.to_string()),
         ),
-        ("resolved_view_id", string(input.resolved_view_id.to_string())),
+        (
+            "resolved_view_id",
+            string(input.resolved_view_id.to_string()),
+        ),
         ("topic_frontier", topic_frontier_json(&input.topic_frontier)),
         ("generation_number", JsonValue::Number("0".to_string())),
         (
@@ -493,7 +506,10 @@ mod tests {
         };
         assert_eq!(record.get("record_type"), Some(&string("topic")));
         assert_eq!(record.get("slug"), Some(&string("auth-nullability")));
-        assert_eq!(record.get("display_name"), Some(&string("Auth nullability")));
+        assert_eq!(
+            record.get("display_name"),
+            Some(&string("Auth nullability"))
+        );
         assert_eq!(record.get("status"), Some(&string("open")));
         assert_eq!(record.get("head_revision_id"), Some(&JsonValue::Null));
         assert_eq!(
@@ -506,7 +522,14 @@ mod tests {
     fn topic_slugs_are_narrow_and_agent_friendly() {
         assert!(TopicSlug::new("profile-ui-2").is_ok());
 
-        for value in ["", "Profile", "profile_ui", "-profile", "profile-", "profile--ui"] {
+        for value in [
+            "",
+            "Profile",
+            "profile_ui",
+            "-profile",
+            "profile-",
+            "profile--ui",
+        ] {
             assert_eq!(
                 TopicSlug::new(value).unwrap_err(),
                 TopicSessionError::InvalidTopicSlug {
@@ -542,9 +565,18 @@ mod tests {
             records.session.capabilities,
             PHASE1_SESSION_CAPABILITIES.to_vec()
         );
-        assert!(records.session.capabilities.contains(&SessionCapability::Read));
-        assert!(records.session.capabilities.contains(&SessionCapability::Write));
-        assert!(records.session.capabilities.contains(&SessionCapability::Patch));
+        assert!(records
+            .session
+            .capabilities
+            .contains(&SessionCapability::Read));
+        assert!(records
+            .session
+            .capabilities
+            .contains(&SessionCapability::Write));
+        assert!(records
+            .session
+            .capabilities
+            .contains(&SessionCapability::Patch));
         assert_eq!(records.generation.generation_number, 0);
         assert_eq!(records.generation.base_resolved_view_id, view);
     }

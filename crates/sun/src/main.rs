@@ -34,12 +34,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         [scope, command, ..] if scope == "topic" && command == "create" => {
             Err("sun topic create is parsed, but topic records are not persisted yet".to_string())
         }
-        [scope, command, ..] if scope == "session" && command == "start" => {
-            Err(
-                "sun session start is parsed, but session records are not persisted yet"
-                    .to_string(),
-            )
-        }
+        [scope, command, ..] if scope == "session" && command == "start" => Err(
+            "sun session start is parsed, but session records are not persisted yet".to_string(),
+        ),
         [command, ..] => Err(format!("unknown command `{command}`")),
     }
 }

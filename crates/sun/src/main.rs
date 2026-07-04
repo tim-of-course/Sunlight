@@ -4725,7 +4725,10 @@ fn local_projection_root_verification(
     let missing_files = expected_paths.difference(&local_paths).count();
     let extra_files = local_paths.difference(&expected_paths).count();
     let mut mismatched_files = 0;
+    #[cfg(unix)]
     let mut metadata_mismatches = 0;
+    #[cfg(not(unix))]
+    let metadata_mismatches = 0;
     let mut verification_errors = Vec::new();
 
     for entry in &manifest.entries {

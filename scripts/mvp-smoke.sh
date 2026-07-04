@@ -115,7 +115,7 @@ assert_contains "$out" '"selected_strategy":"copy"' "projection strategy"
 assert_contains "$out" '"files_written":5' "projected file count"
 assert_contains "$out" '"executable_files":1' "projected executable count"
 
-projected_file_count="$(find "$projection_root" -type f | wc -l | tr -d '[:space:]')"
+projected_file_count="$(find "$projection_root" -path "$projection_root/.sunlight" -prune -o -type f -print | wc -l | tr -d '[:space:]')"
 [[ "$projected_file_count" == "5" ]] || fail "projected file count is $projected_file_count, expected 5"
 for path in README.md docs/guide.md scripts/build.sh src/auth.ts src/profile.ts; do
     [[ -f "$projection_root/$path" ]] || fail "projection root missing $path"

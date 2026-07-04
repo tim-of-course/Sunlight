@@ -129,7 +129,9 @@ try {
     Assert-Contains $out '"files_written":5' 'projected file count'
     Assert-Contains $out '"executable_files":1' 'projected executable count'
 
-    $projectedFiles = Get-ChildItem -LiteralPath $projectionRoot -File -Recurse
+    $projectionMetadataPrefix = (Join-Path $projectionRoot '.sunlight') + [System.IO.Path]::DirectorySeparatorChar
+    $projectedFiles = Get-ChildItem -LiteralPath $projectionRoot -File -Recurse |
+        Where-Object { -not ($_.FullName.StartsWith($projectionMetadataPrefix, [System.StringComparison]::OrdinalIgnoreCase)) }
     if ($projectedFiles.Count -ne 5) {
         throw "Projected file count is $($projectedFiles.Count), expected 5"
     }

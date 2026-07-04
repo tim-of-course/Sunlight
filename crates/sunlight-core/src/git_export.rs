@@ -1729,8 +1729,7 @@ mod tests {
         assert!(!report.ok);
         assert!(report.failures.iter().any(|failure| {
             failure.check == GitExportValidationCheck::GeneratedPolicy
-                && failure.code
-                    == GitExportValidationFailureCode::GeneratedOutputRequiresPromotion
+                && failure.code == GitExportValidationFailureCode::GeneratedOutputRequiresPromotion
                 && failure.field.as_deref() == Some("generated_outputs[].path")
                 && failure.value.as_deref() == Some("src/generated/auth.generated.ts")
                 && failure.reason.contains("promotion_operation_id")

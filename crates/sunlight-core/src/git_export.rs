@@ -182,6 +182,86 @@ pub struct GitExportWriterPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitExportExecutionFixture {
+    pub commit_creation: GitExportExecutionStepFixture,
+    pub ref_update: GitExportExecutionStepFixture,
+    pub export_map_write: GitExportExecutionStepFixture,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitExportExecutionStepFixture {
+    Succeed,
+    Fail { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitExportExecutionResult {
+    pub lifecycle_state: GitExportExecutionLifecycleState,
+    pub checkpoint_id: String,
+    pub validation_report_id: String,
+    pub target_ref: String,
+    pub parent_commit_id: String,
+    pub created_commit_id: Option<String>,
+    pub summary: GitExportExecutionSummary,
+    pub export_map: Option<GitExportMapRecord>,
+    pub error: Option<GitExportExecutionError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitExportExecutionLifecycleState {
+    Exported,
+    Partial,
+    Failed,
+}
+
+impl GitExportExecutionLifecycleState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exported => "exported",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitExportExecutionSummary {
+    pub commit_created: bool,
+    pub ref_updated: bool,
+    pub export_map_written: bool,
+    pub completed_steps: Vec<GitExportExecutionStep>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitExportExecutionStep {
+    CommitCreated,
+    RefUpdated,
+    ExportMapWritten,
+}
+
+impl GitExportExecutionStep {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CommitCreated => "commit_created",
+            Self::RefUpdated => "ref_updated",
+            Self::ExportMapWritten => "export_map_written",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitExportExecutionError {
+    pub code: GitExportErrorCode,
+    pub failed_step: GitExportExecutionStep,
+    pub checkpoint_id: String,
+    pub validation_report_id: String,
+    pub target_ref: String,
+    pub parent_commit_id: String,
+    pub created_commit_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitExportParentPlan {
     pub checkpoint_id: String,
     pub commit_id: String,
@@ -220,6 +300,24 @@ impl GitExportRefUpdateReason {
             Self::CreateRef => "create_ref",
             Self::ReplaceSelectedParent => "replace_selected_parent",
             Self::ReplacePriorExportForSameCheckpoint => "replace_prior_export_for_same_checkpoint",
+        }
+    }
+}
+
+impl GitExportExecutionFixture {
+    pub fn success() -> Self {
+        Self {
+            commit_creation: GitExportExecutionStepFixture::Succeed,
+            ref_update: GitExportExecutionStepFixture::Succeed,
+            export_map_write: GitExportExecutionStepFixture::Succeed,
+        }
+    }
+}
+
+impl GitExportExecutionStepFixture {
+    pub fn fail(message: impl Into<String>) -> Self {
+        Self::Fail {
+            message: message.into(),
         }
     }
 }
@@ -275,6 +373,56 @@ pub fn plan_git_export_writer(
     })
 }
 
+pub fn execute_git_export_writer_plan_fixture(
+    plan: &GitExportWriterPlan,
+    fixture: GitExportExecutionFixture,
+) -> GitExportExecutionResult {
+    let base = GitExportExecutionResultBuilder::new(plan);
+
+    if let GitExportExecutionStepFixture::Fail { message } = fixture.commit_creation {
+        return base.failed(
+            GitExportExecutionStep::CommitCreated,
+            GitExportErrorCode::ExportGitFailed,
+            None,
+            summary(false, false, false),
+            message,
+        );
+    }
+
+    let created_commit_id = plan.commit.planned_commit_id.clone();
+    if let GitExportExecutionStepFixture::Fail { message } = fixture.ref_update {
+        return base.partial(
+            GitExportExecutionStep::RefUpdated,
+            GitExportErrorCode::ExportRefUpdateFailed,
+            Some(created_commit_id),
+            summary(true, false, false),
+            message,
+        );
+    }
+
+    if let GitExportExecutionStepFixture::Fail { message } = fixture.export_map_write {
+        return base.partial(
+            GitExportExecutionStep::ExportMapWritten,
+            GitExportErrorCode::ExportMapWriteFailed,
+            Some(created_commit_id),
+            summary(true, true, false),
+            message,
+        );
+    }
+
+    GitExportExecutionResult {
+        lifecycle_state: GitExportExecutionLifecycleState::Exported,
+        checkpoint_id: plan.commit.checkpoint_id.clone(),
+        validation_report_id: plan.commit.validation_report_id.clone(),
+        target_ref: plan.ref_update.git_ref.clone(),
+        parent_commit_id: plan.commit.parent_commit_id.clone(),
+        created_commit_id: Some(created_commit_id),
+        summary: summary(true, true, true),
+        export_map: Some(plan.export_map.clone()),
+        error: None,
+    }
+}
+
 pub fn export_map_write_failed_error(
     checkpoint_id: impl Into<String>,
     validation_report_id: impl Into<String>,
@@ -315,6 +463,109 @@ pub fn ref_update_failed_error(
         message: format!(
             "Git commit `{created_commit_id}` was created, but `{target_ref}` was not updated"
         ),
+    }
+}
+
+struct GitExportExecutionResultBuilder<'a> {
+    plan: &'a GitExportWriterPlan,
+}
+
+impl<'a> GitExportExecutionResultBuilder<'a> {
+    fn new(plan: &'a GitExportWriterPlan) -> Self {
+        Self { plan }
+    }
+
+    fn failed(
+        &self,
+        failed_step: GitExportExecutionStep,
+        code: GitExportErrorCode,
+        created_commit_id: Option<String>,
+        summary: GitExportExecutionSummary,
+        message: String,
+    ) -> GitExportExecutionResult {
+        self.result(
+            GitExportExecutionLifecycleState::Failed,
+            failed_step,
+            code,
+            created_commit_id,
+            summary,
+            message,
+        )
+    }
+
+    fn partial(
+        &self,
+        failed_step: GitExportExecutionStep,
+        code: GitExportErrorCode,
+        created_commit_id: Option<String>,
+        summary: GitExportExecutionSummary,
+        message: String,
+    ) -> GitExportExecutionResult {
+        self.result(
+            GitExportExecutionLifecycleState::Partial,
+            failed_step,
+            code,
+            created_commit_id,
+            summary,
+            message,
+        )
+    }
+
+    fn result(
+        &self,
+        lifecycle_state: GitExportExecutionLifecycleState,
+        failed_step: GitExportExecutionStep,
+        code: GitExportErrorCode,
+        created_commit_id: Option<String>,
+        summary: GitExportExecutionSummary,
+        message: String,
+    ) -> GitExportExecutionResult {
+        let error = GitExportExecutionError {
+            code,
+            failed_step,
+            checkpoint_id: self.plan.commit.checkpoint_id.clone(),
+            validation_report_id: self.plan.commit.validation_report_id.clone(),
+            target_ref: self.plan.ref_update.git_ref.clone(),
+            parent_commit_id: self.plan.commit.parent_commit_id.clone(),
+            created_commit_id: created_commit_id.clone(),
+            message,
+        };
+
+        GitExportExecutionResult {
+            lifecycle_state,
+            checkpoint_id: self.plan.commit.checkpoint_id.clone(),
+            validation_report_id: self.plan.commit.validation_report_id.clone(),
+            target_ref: self.plan.ref_update.git_ref.clone(),
+            parent_commit_id: self.plan.commit.parent_commit_id.clone(),
+            created_commit_id,
+            summary,
+            export_map: None,
+            error: Some(error),
+        }
+    }
+}
+
+fn summary(
+    commit_created: bool,
+    ref_updated: bool,
+    export_map_written: bool,
+) -> GitExportExecutionSummary {
+    let mut completed_steps = Vec::new();
+    if commit_created {
+        completed_steps.push(GitExportExecutionStep::CommitCreated);
+    }
+    if ref_updated {
+        completed_steps.push(GitExportExecutionStep::RefUpdated);
+    }
+    if export_map_written {
+        completed_steps.push(GitExportExecutionStep::ExportMapWritten);
+    }
+
+    GitExportExecutionSummary {
+        commit_created,
+        ref_updated,
+        export_map_written,
+        completed_steps,
     }
 }
 
@@ -999,6 +1250,10 @@ mod tests {
             "export_repository_invalid"
         );
         assert_eq!(
+            GitExportErrorCode::ExportGitFailed.as_str(),
+            "export_git_failed"
+        );
+        assert_eq!(
             GitExportErrorCode::ExportRefUpdateFailed.as_str(),
             "export_ref_update_failed"
         );
@@ -1011,6 +1266,27 @@ mod tests {
             "moving_selector"
         );
         assert_eq!(GitExportValidationCheck::GitRef.as_str(), "git_ref");
+        assert_eq!(
+            GitExportExecutionLifecycleState::Exported.as_str(),
+            "exported"
+        );
+        assert_eq!(
+            GitExportExecutionLifecycleState::Partial.as_str(),
+            "partial"
+        );
+        assert_eq!(
+            GitExportExecutionLifecycleState::Failed.as_str(),
+            "failed"
+        );
+        assert_eq!(
+            GitExportExecutionStep::CommitCreated.as_str(),
+            "commit_created"
+        );
+        assert_eq!(GitExportExecutionStep::RefUpdated.as_str(), "ref_updated");
+        assert_eq!(
+            GitExportExecutionStep::ExportMapWritten.as_str(),
+            "export_map_written"
+        );
     }
 
     #[test]
@@ -1215,6 +1491,117 @@ mod tests {
         assert_eq!(
             ref_error.parent_commit_id.as_deref(),
             Some(fixture_base_commit_id().as_str())
+        );
+    }
+
+    #[test]
+    fn fixture_execution_success_records_commit_ref_and_export_map() {
+        let plan = plan_git_export_writer(writer_input()).unwrap();
+
+        let result =
+            execute_git_export_writer_plan_fixture(&plan, GitExportExecutionFixture::success());
+
+        assert_eq!(
+            result.lifecycle_state,
+            GitExportExecutionLifecycleState::Exported
+        );
+        assert_eq!(result.created_commit_id.as_deref(), Some(FIXTURE_GIT_COMMIT_ID));
+        assert_eq!(result.summary.commit_created, true);
+        assert_eq!(result.summary.ref_updated, true);
+        assert_eq!(result.summary.export_map_written, true);
+        assert_eq!(
+            result.summary.completed_steps,
+            vec![
+                GitExportExecutionStep::CommitCreated,
+                GitExportExecutionStep::RefUpdated,
+                GitExportExecutionStep::ExportMapWritten,
+            ]
+        );
+        assert_eq!(result.export_map, Some(plan.export_map));
+        assert_eq!(result.error, None);
+    }
+
+    #[test]
+    fn fixture_execution_commit_failure_reports_failed_summary() {
+        let plan = plan_git_export_writer(writer_input()).unwrap();
+        let mut fixture = GitExportExecutionFixture::success();
+        fixture.commit_creation = GitExportExecutionStepFixture::fail("fixture commit failed");
+
+        let result = execute_git_export_writer_plan_fixture(&plan, fixture);
+
+        assert_eq!(result.lifecycle_state, GitExportExecutionLifecycleState::Failed);
+        assert_eq!(result.created_commit_id, None);
+        assert_eq!(result.summary.commit_created, false);
+        assert_eq!(result.summary.ref_updated, false);
+        assert_eq!(result.summary.export_map_written, false);
+        assert!(result.summary.completed_steps.is_empty());
+        let error = result.error.unwrap();
+        assert_eq!(error.code, GitExportErrorCode::ExportGitFailed);
+        assert_eq!(error.failed_step, GitExportExecutionStep::CommitCreated);
+        assert_eq!(error.created_commit_id, None);
+        assert_eq!(error.message, "fixture commit failed");
+    }
+
+    #[test]
+    fn fixture_execution_ref_update_failure_reports_partial_summary() {
+        let plan = plan_git_export_writer(writer_input()).unwrap();
+        let mut fixture = GitExportExecutionFixture::success();
+        fixture.ref_update = GitExportExecutionStepFixture::fail("fixture ref update failed");
+
+        let result = execute_git_export_writer_plan_fixture(&plan, fixture);
+
+        assert_eq!(
+            result.lifecycle_state,
+            GitExportExecutionLifecycleState::Partial
+        );
+        assert_eq!(result.created_commit_id.as_deref(), Some(FIXTURE_GIT_COMMIT_ID));
+        assert_eq!(result.summary.commit_created, true);
+        assert_eq!(result.summary.ref_updated, false);
+        assert_eq!(result.summary.export_map_written, false);
+        assert_eq!(
+            result.summary.completed_steps,
+            vec![GitExportExecutionStep::CommitCreated]
+        );
+        assert_eq!(result.export_map, None);
+        let error = result.error.unwrap();
+        assert_eq!(error.code, GitExportErrorCode::ExportRefUpdateFailed);
+        assert_eq!(error.failed_step, GitExportExecutionStep::RefUpdated);
+        assert_eq!(error.created_commit_id.as_deref(), Some(FIXTURE_GIT_COMMIT_ID));
+        assert_eq!(error.target_ref, FIXTURE_EXPORTED_GIT_REF);
+    }
+
+    #[test]
+    fn fixture_execution_export_map_failure_reports_partial_summary() {
+        let plan = plan_git_export_writer(writer_input()).unwrap();
+        let mut fixture = GitExportExecutionFixture::success();
+        fixture.export_map_write =
+            GitExportExecutionStepFixture::fail("fixture export map write failed");
+
+        let result = execute_git_export_writer_plan_fixture(&plan, fixture);
+
+        assert_eq!(
+            result.lifecycle_state,
+            GitExportExecutionLifecycleState::Partial
+        );
+        assert_eq!(result.created_commit_id.as_deref(), Some(FIXTURE_GIT_COMMIT_ID));
+        assert_eq!(result.summary.commit_created, true);
+        assert_eq!(result.summary.ref_updated, true);
+        assert_eq!(result.summary.export_map_written, false);
+        assert_eq!(
+            result.summary.completed_steps,
+            vec![
+                GitExportExecutionStep::CommitCreated,
+                GitExportExecutionStep::RefUpdated,
+            ]
+        );
+        assert_eq!(result.export_map, None);
+        let error = result.error.unwrap();
+        assert_eq!(error.code, GitExportErrorCode::ExportMapWriteFailed);
+        assert_eq!(error.failed_step, GitExportExecutionStep::ExportMapWritten);
+        assert_eq!(error.created_commit_id.as_deref(), Some(FIXTURE_GIT_COMMIT_ID));
+        assert_eq!(
+            error.validation_report_id,
+            FIXTURE_VALIDATION_REPORT_ID.to_string()
         );
     }
 

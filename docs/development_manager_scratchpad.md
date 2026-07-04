@@ -134,11 +134,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-store-integrity-scan-seam`: integrated as `a5a7992`; formatting checkpoint `efc0206`.
 - Completed slice `projection-store-integrity-cli-scan-wiring`: integrated as `e5500af`; formatting checkpoint `a58f8d6`.
 - Completed slice `execution-store-integrity-gate-fixture`: integrated as `9f700c1`; formatting checkpoint `dfd23bb`.
-- No active WSL slice at this checkpoint. Next heartbeat should start the next project-wide slice from the candidate list after confirming `main` is still clean.
+- Active WSL slice `projection-quarantine-durable-record`: clone `/home/timothycard/code/Sunlight-2-projection-quarantine-durable-record-20260704-175151`, branch `dm/projection-quarantine-durable-record`, started from `5cb5d89`.
 
 ## Candidate Next Slices
 
-- Projection store-integrity next needs durable quarantine persistence/cache invalidation follow-through beyond fixture JSON errors.
+- Projection store-integrity durable quarantine/cache invalidation follow-through is active.
 - First external validation repo and exact test command are now the next product-level decision once the projection integrity persistence path is stable enough to test against real project files.
 
 ## Decisions

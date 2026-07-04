@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 150 tests, and `git diff --check` after Git export writer CLI fixture and projection materialization foundation integration. Scratchpad guard must run after this edit.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 156 tests, and `git diff --check` after projection materialization CLI and compatibility import status/inspect integration. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -88,9 +88,9 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `git-export-writer-foundation`: integrated as `f7b0723`; formatting checkpoint `62e28a5`.
 - Completed slice `cli-git-export-writer-fixture`: integrated as `d913e39`; formatting checkpoint `1ddf6b9`.
 - Completed slice `projection-materialization-foundation`: integrated as `b58f308`; formatting checkpoint `1ddf6b9`.
-- Active slice `cli-projection-materialization-fixture`: WSL clone `/home/timothycard/code/Sunlight-2-cli-projection-materialization-fixture-20260703-234831`, branch `dm/cli-projection-materialization-fixture`, run artifacts under `C:\tmp\sunlight-manager\20260703-234831`.
-- Active slice `compat-import-status-inspect`: WSL clone `/home/timothycard/code/Sunlight-2-compat-import-status-inspect-20260703-234831`, branch `dm/compat-import-status-inspect`, run artifacts under `C:\tmp\sunlight-manager\20260703-234831`.
-- Next heartbeat should inspect active slice last-message files, verify completed work, integrate acceptable commits, and keep one or two project-wide slices moving.
+- Completed slice `cli-projection-materialization-fixture`: integrated as `e0b39e9`; formatting checkpoint `02911da`.
+- Completed slice `compat-import-status-inspect`: integrated as `af9d5e2`; formatting checkpoint `02911da`.
+- Active capacity is open after this integration; next launch should pick non-conflicting implementation or validation slices.
 
 ## Candidate Next Slices
 

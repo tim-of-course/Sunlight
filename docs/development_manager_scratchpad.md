@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 160 tests, and `git diff --check` after Git export execution foundation and validation repo plan integration. Scratchpad guard must run after this edit.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 163 tests, `git diff --check HEAD~3 HEAD`, and native `scripts/validation-smoke.ps1` after CLI Git export execution fixture and validation smoke integration. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -92,15 +92,15 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `compat-import-status-inspect`: integrated as `af9d5e2`; formatting checkpoint `02911da`.
 - Completed slice `git-export-execution-foundation`: integrated as `988b5cf`; formatting checkpoint `22d55f9`.
 - Completed slice `validation-repo-plan`: integrated as `fb13cef`.
-- Active slice `cli-git-export-execution-fixture`: WSL clone `/home/timothycard/code/Sunlight-2-cli-git-export-execution-fixture-20260704-010030`, branch `dm/cli-git-export-execution-fixture`, run artifacts under `C:\tmp\sunlight-manager\20260704-010030`.
-- Active slice `validation-smoke-script`: WSL clone `/home/timothycard/code/Sunlight-2-validation-smoke-script-20260704-010030`, branch `dm/validation-smoke-script`, run artifacts under `C:\tmp\sunlight-manager\20260704-010030`.
-- Next heartbeat should inspect active WSL progress, import verified work if finished, run full verification, and keep one or two project-wide slices moving.
+- Completed slice `cli-git-export-execution-fixture`: integrated as `5347921`; formatting checkpoint `d553789`.
+- Completed slice `validation-smoke-script`: integrated as `20a1c13`.
+- Active capacity is open after this integration; next launch should pick non-conflicting implementation or validation slices.
 
 ## Candidate Next Slices
 
-- CLI Git export execution integration after active fixture slice lands.
+- Real Git export execution planning after fixture execution path lands.
 - Projection strategy implementation after the spike plan selects the first materialization path.
-- Validation repo smoke usage follow-up after active script slice lands.
+- Validation smoke CI/usage follow-up after script lands.
 
 ## Decisions
 

@@ -1274,10 +1274,7 @@ mod tests {
             GitExportExecutionLifecycleState::Partial.as_str(),
             "partial"
         );
-        assert_eq!(
-            GitExportExecutionLifecycleState::Failed.as_str(),
-            "failed"
-        );
+        assert_eq!(GitExportExecutionLifecycleState::Failed.as_str(), "failed");
         assert_eq!(
             GitExportExecutionStep::CommitCreated.as_str(),
             "commit_created"
@@ -1505,7 +1502,10 @@ mod tests {
             result.lifecycle_state,
             GitExportExecutionLifecycleState::Exported
         );
-        assert_eq!(result.created_commit_id.as_deref(), Some(FIXTURE_GIT_COMMIT_ID));
+        assert_eq!(
+            result.created_commit_id.as_deref(),
+            Some(FIXTURE_GIT_COMMIT_ID)
+        );
         assert_eq!(result.summary.commit_created, true);
         assert_eq!(result.summary.ref_updated, true);
         assert_eq!(result.summary.export_map_written, true);
@@ -1529,7 +1529,10 @@ mod tests {
 
         let result = execute_git_export_writer_plan_fixture(&plan, fixture);
 
-        assert_eq!(result.lifecycle_state, GitExportExecutionLifecycleState::Failed);
+        assert_eq!(
+            result.lifecycle_state,
+            GitExportExecutionLifecycleState::Failed
+        );
         assert_eq!(result.created_commit_id, None);
         assert_eq!(result.summary.commit_created, false);
         assert_eq!(result.summary.ref_updated, false);
@@ -1554,7 +1557,10 @@ mod tests {
             result.lifecycle_state,
             GitExportExecutionLifecycleState::Partial
         );
-        assert_eq!(result.created_commit_id.as_deref(), Some(FIXTURE_GIT_COMMIT_ID));
+        assert_eq!(
+            result.created_commit_id.as_deref(),
+            Some(FIXTURE_GIT_COMMIT_ID)
+        );
         assert_eq!(result.summary.commit_created, true);
         assert_eq!(result.summary.ref_updated, false);
         assert_eq!(result.summary.export_map_written, false);
@@ -1566,7 +1572,10 @@ mod tests {
         let error = result.error.unwrap();
         assert_eq!(error.code, GitExportErrorCode::ExportRefUpdateFailed);
         assert_eq!(error.failed_step, GitExportExecutionStep::RefUpdated);
-        assert_eq!(error.created_commit_id.as_deref(), Some(FIXTURE_GIT_COMMIT_ID));
+        assert_eq!(
+            error.created_commit_id.as_deref(),
+            Some(FIXTURE_GIT_COMMIT_ID)
+        );
         assert_eq!(error.target_ref, FIXTURE_EXPORTED_GIT_REF);
     }
 
@@ -1583,7 +1592,10 @@ mod tests {
             result.lifecycle_state,
             GitExportExecutionLifecycleState::Partial
         );
-        assert_eq!(result.created_commit_id.as_deref(), Some(FIXTURE_GIT_COMMIT_ID));
+        assert_eq!(
+            result.created_commit_id.as_deref(),
+            Some(FIXTURE_GIT_COMMIT_ID)
+        );
         assert_eq!(result.summary.commit_created, true);
         assert_eq!(result.summary.ref_updated, true);
         assert_eq!(result.summary.export_map_written, false);
@@ -1598,7 +1610,10 @@ mod tests {
         let error = result.error.unwrap();
         assert_eq!(error.code, GitExportErrorCode::ExportMapWriteFailed);
         assert_eq!(error.failed_step, GitExportExecutionStep::ExportMapWritten);
-        assert_eq!(error.created_commit_id.as_deref(), Some(FIXTURE_GIT_COMMIT_ID));
+        assert_eq!(
+            error.created_commit_id.as_deref(),
+            Some(FIXTURE_GIT_COMMIT_ID)
+        );
         assert_eq!(
             error.validation_report_id,
             FIXTURE_VALIDATION_REPORT_ID.to_string()

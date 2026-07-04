@@ -931,6 +931,42 @@ fn status_json_fixture_projection_reports_local_root_verification() {
 }
 
 #[test]
+fn status_json_fixture_projection_store_mismatch_reports_quarantine() {
+    let repo = TestRepo::new("projection-status-store-mismatch");
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--integrity-fixture")
+        .arg("store-mismatch")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.projection\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"lifecycle_state\":\"quarantined\""));
+    assert!(stdout.contains("\"retention_state\":\"quarantined\""));
+    assert!(stdout.contains("\"integrity_status\":\"failed\""));
+    assert!(stdout.contains("\"reason\":\"store_integrity_mismatch\""));
+    assert!(stdout.contains("\"reason_code\":\"execution_store_integrity_failed\""));
+    assert!(stdout.contains("\"cache_key\":\"projection-cache:repo_fixture_basic_app:"));
+    assert!(stdout.contains("\"manifest_ref\":\"objects/projection-manifests/sha256/"));
+    assert!(stdout.contains("\"quarantine_refs\":{\"projection\":\"projection:projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"source_truth\":\"immutable_store_manifest\""));
+    assert!(stdout.contains("\"local_filesystem_source_truth\":false"));
+    assert!(stdout.contains("\"native_errors\":[{\"code\":\"execution_store_integrity_failed\""));
+    assert!(stdout.contains("\"local_root_verification\":null"));
+    assert!(!stdout.contains("\"content_verification\":\"verified\""));
+}
+
+#[test]
 fn status_json_fixture_projection_reports_dirty_content_from_manifest() {
     let repo = TestRepo::new("projection-status-root-dirty-content");
     let projection_root = repo.path().join("projection-root");
@@ -3056,6 +3092,36 @@ fn inspect_json_fixture_projection_returns_local_only_metadata() {
     assert!(stdout.contains("\"verification_state\":\"present\""));
     assert!(stdout.contains("\"files\":5"));
     assert!(stdout.contains("\"bytes\":222"));
+}
+
+#[test]
+fn inspect_json_fixture_projection_store_mismatch_reports_local_quarantine_metadata() {
+    let repo = TestRepo::new("inspect-fixture-projection-store-mismatch");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("projection:projection_exec_auth_profile_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--integrity-fixture")
+        .arg("store-mismatch")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.projection\""));
+    assert!(stdout.contains("\"record_type\":\"projection\""));
+    assert!(stdout.contains("\"id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"retention_state\":\"active\""));
+    assert!(stdout.contains("\"local_store_integrity\":{\"privacy_class\":\"local_only\",\"integrity_status\":\"failed\""));
+    assert!(stdout.contains("\"local_quarantine\":{\"privacy_class\":\"local_only\",\"state\":\"quarantined\""));
+    assert!(stdout.contains("\"reason_code\":\"execution_store_integrity_failed\""));
+    assert!(stdout.contains("\"durable_record\":null"));
+    assert!(stdout.contains("\"local_root_verification\":null"));
+    assert!(!stdout.contains("\"content_verification\":\"verified\""));
 }
 
 #[test]

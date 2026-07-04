@@ -761,7 +761,11 @@ fn status(ctx: &CommandContext) -> Result<(), CliError> {
                     .ok_or_else(|| object_not_found("projection", &projection_id))?
                     .map_err(projection_error)?;
                 if ctx.json {
-                    fixture_status_projection_json(&projection, options.projection_root.as_deref())?
+                    fixture_status_projection_json(
+                        &projection,
+                        options.projection_root.as_deref(),
+                        options.integrity_fixture,
+                    )?
                 } else {
                     format!(
                         "{} {}",
@@ -843,6 +847,7 @@ struct StatusOptions {
     fixture: String,
     scope: StatusScope,
     projection_root: Option<PathBuf>,
+    integrity_fixture: Option<StoreIntegrityFixture>,
 }
 
 #[derive(Debug)]
@@ -862,6 +867,12 @@ struct InspectOptions {
     selector: String,
     session_id: Option<String>,
     projection_root: Option<PathBuf>,
+    integrity_fixture: Option<StoreIntegrityFixture>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreIntegrityFixture {
+    StoreMismatch,
 }
 
 #[derive(Debug)]
@@ -1544,6 +1555,7 @@ fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, C
     let mut fixture = None;
     let mut scope = StatusScope::Repository;
     let mut projection_root = None;
+    let mut integrity_fixture = None;
     let mut args = ctx.args.iter().skip(1);
 
     while let Some(arg) = args.next() {
@@ -1578,6 +1590,12 @@ fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, C
                 })?;
                 projection_root = Some(PathBuf::from(value));
             }
+            "--integrity-fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun status --integrity-fixture store-mismatch")
+                })?;
+                integrity_fixture = Some(parse_store_integrity_fixture(value)?);
+            }
             "--checkpoint" => {
                 let value = args.next().ok_or_else(|| {
                     invalid_request("usage: sun status --checkpoint <checkpoint>")
@@ -1609,10 +1627,17 @@ fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, C
         }
     }
 
+    if integrity_fixture.is_some() && !matches!(scope, StatusScope::Projection(_)) {
+        return Err(invalid_request(
+            "sun status --integrity-fixture applies only with --projection",
+        ));
+    }
+
     Ok(fixture.map(|fixture| StatusOptions {
         fixture,
         scope,
         projection_root,
+        integrity_fixture,
     }))
 }
 
@@ -1620,6 +1645,7 @@ fn parse_inspect_options(ctx: &CommandContext) -> Result<Option<InspectOptions>,
     let mut fixture = None;
     let mut session_id = None;
     let mut projection_root = None;
+    let mut integrity_fixture = None;
     let mut selectors = Vec::new();
     let mut args = ctx.args.iter().skip(1);
 
@@ -1643,6 +1669,12 @@ fn parse_inspect_options(ctx: &CommandContext) -> Result<Option<InspectOptions>,
                 })?;
                 projection_root = Some(PathBuf::from(value));
             }
+            "--integrity-fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun inspect --integrity-fixture store-mismatch")
+                })?;
+                integrity_fixture = Some(parse_store_integrity_fixture(value)?);
+            }
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
                     "unknown flag `{flag}` for sun inspect"
@@ -1660,13 +1692,29 @@ fn parse_inspect_options(ctx: &CommandContext) -> Result<Option<InspectOptions>,
             "usage: sun inspect <selector> --fixture basic-app [--session <session>]",
         ));
     }
+    if integrity_fixture.is_some() && !selectors[0].starts_with("projection:") {
+        return Err(invalid_request(
+            "sun inspect --integrity-fixture applies only to projection selectors",
+        ));
+    }
 
     Ok(Some(InspectOptions {
         fixture: fixture.unwrap(),
         selector: selectors.remove(0),
         session_id,
         projection_root,
+        integrity_fixture,
     }))
+}
+
+fn parse_store_integrity_fixture(value: &str) -> Result<StoreIntegrityFixture, CliError> {
+    match value {
+        "store-mismatch" => Ok(StoreIntegrityFixture::StoreMismatch),
+        _ => Err(invalid_request(format!(
+            "unknown integrity fixture `{value}`"
+        ))
+        .with_detail("integrity_fixture", value)),
+    }
 }
 
 fn ensure_fixture_session(session_id: &str) -> Result<(), CliError> {
@@ -1794,7 +1842,11 @@ fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliEr
             .ok_or_else(|| object_not_found("projection", projection_id))?
             .map_err(projection_error)?;
         return Ok(if json {
-            fixture_inspect_projection_json(&projection, options.projection_root.as_deref())?
+            fixture_inspect_projection_json(
+                &projection,
+                options.projection_root.as_deref(),
+                options.integrity_fixture,
+            )?
         } else {
             format!("projection {}", projection.id)
         });
@@ -2042,12 +2094,21 @@ fn fixture_status_topic_json() -> String {
 fn fixture_status_projection_json(
     projection: &ProjectionRecord,
     projection_root: Option<&std::path::Path>,
+    integrity_fixture: Option<StoreIntegrityFixture>,
 ) -> Result<String, CliError> {
-    let lifecycle_state = projection_lifecycle_state(projection, projection_root);
+    ensure_store_integrity_fixture_scope(projection, integrity_fixture)?;
+    let lifecycle_state = match integrity_fixture {
+        Some(StoreIntegrityFixture::StoreMismatch) => "quarantined",
+        None => projection_lifecycle_state(projection, projection_root),
+    };
     let manifest = fixture_local_projection_manifest(projection)?;
     let verification = local_projection_root_verification(projection, &manifest, projection_root);
     let verification_json =
         local_projection_root_verification_json_from_verification(projection_root, &verification);
+    let integrity_status = projection_integrity_status(integrity_fixture);
+    let retention_state = projection_retention_state_for_status(projection, integrity_fixture);
+    let quarantine_json = projection_quarantine_json(projection, &manifest, integrity_fixture);
+    let native_errors_json = projection_native_errors_json(projection, &manifest, integrity_fixture);
     Ok(format!(
         concat!(
             "{{\"ok\":true,\"data\":{{",
@@ -2066,13 +2127,15 @@ fn fixture_status_projection_json(
             "\"resolved_view_id\":\"{}\",",
             "\"tree_identity\":{},",
             "\"retention_state\":\"{}\",",
-            "\"integrity_status\":\"not_checked\",",
+            "\"integrity_status\":\"{}\",",
             "\"root_ref\":{},",
+            "\"cache_key\":\"{}\",",
             "\"local_projection_manifest\":{},",
+            "\"quarantine\":{},",
             "\"dirty_local\":{},",
             "\"local_root_verification\":{}",
             "}},",
-            "\"native_errors\":[]",
+            "\"native_errors\":{}",
             "}},\"warnings\":[]}}"
         ),
         json_escape(&projection.repository_id),
@@ -2086,11 +2149,15 @@ fn fixture_status_projection_json(
         projection.strategy.as_str(),
         json_escape(&projection.resolved_view_id),
         single_repo_tree_json(&projection.tree_identity),
-        projection.retention_state.as_str(),
+        retention_state,
+        integrity_status,
         projection_root_ref_json(projection),
+        json_escape(&projection.cache_key.stable_string()),
         local_projection_manifest_json(&manifest),
+        quarantine_json,
         verification.dirty_local_json(),
         verification_json,
+        native_errors_json,
     ))
 }
 
@@ -4735,7 +4802,9 @@ fn projection_manifest_ref(manifest: &ProjectionManifestRecord) -> String {
 fn fixture_inspect_projection_json(
     projection: &ProjectionRecord,
     projection_root: Option<&std::path::Path>,
+    integrity_fixture: Option<StoreIntegrityFixture>,
 ) -> Result<String, CliError> {
+    ensure_store_integrity_fixture_scope(projection, integrity_fixture)?;
     let manifest = fixture_local_projection_manifest(projection)?;
     Ok(format!(
         concat!(
@@ -4749,6 +4818,8 @@ fn fixture_inspect_projection_json(
             "}},",
             "\"projection\":{},",
             "\"local_projection_manifest\":{},",
+            "\"local_store_integrity\":{},",
+            "\"local_quarantine\":{},",
             "\"local_root_verification\":{}",
             "}},\"warnings\":[]}}"
         ),
@@ -4759,8 +4830,182 @@ fn fixture_inspect_projection_json(
         single_repo_tree_json(&projection.tree_identity),
         projection_record_json(projection),
         local_projection_manifest_json(&manifest),
+        projection_local_store_integrity_json(projection, &manifest, integrity_fixture),
+        projection_quarantine_json(projection, &manifest, integrity_fixture),
         local_projection_root_verification_json(projection, &manifest, projection_root),
     ))
+}
+
+fn ensure_store_integrity_fixture_scope(
+    projection: &ProjectionRecord,
+    integrity_fixture: Option<StoreIntegrityFixture>,
+) -> Result<(), CliError> {
+    if integrity_fixture.is_some() && projection.id != FIXTURE_EXECUTION_PROJECTION_ID {
+        return Err(invalid_request(
+            "store-mismatch integrity fixture applies only to the basic-app execution projection",
+        )
+        .with_detail("projection_id", projection.id.clone())
+        .with_detail("integrity_fixture", "store-mismatch"));
+    }
+    Ok(())
+}
+
+fn projection_integrity_status(
+    integrity_fixture: Option<StoreIntegrityFixture>,
+) -> &'static str {
+    match integrity_fixture {
+        Some(StoreIntegrityFixture::StoreMismatch) => "failed",
+        None => "not_checked",
+    }
+}
+
+fn projection_retention_state_for_status(
+    projection: &ProjectionRecord,
+    integrity_fixture: Option<StoreIntegrityFixture>,
+) -> &'static str {
+    match integrity_fixture {
+        Some(StoreIntegrityFixture::StoreMismatch) => "quarantined",
+        None => projection.retention_state.as_str(),
+    }
+}
+
+fn projection_local_store_integrity_json(
+    projection: &ProjectionRecord,
+    manifest: &ProjectionManifestRecord,
+    integrity_fixture: Option<StoreIntegrityFixture>,
+) -> String {
+    match integrity_fixture {
+        Some(StoreIntegrityFixture::StoreMismatch) => format!(
+            concat!(
+                "{{",
+                "\"privacy_class\":\"local_only\",",
+                "\"integrity_status\":\"failed\",",
+                "\"policy\":\"{}\",",
+                "\"reason\":\"store_integrity_mismatch\",",
+                "\"reason_code\":\"execution_store_integrity_failed\",",
+                "\"projection_id\":\"{}\",",
+                "\"resolved_view_id\":\"{}\",",
+                "\"tree_identity\":{},",
+                "\"root_ref\":{},",
+                "\"cache_key\":\"{}\",",
+                "\"manifest_ref\":\"{}\",",
+                "\"manifest_digest\":\"{}\",",
+                "\"source_truth\":\"immutable_store_manifest\",",
+                "\"local_filesystem_source_truth\":false",
+                "}}"
+            ),
+            projection.store_integrity_policy.as_str(),
+            json_escape(&projection.id),
+            json_escape(&projection.resolved_view_id),
+            single_repo_tree_json(&projection.tree_identity),
+            projection_root_ref_json(projection),
+            json_escape(&projection.cache_key.stable_string()),
+            json_escape(&projection_manifest_ref(manifest)),
+            json_escape(&manifest.manifest_digest),
+        ),
+        None => format!(
+            concat!(
+                "{{",
+                "\"privacy_class\":\"local_only\",",
+                "\"integrity_status\":\"not_checked\",",
+                "\"policy\":\"{}\",",
+                "\"projection_id\":\"{}\",",
+                "\"source_truth\":\"not_checked\",",
+                "\"local_filesystem_source_truth\":false",
+                "}}"
+            ),
+            projection.store_integrity_policy.as_str(),
+            json_escape(&projection.id),
+        ),
+    }
+}
+
+fn projection_quarantine_json(
+    projection: &ProjectionRecord,
+    manifest: &ProjectionManifestRecord,
+    integrity_fixture: Option<StoreIntegrityFixture>,
+) -> String {
+    match integrity_fixture {
+        Some(StoreIntegrityFixture::StoreMismatch) => format!(
+            concat!(
+                "{{",
+                "\"privacy_class\":\"local_only\",",
+                "\"state\":\"quarantined\",",
+                "\"reason\":\"store_integrity_mismatch\",",
+                "\"reason_code\":\"execution_store_integrity_failed\",",
+                "\"projection_id\":\"{}\",",
+                "\"resolved_view_id\":\"{}\",",
+                "\"root_ref\":{},",
+                "\"cache_key\":\"{}\",",
+                "\"manifest_ref\":\"{}\",",
+                "\"manifest_digest\":\"{}\",",
+                "\"quarantine_refs\":{{",
+                "\"projection\":\"projection:{}\",",
+                "\"cache\":\"{}\",",
+                "\"native_error\":\"native-error:execution_store_integrity_failed:{}\"",
+                "}},",
+                "\"provenance\":{{",
+                "\"repository_id\":\"{}\",",
+                "\"resolved_view_id\":\"{}\",",
+                "\"tree_identity\":{},",
+                "\"created_from_content_tree\":\"{}\",",
+                "\"store_integrity_policy\":\"{}\"",
+                "}},",
+                "\"source_truth\":\"immutable_store_manifest\",",
+                "\"local_filesystem_source_truth\":false,",
+                "\"durable_record\":null",
+                "}}"
+            ),
+            json_escape(&projection.id),
+            json_escape(&projection.resolved_view_id),
+            projection_root_ref_json(projection),
+            json_escape(&projection.cache_key.stable_string()),
+            json_escape(&projection_manifest_ref(manifest)),
+            json_escape(&manifest.manifest_digest),
+            json_escape(&projection.id),
+            json_escape(&projection.cache_key.stable_string()),
+            json_escape(&projection.id),
+            json_escape(&projection.repository_id),
+            json_escape(&projection.resolved_view_id),
+            single_repo_tree_json(&projection.tree_identity),
+            json_escape(&projection.created_from_content_tree),
+            projection.store_integrity_policy.as_str(),
+        ),
+        None => "null".to_string(),
+    }
+}
+
+fn projection_native_errors_json(
+    projection: &ProjectionRecord,
+    manifest: &ProjectionManifestRecord,
+    integrity_fixture: Option<StoreIntegrityFixture>,
+) -> String {
+    match integrity_fixture {
+        Some(StoreIntegrityFixture::StoreMismatch) => format!(
+            concat!(
+                "[{{",
+                "\"code\":\"execution_store_integrity_failed\",",
+                "\"message\":\"projection store integrity verification failed for fixture store-mismatch\",",
+                "\"projection_id\":\"{}\",",
+                "\"resolved_view_id\":\"{}\",",
+                "\"integrity_status\":\"failed\",",
+                "\"quarantine_reason\":\"store_integrity_mismatch\",",
+                "\"root_ref\":{},",
+                "\"cache_key\":\"{}\",",
+                "\"manifest_ref\":\"{}\",",
+                "\"manifest_digest\":\"{}\",",
+                "\"privacy_class\":\"local_only\"",
+                "}}]"
+            ),
+            json_escape(&projection.id),
+            json_escape(&projection.resolved_view_id),
+            projection_root_ref_json(projection),
+            json_escape(&projection.cache_key.stable_string()),
+            json_escape(&projection_manifest_ref(manifest)),
+            json_escape(&manifest.manifest_digest),
+        ),
+        None => "[]".to_string(),
+    }
 }
 
 fn projection_lifecycle_state(
@@ -6383,6 +6628,8 @@ Usage:
   sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> --fixture basic-app [--json]
   sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
   sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan|--execute-fixture success|ref-update-failure|export-map-failure|--execute-local --repo <path>] --json
+  sun status --projection <projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch] [--json]
+  sun inspect projection:<projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch] [--json]
 
 Commands:
   init       Create the conservative local .sunlight repository layout
@@ -6399,6 +6646,8 @@ Commands:
   execution  Promote a declared fixture execution output into a topic operation
   checkpoint Freeze a fixture resolved view as an in-memory checkpoint
   git        Export a fixture checkpoint to a Git ref
+  status     Show fixture object status, including projection integrity diagnostics
+  inspect    Inspect fixture objects and local-only projection diagnostics
 "
     );
 }

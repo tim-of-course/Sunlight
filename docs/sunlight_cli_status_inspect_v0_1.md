@@ -15,6 +15,8 @@ Phase 1 status and inspect must not rely on `git status`, filesystem projections
 
 Projection status and inspect are operator diagnostics over a projection record plus optional caller-supplied local root verification. Local root paths are local-only metadata and are never source truth. Content verification requires a persisted projection manifest; scan summaries alone are not proof of correctness.
 
+The v0.1 CLI fixture also accepts `--integrity-fixture store-mismatch` on projection status and inspect for `projection_exec_auth_profile_0001`. This is a narrow operator-visibility fixture for a failed immutable-store integrity check. It reports local-only quarantine and integrity metadata; it does not create a durable source record, scan the filesystem as source truth, or implement a general persistent quarantine database.
+
 ## Common JSON Envelope
 
 Every CLI command that accepts `--json` returns one of the two envelope shapes below.
@@ -343,6 +345,43 @@ Allowed `content_verification` values:
 | `manifest_invalid` | The persisted manifest envelope, schema, digest, identity inputs, or entry ordering is invalid or stale. |
 | `root_mismatch` | A valid persisted envelope records a root binding that does not match the current projection root. |
 | `verification_error` | Verification could not complete because of an unreadable file, unsupported required metadata check, traversal ambiguity, or other local IO error. |
+
+### Store Integrity Quarantine Fixture
+
+For the basic-app execution projection, `sun status --projection projection_exec_auth_profile_0001 --fixture basic-app --integrity-fixture store-mismatch --json` reports the projection lifecycle and status as quarantined/failed:
+
+```json
+{
+  "lifecycle_state": "quarantined",
+  "projection_id": "projection_exec_auth_profile_0001",
+  "retention_state": "quarantined",
+  "integrity_status": "failed",
+  "root_ref": {
+    "value": "local://.sunlight/projections/execution/projection_exec_auth_profile_0001",
+    "privacy": "local_only_path",
+    "privacy_class": "local_only"
+  },
+  "cache_key": "projection-cache:repo_fixture_basic_app:...",
+  "quarantine": {
+    "privacy_class": "local_only",
+    "state": "quarantined",
+    "reason": "store_integrity_mismatch",
+    "reason_code": "execution_store_integrity_failed",
+    "projection_id": "projection_exec_auth_profile_0001",
+    "source_truth": "immutable_store_manifest",
+    "local_filesystem_source_truth": false,
+    "durable_record": null
+  }
+}
+```
+
+Required fixture rules:
+
+- `store-mismatch` is accepted only for the basic-app execution projection ID.
+- Status includes `native_errors[0].code: "execution_store_integrity_failed"` and stable projection, root, cache, manifest, quarantine reason, and provenance refs.
+- Inspect includes matching `local_store_integrity` and `local_quarantine` blocks next to the unchanged projection record.
+- Without `--projection-root`, `local_root_verification` remains `null`; the failure path must not synthesize `content_verification: verified` from local bytes.
+- The fixture is local-only diagnostic metadata. It must not add a store scanner, durable quarantine table, or source record.
 
 ### Artifact Summary
 

@@ -13,7 +13,8 @@ use sunlight_core::artifacts::{
 };
 use sunlight_core::checkpoint::{
     fixture_checkpoint_from_resolved_view, CheckpointRecord, CheckpointValidationError,
-    EvidenceRef, GitExportMapRecord,
+    EvidenceRef, GitExportMapRecord, FIXTURE_CREATED_AT, FIXTURE_EXPORT_MAP_ID,
+    FIXTURE_GIT_COMMIT_ID,
 };
 use sunlight_core::compat_import::{
     fixture_basic_app_candidate_deltas, plan_fixture_basic_app_import, CompatImportErrorCode,
@@ -25,8 +26,10 @@ use sunlight_core::execution::{
     OutputClassification, OutputKind, PromotionCandidateProvenance,
 };
 use sunlight_core::git_export::{
-    git_export_checkpoint, GitExportError, GitExportRequest, GitExportResponse,
-    GitExportValidationFailure, GitExportValidationReport,
+    git_export_checkpoint, plan_git_export_writer, GitExportError, GitExportPlanningError,
+    GitExportRefUpdatePlan, GitExportRequest, GitExportResponse, GitExportValidationFailure,
+    GitExportValidationReport, GitExportWriterInput, GitExportWriterPlan,
+    GitExportCommitPlan, GitExportRepositoryState, GitRefState, ImportedBaseGitCommit,
 };
 use sunlight_core::projection::{
     fixture_compatibility_projection_from_resolved_view,
@@ -44,7 +47,7 @@ use sunlight_core::resolver::{
     fixture_profile_revision, fixture_profile_revision_missing_auth_dependency,
     fixture_resolver_input, resolve_fixture_view, DependencyClosure, DeterministicResolverOrder,
     ResolvedViewResult, ResolverConflictOrStalenessRecord, ResolverRecordKind, SingleRepoTree,
-    TopicRevisionRef, TopicRevisionSelection,
+    TopicRevisionRef, TopicRevisionSelection, FIXTURE_BASE_CHECKPOINT_ID,
 };
 
 fn main() -> ExitCode {
@@ -487,6 +490,22 @@ fn git_export(ctx: &CommandContext) -> Result<(), CliError> {
 
     let mut request = GitExportRequest::from_checkpoint(&checkpoint);
     request.git_ref = options.git_ref;
+    if options.write_plan {
+        let input = fixture_git_export_writer_input(request);
+        let plan = plan_git_export_writer(input).map_err(git_export_planning_error)?;
+
+        if ctx.json {
+            println!("{}", git_export_write_plan_success_envelope(&plan));
+        } else {
+            println!(
+                "{} {}",
+                plan.commit.checkpoint_id, plan.ref_update.git_ref
+            );
+        }
+
+        return Ok(());
+    }
+
     let response = git_export_checkpoint(request).map_err(git_export_error)?;
 
     if ctx.json {
@@ -675,6 +694,7 @@ struct GitExportOptions {
     fixture: String,
     checkpoint_id: String,
     git_ref: String,
+    write_plan: bool,
 }
 
 #[derive(Debug)]
@@ -886,6 +906,7 @@ fn parse_git_export_options(ctx: &CommandContext) -> Result<GitExportOptions, Cl
     let mut fixture = None;
     let mut checkpoint_id = None;
     let mut git_ref = None;
+    let mut write_plan = false;
     let mut args = ctx.args.iter().skip(2);
 
     while let Some(arg) = args.next() {
@@ -907,6 +928,9 @@ fn parse_git_export_options(ctx: &CommandContext) -> Result<GitExportOptions, Cl
                     invalid_request("usage: sun git export requires --branch <git-ref>")
                 })?;
                 git_ref = Some(value.clone());
+            }
+            "--write-plan" => {
+                write_plan = true;
             }
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
@@ -941,6 +965,7 @@ fn parse_git_export_options(ctx: &CommandContext) -> Result<GitExportOptions, Cl
         fixture,
         checkpoint_id,
         git_ref,
+        write_plan,
     })
 }
 
@@ -2290,6 +2315,54 @@ fn fixture_git_export_response() -> Result<FixtureGitExport, CliError> {
     })
 }
 
+fn fixture_git_export_writer_input(request: GitExportRequest) -> GitExportWriterInput {
+    let mut validation_report = sunlight_core::git_export::validate_git_export_request(&request);
+    if request.git_ref == "refs/heads/sunlight/stale-validation" {
+        validation_report.git_ref = "refs/heads/sunlight/auth-profile-ready".to_string();
+    }
+
+    let mut repository = GitExportRepositoryState {
+        repository_id: request.checkpoint.repository_id.clone(),
+        git_root: "/repo/basic-app".to_string(),
+        sunlight_repo_root: "/repo/basic-app".to_string(),
+        reachable_commit_ids: vec![fixture_base_git_commit_id()],
+        refs: vec![GitRefState {
+            git_ref: request.git_ref.clone(),
+            commit_id: fixture_base_git_commit_id(),
+        }],
+    };
+
+    if request.git_ref == "refs/heads/sunlight/ref-conflict" {
+        repository.refs = vec![GitRefState {
+            git_ref: request.git_ref.clone(),
+            commit_id: "git_sha1_unrelated_ref_tip_0001".to_string(),
+        }];
+    }
+
+    if request.git_ref == "refs/heads/sunlight/invalid-repository" {
+        repository.git_root = "/repo/other".to_string();
+    }
+
+    GitExportWriterInput {
+        base_checkpoint_ids: vec![FIXTURE_BASE_CHECKPOINT_ID.to_string()],
+        imported_base_commits: vec![ImportedBaseGitCommit {
+            checkpoint_id: FIXTURE_BASE_CHECKPOINT_ID.to_string(),
+            git_commit_id: fixture_base_git_commit_id(),
+        }],
+        prior_export_maps: Vec::new(),
+        planned_commit_id: FIXTURE_GIT_COMMIT_ID.to_string(),
+        export_map_id: FIXTURE_EXPORT_MAP_ID.to_string(),
+        exported_at: FIXTURE_CREATED_AT.to_string(),
+        request,
+        validation_report,
+        repository,
+    }
+}
+
+fn fixture_base_git_commit_id() -> String {
+    "git_sha1_base_parent_0001".to_string()
+}
+
 fn fixture_projection_for_purpose(
     view: &ResolvedViewResult,
     purpose: ProjectionPurpose,
@@ -2525,6 +2598,25 @@ fn git_export_error(error: GitExportError) -> CliError {
     ))
 }
 
+fn git_export_planning_error(error: GitExportPlanningError) -> CliError {
+    CliError::new(error.code.as_str(), error.message.clone()).with_raw_details_json(format!(
+        concat!(
+            "{{",
+            "\"checkpoint_id\":{},",
+            "\"validation_report_id\":{},",
+            "\"target_ref\":{},",
+            "\"parent_commit_id\":{},",
+            "\"created_commit_id\":{}",
+            "}}"
+        ),
+        optional_string_json(error.checkpoint_id.as_deref()),
+        optional_string_json(error.validation_report_id.as_deref()),
+        optional_string_json(error.target_ref.as_deref()),
+        optional_string_json(error.parent_commit_id.as_deref()),
+        optional_string_json(error.created_commit_id.as_deref()),
+    ))
+}
+
 fn compat_import_error(error: CompatImportValidationError) -> CliError {
     let message = match error.code {
         CompatImportErrorCode::NoSelectedChanges => "no compatibility import candidates selected",
@@ -2701,6 +2793,41 @@ fn git_export_success_envelope(response: &GitExportResponse) -> String {
         json_escape(&response.git_ref),
         string_array_json(response.git_commit_ids.iter().map(String::as_str)),
         git_export_map_json(&response.export_map),
+    )
+}
+
+fn git_export_write_plan_success_envelope(plan: &GitExportWriterPlan) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"git.export.write_plan\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"checkpoint_id\":\"{}\",",
+            "\"export_map_id\":\"{}\",",
+            "\"validation_report_id\":\"{}\"",
+            "}},",
+            "\"parent_commit\":{{",
+            "\"checkpoint_id\":\"{}\",",
+            "\"commit_id\":\"{}\"",
+            "}},",
+            "\"planned_commit\":{},",
+            "\"ref_update\":{},",
+            "\"export_map\":{}",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(&plan.commit.checkpoint_id),
+        json_escape(&plan.commit.checkpoint_id),
+        json_escape(&plan.export_map.id),
+        json_escape(&plan.commit.validation_report_id),
+        json_escape(&plan.parent.checkpoint_id),
+        json_escape(&plan.parent.commit_id),
+        git_export_commit_plan_json(&plan.commit),
+        git_export_ref_update_plan_json(&plan.ref_update),
+        git_export_map_json(&plan.export_map),
     )
 }
 
@@ -3099,6 +3226,71 @@ fn export_shape_json(export_map: &GitExportMapRecord) -> String {
         export_map.export_shape.kind.as_str(),
         json_escape(&export_map.export_shape.parent_policy),
         json_escape(&export_map.export_shape.include_sunlight_metadata),
+    )
+}
+
+fn git_export_commit_plan_json(commit: &GitExportCommitPlan) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"checkpoint_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"parent_commit_id\":\"{}\",",
+            "\"planned_commit_id\":\"{}\",",
+            "\"export_shape\":{},",
+            "\"validation_report_id\":\"{}\",",
+            "\"message\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&commit.checkpoint_id),
+        json_escape(&commit.resolved_view_id),
+        single_repo_tree_json(&commit.tree_identity),
+        json_escape(&commit.parent_commit_id),
+        json_escape(&commit.planned_commit_id),
+        export_shape_value_json(
+            commit.export_shape.kind.as_str(),
+            &commit.export_shape.parent_policy,
+            &commit.export_shape.include_sunlight_metadata,
+        ),
+        json_escape(&commit.validation_report_id),
+        json_escape(&commit.message),
+    )
+}
+
+fn git_export_ref_update_plan_json(ref_update: &GitExportRefUpdatePlan) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"git_ref\":\"{}\",",
+            "\"expected_old_commit_id\":{},",
+            "\"new_commit_id\":\"{}\",",
+            "\"allowed_reason\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&ref_update.git_ref),
+        optional_string_json(ref_update.expected_old_commit_id.as_deref()),
+        json_escape(&ref_update.new_commit_id),
+        ref_update.allowed_reason.as_str(),
+    )
+}
+
+fn export_shape_value_json(
+    kind: &str,
+    parent_policy: &str,
+    include_sunlight_metadata: &str,
+) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"kind\":\"{}\",",
+            "\"parent_policy\":\"{}\",",
+            "\"include_sunlight_metadata\":\"{}\"",
+            "}}"
+        ),
+        json_escape(kind),
+        json_escape(parent_policy),
+        json_escape(include_sunlight_metadata),
     )
 }
 
@@ -4179,7 +4371,7 @@ Usage:
   sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app [--json]
   sun run --view <resolved-view-id> --fixture basic-app --json -- cargo test
   sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
-  sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app --json
+  sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan] --json
 
 Commands:
   init       Create the conservative local .sunlight repository layout

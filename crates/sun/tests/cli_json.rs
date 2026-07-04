@@ -1168,6 +1168,103 @@ fn git_export_json_fixture_invalid_git_ref_returns_validation_failure() {
 }
 
 #[test]
+fn git_export_write_plan_json_fixture_returns_writer_plan() {
+    let repo = TestRepo::new("git-export-write-plan-fixture-ready");
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/auth-profile-ready")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--write-plan")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export write plan should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"git.export.write_plan\""));
+    assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
+    assert!(
+        stdout.contains("\"parent_commit\":{\"checkpoint_id\":\"checkpoint_base_0001\",\"commit_id\":\"git_sha1_base_parent_0001\"}")
+    );
+    assert!(stdout.contains("\"planned_commit\":{"));
+    assert!(stdout.contains("\"parent_commit_id\":\"git_sha1_base_parent_0001\""));
+    assert!(
+        stdout.contains("\"planned_commit_id\":\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"")
+    );
+    assert!(stdout.contains(
+        "\"ref_update\":{\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\",\"expected_old_commit_id\":\"git_sha1_base_parent_0001\",\"new_commit_id\":\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"allowed_reason\":\"replace_selected_parent\"}"
+    ));
+    assert!(stdout.contains("\"export_map\":{"));
+    assert!(stdout.contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"git_commit_ids\":[\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"));
+}
+
+#[test]
+fn git_export_write_plan_json_fixture_target_ref_conflict_returns_planner_error() {
+    let repo = TestRepo::new("git-export-write-plan-ref-conflict");
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/ref-conflict")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--write-plan")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export write plan should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"export_target_ref_conflict\""));
+    assert!(stdout.contains("existing target ref points at"));
+    assert!(stdout.contains("\"target_ref\":\"refs/heads/sunlight/ref-conflict\""));
+    assert!(stdout.contains("\"parent_commit_id\":\"git_sha1_base_parent_0001\""));
+    assert!(stdout.contains("\"created_commit_id\":null"));
+}
+
+#[test]
+fn git_export_write_plan_json_fixture_stale_validation_returns_planner_error() {
+    let repo = TestRepo::new("git-export-write-plan-stale-validation");
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/stale-validation")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--write-plan")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export write plan should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"export_policy_failed\""));
+    assert!(stdout.contains("export validation report must pass and match checkpoint"));
+    assert!(stdout.contains("\"target_ref\":\"refs/heads/sunlight/stale-validation\""));
+    assert!(stdout.contains("\"parent_commit_id\":null"));
+    assert!(stdout.contains("\"created_commit_id\":null"));
+}
+
+#[test]
 fn status_json_fixture_basic_app_returns_repository_snapshot() {
     let repo = TestRepo::new("status-fixture-repository");
 

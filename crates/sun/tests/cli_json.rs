@@ -410,6 +410,165 @@ fn write_json_fixture_basic_app_existing_with_new_returns_precondition_failure()
     assert!(!stdout.contains("topic_revision_id"));
 }
 
+#[test]
+fn status_json_fixture_basic_app_returns_repository_snapshot() {
+    let repo = TestRepo::new("status-fixture-repository");
+
+    let output = sun()
+        .arg("status")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.repository\""));
+    assert!(stdout.contains("\"repository_id\":\"repo_fixture_basic_app\""));
+    assert!(stdout.contains("\"ids\":{\"base_checkpoint_id\":\"checkpoint_base_0001\"}"));
+    assert!(stdout.contains("\"view\":null"));
+    assert!(stdout.contains("\"path_policy_id\":\"path_policy_posix_case_sensitive_v1\""));
+    assert!(stdout.contains("\"operation_semantics_version\":\"file_ops_v1\""));
+    assert!(stdout.contains("\"topic_id\":\"topic_auth_nullability\""));
+    assert!(stdout.contains("\"head_revision_id\":\"rev_auth_nullability_0001\""));
+    assert!(stdout.contains("\"session_id\":\"session_agent_a\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
+    assert!(stdout.contains("\"native_errors\":[]"));
+    assert!(stdout.contains("\"pending_work\":[]"));
+}
+
+#[test]
+fn status_json_fixture_basic_app_returns_session_snapshot() {
+    let repo = TestRepo::new("status-fixture-session");
+
+    let output = sun()
+        .arg("status")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.session\""));
+    assert!(stdout.contains("\"ids\":{\"session_id\":\"session_agent_a\",\"write_topic_id\":\"topic_auth_nullability\"}"));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_patch_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
+    assert!(stdout
+        .contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_0001\"}"));
+    assert!(stdout.contains("\"capabilities\":[\"read\",\"list\",\"search\",\"inspect\""));
+    assert!(stdout.contains("\"before_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"after_hash\":\"sha256:auth_trim_guard\""));
+    assert!(stdout.contains("\"last_operation_id\":\"op_auth_trim_guard_0001\""));
+}
+
+#[test]
+fn inspect_json_fixture_basic_app_path_returns_artifact_snapshot() {
+    let repo = TestRepo::new("inspect-fixture-artifact");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("src/auth.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.artifact\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
+    assert!(stdout.contains("\"path\":\"src/auth.ts\""));
+    assert!(stdout.contains("\"content_hash\":\"sha256:auth_trim_guard\""));
+    assert!(stdout.contains("\"byte_length\":103"));
+    assert!(stdout.contains("\"latest_operation_id\":\"op_auth_trim_guard_0001\""));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_0001\""));
+    assert!(stdout.contains("\"before_refs\":[{\"operation_transaction_id\":\"op_auth_trim_guard_0001\",\"content_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"after_refs\":[{\"operation_transaction_id\":\"op_auth_trim_guard_0001\",\"content_hash\":\"sha256:auth_trim_guard\""));
+}
+
+#[test]
+fn inspect_json_fixture_basic_app_operation_returns_authored_context() {
+    let repo = TestRepo::new("inspect-fixture-operation");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("operation:op_auth_trim_guard_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.operation\""));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_auth_trim_guard_0001\""));
+    assert!(stdout.contains("\"view\":{\"resolved_view_id\":\"view_base_0001\",\"session_generation_id\":\"gen_agent_a_0001\""));
+    assert!(stdout.contains("\"mutation\":\"patch\""));
+    assert!(stdout.contains("\"authored_context_id\":\"ctx_agent_a_gen_0001\""));
+    assert!(stdout.contains("\"expected_path\":\"src/auth.ts\""));
+    assert!(stdout.contains("\"expected_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"created_revision\":{\"topic_revision_id\":\"rev_auth_nullability_0001\""));
+}
+
+#[test]
+fn inspect_json_fixture_basic_app_session_returns_typed_snapshot() {
+    let repo = TestRepo::new("inspect-fixture-session");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("session:session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.session\""));
+    assert!(stdout.contains("\"current_generation_number\":2"));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
+    assert!(stdout.contains("\"created_by\":{\"kind\":\"operation_transaction\",\"id\":\"op_auth_trim_guard_0001\"}"));
+}
+
+#[test]
+fn inspect_json_fixture_basic_app_missing_operation_returns_failure_envelope() {
+    let repo = TestRepo::new("inspect-fixture-missing");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("operation:missing")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"object_not_found\""));
+    assert!(stdout.contains("\"message\":\"Sunlight object was not found\""));
+    assert!(stdout.contains("\"selector\":\"missing\""));
+    assert!(stdout.contains("\"object_type\":\"operation\""));
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),

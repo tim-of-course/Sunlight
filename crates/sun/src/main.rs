@@ -7,6 +7,9 @@ use sunlight_core::artifacts::{
     ArtifactIoError, ExpectedHash, InMemoryArtifactStore, ListResponse, MutationArtifactView,
     MutationPayload, MutationRefs, MutationResponse, PatchRequest, ReadResponse, SearchResponse,
     SessionView, SessionVisibleArtifactView, TreeIdentityView, WriteMode, WriteRequest,
+    FILE_OPERATION_SEMANTICS_VERSION, FIXTURE_ACTOR_ID, FIXTURE_REPOSITORY_ID,
+    FIXTURE_RESOLVED_VIEW_ID, FIXTURE_SESSION_GENERATION_ID, FIXTURE_SESSION_ID,
+    FIXTURE_TREE_HASH, FIXTURE_WRITE_TOPIC_ID, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
 };
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
@@ -102,13 +105,7 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         [command, ..] if command == "search" => artifact_search(&ctx),
         [command, ..] if command == "patch" => artifact_patch(&ctx),
         [command, ..] if command == "write" => artifact_write(&ctx),
-        [command] if command == "status" => status(&ctx),
-        [command, flag, _] if command == "status" && (flag == "--session" || flag == "--topic") => {
-            status(&ctx)
-        }
-        [command, ..] if command == "status" => Err(invalid_request(
-            "usage: sun status [--session <session>|--topic <topic>]",
-        )),
+        [command, ..] if command == "status" => status(&ctx),
         [command, ..] if command == "inspect" => inspect(&ctx),
         [command, ..] => Err(invalid_request(format!("unknown command `{command}`"))
             .with_detail("command", command.clone())),
@@ -280,6 +277,43 @@ fn artifact_write(ctx: &CommandContext) -> Result<(), CliError> {
 }
 
 fn status(ctx: &CommandContext) -> Result<(), CliError> {
+    if let Some(options) = parse_status_options(ctx)? {
+        if options.fixture != "basic-app" {
+            return Err(invalid_request(format!(
+                "unknown fixture `{}`",
+                options.fixture
+            ))
+            .with_detail("fixture", options.fixture));
+        }
+        let output = match options.scope {
+            StatusScope::Repository => {
+                if ctx.json {
+                    fixture_status_repository_json()
+                } else {
+                    fixture_status_repository_text()
+                }
+            }
+            StatusScope::Session(session_id) => {
+                ensure_fixture_session(&session_id)?;
+                if ctx.json {
+                    fixture_status_session_json()
+                } else {
+                    fixture_status_session_text()
+                }
+            }
+            StatusScope::Topic(topic) => {
+                ensure_fixture_topic(&topic)?;
+                if ctx.json {
+                    fixture_status_topic_json()
+                } else {
+                    fixture_status_topic_text()
+                }
+            }
+        };
+        println!("{output}");
+        return Ok(());
+    }
+
     let config = require_repository_config(".")?;
     let command = match ctx.args.as_slice() {
         [_, flag, _] if flag == "--session" => "status.session",
@@ -296,12 +330,760 @@ fn status(ctx: &CommandContext) -> Result<(), CliError> {
     ))
 }
 
-fn inspect(_ctx: &CommandContext) -> Result<(), CliError> {
+fn inspect(ctx: &CommandContext) -> Result<(), CliError> {
+    if let Some(options) = parse_inspect_options(ctx)? {
+        if options.fixture != "basic-app" {
+            return Err(invalid_request(format!(
+                "unknown fixture `{}`",
+                options.fixture
+            ))
+            .with_detail("fixture", options.fixture));
+        }
+        let output = fixture_inspect(&options, ctx.json)?;
+        println!("{output}");
+        return Ok(());
+    }
+
     require_repository_config(".")?;
     Err(CliError::new(
         "object_not_found",
         "Sunlight object was not found",
     ))
+}
+
+#[derive(Debug)]
+struct StatusOptions {
+    fixture: String,
+    scope: StatusScope,
+}
+
+#[derive(Debug)]
+enum StatusScope {
+    Repository,
+    Session(String),
+    Topic(String),
+}
+
+#[derive(Debug)]
+struct InspectOptions {
+    fixture: String,
+    selector: String,
+    session_id: Option<String>,
+}
+
+fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, CliError> {
+    let mut fixture = None;
+    let mut scope = StatusScope::Repository;
+    let mut args = ctx.args.iter().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| invalid_request("usage: sun status requires --fixture basic-app"))?;
+                fixture = Some(value.clone());
+            }
+            "--session" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| invalid_request("usage: sun status --session <session>"))?;
+                scope = StatusScope::Session(value.clone());
+            }
+            "--topic" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| invalid_request("usage: sun status --topic <topic>"))?;
+                scope = StatusScope::Topic(value.clone());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!("unknown flag `{flag}` for sun status")));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected status argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    Ok(fixture.map(|fixture| StatusOptions { fixture, scope }))
+}
+
+fn parse_inspect_options(ctx: &CommandContext) -> Result<Option<InspectOptions>, CliError> {
+    let mut fixture = None;
+    let mut session_id = None;
+    let mut selectors = Vec::new();
+    let mut args = ctx.args.iter().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun inspect requires --fixture basic-app")
+                })?;
+                fixture = Some(value.clone());
+            }
+            "--session" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun inspect requires --session <session>")
+                })?;
+                session_id = Some(value.clone());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!("unknown flag `{flag}` for sun inspect")));
+            }
+            value => selectors.push(value.to_string()),
+        }
+    }
+
+    if fixture.is_none() {
+        return Ok(None);
+    }
+    if selectors.len() != 1 {
+        return Err(invalid_request(
+            "usage: sun inspect <selector> --fixture basic-app [--session <session>]",
+        ));
+    }
+
+    Ok(Some(InspectOptions {
+        fixture: fixture.unwrap(),
+        selector: selectors.remove(0),
+        session_id,
+    }))
+}
+
+fn ensure_fixture_session(session_id: &str) -> Result<(), CliError> {
+    if session_id == FIXTURE_SESSION_ID {
+        Ok(())
+    } else {
+        Err(CliError::new(
+            "session_not_found",
+            format!("session `{session_id}` was not found"),
+        )
+        .with_detail("session_id", session_id))
+    }
+}
+
+fn ensure_fixture_topic(topic: &str) -> Result<(), CliError> {
+    if topic == "auth-nullability" || topic == FIXTURE_WRITE_TOPIC_ID {
+        Ok(())
+    } else {
+        Err(CliError::new(
+            "topic_not_found",
+            format!("topic `{topic}` was not found"),
+        )
+        .with_detail("topic", topic))
+    }
+}
+
+fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliError> {
+    let selector = options.selector.as_str();
+    if let Some(session_id) = &options.session_id {
+        ensure_fixture_session(session_id)?;
+    }
+
+    if let Some(operation_id) = selector.strip_prefix("operation:") {
+        if operation_id == "op_auth_trim_guard_0001" {
+            return Ok(if json {
+                fixture_inspect_operation_json()
+            } else {
+                "operation op_auth_trim_guard_0001 patch src/auth.ts".to_string()
+            });
+        }
+        return Err(object_not_found("operation", operation_id));
+    }
+    if let Some(session_id) = selector.strip_prefix("session:") {
+        ensure_fixture_session(session_id)?;
+        return Ok(if json {
+            fixture_inspect_session_json()
+        } else {
+            fixture_status_session_text()
+        });
+    }
+    if let Some(revision_id) = selector.strip_prefix("revision:") {
+        if revision_id == "rev_auth_nullability_0001" {
+            return Ok(if json {
+                fixture_inspect_revision_json()
+            } else {
+                "revision rev_auth_nullability_0001 patch src/auth.ts".to_string()
+            });
+        }
+        return Err(object_not_found("revision", revision_id));
+    }
+    if let Some(topic) = selector.strip_prefix("topic:") {
+        ensure_fixture_topic(topic)?;
+        return Ok(if json {
+            fixture_inspect_topic_json()
+        } else {
+            fixture_status_topic_text()
+        });
+    }
+
+    let session_id = options.session_id.as_deref().ok_or_else(|| {
+        invalid_request("bare path inspect requires --session <session> for fixture views")
+    })?;
+    ensure_fixture_session(session_id)?;
+    fixture_inspect_artifact(selector, json)
+}
+
+fn fixture_inspect_artifact(selector: &str, json: bool) -> Result<String, CliError> {
+    let artifact = fixture_artifact_after_patch(selector)
+        .or_else(|| fixture_artifact_after_patch_by_id(selector))
+        .ok_or_else(|| {
+            CliError::new(
+                "path_not_found",
+                format!("path `{selector}` was not found"),
+            )
+            .with_detail("path", selector)
+            .with_detail("session_generation_id", "gen_agent_a_0002")
+        })?;
+
+    if json {
+        Ok(fixture_inspect_artifact_json(artifact))
+    } else {
+        Ok(format!("{} {}", artifact.artifact_id, artifact.path))
+    }
+}
+
+fn object_not_found(kind: &'static str, selector: &str) -> CliError {
+    CliError::new("object_not_found", "Sunlight object was not found")
+        .with_detail("selector", selector)
+        .with_detail("object_type", kind)
+}
+
+#[derive(Clone, Copy)]
+struct FixtureArtifact {
+    artifact_id: &'static str,
+    path: &'static str,
+    content_hash: &'static str,
+    byte_length: usize,
+    classification: &'static str,
+    executable: bool,
+    created_by_operation_id: &'static str,
+    latest_operation_id: Option<&'static str>,
+    before_hash: Option<&'static str>,
+    after_hash: Option<&'static str>,
+}
+
+fn fixture_artifact_after_patch(path: &str) -> Option<FixtureArtifact> {
+    match path {
+        "README.md" => Some(FixtureArtifact {
+            artifact_id: "artifact_readme_md",
+            path: "README.md",
+            content_hash: "sha256:readme_base",
+            byte_length: 48,
+            classification: "source",
+            executable: false,
+            created_by_operation_id: "op_import_base_0001",
+            latest_operation_id: None,
+            before_hash: None,
+            after_hash: None,
+        }),
+        "docs/guide.md" => Some(FixtureArtifact {
+            artifact_id: "artifact_docs_guide_md",
+            path: "docs/guide.md",
+            content_hash: "sha256:guide_base",
+            byte_length: 25,
+            classification: "source",
+            executable: false,
+            created_by_operation_id: "op_import_base_0001",
+            latest_operation_id: None,
+            before_hash: None,
+            after_hash: None,
+        }),
+        "scripts/build.sh" => Some(FixtureArtifact {
+            artifact_id: "artifact_scripts_build_sh",
+            path: "scripts/build.sh",
+            content_hash: "sha256:build_base",
+            byte_length: 28,
+            classification: "source",
+            executable: true,
+            created_by_operation_id: "op_import_base_0001",
+            latest_operation_id: None,
+            before_hash: None,
+            after_hash: None,
+        }),
+        "src/auth.ts" => Some(FixtureArtifact {
+            artifact_id: "artifact_src_auth_ts",
+            path: "src/auth.ts",
+            content_hash: "sha256:auth_trim_guard",
+            byte_length: 103,
+            classification: "source",
+            executable: false,
+            created_by_operation_id: "op_import_base_0001",
+            latest_operation_id: Some("op_auth_trim_guard_0001"),
+            before_hash: Some("sha256:auth_base"),
+            after_hash: Some("sha256:auth_trim_guard"),
+        }),
+        "src/profile.ts" => Some(FixtureArtifact {
+            artifact_id: "artifact_src_profile_ts",
+            path: "src/profile.ts",
+            content_hash: "sha256:profile_base",
+            byte_length: 41,
+            classification: "source",
+            executable: false,
+            created_by_operation_id: "op_import_base_0001",
+            latest_operation_id: None,
+            before_hash: None,
+            after_hash: None,
+        }),
+        _ => None,
+    }
+}
+
+fn fixture_artifact_after_patch_by_id(artifact_id: &str) -> Option<FixtureArtifact> {
+    [
+        "README.md",
+        "docs/guide.md",
+        "scripts/build.sh",
+        "src/auth.ts",
+        "src/profile.ts",
+    ]
+    .iter()
+    .filter_map(|path| fixture_artifact_after_patch(path))
+    .find(|artifact| artifact.artifact_id == artifact_id)
+}
+
+fn fixture_status_repository_text() -> String {
+    format!(
+        "repository {FIXTURE_REPOSITORY_ID}\ntopic auth-nullability rev_auth_nullability_0001\nsession {FIXTURE_SESSION_ID} gen_agent_a_0002"
+    )
+}
+
+fn fixture_status_session_text() -> String {
+    format!("{FIXTURE_SESSION_ID} gen_agent_a_0002 view_agent_a_after_patch_0001")
+}
+
+fn fixture_status_topic_text() -> String {
+    "auth-nullability rev_auth_nullability_0001".to_string()
+}
+
+fn fixture_status_repository_json() -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"status.repository\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"base_checkpoint_id\":\"checkpoint_base_0001\"}},",
+            "\"view\":null,",
+            "\"repository\":{{",
+            "\"initialized\":true,",
+            "\"storage_schema_version\":{},",
+            "\"path_policy_id\":\"{}\",",
+            "\"operation_semantics_version\":\"{}\",",
+            "\"git_interop_policy\":\"default_local_mvp\"",
+            "}},",
+            "\"topics\":[{}],",
+            "\"sessions\":[{}],",
+            "\"native_errors\":[],",
+            "\"pending_work\":[]",
+            "}},\"warnings\":[]}}"
+        ),
+        FIXTURE_REPOSITORY_ID,
+        CURRENT_STORAGE_SCHEMA_VERSION,
+        POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
+        FILE_OPERATION_SEMANTICS_VERSION,
+        fixture_topic_summary_json(),
+        fixture_session_summary_json(),
+    )
+}
+
+fn fixture_status_session_json() -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"status.session\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"session_id\":\"{}\",\"write_topic_id\":\"{}\"}},",
+            "\"view\":{},",
+            "\"session\":{{",
+            "\"actor_id\":\"{}\",",
+            "\"base_resolved_view_id\":\"{}\",",
+            "\"write_topic_id\":\"{}\",",
+            "\"capabilities\":[\"read\",\"list\",\"search\",\"inspect\",\"patch\",\"write\",\"move\",\"delete\",\"metadata\"]",
+            "}},",
+            "\"topic_head\":{{",
+            "\"topic_id\":\"{}\",",
+            "\"head_revision_id\":\"rev_auth_nullability_0001\",",
+            "\"revision_number\":1",
+            "}},",
+            "\"changed_artifacts\":[{}],",
+            "\"last_operation_id\":\"op_auth_trim_guard_0001\"",
+            "}},\"warnings\":[]}}"
+        ),
+        FIXTURE_REPOSITORY_ID,
+        FIXTURE_SESSION_ID,
+        FIXTURE_WRITE_TOPIC_ID,
+        fixture_post_patch_view_json(),
+        FIXTURE_ACTOR_ID,
+        FIXTURE_RESOLVED_VIEW_ID,
+        FIXTURE_WRITE_TOPIC_ID,
+        FIXTURE_WRITE_TOPIC_ID,
+        fixture_changed_artifact_json(),
+    )
+}
+
+fn fixture_status_topic_json() -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"status.topic\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"topic_id\":\"{}\",\"head_revision_id\":\"rev_auth_nullability_0001\"}},",
+            "\"view\":null,",
+            "\"topic\":{{",
+            "\"slug\":\"auth-nullability\",",
+            "\"display_name\":\"Auth nullability\",",
+            "\"status\":\"open\",",
+            "\"owner_actor_id\":\"{}\",",
+            "\"base_checkpoint_id\":\"checkpoint_base_0001\",",
+            "\"revision_count\":1",
+            "}},",
+            "\"head\":{{",
+            "\"topic_revision_id\":\"rev_auth_nullability_0001\",",
+            "\"revision_number\":1,",
+            "\"operation_transaction_id\":\"op_auth_trim_guard_0001\",",
+            "\"parent_revision_id\":null",
+            "}},",
+            "\"changed_artifacts\":[{}],",
+            "\"sessions\":[{{",
+            "\"session_id\":\"{}\",",
+            "\"session_generation_id\":\"gen_agent_a_0002\",",
+            "\"resolved_view_id\":\"view_agent_a_after_patch_0001\"",
+            "}}]",
+            "}},\"warnings\":[]}}"
+        ),
+        FIXTURE_REPOSITORY_ID,
+        FIXTURE_WRITE_TOPIC_ID,
+        FIXTURE_ACTOR_ID,
+        fixture_changed_artifact_json(),
+        FIXTURE_SESSION_ID,
+    )
+}
+
+fn fixture_inspect_artifact_json(artifact: FixtureArtifact) -> String {
+    let provenance = if let Some(operation_id) = artifact.latest_operation_id {
+        format!(
+            concat!(
+                "{{",
+                "\"latest_operation_id\":\"{}\",",
+                "\"topic_id\":\"{}\",",
+                "\"topic_revision_id\":\"rev_auth_nullability_0001\",",
+                "\"session_id\":\"{}\",",
+                "\"session_generation_id\":\"gen_agent_a_0002\"",
+                "}}"
+            ),
+            operation_id, FIXTURE_WRITE_TOPIC_ID, FIXTURE_SESSION_ID
+        )
+    } else {
+        "null".to_string()
+    };
+    let before_refs = artifact
+        .before_hash
+        .map(|hash| {
+            format!(
+                "[{{\"operation_transaction_id\":\"op_auth_trim_guard_0001\",\"content_hash\":\"{}\",\"tree_hash\":\"{}\"}}]",
+                hash, FIXTURE_TREE_HASH
+            )
+        })
+        .unwrap_or_else(|| "[]".to_string());
+    let after_refs = artifact
+        .after_hash
+        .map(|hash| {
+            format!(
+                "[{{\"operation_transaction_id\":\"op_auth_trim_guard_0001\",\"content_hash\":\"{}\",\"tree_hash\":\"tree_after_auth_patch_0001\"}}]",
+                hash
+            )
+        })
+        .unwrap_or_else(|| "[]".to_string());
+
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.artifact\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"session_id\":\"{}\",\"artifact_id\":\"{}\"}},",
+            "\"view\":{},",
+            "\"artifact\":{{",
+            "\"artifact_id\":\"{}\",",
+            "\"artifact_kind\":\"file\",",
+            "\"path\":\"{}\",",
+            "\"path_state\":\"active\",",
+            "\"content_hash\":\"{}\",",
+            "\"byte_length\":{},",
+            "\"classification\":\"{}\",",
+            "\"executable\":{},",
+            "\"created_by_operation_id\":\"{}\"",
+            "}},",
+            "\"path_history\":[{{",
+            "\"path\":\"{}\",",
+            "\"state\":\"active\",",
+            "\"introduced_by_operation_id\":\"op_import_base_0001\"",
+            "}}],",
+            "\"provenance\":{},",
+            "\"before_refs\":{},",
+            "\"after_refs\":{}",
+            "}},\"warnings\":[]}}"
+        ),
+        FIXTURE_REPOSITORY_ID,
+        FIXTURE_SESSION_ID,
+        artifact.artifact_id,
+        fixture_post_patch_view_json(),
+        artifact.artifact_id,
+        json_escape(artifact.path),
+        artifact.content_hash,
+        artifact.byte_length,
+        artifact.classification,
+        artifact.executable,
+        artifact.created_by_operation_id,
+        json_escape(artifact.path),
+        provenance,
+        before_refs,
+        after_refs,
+    )
+}
+
+fn fixture_inspect_operation_json() -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.operation\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"operation_transaction_id\":\"op_auth_trim_guard_0001\",",
+            "\"topic_id\":\"{}\",",
+            "\"session_id\":\"{}\",",
+            "\"topic_revision_id\":\"rev_auth_nullability_0001\"",
+            "}},",
+            "\"view\":{},",
+            "\"operation\":{{",
+            "\"mutation\":\"patch\",",
+            "\"actor_id\":\"{}\",",
+            "\"authored_context_id\":\"ctx_agent_a_gen_0001\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"classification\":\"source\",",
+            "\"privacy_class\":\"policy_gated\",",
+            "\"preconditions\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"expected_path\":\"src/auth.ts\",",
+            "\"expected_hash\":\"sha256:auth_base\"",
+            "}},",
+            "\"write_set\":[{{\"artifact_id\":\"artifact_src_auth_ts\",\"path\":\"src/auth.ts\",\"mutation\":\"patch\"}}],",
+            "\"before_refs\":{{\"content_hash\":\"sha256:auth_base\",\"tree_hash\":\"{}\"}},",
+            "\"after_refs\":{{\"content_hash\":\"sha256:auth_trim_guard\",\"tree_hash\":\"tree_after_auth_patch_0001\"}}",
+            "}},",
+            "\"created_revision\":{{",
+            "\"topic_revision_id\":\"rev_auth_nullability_0001\",",
+            "\"revision_number\":1,",
+            "\"parent_revision_id\":null",
+            "}}",
+            "}},\"warnings\":[]}}"
+        ),
+        FIXTURE_REPOSITORY_ID,
+        FIXTURE_WRITE_TOPIC_ID,
+        FIXTURE_SESSION_ID,
+        fixture_base_view_json(),
+        FIXTURE_ACTOR_ID,
+        FIXTURE_SESSION_GENERATION_ID,
+        FIXTURE_RESOLVED_VIEW_ID,
+        FIXTURE_SESSION_GENERATION_ID,
+        FIXTURE_TREE_HASH,
+    )
+}
+
+fn fixture_inspect_session_json() -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.session\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"session_id\":\"{}\",\"write_topic_id\":\"{}\",\"session_generation_id\":\"gen_agent_a_0002\"}},",
+            "\"view\":{},",
+            "\"session\":{{",
+            "\"actor_id\":\"{}\",",
+            "\"base_resolved_view_id\":\"{}\",",
+            "\"write_topic_id\":\"{}\",",
+            "\"current_generation_number\":2,",
+            "\"created_by\":{{\"kind\":\"session_start\",\"id\":\"{}\"}}",
+            "}},",
+            "\"generations\":[",
+            "{{\"session_generation_id\":\"{}\",\"generation_number\":1,\"resolved_view_id\":\"{}\",\"created_by\":{{\"kind\":\"session_start\",\"id\":\"{}\"}}}},",
+            "{{\"session_generation_id\":\"gen_agent_a_0002\",\"generation_number\":2,\"resolved_view_id\":\"view_agent_a_after_patch_0001\",\"created_by\":{{\"kind\":\"operation_transaction\",\"id\":\"op_auth_trim_guard_0001\"}}}}",
+            "]",
+            "}},\"warnings\":[]}}"
+        ),
+        FIXTURE_REPOSITORY_ID,
+        FIXTURE_SESSION_ID,
+        FIXTURE_WRITE_TOPIC_ID,
+        fixture_post_patch_view_json(),
+        FIXTURE_ACTOR_ID,
+        FIXTURE_RESOLVED_VIEW_ID,
+        FIXTURE_WRITE_TOPIC_ID,
+        FIXTURE_SESSION_ID,
+        FIXTURE_SESSION_GENERATION_ID,
+        FIXTURE_RESOLVED_VIEW_ID,
+        FIXTURE_SESSION_ID,
+    )
+}
+
+fn fixture_inspect_topic_json() -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.topic\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"topic_id\":\"{}\",\"head_revision_id\":\"rev_auth_nullability_0001\"}},",
+            "\"view\":null,",
+            "\"topic\":{{",
+            "\"slug\":\"auth-nullability\",",
+            "\"display_name\":\"Auth nullability\",",
+            "\"owner_actor_id\":\"{}\",",
+            "\"base_checkpoint_id\":\"checkpoint_base_0001\",",
+            "\"status\":\"open\",",
+            "\"visibility\":\"local\"",
+            "}},",
+            "\"revisions\":[{{",
+            "\"topic_revision_id\":\"rev_auth_nullability_0001\",",
+            "\"revision_number\":1,",
+            "\"parent_revision_id\":null,",
+            "\"operation_transaction_id\":\"op_auth_trim_guard_0001\",",
+            "\"changed_artifacts\":[{}]",
+            "}}]",
+            "}},\"warnings\":[]}}"
+        ),
+        FIXTURE_REPOSITORY_ID,
+        FIXTURE_WRITE_TOPIC_ID,
+        FIXTURE_ACTOR_ID,
+        fixture_changed_artifact_revision_json(),
+    )
+}
+
+fn fixture_inspect_revision_json() -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.revision\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"topic_id\":\"{}\",",
+            "\"topic_revision_id\":\"rev_auth_nullability_0001\",",
+            "\"operation_transaction_id\":\"op_auth_trim_guard_0001\"",
+            "}},",
+            "\"view\":null,",
+            "\"revision\":{{",
+            "\"revision_number\":1,",
+            "\"parent_revision_id\":null,",
+            "\"tree_delta_ref\":\"delta_auth_trim_guard_0001\",",
+            "\"dependency_revision_ids\":[],",
+            "\"privacy_class\":\"commit_default\"",
+            "}},",
+            "\"operation\":{{",
+            "\"mutation\":\"patch\",",
+            "\"session_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"authored_context_id\":\"ctx_agent_a_gen_0001\"",
+            "}},",
+            "\"changed_artifacts\":[{}]",
+            "}},\"warnings\":[]}}"
+        ),
+        FIXTURE_REPOSITORY_ID,
+        FIXTURE_WRITE_TOPIC_ID,
+        FIXTURE_SESSION_ID,
+        FIXTURE_SESSION_GENERATION_ID,
+        fixture_changed_artifact_revision_json(),
+    )
+}
+
+fn fixture_topic_summary_json() -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"topic_id\":\"{}\",",
+            "\"slug\":\"auth-nullability\",",
+            "\"status\":\"open\",",
+            "\"base_checkpoint_id\":\"checkpoint_base_0001\",",
+            "\"head_revision_id\":\"rev_auth_nullability_0001\",",
+            "\"revision_count\":1,",
+            "\"changed_artifact_count\":1",
+            "}}"
+        ),
+        FIXTURE_WRITE_TOPIC_ID
+    )
+}
+
+fn fixture_session_summary_json() -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"session_id\":\"{}\",",
+            "\"actor_id\":\"{}\",",
+            "\"write_topic_id\":\"{}\",",
+            "\"session_generation_id\":\"gen_agent_a_0002\",",
+            "\"resolved_view_id\":\"view_agent_a_after_patch_0001\",",
+            "\"refresh_policy\":\"pinned_except_own_topic\"",
+            "}}"
+        ),
+        FIXTURE_SESSION_ID, FIXTURE_ACTOR_ID, FIXTURE_WRITE_TOPIC_ID
+    )
+}
+
+fn fixture_changed_artifact_json() -> &'static str {
+    concat!(
+        "{\"artifact_id\":\"artifact_src_auth_ts\",",
+        "\"path\":\"src/auth.ts\",",
+        "\"kind\":\"file\",",
+        "\"path_state\":\"active\",",
+        "\"before_hash\":\"sha256:auth_base\",",
+        "\"after_hash\":\"sha256:auth_trim_guard\",",
+        "\"classification\":\"source\",",
+        "\"executable\":false,",
+        "\"tombstone\":false}"
+    )
+}
+
+fn fixture_changed_artifact_revision_json() -> &'static str {
+    concat!(
+        "{\"artifact_id\":\"artifact_src_auth_ts\",",
+        "\"path\":\"src/auth.ts\",",
+        "\"mutation\":\"patch\",",
+        "\"before_hash\":\"sha256:auth_base\",",
+        "\"after_hash\":\"sha256:auth_trim_guard\"}"
+    )
+}
+
+fn fixture_base_view_json() -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"refresh_policy\":\"pinned_except_own_topic\",",
+            "\"topic_frontier\":{{}},",
+            "\"tree_identity\":{{\"kind\":\"SingleRepoTree\",\"repository_id\":\"{}\",\"tree_hash\":\"{}\"}}",
+            "}}"
+        ),
+        FIXTURE_RESOLVED_VIEW_ID,
+        FIXTURE_SESSION_GENERATION_ID,
+        FIXTURE_REPOSITORY_ID,
+        FIXTURE_TREE_HASH,
+    )
+}
+
+fn fixture_post_patch_view_json() -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"resolved_view_id\":\"view_agent_a_after_patch_0001\",",
+            "\"session_generation_id\":\"gen_agent_a_0002\",",
+            "\"refresh_policy\":\"pinned_except_own_topic\",",
+            "\"topic_frontier\":{{\"{}\":\"rev_auth_nullability_0001\"}},",
+            "\"tree_identity\":{{\"kind\":\"SingleRepoTree\",\"repository_id\":\"{}\",\"tree_hash\":\"tree_after_auth_patch_0001\"}}",
+            "}}"
+        ),
+        FIXTURE_WRITE_TOPIC_ID, FIXTURE_REPOSITORY_ID
+    )
 }
 
 fn require_repository_config(repo_root: impl Into<PathBuf>) -> Result<RepositoryConfig, CliError> {

@@ -15,6 +15,11 @@ use sunlight_core::checkpoint::{
     fixture_checkpoint_from_resolved_view, CheckpointRecord, CheckpointValidationError,
     EvidenceRef, GitExportMapRecord,
 };
+use sunlight_core::compat_import::{
+    fixture_basic_app_candidate_deltas, plan_fixture_basic_app_import, CompatImportErrorCode,
+    CompatImportRequest, CompatImportResponse, CompatImportValidationError,
+    CompatImportedArtifact,
+};
 use sunlight_core::execution::{
     fixture_failing_execution_from_resolved_view, fixture_passing_execution_from_resolved_view,
     fixture_promotion_candidate_provenance, ExecutionFoundationError, ExecutionRecord,
@@ -146,6 +151,7 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
             checkpoint_create(&ctx)
         }
         [scope, command, ..] if scope == "git" && command == "export" => git_export(&ctx),
+        [scope, command, ..] if scope == "compat" && command == "import" => compat_import(&ctx),
         [command, ..] if command == "run" => execution_run(&ctx),
         [command, ..] if command == "read" => artifact_read(&ctx),
         [command, ..] if command == "list" => artifact_list(&ctx),
@@ -493,6 +499,44 @@ fn git_export(ctx: &CommandContext) -> Result<(), CliError> {
     Ok(())
 }
 
+fn compat_import(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_compat_import_options(ctx)?;
+    if options.fixture != "basic-app" {
+        return Err(
+            invalid_request(format!("unknown fixture `{}`", options.fixture))
+                .with_detail("fixture", options.fixture),
+        );
+    }
+
+    let projection = fixture_compat_import_projection_by_id(&options.projection_id)
+        .ok_or_else(|| object_not_found("projection", &options.projection_id))?
+        .map_err(projection_error)?;
+    let current_view = fixture_compat_import_view_for_projection(&projection);
+    let response = plan_fixture_basic_app_import(
+        &projection,
+        &current_view,
+        CompatImportRequest {
+            projection_id: options.projection_id,
+            session_id: FIXTURE_SESSION_ID.to_string(),
+            session_generation_id: FIXTURE_SESSION_GENERATION_ID.to_string(),
+            resolved_view_id: current_view.resolved_view_id.clone(),
+            write_topic_id: FIXTURE_WRITE_TOPIC_ID.to_string(),
+            parent_topic_revision_id: None,
+            selected_candidate_delta_ids: options.candidate_delta_ids,
+        },
+        &fixture_basic_app_candidate_deltas(),
+    )
+    .map_err(compat_import_error)?;
+
+    if ctx.json {
+        println!("{}", compat_import_success_envelope(&response));
+    } else {
+        println!("{} {}", response.operation_id, response.topic_revision_id);
+    }
+
+    Ok(())
+}
+
 fn status(ctx: &CommandContext) -> Result<(), CliError> {
     if let Some(options) = parse_status_options(ctx)? {
         if options.fixture != "basic-app" {
@@ -645,6 +689,70 @@ struct ProjectMaterializeOptions {
     fixture: String,
     view_id: String,
     purpose: ProjectionPurpose,
+}
+
+#[derive(Debug)]
+struct CompatImportOptions {
+    fixture: String,
+    projection_id: String,
+    candidate_delta_ids: Vec<String>,
+}
+
+fn parse_compat_import_options(ctx: &CommandContext) -> Result<CompatImportOptions, CliError> {
+    let mut fixture = None;
+    let mut projection_id = None;
+    let mut candidate_delta_ids = Vec::new();
+    let mut args = ctx.args.iter().skip(2);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun compat import requires --fixture basic-app")
+                })?;
+                fixture = Some(value.clone());
+            }
+            "--projection" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun compat import requires --projection <projection-id>")
+                })?;
+                projection_id = Some(value.clone());
+            }
+            "--candidate" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun compat import requires --candidate <candidate-id>")
+                })?;
+                candidate_delta_ids.push(value.clone());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun compat import"
+                )));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected compat import argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    let fixture = fixture.ok_or_else(|| {
+        invalid_request(
+            "usage: sun compat import --projection <projection-id> --candidate <candidate-id> --fixture basic-app",
+        )
+    })?;
+    let projection_id = projection_id.ok_or_else(|| {
+        invalid_request(
+            "usage: sun compat import --projection <projection-id> --candidate <candidate-id> --fixture basic-app",
+        )
+    })?;
+
+    Ok(CompatImportOptions {
+        fixture,
+        projection_id,
+        candidate_delta_ids,
+    })
 }
 
 fn parse_project_materialize_options(
@@ -2214,6 +2322,29 @@ fn fixture_projection_by_id(
     }
 }
 
+fn fixture_compat_import_projection_by_id(
+    projection_id: &str,
+) -> Option<Result<ProjectionRecord, ProjectionValidationError>> {
+    if projection_id == FIXTURE_COMPATIBILITY_PROJECTION_ID {
+        let view = fixture_resolved_view(Vec::new());
+        Some(fixture_compatibility_projection_from_resolved_view(
+            &view,
+            "gen_agent_a_0001",
+        ))
+    } else {
+        fixture_projection_by_id(projection_id)
+    }
+}
+
+fn fixture_compat_import_view_for_projection(projection: &ProjectionRecord) -> ResolvedViewResult {
+    if projection.id == FIXTURE_COMPATIBILITY_PROJECTION_ID {
+        fixture_resolved_view(Vec::new())
+    } else {
+        fixture_resolved_view_by_id(&projection.resolved_view_id)
+            .unwrap_or_else(|| fixture_resolved_view(Vec::new()))
+    }
+}
+
 fn artifact_error(error: ArtifactIoError) -> CliError {
     let message = match &error {
         ArtifactIoError::PathPolicyViolation { .. } => {
@@ -2393,6 +2524,43 @@ fn git_export_error(error: GitExportError) -> CliError {
     ))
 }
 
+fn compat_import_error(error: CompatImportValidationError) -> CliError {
+    let message = match error.code {
+        CompatImportErrorCode::NoSelectedChanges => "no compatibility import candidates selected",
+        CompatImportErrorCode::DiffFailed => "selected compatibility candidate was not found",
+        CompatImportErrorCode::SecretDetected => "selected compatibility candidate contains secrets",
+        CompatImportErrorCode::CacheBlocked => "selected compatibility candidate is cache or build output",
+        CompatImportErrorCode::ProjectionNotFound => "compatibility projection was not found",
+        CompatImportErrorCode::ProjectionInvalid => "projection is not valid for compatibility import",
+        CompatImportErrorCode::ProjectionStale => "compatibility projection is stale",
+        CompatImportErrorCode::ProjectionIntegrityFailed => "compatibility projection integrity check failed",
+        CompatImportErrorCode::PathPolicyFailed => "selected compatibility candidate failed path policy",
+        CompatImportErrorCode::PreconditionFailed => "compatibility import precondition failed",
+        CompatImportErrorCode::ConflictedDelta => "selected compatibility candidate is conflicted",
+        CompatImportErrorCode::AmbiguousRename => "selected compatibility candidate has ambiguous rename identity",
+        CompatImportErrorCode::PolicyFailed => "selected compatibility candidate failed import policy",
+        CompatImportErrorCode::PartialWriteBlocked => "compatibility import partial write is blocked",
+    };
+
+    CliError::new(error.code.as_str(), message).with_raw_details_json(format!(
+        concat!(
+            "{{",
+            "\"projection_id\":\"{}\",",
+            "\"session_id\":\"{}\",",
+            "\"candidate_delta_ids\":{},",
+            "\"imported_artifacts\":[],",
+            "\"operation_transaction_id\":null,",
+            "\"topic_revision_id\":null,",
+            "\"reason\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&error.projection_id),
+        json_escape(&error.session_id),
+        string_array_json(error.candidate_delta_ids.iter().map(String::as_str)),
+        json_escape(&error.message),
+    ))
+}
+
 fn init_success_envelope(
     repository_id: &str,
     repo_root: &str,
@@ -2516,6 +2684,304 @@ fn git_export_success_envelope(response: &GitExportResponse) -> String {
         json_escape(&response.git_ref),
         string_array_json(response.git_commit_ids.iter().map(String::as_str)),
         git_export_map_json(&response.export_map),
+    )
+}
+
+fn compat_import_success_envelope(response: &CompatImportResponse) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"projection_id\":\"{}\",",
+            "\"session_id\":\"{}\",",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"topic_revision_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"projection_id\":\"{}\",",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"topic_revision_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"imported_artifacts\":[{}],",
+            "\"ignored_candidate_delta_ids\":{},",
+            "\"quarantine_refs\":{},",
+            "\"operation\":{},",
+            "\"topic_revision\":{},",
+            "\"session_generation\":{}",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(response.command),
+        json_escape(&response.repository_id),
+        json_escape(&response.projection_id),
+        json_escape(&response.session_id),
+        json_escape(&response.operation_id),
+        json_escape(&response.topic_revision_id),
+        json_escape(&response.session_generation_id),
+        json_escape(&response.resolved_view_id),
+        json_escape(&response.resolved_view_id),
+        json_escape(&response.session_generation_id),
+        single_repo_tree_json(&response.tree_identity),
+        json_escape(&response.projection_id),
+        json_escape(&response.operation_id),
+        json_escape(&response.topic_revision_id),
+        json_escape(&response.session_generation_id),
+        json_escape(&response.resolved_view_id),
+        single_repo_tree_json(&response.tree_identity),
+        response
+            .imported_artifacts
+            .iter()
+            .map(compat_imported_artifact_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        string_array_json(
+            response
+                .ignored_candidate_delta_ids
+                .iter()
+                .map(String::as_str)
+        ),
+        string_array_json(response.quarantine_refs.iter().map(String::as_str)),
+        compat_operation_json(response),
+        compat_topic_revision_json(response),
+        compat_session_generation_json(response),
+    )
+}
+
+fn compat_imported_artifact_json(artifact: &CompatImportedArtifact) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"candidate_delta_id\":\"{}\",",
+            "\"artifact_id\":\"{}\",",
+            "\"path\":\"{}\",",
+            "\"operation_kind\":\"{}\",",
+            "\"before_hash\":{},",
+            "\"after_hash\":{},",
+            "\"classification\":\"{}\",",
+            "\"privacy_class\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&artifact.candidate_delta_id),
+        json_escape(&artifact.artifact_id),
+        json_escape(&artifact.path),
+        artifact.operation_kind.as_str(),
+        optional_string_json(artifact.before_hash.as_deref()),
+        optional_string_json(artifact.after_hash.as_deref()),
+        json_escape(&artifact.classification),
+        artifact.privacy_class.as_str(),
+    )
+}
+
+fn compat_operation_json(response: &CompatImportResponse) -> String {
+    let operation = &response.plan.operation;
+    format!(
+        concat!(
+            "{{",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"topic_id\":\"{}\",",
+            "\"session_id\":\"{}\",",
+            "\"actor_id\":\"{}\",",
+            "\"authored_context_id\":\"{}\",",
+            "\"mutation\":\"compat_import\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"classification\":\"{}\",",
+            "\"parent_topic_revision_id\":{},",
+            "\"next_topic_revision_number\":{},",
+            "\"parents\":{},",
+            "\"preconditions\":{{",
+            "\"projection_id\":\"{}\",",
+            "\"projection_purpose\":\"{}\",",
+            "\"projection_baseline_resolved_view_id\":\"{}\",",
+            "\"projection_baseline_tree_identity\":{},",
+            "\"session_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"write_topic_id\":\"{}\",",
+            "\"parent_topic_revision_id\":{},",
+            "\"path_policy_id\":\"{}\",",
+            "\"operation_semantics_version\":\"{}\",",
+            "\"selected_candidate_delta_ids\":{}",
+            "}},",
+            "\"read_set\":{{\"mode\":\"{}\",\"resolved_view_id\":\"{}\",\"projection_id\":\"{}\"}},",
+            "\"write_set\":[{}],",
+            "\"payload\":{},",
+            "\"before_refs\":{},",
+            "\"after_refs\":{}",
+            "}}"
+        ),
+        json_escape(&operation.id),
+        json_escape(&operation.topic_id),
+        json_escape(&operation.session_id),
+        json_escape(&operation.actor_id),
+        json_escape(&operation.authored_context_id),
+        json_escape(&operation.session_generation_id),
+        json_escape(&operation.classification),
+        optional_string_json(operation.parent_topic_revision_id.as_deref()),
+        operation.next_topic_revision_number,
+        string_array_json(operation.parents.iter().map(String::as_str)),
+        json_escape(&operation.preconditions.projection_id),
+        operation.preconditions.projection_purpose.as_str(),
+        json_escape(&operation.preconditions.projection_baseline_resolved_view_id),
+        single_repo_tree_json(&operation.preconditions.projection_baseline_tree_identity),
+        json_escape(&operation.preconditions.session_id),
+        json_escape(&operation.preconditions.session_generation_id),
+        json_escape(&operation.preconditions.resolved_view_id),
+        json_escape(&operation.preconditions.write_topic_id),
+        optional_string_json(operation.preconditions.parent_topic_revision_id.as_deref()),
+        json_escape(&operation.preconditions.path_policy_id),
+        json_escape(&operation.preconditions.operation_semantics_version),
+        string_array_json(
+            operation
+                .preconditions
+                .selected_candidate_delta_ids
+                .iter()
+                .map(String::as_str)
+        ),
+        json_escape(&operation.read_set.mode),
+        json_escape(&operation.read_set.resolved_view_id),
+        json_escape(&operation.read_set.projection_id),
+        operation
+            .write_set
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{{\"artifact_id\":\"{}\",\"path\":\"{}\",\"mutation\":\"{}\"}}",
+                    json_escape(&entry.artifact_id),
+                    json_escape(&entry.path),
+                    entry.mutation.as_str(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        compat_import_payload_json(response),
+        refs_json(&operation.before_refs),
+        refs_json(&operation.after_refs),
+    )
+}
+
+fn compat_import_payload_json(response: &CompatImportResponse) -> String {
+    let payload = &response.plan.operation.mutation_payload;
+    format!(
+        concat!(
+            "{{",
+            "\"kind\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"baseline_manifest_digest\":\"{}\",",
+            "\"selected_deltas\":[{}]",
+            "}}"
+        ),
+        json_escape(&payload.kind),
+        json_escape(&payload.projection_id),
+        json_escape(&payload.baseline_manifest_digest),
+        payload
+            .selected_deltas
+            .iter()
+            .map(|delta| {
+                format!(
+                    concat!(
+                        "{{",
+                        "\"candidate_delta_id\":\"{}\",",
+                        "\"operation_kind\":\"{}\",",
+                        "\"path\":\"{}\",",
+                        "\"patch_digest\":{},",
+                        "\"base_content_hash\":{},",
+                        "\"result_content_hash\":{},",
+                        "\"classification\":\"{}\",",
+                        "\"privacy_class\":\"{}\"",
+                        "}}"
+                    ),
+                    json_escape(&delta.candidate_delta_id),
+                    delta.operation_kind.as_str(),
+                    json_escape(&delta.path),
+                    optional_string_json(delta.patch_digest.as_deref()),
+                    optional_string_json(delta.base_content_hash.as_deref()),
+                    optional_string_json(delta.result_content_hash.as_deref()),
+                    json_escape(&delta.classification),
+                    delta.privacy_class.as_str(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn compat_topic_revision_json(response: &CompatImportResponse) -> String {
+    let revision = &response.plan.topic_revision;
+    format!(
+        concat!(
+            "{{",
+            "\"topic_revision_id\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"topic_id\":\"{}\",",
+            "\"revision_number\":{},",
+            "\"parent_revision_id\":{},",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"tree_delta_ref\":\"{}\",",
+            "\"dependency_revision_ids\":{}",
+            "}}"
+        ),
+        json_escape(&revision.id),
+        json_escape(&revision.repository_id),
+        json_escape(&revision.topic_id),
+        revision.revision_number,
+        optional_string_json(revision.parent_revision_id.as_deref()),
+        json_escape(&revision.operation_transaction_id),
+        json_escape(&revision.tree_delta_ref),
+        string_array_json(revision.dependency_revision_ids.iter().map(String::as_str)),
+    )
+}
+
+fn compat_session_generation_json(response: &CompatImportResponse) -> String {
+    let generation = &response.plan.session_generation;
+    let topic_frontier = generation
+        .topic_frontier
+        .iter()
+        .map(|(topic_id, revision_id)| {
+            format!(
+                "\"{}\":\"{}\"",
+                json_escape(topic_id),
+                json_escape(revision_id)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        concat!(
+            "{{",
+            "\"session_generation_id\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"session_id\":\"{}\",",
+            "\"write_topic_id\":\"{}\",",
+            "\"base_resolved_view_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"topic_frontier\":{{{}}},",
+            "\"generation_number\":{},",
+            "\"refresh_policy\":\"{}\",",
+            "\"created_by_operation_id\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&generation.id),
+        json_escape(&generation.repository_id),
+        json_escape(&generation.session_id),
+        json_escape(&generation.write_topic_id),
+        json_escape(&generation.base_resolved_view_id),
+        json_escape(&generation.resolved_view_id),
+        topic_frontier,
+        generation.generation_number,
+        json_escape(&generation.refresh_policy),
+        json_escape(&generation.created_by_operation_id),
     )
 }
 

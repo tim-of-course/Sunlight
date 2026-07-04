@@ -755,6 +755,163 @@ fn project_materialize_json_fixture_compatibility_records_import_policy() {
 }
 
 #[test]
+fn compat_import_json_fixture_candidate_returns_operation_plan() {
+    let repo = TestRepo::new("compat-import-fixture");
+
+    let output = sun()
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--candidate")
+        .arg("compat_delta_src_auth_ts_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat import should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"compat.import\""));
+    assert!(stdout.contains("\"repository_id\":\"repo_fixture_basic_app\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_compat_import_0001\""));
+    assert!(stdout.contains("\"tree_hash\":\"tree_after_compat_import_0001\""));
+    assert!(stdout.contains("\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
+    assert!(stdout.contains("\"path\":\"src/auth.ts\""));
+    assert!(stdout.contains("\"operation_kind\":\"patch\""));
+    assert!(stdout.contains("\"before_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"after_hash\":\"sha256:auth_projection_after\""));
+    assert!(stdout.contains("\"mutation\":\"compat_import\""));
+    assert!(stdout.contains("\"projection_purpose\":\"compatibility\""));
+    assert!(stdout.contains(
+        "\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"
+    ));
+    assert!(stdout.contains("\"baseline_manifest_digest\":\"sha256:compat_baseline\""));
+    assert!(stdout
+        .contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_compat_0001\"}"));
+}
+
+#[test]
+fn compat_import_json_fixture_no_candidate_returns_no_selected_changes() {
+    let repo = TestRepo::new("compat-import-no-candidate");
+
+    let output = sun()
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat import should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"compat_no_selected_changes\""));
+    assert!(stdout.contains("\"message\":\"no compatibility import candidates selected\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
+    assert!(stdout.contains("\"candidate_delta_ids\":[]"));
+    assert!(stdout.contains("\"operation_transaction_id\":null"));
+    assert!(stdout.contains("\"topic_revision_id\":null"));
+}
+
+#[test]
+fn compat_import_json_fixture_missing_candidate_returns_diff_failed() {
+    let repo = TestRepo::new("compat-import-missing-candidate");
+
+    let output = sun()
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--candidate")
+        .arg("compat_delta_missing_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat import should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"compat_diff_failed\""));
+    assert!(stdout.contains("\"message\":\"selected compatibility candidate was not found\""));
+    assert!(stdout.contains("\"candidate_delta_ids\":[\"compat_delta_missing_0001\"]"));
+    assert!(stdout
+        .contains("\"reason\":\"selected candidate delta was not present in fixture diff output\""));
+    assert!(stdout.contains("\"operation_transaction_id\":null"));
+}
+
+#[test]
+fn compat_import_json_fixture_secret_candidate_is_policy_blocked() {
+    let repo = TestRepo::new("compat-import-secret-candidate");
+
+    let output = sun()
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--candidate")
+        .arg("compat_delta_env_secret_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat import should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"compat_secret_detected\""));
+    assert!(stdout.contains("\"message\":\"selected compatibility candidate contains secrets\""));
+    assert!(stdout.contains("\"candidate_delta_ids\":[\"compat_delta_env_secret_0001\"]"));
+    assert!(stdout.contains("\"reason\":\"secret-like candidate cannot be imported as source\""));
+    assert!(stdout.contains("\"imported_artifacts\":[]"));
+    assert!(stdout.contains("\"operation_transaction_id\":null"));
+}
+
+#[test]
+fn compat_import_json_fixture_cache_candidate_is_policy_blocked() {
+    let repo = TestRepo::new("compat-import-cache-candidate");
+
+    let output = sun()
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--candidate")
+        .arg("compat_delta_dist_bundle_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat import should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"compat_cache_blocked\""));
+    assert!(stdout
+        .contains("\"message\":\"selected compatibility candidate is cache or build output\""));
+    assert!(stdout.contains("\"candidate_delta_ids\":[\"compat_delta_dist_bundle_0001\"]"));
+    assert!(stdout
+        .contains("\"reason\":\"cache, build, and ignored candidates are blocked by default\""));
+    assert!(stdout.contains("\"imported_artifacts\":[]"));
+    assert!(stdout.contains("\"operation_transaction_id\":null"));
+}
+
+#[test]
 fn project_materialize_json_fixture_conflicted_view_returns_projection_error() {
     let repo = TestRepo::new("projection-fixture-conflicted");
     let view_id = resolve_fixture_view_id(

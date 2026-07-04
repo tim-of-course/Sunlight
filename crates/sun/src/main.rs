@@ -50,7 +50,7 @@ use sunlight_core::projection::{
     materialize_fixture_projection_copy, plan_fixture_projection_materialization,
     projection_manifest_local_record_path, projection_manifest_ref,
     projection_store_integrity_failed_quarantined, projection_store_integrity_not_checked,
-    projection_store_integrity_verified, ProjectionFilesystemMaterialization,
+    projection_store_integrity_from_manifest_scan, ProjectionFilesystemMaterialization,
     ProjectionManifestRecord, ProjectionMaterializationCapabilities,
     ProjectionMaterializationError, ProjectionMaterializationErrorCode,
     ProjectionMaterializationLocalMetadata, ProjectionMaterializationPlan,
@@ -894,6 +894,7 @@ struct InspectOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoreIntegrityFixture {
+    ScanMissingBlob,
     StoreMismatch,
     Verified,
 }
@@ -901,6 +902,7 @@ enum StoreIntegrityFixture {
 impl StoreIntegrityFixture {
     fn as_str(self) -> &'static str {
         match self {
+            Self::ScanMissingBlob => "scan-missing-blob",
             Self::StoreMismatch => "store-mismatch",
             Self::Verified => "verified",
         }
@@ -1625,7 +1627,9 @@ fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, C
             }
             "--integrity-fixture" => {
                 let value = args.next().ok_or_else(|| {
-                    invalid_request("usage: sun status --integrity-fixture store-mismatch|verified")
+                    invalid_request(
+                        "usage: sun status --integrity-fixture store-mismatch|scan-missing-blob|verified",
+                    )
                 })?;
                 integrity_fixture = Some(parse_store_integrity_fixture(value)?);
             }
@@ -1721,7 +1725,7 @@ fn parse_inspect_options(ctx: &CommandContext) -> Result<Option<InspectOptions>,
             "--integrity-fixture" => {
                 let value = args.next().ok_or_else(|| {
                     invalid_request(
-                        "usage: sun inspect --integrity-fixture store-mismatch|verified",
+                        "usage: sun inspect --integrity-fixture store-mismatch|scan-missing-blob|verified",
                     )
                 })?;
                 integrity_fixture = Some(parse_store_integrity_fixture(value)?);
@@ -1769,6 +1773,7 @@ fn parse_inspect_options(ctx: &CommandContext) -> Result<Option<InspectOptions>,
 
 fn parse_store_integrity_fixture(value: &str) -> Result<StoreIntegrityFixture, CliError> {
     match value {
+        "scan-missing-blob" => Ok(StoreIntegrityFixture::ScanMissingBlob),
         "store-mismatch" => Ok(StoreIntegrityFixture::StoreMismatch),
         "verified" | "store-verified" => Ok(StoreIntegrityFixture::Verified),
         _ => Err(
@@ -2218,6 +2223,7 @@ fn fixture_status_projection_json(
 ) -> Result<String, CliError> {
     ensure_store_integrity_fixture_scope(projection, integrity_fixture)?;
     let lifecycle_state = match integrity_fixture {
+        Some(StoreIntegrityFixture::ScanMissingBlob) => "quarantined",
         Some(StoreIntegrityFixture::StoreMismatch) => "quarantined",
         Some(StoreIntegrityFixture::Verified) | None => {
             projection_lifecycle_state(projection, projection_root)
@@ -5019,6 +5025,14 @@ fn fixture_projection_store_integrity_result(
     integrity_fixture: Option<StoreIntegrityFixture>,
 ) -> ProjectionStoreIntegrityResult {
     match integrity_fixture {
+        Some(StoreIntegrityFixture::ScanMissingBlob) => {
+            let store = InMemoryArtifactStore::fixture_basic_app();
+            let mut blobs = store.content_blobs().clone();
+            if let Some(entry) = manifest.entries.iter().find(|entry| !entry.tombstone) {
+                blobs.remove(&entry.content_hash);
+            }
+            projection_store_integrity_from_manifest_scan(projection, manifest, &blobs)
+        }
         Some(StoreIntegrityFixture::StoreMismatch) => {
             projection_store_integrity_failed_quarantined(
                 projection,
@@ -5027,7 +5041,12 @@ fn fixture_projection_store_integrity_result(
             )
         }
         Some(StoreIntegrityFixture::Verified) => {
-            projection_store_integrity_verified(projection, manifest)
+            let store = InMemoryArtifactStore::fixture_basic_app();
+            projection_store_integrity_from_manifest_scan(
+                projection,
+                manifest,
+                store.content_blobs(),
+            )
         }
         None => projection_store_integrity_not_checked(projection),
     }
@@ -5171,29 +5190,35 @@ fn projection_native_errors_json(
     integrity_fixture: Option<StoreIntegrityFixture>,
 ) -> String {
     match integrity_fixture {
-        Some(StoreIntegrityFixture::StoreMismatch) => format!(
-            concat!(
-                "[{{",
-                "\"code\":\"execution_store_integrity_failed\",",
-                "\"message\":\"projection store integrity verification failed for fixture store-mismatch\",",
-                "\"projection_id\":\"{}\",",
-                "\"resolved_view_id\":\"{}\",",
-                "\"integrity_status\":\"failed\",",
-                "\"quarantine_reason\":\"store_integrity_mismatch\",",
-                "\"root_ref\":{},",
-                "\"cache_key\":\"{}\",",
-                "\"manifest_ref\":\"{}\",",
-                "\"manifest_digest\":\"{}\",",
-                "\"privacy_class\":\"local_only\"",
-                "}}]"
-            ),
-            json_escape(&projection.id),
-            json_escape(&projection.resolved_view_id),
-            projection_root_ref_json(projection),
-            json_escape(&projection.cache_key.stable_string()),
-            json_escape(&projection_manifest_ref(manifest)),
-            json_escape(&manifest.manifest_digest),
-        ),
+        Some(StoreIntegrityFixture::ScanMissingBlob)
+        | Some(StoreIntegrityFixture::StoreMismatch) => {
+            format!(
+                concat!(
+                    "[{{",
+                    "\"code\":\"execution_store_integrity_failed\",",
+                    "\"message\":\"projection store integrity verification failed for fixture {}\",",
+                    "\"projection_id\":\"{}\",",
+                    "\"resolved_view_id\":\"{}\",",
+                    "\"integrity_status\":\"failed\",",
+                    "\"quarantine_reason\":\"store_integrity_mismatch\",",
+                    "\"root_ref\":{},",
+                    "\"cache_key\":\"{}\",",
+                    "\"manifest_ref\":\"{}\",",
+                    "\"manifest_digest\":\"{}\",",
+                    "\"privacy_class\":\"local_only\"",
+                    "}}]"
+                ),
+                integrity_fixture
+                    .map(StoreIntegrityFixture::as_str)
+                    .unwrap_or("unknown"),
+                json_escape(&projection.id),
+                json_escape(&projection.resolved_view_id),
+                projection_root_ref_json(projection),
+                json_escape(&projection.cache_key.stable_string()),
+                json_escape(&projection_manifest_ref(manifest)),
+                json_escape(&manifest.manifest_digest),
+            )
+        }
         Some(StoreIntegrityFixture::Verified) | None => "[]".to_string(),
     }
 }
@@ -7024,9 +7049,9 @@ Usage:
   sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> --fixture basic-app [--json]
   sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
   sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan|--execute-fixture success|ref-update-failure|export-map-failure|--execute-local --repo <path>] --json
-  sun status --projection <projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|verified] [--json]
+  sun status --projection <projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|scan-missing-blob|verified] [--json]
   sun status --execution <execution-id> --fixture basic-app [--promoted] [--json]
-  sun inspect projection:<projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|verified] [--json]
+  sun inspect projection:<projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|scan-missing-blob|verified] [--json]
   sun inspect execution:<execution-id> --fixture basic-app [--promoted] [--json]
 
 Commands:

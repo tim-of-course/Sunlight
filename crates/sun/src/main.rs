@@ -51,15 +51,14 @@ use sunlight_core::projection::{
     projection_manifest_local_record_path, projection_manifest_ref,
     projection_store_integrity_failed_quarantined, projection_store_integrity_not_checked,
     projection_store_integrity_verified, ProjectionFilesystemMaterialization,
-    ProjectionManifestRecord,
-    ProjectionMaterializationCapabilities, ProjectionMaterializationError,
-    ProjectionMaterializationErrorCode, ProjectionMaterializationLocalMetadata,
-    ProjectionMaterializationPlan, ProjectionMaterializationRequest, ProjectionPurpose,
-    ProjectionRecord, ProjectionRootRef, ProjectionStoreIntegrityReasonCode,
-    ProjectionStoreIntegrityResult, ProjectionStoreIntegrityStatus, ProjectionStrategy,
-    ProjectionValidationError, FIXTURE_COMPATIBILITY_PROJECTION_ID,
-    FIXTURE_EXECUTION_PROJECTION_ID, FIXTURE_EXPORT_PROJECTION_ID,
-    FIXTURE_INSPECTION_PROJECTION_ID,
+    ProjectionManifestRecord, ProjectionMaterializationCapabilities,
+    ProjectionMaterializationError, ProjectionMaterializationErrorCode,
+    ProjectionMaterializationLocalMetadata, ProjectionMaterializationPlan,
+    ProjectionMaterializationRequest, ProjectionPurpose, ProjectionRecord, ProjectionRootRef,
+    ProjectionStoreIntegrityReasonCode, ProjectionStoreIntegrityResult,
+    ProjectionStoreIntegrityStatus, ProjectionStrategy, ProjectionValidationError,
+    FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
+    FIXTURE_EXPORT_PROJECTION_ID, FIXTURE_INSPECTION_PROJECTION_ID,
 };
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repository::{
@@ -1721,7 +1720,9 @@ fn parse_inspect_options(ctx: &CommandContext) -> Result<Option<InspectOptions>,
             }
             "--integrity-fixture" => {
                 let value = args.next().ok_or_else(|| {
-                    invalid_request("usage: sun inspect --integrity-fixture store-mismatch|verified")
+                    invalid_request(
+                        "usage: sun inspect --integrity-fixture store-mismatch|verified",
+                    )
                 })?;
                 integrity_fixture = Some(parse_store_integrity_fixture(value)?);
             }

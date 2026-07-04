@@ -824,6 +824,62 @@ fn status_json_fixture_projection_reports_local_root_verification() {
 }
 
 #[test]
+fn status_json_fixture_projection_reports_sorted_nested_local_root_sample() {
+    let repo = TestRepo::new("projection-status-root-nested-sample");
+    let projection_root = repo.path().join("projection-root");
+    write_nested_file(&projection_root, "z-last.txt", "x\n");
+    write_nested_file(&projection_root, "alpha/deep/02.txt", "x\n");
+    write_nested_file(&projection_root, "00-root.txt", "x\n");
+    write_nested_file(&projection_root, "gamma/nested/file.txt", "x\n");
+    write_nested_file(&projection_root, "theta.txt", "x\n");
+    write_nested_file(&projection_root, "alpha/00-first.txt", "x\n");
+    write_nested_file(&projection_root, "zz-extra.txt", "x\n");
+    write_nested_file(&projection_root, "beta.txt", "x\n");
+    write_nested_file(&projection_root, "omega.txt", "x\n");
+    write_nested_file(&projection_root, "alpha/deep/01.txt", "x\n");
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.projection\""));
+    assert!(stdout.contains("\"lifecycle_state\":\"materialized\""));
+    assert!(stdout.contains("\"verification_state\":\"present\""));
+    assert!(
+        stdout.contains("\"content_verification\":\"not_available_without_persisted_manifest\"")
+    );
+    assert!(stdout.contains("\"directories\":5"));
+    assert!(stdout.contains("\"files\":10"));
+    assert!(stdout.contains("\"bytes\":20"));
+    assert!(stdout.contains(concat!(
+        "\"sample_paths\":[",
+        "\"00-root.txt\",",
+        "\"alpha/00-first.txt\",",
+        "\"alpha/deep/01.txt\",",
+        "\"alpha/deep/02.txt\",",
+        "\"beta.txt\",",
+        "\"gamma/nested/file.txt\",",
+        "\"omega.txt\",",
+        "\"theta.txt\"",
+        "]"
+    )));
+    assert!(!stdout.contains("z-last.txt"));
+    assert!(!stdout.contains("zz-extra.txt"));
+    assert!(stdout.contains("\"scan_error\":null"));
+}
+
+#[test]
 fn status_json_fixture_projection_reports_missing_local_root() {
     let repo = TestRepo::new("projection-status-root-missing");
     let projection_root = repo.path().join("missing-projection-root");
@@ -2558,6 +2614,12 @@ impl TestRepo {
         fs::write(&path, body).unwrap();
         path
     }
+}
+
+fn write_nested_file(root: &Path, relative_path: &str, body: &str) {
+    let path = root.join(relative_path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, body).unwrap();
 }
 
 impl Drop for TestRepo {

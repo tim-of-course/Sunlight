@@ -4541,9 +4541,13 @@ fn local_projection_root_verification_json(projection_root: Option<&std::path::P
 }
 
 fn scan_local_projection_root(root: &std::path::Path) -> LocalProjectionRootScan {
+    let root_metadata = fs::symlink_metadata(root);
     let mut scan = LocalProjectionRootScan {
-        exists: root.exists(),
-        is_dir: root.is_dir(),
+        exists: root_metadata.is_ok(),
+        is_dir: root_metadata
+            .as_ref()
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false),
         ..LocalProjectionRootScan::default()
     };
     if !scan.exists || !scan.is_dir {
@@ -4570,19 +4574,18 @@ fn scan_local_projection_root_inner(
 
     for entry in entries {
         let path = entry.path();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
             scan.directories += 1;
             scan_local_projection_root_inner(root, &path, scan)?;
-        } else if metadata.is_file() {
+        } else if file_type.is_file() {
+            let metadata = fs::symlink_metadata(&path)?;
             scan.files += 1;
             scan.bytes += metadata.len();
             scan.executable_files += usize::from(local_file_is_executable(&metadata));
-            if scan.sample_paths.len() < 8 {
-                if let Ok(relative_path) = path.strip_prefix(root) {
-                    scan.sample_paths
-                        .push(relative_path.display().to_string().replace('\\', "/"));
-                }
+            if let Ok(relative_path) = path.strip_prefix(root) {
+                scan.sample_paths
+                    .push(relative_path.display().to_string().replace('\\', "/"));
             }
         }
     }

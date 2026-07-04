@@ -8,8 +8,8 @@ use sunlight_core::artifacts::{
     MutationPayload, MutationRefs, MutationResponse, PatchRequest, ReadResponse, SearchResponse,
     SessionView, SessionVisibleArtifactView, TreeIdentityView, WriteMode, WriteRequest,
     FILE_OPERATION_SEMANTICS_VERSION, FIXTURE_ACTOR_ID, FIXTURE_REPOSITORY_ID,
-    FIXTURE_RESOLVED_VIEW_ID, FIXTURE_SESSION_GENERATION_ID, FIXTURE_SESSION_ID,
-    FIXTURE_TREE_HASH, FIXTURE_WRITE_TOPIC_ID, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
+    FIXTURE_RESOLVED_VIEW_ID, FIXTURE_SESSION_GENERATION_ID, FIXTURE_SESSION_ID, FIXTURE_TREE_HASH,
+    FIXTURE_WRITE_TOPIC_ID, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
 };
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
@@ -279,11 +279,10 @@ fn artifact_write(ctx: &CommandContext) -> Result<(), CliError> {
 fn status(ctx: &CommandContext) -> Result<(), CliError> {
     if let Some(options) = parse_status_options(ctx)? {
         if options.fixture != "basic-app" {
-            return Err(invalid_request(format!(
-                "unknown fixture `{}`",
-                options.fixture
-            ))
-            .with_detail("fixture", options.fixture));
+            return Err(
+                invalid_request(format!("unknown fixture `{}`", options.fixture))
+                    .with_detail("fixture", options.fixture),
+            );
         }
         let output = match options.scope {
             StatusScope::Repository => {
@@ -333,11 +332,10 @@ fn status(ctx: &CommandContext) -> Result<(), CliError> {
 fn inspect(ctx: &CommandContext) -> Result<(), CliError> {
     if let Some(options) = parse_inspect_options(ctx)? {
         if options.fixture != "basic-app" {
-            return Err(invalid_request(format!(
-                "unknown fixture `{}`",
-                options.fixture
-            ))
-            .with_detail("fixture", options.fixture));
+            return Err(
+                invalid_request(format!("unknown fixture `{}`", options.fixture))
+                    .with_detail("fixture", options.fixture),
+            );
         }
         let output = fixture_inspect(&options, ctx.json)?;
         println!("{output}");
@@ -379,9 +377,9 @@ fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, C
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--fixture" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| invalid_request("usage: sun status requires --fixture basic-app"))?;
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun status requires --fixture basic-app")
+                })?;
                 fixture = Some(value.clone());
             }
             "--session" => {
@@ -397,7 +395,9 @@ fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, C
                 scope = StatusScope::Topic(value.clone());
             }
             flag if flag.starts_with("--") => {
-                return Err(invalid_request(format!("unknown flag `{flag}` for sun status")));
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun status"
+                )));
             }
             value => {
                 return Err(invalid_request(format!(
@@ -431,7 +431,9 @@ fn parse_inspect_options(ctx: &CommandContext) -> Result<Option<InspectOptions>,
                 session_id = Some(value.clone());
             }
             flag if flag.starts_with("--") => {
-                return Err(invalid_request(format!("unknown flag `{flag}` for sun inspect")));
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun inspect"
+                )));
             }
             value => selectors.push(value.to_string()),
         }
@@ -469,11 +471,10 @@ fn ensure_fixture_topic(topic: &str) -> Result<(), CliError> {
     if topic == "auth-nullability" || topic == FIXTURE_WRITE_TOPIC_ID {
         Ok(())
     } else {
-        Err(CliError::new(
-            "topic_not_found",
-            format!("topic `{topic}` was not found"),
+        Err(
+            CliError::new("topic_not_found", format!("topic `{topic}` was not found"))
+                .with_detail("topic", topic),
         )
-        .with_detail("topic", topic))
     }
 }
 
@@ -531,12 +532,9 @@ fn fixture_inspect_artifact(selector: &str, json: bool) -> Result<String, CliErr
     let artifact = fixture_artifact_after_patch(selector)
         .or_else(|| fixture_artifact_after_patch_by_id(selector))
         .ok_or_else(|| {
-            CliError::new(
-                "path_not_found",
-                format!("path `{selector}` was not found"),
-            )
-            .with_detail("path", selector)
-            .with_detail("session_generation_id", "gen_agent_a_0002")
+            CliError::new("path_not_found", format!("path `{selector}` was not found"))
+                .with_detail("path", selector)
+                .with_detail("session_generation_id", "gen_agent_a_0002")
         })?;
 
     if json {

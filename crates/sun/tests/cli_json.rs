@@ -520,7 +520,8 @@ fn inspect_json_fixture_basic_app_operation_returns_authored_context() {
     assert!(stdout.contains("\"authored_context_id\":\"ctx_agent_a_gen_0001\""));
     assert!(stdout.contains("\"expected_path\":\"src/auth.ts\""));
     assert!(stdout.contains("\"expected_hash\":\"sha256:auth_base\""));
-    assert!(stdout.contains("\"created_revision\":{\"topic_revision_id\":\"rev_auth_nullability_0001\""));
+    assert!(stdout
+        .contains("\"created_revision\":{\"topic_revision_id\":\"rev_auth_nullability_0001\""));
 }
 
 #[test]
@@ -543,7 +544,9 @@ fn inspect_json_fixture_basic_app_session_returns_typed_snapshot() {
     assert!(stdout.contains("\"current_generation_number\":2"));
     assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0001\""));
     assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
-    assert!(stdout.contains("\"created_by\":{\"kind\":\"operation_transaction\",\"id\":\"op_auth_trim_guard_0001\"}"));
+    assert!(stdout.contains(
+        "\"created_by\":{\"kind\":\"operation_transaction\",\"id\":\"op_auth_trim_guard_0001\"}"
+    ));
 }
 
 #[test]

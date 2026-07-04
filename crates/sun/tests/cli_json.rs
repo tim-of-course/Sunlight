@@ -664,7 +664,9 @@ fn execution_promote_output_json_fixture_returns_mutation_with_execution_provena
     assert!(stdout.contains("\"target_topic_id\":\"topic_auth_nullability\""));
     assert!(stdout.contains("\"classification\":\"source_like_delta\""));
     assert!(stdout.contains("\"execution_provenance\":{\"execution_id\":\"exec_auth_profile_tests_0001\",\"projection_id\":\"projection_exec_auth_profile_0001\",\"output_path\":\"src/generated/auth.generated.ts\",\"classification\":\"source_like_delta\"}"));
-    assert!(stdout.contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_promotion_0001\"}"));
+    assert!(stdout.contains(
+        "\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_promotion_0001\"}"
+    ));
 }
 
 #[test]

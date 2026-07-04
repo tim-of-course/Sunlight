@@ -1466,7 +1466,9 @@ fn parse_execution_promote_output_options(
         match arg.as_str() {
             "--fixture" => {
                 let value = args.next().ok_or_else(|| {
-                    invalid_request("usage: sun execution promote-output requires --fixture basic-app")
+                    invalid_request(
+                        "usage: sun execution promote-output requires --fixture basic-app",
+                    )
                 })?;
                 fixture = Some(value.clone());
             }
@@ -5894,8 +5896,10 @@ fn normalize_promotion_mutation_response(
     response.view.session_generation_id = SESSION_GENERATION_ID.to_string();
     response.view.tree_identity.tree_hash = TREE_HASH.to_string();
     response.operation.id = OPERATION_ID.to_string();
-    response.operation.authored_context_id =
-        format!("execution:{}:{}", candidate.execution_id, candidate.output_path);
+    response.operation.authored_context_id = format!(
+        "execution:{}:{}",
+        candidate.execution_id, candidate.output_path
+    );
     response.operation.write_set[0].artifact_id = response.artifact.artifact_id.clone();
     response.operation.preconditions.expected_path = candidate.output_path.clone();
     response.operation.before_refs.tree_identity.tree_hash = candidate
@@ -5916,10 +5920,10 @@ fn normalize_promotion_mutation_response(
     response.topic_revision.tree_delta_ref = "delta_promote_generated_auth_0001".to_string();
     response.session_generation.id = SESSION_GENERATION_ID.to_string();
     response.session_generation.resolved_view_id = RESOLVED_VIEW_ID.to_string();
-    response
-        .session_generation
-        .topic_frontier
-        .insert(FIXTURE_WRITE_TOPIC_ID.to_string(), TOPIC_REVISION_ID.to_string());
+    response.session_generation.topic_frontier.insert(
+        FIXTURE_WRITE_TOPIC_ID.to_string(),
+        TOPIC_REVISION_ID.to_string(),
+    );
     response.session_generation.created_by_operation_id = OPERATION_ID.to_string();
 }
 

@@ -473,13 +473,13 @@ pub fn materialize_projection_plan_copy(
     entries.sort_by(|left, right| left.path.cmp(&right.path));
 
     for entry in entries.iter().filter(|entry| !entry.tombstone) {
-        let relative_path = path_policy
-            .validate(&entry.path)
-            .map_err(|_| materialization_error(
+        let relative_path = path_policy.validate(&entry.path).map_err(|_| {
+            materialization_error(
                 ProjectionMaterializationErrorCode::ContentTreeMismatch,
                 view,
                 Some(plan.projection.strategy),
-            ))?;
+            )
+        })?;
         let destination = root.join(&relative_path);
 
         match entry.kind {
@@ -879,14 +879,13 @@ fn validate_content_tree_matches_view(
     view: &ResolvedViewResult,
     content_tree: &ContentTree,
 ) -> Result<(), ProjectionMaterializationError> {
-    let tree_identity = validate_projectable_view(view).map_err(|error| {
-        ProjectionMaterializationError {
+    let tree_identity =
+        validate_projectable_view(view).map_err(|error| ProjectionMaterializationError {
             code: ProjectionMaterializationErrorCode::ProjectionValidationFailed,
             resolved_view_id: view.resolved_view_id.clone(),
             strategy: Some(ProjectionStrategy::Copy),
             validation_error: Some(error),
-        }
-    })?;
+        })?;
 
     if content_tree.repository_id != view.repository_id
         || content_tree.repository_id != tree_identity.repository_id
@@ -942,7 +941,11 @@ fn prepare_projection_root(
     view: &ResolvedViewResult,
 ) -> Result<(), ProjectionMaterializationError> {
     if root.exists() {
-        if !root.is_dir() || root.read_dir().map_or(true, |mut entries| entries.next().is_some()) {
+        if !root.is_dir()
+            || root
+                .read_dir()
+                .map_or(true, |mut entries| entries.next().is_some())
+        {
             return Err(materialization_error(
                 ProjectionMaterializationErrorCode::ProjectionRootUnavailable,
                 view,
@@ -1382,7 +1385,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(materialization.plan.projection.strategy, ProjectionStrategy::Copy);
+        assert_eq!(
+            materialization.plan.projection.strategy,
+            ProjectionStrategy::Copy
+        );
         assert_eq!(materialization.files_written, 5);
         assert_eq!(materialization.executable_files, 1);
         assert!(materialization.cleanup.local_only);

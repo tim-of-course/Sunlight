@@ -582,8 +582,8 @@ fn validate_local_git_repository_root(
 ) -> Result<(), GitExportPlanningError> {
     let git_root = Path::new(&input.repository.git_root);
     let sunlight_root = Path::new(&input.repository.sunlight_repo_root);
-    let discovered = run_git(git_root, &["rev-parse", "--show-toplevel"], None, &[])
-        .map_err(|message| {
+    let discovered =
+        run_git(git_root, &["rev-parse", "--show-toplevel"], None, &[]).map_err(|message| {
             planning_error(
                 GitExportErrorCode::ExportRepositoryInvalid,
                 input,
@@ -713,7 +713,11 @@ fn update_git_ref(
     created_commit_id: &str,
 ) -> Result<(), String> {
     let zero = "0000000000000000000000000000000000000000";
-    let expected_old = plan.ref_update.expected_old_commit_id.as_deref().unwrap_or(zero);
+    let expected_old = plan
+        .ref_update
+        .expected_old_commit_id
+        .as_deref()
+        .unwrap_or(zero);
     run_git(
         git_root,
         &[
@@ -2216,8 +2220,11 @@ mod tests {
     fn git_export_writes_real_commit_and_persists_map() {
         let repo = LocalGitRepo::new();
         let base_commit_id = repo.create_commit("base", fixture_base_files(), None);
-        let unrelated_commit_id =
-            repo.create_commit("unrelated", vec![file("unrelated.txt", b"keep\n", false)], None);
+        let unrelated_commit_id = repo.create_commit(
+            "unrelated",
+            vec![file("unrelated.txt", b"keep\n", false)],
+            None,
+        );
         repo.update_ref("refs/heads/unrelated", &unrelated_commit_id);
         let mut input = writer_input_for_repo(&repo, &base_commit_id);
         input.repository.refs.clear();
@@ -2263,12 +2270,18 @@ mod tests {
             repo.cat_file(&commit_id, ".sunlight/export-manifest.json"),
             b"{\"policy\":\"approved_manifest_only\"}\n"
         );
-        assert_eq!(repo.cat_file(&commit_id, "src/auth.rs"), b"pub fn auth() {}\n");
+        assert_eq!(
+            repo.cat_file(&commit_id, "src/auth.rs"),
+            b"pub fn auth() {}\n"
+        );
         assert_eq!(
             repo.cat_file(&commit_id, "src/profile.rs"),
             b"pub fn profile() {}\n"
         );
-        assert_eq!(repo.cat_file(&commit_id, "bin/run-auth-check"), b"#!/bin/sh\n");
+        assert_eq!(
+            repo.cat_file(&commit_id, "bin/run-auth-check"),
+            b"#!/bin/sh\n"
+        );
     }
 
     #[test]
@@ -2321,9 +2334,8 @@ mod tests {
         input.repository.refs.clear();
         let mut store = InMemoryGitExportMapStore::default();
 
-        let error =
-            execute_local_git_export_writer(input, fixture_checkpoint_files(), &mut store)
-                .unwrap_err();
+        let error = execute_local_git_export_writer(input, fixture_checkpoint_files(), &mut store)
+            .unwrap_err();
 
         assert_eq!(error.code, GitExportErrorCode::ExportParentNotFound);
         assert_eq!(repo.try_rev_parse(FIXTURE_EXPORTED_GIT_REF), None);
@@ -2344,9 +2356,8 @@ mod tests {
         }];
         let mut store = InMemoryGitExportMapStore::default();
 
-        let error =
-            execute_local_git_export_writer(input, fixture_checkpoint_files(), &mut store)
-                .unwrap_err();
+        let error = execute_local_git_export_writer(input, fixture_checkpoint_files(), &mut store)
+            .unwrap_err();
 
         assert_eq!(error.code, GitExportErrorCode::ExportTargetRefConflict);
         assert_eq!(repo.rev_parse(FIXTURE_EXPORTED_GIT_REF), conflict_commit_id);
@@ -2564,12 +2575,7 @@ mod tests {
 
         fn ls_tree(&self, commit_id: &str) -> Vec<String> {
             let mut entries = self
-                .git(&[
-                    "ls-tree",
-                    "-r",
-                    "--format=%(objectmode) %(path)",
-                    commit_id,
-                ])
+                .git(&["ls-tree", "-r", "--format=%(objectmode) %(path)", commit_id])
                 .lines()
                 .map(str::to_string)
                 .collect::<Vec<_>>();

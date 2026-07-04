@@ -669,6 +669,20 @@ fn status(ctx: &CommandContext) -> Result<(), CliError> {
                     fixture_status_topic_text()
                 }
             }
+            StatusScope::Projection(projection_id) => {
+                let projection = fixture_projection_by_id(&projection_id)
+                    .ok_or_else(|| object_not_found("projection", &projection_id))?
+                    .map_err(projection_error)?;
+                if ctx.json {
+                    fixture_status_projection_json(&projection, options.projection_root.as_deref())
+                } else {
+                    format!(
+                        "{} {}",
+                        projection.id,
+                        projection_lifecycle_state(&projection, options.projection_root.as_deref())
+                    )
+                }
+            }
             StatusScope::Checkpoint(checkpoint_id) => {
                 ensure_fixture_checkpoint(&checkpoint_id)?;
                 if ctx.json {
@@ -741,6 +755,7 @@ fn inspect(ctx: &CommandContext) -> Result<(), CliError> {
 struct StatusOptions {
     fixture: String,
     scope: StatusScope,
+    projection_root: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -748,6 +763,7 @@ enum StatusScope {
     Repository,
     Session(String),
     Topic(String),
+    Projection(String),
     Checkpoint(String),
     ExportMap(String),
     CompatImport(String),
@@ -758,6 +774,7 @@ struct InspectOptions {
     fixture: String,
     selector: String,
     session_id: Option<String>,
+    projection_root: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -1351,6 +1368,7 @@ fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptio
 fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, CliError> {
     let mut fixture = None;
     let mut scope = StatusScope::Repository;
+    let mut projection_root = None;
     let mut args = ctx.args.iter().skip(1);
 
     while let Some(arg) = args.next() {
@@ -1372,6 +1390,18 @@ fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, C
                     .next()
                     .ok_or_else(|| invalid_request("usage: sun status --topic <topic>"))?;
                 scope = StatusScope::Topic(value.clone());
+            }
+            "--projection" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun status --projection <projection-id>")
+                })?;
+                scope = StatusScope::Projection(value.clone());
+            }
+            "--projection-root" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun status --projection-root <local-path>")
+                })?;
+                projection_root = Some(PathBuf::from(value));
             }
             "--checkpoint" => {
                 let value = args.next().ok_or_else(|| {
@@ -1404,12 +1434,17 @@ fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, C
         }
     }
 
-    Ok(fixture.map(|fixture| StatusOptions { fixture, scope }))
+    Ok(fixture.map(|fixture| StatusOptions {
+        fixture,
+        scope,
+        projection_root,
+    }))
 }
 
 fn parse_inspect_options(ctx: &CommandContext) -> Result<Option<InspectOptions>, CliError> {
     let mut fixture = None;
     let mut session_id = None;
+    let mut projection_root = None;
     let mut selectors = Vec::new();
     let mut args = ctx.args.iter().skip(1);
 
@@ -1426,6 +1461,12 @@ fn parse_inspect_options(ctx: &CommandContext) -> Result<Option<InspectOptions>,
                     invalid_request("usage: sun inspect requires --session <session>")
                 })?;
                 session_id = Some(value.clone());
+            }
+            "--projection-root" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun inspect --projection-root <local-path>")
+                })?;
+                projection_root = Some(PathBuf::from(value));
             }
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
@@ -1449,6 +1490,7 @@ fn parse_inspect_options(ctx: &CommandContext) -> Result<Option<InspectOptions>,
         fixture: fixture.unwrap(),
         selector: selectors.remove(0),
         session_id,
+        projection_root,
     }))
 }
 
@@ -1577,7 +1619,7 @@ fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliEr
             .ok_or_else(|| object_not_found("projection", projection_id))?
             .map_err(projection_error)?;
         return Ok(if json {
-            fixture_inspect_projection_json(&projection)
+            fixture_inspect_projection_json(&projection, options.projection_root.as_deref())
         } else {
             format!("projection {}", projection.id)
         });
@@ -1819,6 +1861,54 @@ fn fixture_status_topic_json() -> String {
         FIXTURE_ACTOR_ID,
         fixture_changed_artifact_json(),
         FIXTURE_SESSION_ID,
+    )
+}
+
+fn fixture_status_projection_json(
+    projection: &ProjectionRecord,
+    projection_root: Option<&std::path::Path>,
+) -> String {
+    let lifecycle_state = projection_lifecycle_state(projection, projection_root);
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"status.projection\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"projection\":{{",
+            "\"lifecycle_state\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"purpose\":\"{}\",",
+            "\"strategy\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"retention_state\":\"{}\",",
+            "\"integrity_status\":\"not_checked\",",
+            "\"dirty_local\":null,",
+            "\"root_ref\":{},",
+            "\"local_root_verification\":{}",
+            "}},",
+            "\"native_errors\":[]",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&projection.repository_id),
+        json_escape(&projection.id),
+        json_escape(&projection.resolved_view_id),
+        json_escape(&projection.resolved_view_id),
+        single_repo_tree_json(&projection.tree_identity),
+        lifecycle_state,
+        json_escape(&projection.id),
+        projection.purpose.as_str(),
+        projection.strategy.as_str(),
+        json_escape(&projection.resolved_view_id),
+        single_repo_tree_json(&projection.tree_identity),
+        projection.retention_state.as_str(),
+        projection_root_ref_json(projection),
+        local_projection_root_verification_json(projection_root),
     )
 }
 
@@ -4348,7 +4438,10 @@ fn projection_cleanup_check_json(materialization: &ProjectionFilesystemMateriali
     )
 }
 
-fn fixture_inspect_projection_json(projection: &ProjectionRecord) -> String {
+fn fixture_inspect_projection_json(
+    projection: &ProjectionRecord,
+    projection_root: Option<&std::path::Path>,
+) -> String {
     format!(
         concat!(
             "{{\"ok\":true,\"data\":{{",
@@ -4359,7 +4452,8 @@ fn fixture_inspect_projection_json(projection: &ProjectionRecord) -> String {
             "\"resolved_view_id\":\"{}\",",
             "\"tree_identity\":{}",
             "}},",
-            "\"projection\":{}",
+            "\"projection\":{},",
+            "\"local_root_verification\":{}",
             "}},\"warnings\":[]}}"
         ),
         json_escape(&projection.repository_id),
@@ -4368,7 +4462,144 @@ fn fixture_inspect_projection_json(projection: &ProjectionRecord) -> String {
         json_escape(&projection.resolved_view_id),
         single_repo_tree_json(&projection.tree_identity),
         projection_record_json(projection),
+        local_projection_root_verification_json(projection_root),
     )
+}
+
+fn projection_lifecycle_state(
+    projection: &ProjectionRecord,
+    projection_root: Option<&std::path::Path>,
+) -> &'static str {
+    if matches!(
+        projection.retention_state,
+        sunlight_core::projection::ProjectionRetentionState::Quarantined
+    ) {
+        return "quarantined";
+    }
+    if let Some(root) = projection_root {
+        if !root.exists() {
+            return "removed";
+        }
+    }
+    "materialized"
+}
+
+#[derive(Debug, Default)]
+struct LocalProjectionRootScan {
+    exists: bool,
+    is_dir: bool,
+    directories: usize,
+    files: usize,
+    bytes: u64,
+    executable_files: usize,
+    sample_paths: Vec<String>,
+    scan_error: Option<String>,
+}
+
+fn local_projection_root_verification_json(projection_root: Option<&std::path::Path>) -> String {
+    let Some(root) = projection_root else {
+        return "null".to_string();
+    };
+    let scan = scan_local_projection_root(root);
+    let state = if !scan.exists {
+        "missing"
+    } else if !scan.is_dir {
+        "not_directory"
+    } else if scan.scan_error.is_some() {
+        "scan_failed"
+    } else {
+        "present"
+    };
+    format!(
+        concat!(
+            "{{",
+            "\"projection_root\":{},",
+            "\"verification_state\":\"{}\",",
+            "\"content_verification\":\"not_available_without_persisted_manifest\",",
+            "\"exists\":{},",
+            "\"is_dir\":{},",
+            "\"directories\":{},",
+            "\"files\":{},",
+            "\"bytes\":{},",
+            "\"executable_files\":{},",
+            "\"dirty_local\":null,",
+            "\"sample_paths\":{},",
+            "\"scan_error\":{}",
+            "}}"
+        ),
+        local_projection_root_json(root),
+        state,
+        scan.exists,
+        scan.is_dir,
+        scan.directories,
+        scan.files,
+        scan.bytes,
+        scan.executable_files,
+        string_array_json(scan.sample_paths.iter().map(String::as_str)),
+        optional_string_json(scan.scan_error.as_deref()),
+    )
+}
+
+fn scan_local_projection_root(root: &std::path::Path) -> LocalProjectionRootScan {
+    let mut scan = LocalProjectionRootScan {
+        exists: root.exists(),
+        is_dir: root.is_dir(),
+        ..LocalProjectionRootScan::default()
+    };
+    if !scan.exists || !scan.is_dir {
+        return scan;
+    }
+    scan.directories = 1;
+    if let Err(error) = scan_local_projection_root_inner(root, root, &mut scan) {
+        scan.scan_error = Some(error.to_string());
+    }
+    scan.sample_paths.sort();
+    if scan.sample_paths.len() > 8 {
+        scan.sample_paths.truncate(8);
+    }
+    scan
+}
+
+fn scan_local_projection_root_inner(
+    root: &std::path::Path,
+    current: &std::path::Path,
+    scan: &mut LocalProjectionRootScan,
+) -> std::io::Result<()> {
+    let mut entries = fs::read_dir(current)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            scan.directories += 1;
+            scan_local_projection_root_inner(root, &path, scan)?;
+        } else if metadata.is_file() {
+            scan.files += 1;
+            scan.bytes += metadata.len();
+            scan.executable_files += usize::from(local_file_is_executable(&metadata));
+            if scan.sample_paths.len() < 8 {
+                if let Ok(relative_path) = path.strip_prefix(root) {
+                    scan.sample_paths
+                        .push(relative_path.display().to_string().replace('\\', "/"));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn local_file_is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn local_file_is_executable(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn projection_record_json(projection: &ProjectionRecord) -> String {

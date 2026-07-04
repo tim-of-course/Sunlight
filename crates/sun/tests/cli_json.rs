@@ -768,6 +768,62 @@ fn project_materialize_json_projection_root_writes_basic_app_copy() {
 }
 
 #[test]
+fn status_json_fixture_projection_reports_local_root_verification() {
+    let repo = TestRepo::new("projection-status-root");
+    let projection_root = repo.path().join("projection-root");
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.projection\""));
+    assert!(stdout.contains("\"lifecycle_state\":\"materialized\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"integrity_status\":\"not_checked\""));
+    assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
+    assert!(stdout.contains("\"verification_state\":\"present\""));
+    assert!(stdout.contains(
+        "\"content_verification\":\"not_available_without_persisted_manifest\""
+    ));
+    assert!(stdout.contains("\"files\":5"));
+    assert!(stdout.contains("\"bytes\":222"));
+    #[cfg(unix)]
+    assert!(stdout.contains("\"executable_files\":1"));
+    #[cfg(not(unix))]
+    assert!(stdout.contains("\"executable_files\":0"));
+    assert!(stdout.contains("\"sample_paths\":[\"README.md\",\"docs/guide.md\""));
+    assert!(stdout.contains("\"scan_error\":null"));
+}
+
+#[test]
 fn project_materialize_json_projection_root_requires_empty_directory() {
     let repo = TestRepo::new("projection-fixture-copy-nonempty");
     let projection_root = repo.path().join("projection-root");
@@ -2098,10 +2154,29 @@ fn inspect_json_fixture_export_map_returns_mapping_record() {
 #[test]
 fn inspect_json_fixture_projection_returns_local_only_metadata() {
     let repo = TestRepo::new("inspect-fixture-projection");
+    let projection_root = repo.path().join("projection-root");
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
 
     let output = sun()
         .arg("inspect")
         .arg("projection:projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
         .arg("--fixture")
         .arg("basic-app")
         .arg("--json")
@@ -2118,6 +2193,10 @@ fn inspect_json_fixture_projection_returns_local_only_metadata() {
     assert!(stdout.contains("\"cache_key\":\"projection-cache:repo_fixture_basic_app:"));
     assert!(stdout.contains("\"retention_state\":\"active\""));
     assert!(stdout.contains("\"privacy_class\":\"local_only\""));
+    assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
+    assert!(stdout.contains("\"verification_state\":\"present\""));
+    assert!(stdout.contains("\"files\":5"));
+    assert!(stdout.contains("\"bytes\":222"));
 }
 
 #[test]

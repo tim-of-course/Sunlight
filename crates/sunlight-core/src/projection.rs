@@ -16,6 +16,8 @@ pub const FIXTURE_INSPECTION_PROJECTION_ID: &str = "projection_inspect_auth_prof
 pub const FIXTURE_EXPORT_PROJECTION_ID: &str = "projection_export_auth_profile_0001";
 pub const FIXTURE_CREATED_AT: &str = "2026-07-03T00:00:00Z";
 pub const FIXTURE_MANIFEST_MATERIALIZATION_GENERATION: u64 = 1;
+pub const PROJECTION_LOCAL_METADATA_DIR: &str = ".sunlight/projections";
+pub const PROJECTION_MANIFEST_LOCAL_RECORD_FILE: &str = "projection-manifest-local.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionRecord {
@@ -315,6 +317,7 @@ pub struct ProjectionMaterializationPlan {
 pub struct ProjectionFilesystemMaterialization {
     pub plan: ProjectionMaterializationPlan,
     pub projection_root: PathBuf,
+    pub local_manifest_record_path: PathBuf,
     pub files_written: usize,
     pub directories_created: usize,
     pub bytes_written: u64,
@@ -788,11 +791,29 @@ pub fn materialize_projection_plan_copy(
         })?;
     }
 
+    let manifest = projection_manifest_from_content_tree(
+        &plan.projection,
+        view,
+        content_tree,
+        blobs,
+        FIXTURE_MANIFEST_MATERIALIZATION_GENERATION,
+        FIXTURE_CREATED_AT,
+    )?;
+    let local_record = ProjectionManifestLocalRecord {
+        manifest,
+        root_binding: ProjectionManifestRootBinding::from_normalized_root_ref(
+            plan.local_metadata.root_ref.clone(),
+        ),
+    };
+    let local_manifest_record_path =
+        persist_projection_manifest_local_record(root, &plan.projection, &local_record, view)?;
+
     Ok(ProjectionFilesystemMaterialization {
         plan: plan.clone(),
         projection_root: root.to_path_buf(),
+        local_manifest_record_path,
         files_written,
-        directories_created: count_directories(root).map_err(|_| {
+        directories_created: count_materialized_directories(root).map_err(|_| {
             materialization_error(
                 ProjectionMaterializationErrorCode::ProjectionWriteFailed,
                 view,
@@ -1609,16 +1630,77 @@ fn projection_cleanup_check(root: &Path) -> ProjectionCleanupCheck {
     }
 }
 
-fn count_directories(root: &Path) -> std::io::Result<usize> {
+pub fn projection_manifest_local_record_path(
+    projection_root: impl AsRef<Path>,
+    projection: &ProjectionRecord,
+) -> PathBuf {
+    projection_root
+        .as_ref()
+        .join(PROJECTION_LOCAL_METADATA_DIR)
+        .join(projection.purpose.as_str())
+        .join(&projection.id)
+        .join(PROJECTION_MANIFEST_LOCAL_RECORD_FILE)
+}
+
+fn persist_projection_manifest_local_record(
+    projection_root: &Path,
+    projection: &ProjectionRecord,
+    local_record: &ProjectionManifestLocalRecord,
+    view: &ResolvedViewResult,
+) -> Result<PathBuf, ProjectionMaterializationError> {
+    let path = projection_manifest_local_record_path(projection_root, projection);
+    let Some(parent) = path.parent() else {
+        return Err(materialization_error(
+            ProjectionMaterializationErrorCode::ProjectionWriteFailed,
+            view,
+            Some(projection.strategy),
+        ));
+    };
+    fs::create_dir_all(parent).map_err(|_| {
+        materialization_error(
+            ProjectionMaterializationErrorCode::ProjectionWriteFailed,
+            view,
+            Some(projection.strategy),
+        )
+    })?;
+    let bytes = canonical_json_bytes(&local_record.to_json_value()).map_err(|_| {
+        materialization_error(
+            ProjectionMaterializationErrorCode::ProjectionWriteFailed,
+            view,
+            Some(projection.strategy),
+        )
+    })?;
+    fs::write(&path, bytes).map_err(|_| {
+        materialization_error(
+            ProjectionMaterializationErrorCode::ProjectionWriteFailed,
+            view,
+            Some(projection.strategy),
+        )
+    })?;
+    Ok(path)
+}
+
+fn count_materialized_directories(root: &Path) -> std::io::Result<usize> {
     let mut count = usize::from(root.is_dir());
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
+        if is_projection_local_metadata_path(root, &path) {
+            continue;
+        }
         if path.is_dir() {
-            count += count_directories(&path)?;
+            count += count_materialized_directories(&path)?;
         }
     }
     Ok(count)
+}
+
+pub fn is_projection_local_metadata_path(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .map(|component| component.as_os_str() == ".sunlight")
+        .unwrap_or(false)
 }
 
 #[cfg(unix)]
@@ -1652,6 +1734,7 @@ fn materialization_error(
 mod tests {
     use super::*;
     use crate::artifacts::{InMemoryArtifactStore, FILE_OPERATION_SEMANTICS_VERSION};
+    use crate::records::parse_json_record;
     use crate::resolver::{
         fixture_auth_revision, fixture_base_entries, fixture_overlapping_auth_revision,
         fixture_profile_revision, fixture_profile_revision_missing_auth_dependency,
@@ -2209,6 +2292,88 @@ mod tests {
             assert_ne!(script_mode, 0);
             assert_eq!(source_mode, 0);
         }
+    }
+
+    #[test]
+    fn filesystem_copy_persists_local_projection_manifest_root_binding() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let root = temp_projection_root("copy-persists-local-root-binding");
+
+        let materialization = materialize_fixture_projection_copy(
+            &view,
+            copy_request(),
+            store.tree(),
+            store.content_blobs(),
+            &root,
+        )
+        .unwrap();
+        let expected_path =
+            projection_manifest_local_record_path(&root, &materialization.plan.projection);
+
+        assert_eq!(materialization.local_manifest_record_path, expected_path);
+        assert!(expected_path.is_file());
+        assert_eq!(materialization.directories_created, 4);
+        let bytes = fs::read(&expected_path).unwrap();
+        let parsed = parse_json_record(&bytes).unwrap();
+        let JsonValue::Object(envelope) = parsed else {
+            panic!("local manifest record should be a JSON object");
+        };
+        assert_eq!(
+            envelope.get("privacy_class"),
+            Some(&JsonValue::String("local_only".to_string()))
+        );
+
+        let JsonValue::Object(manifest) = envelope.get("manifest").unwrap() else {
+            panic!("local manifest record should include manifest object");
+        };
+        let manifest_digest = manifest.get("manifest_digest").unwrap();
+        assert_eq!(
+            manifest.get("id"),
+            Some(&JsonValue::String(
+                "projection_manifest_exec_auth_profile_0001".to_string()
+            ))
+        );
+        assert_eq!(
+            manifest.get("root_ref").and_then(|value| match value {
+                JsonValue::Object(root_ref) => root_ref.get("value"),
+                _ => None,
+            }),
+            Some(&JsonValue::String(
+                "local://.sunlight/projections/execution/projection_exec_auth_profile_0001"
+                    .to_string()
+            ))
+        );
+
+        let JsonValue::Object(root_binding) = envelope.get("root_binding").unwrap() else {
+            panic!("local manifest record should include root_binding object");
+        };
+        assert_eq!(
+            root_binding.get("normalization"),
+            Some(&JsonValue::String("local_uri_relative_v1".to_string()))
+        );
+        assert_eq!(
+            root_binding.get("privacy_class"),
+            Some(&JsonValue::String("local_only".to_string()))
+        );
+        assert_eq!(
+            root_binding
+                .get("normalized_root_ref")
+                .and_then(|value| match value {
+                    JsonValue::Object(root_ref) => root_ref.get("value"),
+                    _ => None,
+                }),
+            Some(&JsonValue::String(
+                "local://.sunlight/projections/execution/projection_exec_auth_profile_0001"
+                    .to_string()
+            ))
+        );
+
+        let persisted = String::from_utf8(bytes).unwrap();
+        assert!(!persisted.contains(&root.display().to_string()));
+        assert!(
+            matches!(manifest_digest, JsonValue::String(value) if value.starts_with("sha256:"))
+        );
     }
 
     #[test]

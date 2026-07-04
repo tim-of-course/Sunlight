@@ -772,6 +772,17 @@ fn project_materialize_json_projection_root_writes_basic_app_copy() {
     );
     assert!(projection_root.join("docs/guide.md").is_file());
     assert!(projection_root.join("scripts/build.sh").is_file());
+    let local_record_path = projection_root
+        .join(".sunlight/projections/execution/projection_exec_auth_profile_0001")
+        .join("projection-manifest-local.json");
+    let local_record = fs::read_to_string(local_record_path).unwrap();
+    assert!(local_record.contains("\"manifest\":{"));
+    assert!(local_record.contains("\"root_binding\":{"));
+    assert!(local_record.contains("\"normalization\":\"local_uri_relative_v1\""));
+    assert!(local_record.contains(
+        "\"value\":\"local://.sunlight/projections/execution/projection_exec_auth_profile_0001\""
+    ));
+    assert!(!local_record.contains(&projection_root.display().to_string()));
 }
 
 #[test]

@@ -41,14 +41,14 @@ use sunlight_core::projection::{
     fixture_execution_projection_from_resolved_view, fixture_export_projection_from_resolved_view,
     fixture_inspection_projection_from_resolved_view,
     fixture_projection_manifest_from_content_tree, materialize_fixture_projection_copy,
-    plan_fixture_projection_materialization, ProjectionFilesystemMaterialization,
-    ProjectionManifestRecord, ProjectionMaterializationCapabilities,
-    ProjectionMaterializationError, ProjectionMaterializationErrorCode,
-    ProjectionMaterializationLocalMetadata, ProjectionMaterializationPlan,
-    ProjectionMaterializationRequest, ProjectionPurpose, ProjectionRecord, ProjectionRootRef,
-    ProjectionStrategy, ProjectionValidationError, FIXTURE_COMPATIBILITY_PROJECTION_ID,
-    FIXTURE_EXECUTION_PROJECTION_ID, FIXTURE_EXPORT_PROJECTION_ID,
-    FIXTURE_INSPECTION_PROJECTION_ID,
+    is_projection_local_metadata_path, plan_fixture_projection_materialization,
+    ProjectionFilesystemMaterialization, ProjectionManifestRecord,
+    ProjectionMaterializationCapabilities, ProjectionMaterializationError,
+    ProjectionMaterializationErrorCode, ProjectionMaterializationLocalMetadata,
+    ProjectionMaterializationPlan, ProjectionMaterializationRequest, ProjectionPurpose,
+    ProjectionRecord, ProjectionRootRef, ProjectionStrategy, ProjectionValidationError,
+    FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
+    FIXTURE_EXPORT_PROJECTION_ID, FIXTURE_INSPECTION_PROJECTION_ID,
 };
 use sunlight_core::records::canonical_json_bytes;
 use sunlight_core::repository::{
@@ -4814,6 +4814,9 @@ fn scan_local_projection_root_inner(
 
     for entry in entries {
         let path = entry.path();
+        if is_projection_local_metadata_path(root, &path) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.is_dir() {
             scan.directories += 1;

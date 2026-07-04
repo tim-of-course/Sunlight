@@ -435,7 +435,9 @@ impl ProjectionManifestRecord {
     }
 
     pub fn digest(&self) -> Result<String, ProjectionManifestDigestError> {
-        Ok(sha256_digest(&canonical_json_bytes(&self.digest_payload_json())?))
+        Ok(sha256_digest(&canonical_json_bytes(
+            &self.digest_payload_json(),
+        )?))
     }
 
     pub fn to_json_value(&self) -> JsonValue {
@@ -517,10 +519,7 @@ impl ProjectionManifestRecord {
 }
 
 impl ProjectionManifestIdentityInputs {
-    pub fn from_projection(
-        projection: &ProjectionRecord,
-        materialization_generation: u64,
-    ) -> Self {
+    pub fn from_projection(projection: &ProjectionRecord, materialization_generation: u64) -> Self {
         Self {
             projection_id: projection.id.clone(),
             purpose: projection.purpose,
@@ -1409,7 +1408,10 @@ fn tree_identity_json(tree_identity: &SingleRepoTree) -> JsonValue {
 
 fn root_ref_json(root_ref: &ProjectionRootRef) -> JsonValue {
     let mut object = BTreeMap::new();
-    object.insert("value".to_string(), JsonValue::String(root_ref.value.clone()));
+    object.insert(
+        "value".to_string(),
+        JsonValue::String(root_ref.value.clone()),
+    );
     object.insert(
         "privacy".to_string(),
         JsonValue::String(root_ref.privacy.as_str().to_string()),

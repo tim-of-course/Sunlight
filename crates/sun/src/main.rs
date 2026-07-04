@@ -4875,8 +4875,7 @@ fn parse_persisted_local_manifest_binding(
         manifest,
         "manifest_digest",
         &expected_manifest.manifest_digest,
-    )
-        || !manifest_string_field_matches(manifest, "projection_id", &projection.id)
+    ) || !manifest_string_field_matches(manifest, "projection_id", &projection.id)
         || !manifest_string_field_matches(
             manifest,
             "resolved_view_id",

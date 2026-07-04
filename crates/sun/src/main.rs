@@ -42,14 +42,16 @@ use sunlight_core::projection::{
     fixture_inspection_projection_from_resolved_view,
     fixture_projection_manifest_from_content_tree, is_projection_local_metadata_path,
     materialize_fixture_projection_copy, plan_fixture_projection_materialization,
-    projection_manifest_local_record_path, ProjectionFilesystemMaterialization,
+    projection_manifest_local_record_path, projection_manifest_ref,
+    projection_store_integrity_failed_quarantined, projection_store_integrity_not_checked,
+    ProjectionFilesystemMaterialization,
     ProjectionManifestRecord, ProjectionMaterializationCapabilities,
     ProjectionMaterializationError, ProjectionMaterializationErrorCode,
     ProjectionMaterializationLocalMetadata, ProjectionMaterializationPlan,
     ProjectionMaterializationRequest, ProjectionPurpose, ProjectionRecord, ProjectionRootRef,
-    ProjectionStrategy, ProjectionValidationError, FIXTURE_COMPATIBILITY_PROJECTION_ID,
-    FIXTURE_EXECUTION_PROJECTION_ID, FIXTURE_EXPORT_PROJECTION_ID,
-    FIXTURE_INSPECTION_PROJECTION_ID,
+    ProjectionStoreIntegrityReasonCode, ProjectionStoreIntegrityResult, ProjectionStrategy,
+    ProjectionValidationError, FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
+    FIXTURE_EXPORT_PROJECTION_ID, FIXTURE_INSPECTION_PROJECTION_ID,
 };
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repository::{
@@ -2112,9 +2114,15 @@ fn fixture_status_projection_json(
     let verification = local_projection_root_verification(projection, &manifest, projection_root);
     let verification_json =
         local_projection_root_verification_json_from_verification(projection_root, &verification);
-    let integrity_status = projection_integrity_status(integrity_fixture);
-    let retention_state = projection_retention_state_for_status(projection, integrity_fixture);
-    let quarantine_json = projection_quarantine_json(projection, &manifest, integrity_fixture);
+    let store_integrity =
+        fixture_projection_store_integrity_result(projection, &manifest, integrity_fixture);
+    let integrity_status = store_integrity.integrity_status.as_str();
+    let retention_state = store_integrity
+        .quarantine
+        .as_ref()
+        .map(|quarantine| quarantine.state.as_str())
+        .unwrap_or_else(|| projection.retention_state.as_str());
+    let quarantine_json = projection_quarantine_json(&store_integrity);
     let native_errors_json =
         projection_native_errors_json(projection, &manifest, integrity_fixture);
     Ok(format!(
@@ -4834,16 +4842,6 @@ fn projection_manifest_summary_json(manifest: &ProjectionManifestRecord) -> Stri
     )
 }
 
-fn projection_manifest_ref(manifest: &ProjectionManifestRecord) -> String {
-    format!(
-        "objects/projection-manifests/sha256/{}",
-        manifest
-            .manifest_digest
-            .strip_prefix("sha256:")
-            .unwrap_or(&manifest.manifest_digest)
-    )
-}
-
 fn fixture_inspect_projection_json(
     projection: &ProjectionRecord,
     projection_root: Option<&std::path::Path>,
@@ -4851,6 +4849,8 @@ fn fixture_inspect_projection_json(
 ) -> Result<String, CliError> {
     ensure_store_integrity_fixture_scope(projection, integrity_fixture)?;
     let manifest = fixture_local_projection_manifest(projection)?;
+    let store_integrity =
+        fixture_projection_store_integrity_result(projection, &manifest, integrity_fixture);
     Ok(format!(
         concat!(
             "{{\"ok\":true,\"data\":{{",
@@ -4875,8 +4875,8 @@ fn fixture_inspect_projection_json(
         single_repo_tree_json(&projection.tree_identity),
         projection_record_json(projection),
         local_projection_manifest_json(&manifest),
-        projection_local_store_integrity_json(projection, &manifest, integrity_fixture),
-        projection_quarantine_json(projection, &manifest, integrity_fixture),
+        projection_local_store_integrity_json(&store_integrity),
+        projection_quarantine_json(&store_integrity),
         local_projection_root_verification_json(projection, &manifest, projection_root),
     ))
 }
@@ -4895,36 +4895,32 @@ fn ensure_store_integrity_fixture_scope(
     Ok(())
 }
 
-fn projection_integrity_status(integrity_fixture: Option<StoreIntegrityFixture>) -> &'static str {
-    match integrity_fixture {
-        Some(StoreIntegrityFixture::StoreMismatch) => "failed",
-        None => "not_checked",
-    }
-}
-
-fn projection_retention_state_for_status(
+fn fixture_projection_store_integrity_result(
     projection: &ProjectionRecord,
+    manifest: &ProjectionManifestRecord,
     integrity_fixture: Option<StoreIntegrityFixture>,
-) -> &'static str {
+) -> ProjectionStoreIntegrityResult {
     match integrity_fixture {
-        Some(StoreIntegrityFixture::StoreMismatch) => "quarantined",
-        None => projection.retention_state.as_str(),
+        Some(StoreIntegrityFixture::StoreMismatch) => projection_store_integrity_failed_quarantined(
+            projection,
+            manifest,
+            ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed,
+        ),
+        None => projection_store_integrity_not_checked(projection),
     }
 }
 
 fn projection_local_store_integrity_json(
-    projection: &ProjectionRecord,
-    manifest: &ProjectionManifestRecord,
-    integrity_fixture: Option<StoreIntegrityFixture>,
+    integrity: &ProjectionStoreIntegrityResult,
 ) -> String {
-    match integrity_fixture {
-        Some(StoreIntegrityFixture::StoreMismatch) => format!(
+    match integrity.reason_code {
+        Some(reason_code) => format!(
             concat!(
                 "{{",
                 "\"privacy_class\":\"local_only\",",
                 "\"integrity_status\":\"failed\",",
                 "\"policy\":\"{}\",",
-                "\"reason\":\"store_integrity_mismatch\",",
+                "\"reason\":\"{}\",",
                 "\"reason_code\":\"execution_store_integrity_failed\",",
                 "\"projection_id\":\"{}\",",
                 "\"resolved_view_id\":\"{}\",",
@@ -4937,14 +4933,15 @@ fn projection_local_store_integrity_json(
                 "\"local_filesystem_source_truth\":false",
                 "}}"
             ),
-            projection.store_integrity_policy.as_str(),
-            json_escape(&projection.id),
-            json_escape(&projection.resolved_view_id),
-            single_repo_tree_json(&projection.tree_identity),
-            projection_root_ref_json(projection),
-            json_escape(&projection.cache_key.stable_string()),
-            json_escape(&projection_manifest_ref(manifest)),
-            json_escape(&manifest.manifest_digest),
+            integrity.policy.as_str(),
+            reason_code.reason(),
+            json_escape(&integrity.projection_id),
+            json_escape(&integrity.resolved_view_id),
+            single_repo_tree_json(&integrity.tree_identity),
+            projection_root_ref_value_json(&integrity.root_ref),
+            json_escape(&integrity.cache_key),
+            json_escape(integrity.manifest_ref.as_deref().unwrap_or("")),
+            json_escape(integrity.manifest_digest.as_deref().unwrap_or("")),
         ),
         None => format!(
             concat!(
@@ -4957,24 +4954,20 @@ fn projection_local_store_integrity_json(
                 "\"local_filesystem_source_truth\":false",
                 "}}"
             ),
-            projection.store_integrity_policy.as_str(),
-            json_escape(&projection.id),
+            integrity.policy.as_str(),
+            json_escape(&integrity.projection_id),
         ),
     }
 }
 
-fn projection_quarantine_json(
-    projection: &ProjectionRecord,
-    manifest: &ProjectionManifestRecord,
-    integrity_fixture: Option<StoreIntegrityFixture>,
-) -> String {
-    match integrity_fixture {
-        Some(StoreIntegrityFixture::StoreMismatch) => format!(
+fn projection_quarantine_json(integrity: &ProjectionStoreIntegrityResult) -> String {
+    match &integrity.quarantine {
+        Some(quarantine) => format!(
             concat!(
                 "{{",
                 "\"privacy_class\":\"local_only\",",
                 "\"state\":\"quarantined\",",
-                "\"reason\":\"store_integrity_mismatch\",",
+                "\"reason\":\"{}\",",
                 "\"reason_code\":\"execution_store_integrity_failed\",",
                 "\"projection_id\":\"{}\",",
                 "\"resolved_view_id\":\"{}\",",
@@ -4983,9 +4976,9 @@ fn projection_quarantine_json(
                 "\"manifest_ref\":\"{}\",",
                 "\"manifest_digest\":\"{}\",",
                 "\"quarantine_refs\":{{",
-                "\"projection\":\"projection:{}\",",
+                "\"projection\":\"{}\",",
                 "\"cache\":\"{}\",",
-                "\"native_error\":\"native-error:execution_store_integrity_failed:{}\"",
+                "\"native_error\":\"{}\"",
                 "}},",
                 "\"provenance\":{{",
                 "\"repository_id\":\"{}\",",
@@ -4999,20 +4992,21 @@ fn projection_quarantine_json(
                 "\"durable_record\":null",
                 "}}"
             ),
-            json_escape(&projection.id),
-            json_escape(&projection.resolved_view_id),
-            projection_root_ref_json(projection),
-            json_escape(&projection.cache_key.stable_string()),
-            json_escape(&projection_manifest_ref(manifest)),
-            json_escape(&manifest.manifest_digest),
-            json_escape(&projection.id),
-            json_escape(&projection.cache_key.stable_string()),
-            json_escape(&projection.id),
-            json_escape(&projection.repository_id),
-            json_escape(&projection.resolved_view_id),
-            single_repo_tree_json(&projection.tree_identity),
-            json_escape(&projection.created_from_content_tree),
-            projection.store_integrity_policy.as_str(),
+            quarantine.reason_code.reason(),
+            json_escape(&quarantine.projection_id),
+            json_escape(&quarantine.resolved_view_id),
+            projection_root_ref_value_json(&quarantine.root_ref),
+            json_escape(&quarantine.cache_key),
+            json_escape(quarantine.manifest_ref.as_deref().unwrap_or("")),
+            json_escape(quarantine.manifest_digest.as_deref().unwrap_or("")),
+            json_escape(&quarantine.quarantine_refs.projection),
+            json_escape(&quarantine.quarantine_refs.cache),
+            json_escape(&quarantine.quarantine_refs.native_error),
+            json_escape(&quarantine.provenance.repository_id),
+            json_escape(&quarantine.provenance.resolved_view_id),
+            single_repo_tree_json(&quarantine.provenance.tree_identity),
+            json_escape(&quarantine.provenance.created_from_content_tree),
+            quarantine.provenance.store_integrity_policy.as_str(),
         ),
         None => "null".to_string(),
     }

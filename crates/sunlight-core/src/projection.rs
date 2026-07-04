@@ -120,6 +120,109 @@ impl StoreIntegrityPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionStoreIntegrityResult {
+    pub privacy_class: PrivacyClass,
+    pub integrity_status: ProjectionStoreIntegrityStatus,
+    pub policy: StoreIntegrityPolicy,
+    pub reason_code: Option<ProjectionStoreIntegrityReasonCode>,
+    pub projection_id: String,
+    pub resolved_view_id: String,
+    pub tree_identity: SingleRepoTree,
+    pub root_ref: ProjectionRootRef,
+    pub cache_key: String,
+    pub manifest_ref: Option<String>,
+    pub manifest_digest: Option<String>,
+    pub source_truth: ProjectionStoreIntegritySourceTruth,
+    pub local_filesystem_source_truth: bool,
+    pub quarantine: Option<ProjectionQuarantineResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionStoreIntegrityStatus {
+    NotChecked,
+    Verified,
+    Failed,
+}
+
+impl ProjectionStoreIntegrityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotChecked => "not_checked",
+            Self::Verified => "verified",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionStoreIntegrityReasonCode {
+    ExecutionStoreIntegrityFailed,
+}
+
+impl ProjectionStoreIntegrityReasonCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecutionStoreIntegrityFailed => "execution_store_integrity_failed",
+        }
+    }
+
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::ExecutionStoreIntegrityFailed => "store_integrity_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionStoreIntegritySourceTruth {
+    NotChecked,
+    ImmutableStoreManifest,
+}
+
+impl ProjectionStoreIntegritySourceTruth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotChecked => "not_checked",
+            Self::ImmutableStoreManifest => "immutable_store_manifest",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionQuarantineResult {
+    pub privacy_class: PrivacyClass,
+    pub state: ProjectionRetentionState,
+    pub reason_code: ProjectionStoreIntegrityReasonCode,
+    pub projection_id: String,
+    pub resolved_view_id: String,
+    pub root_ref: ProjectionRootRef,
+    pub cache_key: String,
+    pub manifest_ref: Option<String>,
+    pub manifest_digest: Option<String>,
+    pub quarantine_refs: ProjectionQuarantineRefs,
+    pub provenance: ProjectionQuarantineProvenance,
+    pub source_truth: ProjectionStoreIntegritySourceTruth,
+    pub local_filesystem_source_truth: bool,
+    pub durable_record: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionQuarantineRefs {
+    pub projection: String,
+    pub cache: String,
+    pub native_error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionQuarantineProvenance {
+    pub repository_id: String,
+    pub resolved_view_id: String,
+    pub tree_identity: SingleRepoTree,
+    pub created_from_content_tree: String,
+    pub store_integrity_policy: StoreIntegrityPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionCacheKey {
     pub repository_id: String,
     pub resolved_view_id: String,
@@ -895,6 +998,111 @@ pub fn fixture_projection_manifest_from_content_tree(
         FIXTURE_MANIFEST_MATERIALIZATION_GENERATION,
         FIXTURE_CREATED_AT,
     )
+}
+
+pub fn projection_manifest_ref(manifest: &ProjectionManifestRecord) -> String {
+    format!(
+        "objects/projection-manifests/sha256/{}",
+        manifest
+            .manifest_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(&manifest.manifest_digest)
+    )
+}
+
+pub fn projection_store_integrity_not_checked(
+    projection: &ProjectionRecord,
+) -> ProjectionStoreIntegrityResult {
+    ProjectionStoreIntegrityResult {
+        privacy_class: PrivacyClass::LocalOnly,
+        integrity_status: ProjectionStoreIntegrityStatus::NotChecked,
+        policy: projection.store_integrity_policy,
+        reason_code: None,
+        projection_id: projection.id.clone(),
+        resolved_view_id: projection.resolved_view_id.clone(),
+        tree_identity: projection.tree_identity.clone(),
+        root_ref: projection.root_ref.clone(),
+        cache_key: projection.cache_key.stable_string(),
+        manifest_ref: None,
+        manifest_digest: None,
+        source_truth: ProjectionStoreIntegritySourceTruth::NotChecked,
+        local_filesystem_source_truth: false,
+        quarantine: None,
+    }
+}
+
+pub fn projection_store_integrity_verified(
+    projection: &ProjectionRecord,
+    manifest: &ProjectionManifestRecord,
+) -> ProjectionStoreIntegrityResult {
+    ProjectionStoreIntegrityResult {
+        privacy_class: PrivacyClass::LocalOnly,
+        integrity_status: ProjectionStoreIntegrityStatus::Verified,
+        policy: projection.store_integrity_policy,
+        reason_code: None,
+        projection_id: projection.id.clone(),
+        resolved_view_id: projection.resolved_view_id.clone(),
+        tree_identity: projection.tree_identity.clone(),
+        root_ref: projection.root_ref.clone(),
+        cache_key: projection.cache_key.stable_string(),
+        manifest_ref: Some(projection_manifest_ref(manifest)),
+        manifest_digest: Some(manifest.manifest_digest.clone()),
+        source_truth: ProjectionStoreIntegritySourceTruth::ImmutableStoreManifest,
+        local_filesystem_source_truth: false,
+        quarantine: None,
+    }
+}
+
+pub fn projection_store_integrity_failed_quarantined(
+    projection: &ProjectionRecord,
+    manifest: &ProjectionManifestRecord,
+    reason_code: ProjectionStoreIntegrityReasonCode,
+) -> ProjectionStoreIntegrityResult {
+    let cache_key = projection.cache_key.stable_string();
+    let manifest_ref = projection_manifest_ref(manifest);
+    let quarantine = ProjectionQuarantineResult {
+        privacy_class: PrivacyClass::LocalOnly,
+        state: ProjectionRetentionState::Quarantined,
+        reason_code,
+        projection_id: projection.id.clone(),
+        resolved_view_id: projection.resolved_view_id.clone(),
+        root_ref: projection.root_ref.clone(),
+        cache_key: cache_key.clone(),
+        manifest_ref: Some(manifest_ref.clone()),
+        manifest_digest: Some(manifest.manifest_digest.clone()),
+        quarantine_refs: ProjectionQuarantineRefs {
+            projection: format!("projection:{}", projection.id),
+            cache: cache_key.clone(),
+            native_error: format!("native-error:{}:{}", reason_code.as_str(), projection.id),
+        },
+        provenance: ProjectionQuarantineProvenance {
+            repository_id: projection.repository_id.clone(),
+            resolved_view_id: projection.resolved_view_id.clone(),
+            tree_identity: projection.tree_identity.clone(),
+            created_from_content_tree: projection.created_from_content_tree.clone(),
+            store_integrity_policy: projection.store_integrity_policy,
+        },
+        source_truth: ProjectionStoreIntegritySourceTruth::ImmutableStoreManifest,
+        local_filesystem_source_truth: false,
+        durable_record: None,
+    };
+
+    ProjectionStoreIntegrityResult {
+        privacy_class: PrivacyClass::LocalOnly,
+        integrity_status: ProjectionStoreIntegrityStatus::Failed,
+        policy: projection.store_integrity_policy,
+        reason_code: Some(reason_code),
+        projection_id: projection.id.clone(),
+        resolved_view_id: projection.resolved_view_id.clone(),
+        tree_identity: projection.tree_identity.clone(),
+        root_ref: projection.root_ref.clone(),
+        cache_key,
+        manifest_ref: Some(manifest_ref),
+        manifest_digest: Some(manifest.manifest_digest.clone()),
+        source_truth: ProjectionStoreIntegritySourceTruth::ImmutableStoreManifest,
+        local_filesystem_source_truth: false,
+        quarantine: Some(quarantine),
+    }
 }
 
 pub fn projection_manifest_from_content_tree(
@@ -2181,6 +2389,107 @@ mod tests {
             canonical_json_bytes(&reordered_manifest.digest_payload_json()).unwrap(),
             canonical_json_bytes(&manifest.digest_payload_json()).unwrap()
         );
+    }
+
+    #[test]
+    fn projection_store_integrity_verified_result_uses_fixture_manifest_context() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let projection = fixture_execution_projection_from_resolved_view(&view).unwrap();
+        let manifest = fixture_projection_manifest_from_content_tree(
+            &projection,
+            &view,
+            store.tree(),
+            store.content_blobs(),
+        )
+        .unwrap();
+
+        let result = projection_store_integrity_verified(&projection, &manifest);
+
+        assert_eq!(
+            result.integrity_status,
+            ProjectionStoreIntegrityStatus::Verified
+        );
+        assert_eq!(result.privacy_class, PrivacyClass::LocalOnly);
+        assert_eq!(result.reason_code, None);
+        assert_eq!(result.projection_id, projection.id);
+        assert_eq!(result.root_ref, projection.root_ref);
+        assert_eq!(result.cache_key, projection.cache_key.stable_string());
+        assert_eq!(
+            result.manifest_ref.as_deref(),
+            Some(projection_manifest_ref(&manifest).as_str())
+        );
+        assert_eq!(
+            result.manifest_digest.as_deref(),
+            Some(manifest.manifest_digest.as_str())
+        );
+        assert_eq!(
+            result.source_truth,
+            ProjectionStoreIntegritySourceTruth::ImmutableStoreManifest
+        );
+        assert!(!result.local_filesystem_source_truth);
+        assert!(result.quarantine.is_none());
+    }
+
+    #[test]
+    fn projection_store_integrity_mismatch_result_quarantines_projection_cache_context() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let projection = fixture_execution_projection_from_resolved_view(&view).unwrap();
+        let manifest = fixture_projection_manifest_from_content_tree(
+            &projection,
+            &view,
+            store.tree(),
+            store.content_blobs(),
+        )
+        .unwrap();
+
+        let result = projection_store_integrity_failed_quarantined(
+            &projection,
+            &manifest,
+            ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed,
+        );
+
+        assert_eq!(result.integrity_status, ProjectionStoreIntegrityStatus::Failed);
+        assert_eq!(
+            result.reason_code,
+            Some(ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed)
+        );
+        assert_eq!(result.projection_id, FIXTURE_EXECUTION_PROJECTION_ID);
+        assert_eq!(result.resolved_view_id, view.resolved_view_id);
+        assert_eq!(result.root_ref, projection.root_ref);
+        assert_eq!(result.cache_key, projection.cache_key.stable_string());
+        assert_eq!(
+            result.manifest_digest.as_deref(),
+            Some(manifest.manifest_digest.as_str())
+        );
+
+        let quarantine = result.quarantine.as_ref().unwrap();
+        assert_eq!(quarantine.privacy_class, PrivacyClass::LocalOnly);
+        assert_eq!(quarantine.state, ProjectionRetentionState::Quarantined);
+        assert_eq!(
+            quarantine.reason_code.reason(),
+            "store_integrity_mismatch"
+        );
+        assert_eq!(
+            quarantine.quarantine_refs.projection,
+            "projection:projection_exec_auth_profile_0001"
+        );
+        assert_eq!(quarantine.quarantine_refs.cache, result.cache_key);
+        assert_eq!(
+            quarantine.quarantine_refs.native_error,
+            "native-error:execution_store_integrity_failed:projection_exec_auth_profile_0001"
+        );
+        assert_eq!(
+            quarantine.provenance.store_integrity_policy,
+            StoreIntegrityPolicy::VerifyBeforeReuse
+        );
+        assert_eq!(
+            quarantine.source_truth,
+            ProjectionStoreIntegritySourceTruth::ImmutableStoreManifest
+        );
+        assert!(!quarantine.local_filesystem_source_truth);
+        assert!(quarantine.durable_record.is_none());
     }
 
     #[test]

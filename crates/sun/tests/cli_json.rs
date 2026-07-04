@@ -934,9 +934,7 @@ fn git_export_json_fixture_checkpoint_returns_export_envelope() {
     let stdout = stdout(&output);
     assert!(stdout.contains("\"command\":\"git.export\""));
     assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
-    assert!(
-        stdout.contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\"")
-    );
+    assert!(stdout.contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
     assert!(
         stdout.contains("\"validation_report_id\":\"validation_export_auth_profile_ready_0001\"")
     );

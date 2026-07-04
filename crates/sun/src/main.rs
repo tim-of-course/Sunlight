@@ -12,8 +12,8 @@ use sunlight_core::artifacts::{
     FIXTURE_WRITE_TOPIC_ID, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
 };
 use sunlight_core::checkpoint::{
-    fixture_checkpoint_from_resolved_view, CheckpointRecord, CheckpointValidationError, EvidenceRef,
-    GitExportMapRecord,
+    fixture_checkpoint_from_resolved_view, CheckpointRecord, CheckpointValidationError,
+    EvidenceRef, GitExportMapRecord,
 };
 use sunlight_core::execution::{
     fixture_failing_execution_from_resolved_view, fixture_passing_execution_from_resolved_view,

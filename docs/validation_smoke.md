@@ -18,6 +18,10 @@ Run on Windows PowerShell:
 scripts/validation-smoke.ps1
 ```
 
+For a broader local validation pass, run `scripts/smoke-suite.sh` or
+`scripts/smoke-suite.ps1`. The suite adds Cargo format, check, and test gates
+before the focused smoke scripts.
+
 By default the PowerShell wrapper uses WSL when `wsl.exe` is available so the
 same Bash script runs on Windows/WSL. Set `SUNLIGHT_SMOKE_USE_WSL=0` to run the
 native PowerShell implementation instead.

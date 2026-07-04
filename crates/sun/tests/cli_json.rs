@@ -760,8 +760,11 @@ fn status_execution_json_fixture_promoted_flag_exposes_promotion_record() {
     assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_promotion_0001\""));
     assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_promotion_0001\""));
     assert!(stdout.contains("\"authored_context_id\":\"execution:exec_auth_profile_tests_0001:src/generated/auth.generated.ts\""));
-    assert!(stdout.contains("\"provenance_refs\":[{\"kind\":\"execution\",\"id\":\"exec_auth_profile_tests_0001\""));
-    assert!(stdout.contains("\"kind\":\"operation_transaction\",\"id\":\"op_promote_generated_auth_0001\""));
+    assert!(stdout.contains(
+        "\"provenance_refs\":[{\"kind\":\"execution\",\"id\":\"exec_auth_profile_tests_0001\""
+    ));
+    assert!(stdout
+        .contains("\"kind\":\"operation_transaction\",\"id\":\"op_promote_generated_auth_0001\""));
     assert!(stdout.contains("\"promotion_record\":\"policy_gated\""));
 }
 

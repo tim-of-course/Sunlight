@@ -22,6 +22,14 @@ For a broader local validation pass, run `scripts/smoke-suite.sh` or
 `scripts/smoke-suite.ps1`. The suite adds Cargo format, check, and test gates
 before the focused smoke scripts.
 
+Optional local real-repo coverage for Super Search is available through
+`scripts/external-validation-super-search.ps1`. It runs the target repo's
+existing `mix test` and `bun run test` baselines, builds `sun`, clones the
+target into a temporary directory, and verifies `sun init --json` against that
+temp clone. This script is intentionally outside the default smoke suite and CI;
+do not add it to `scripts/smoke-suite.ps1` unless the external validation policy
+changes.
+
 Use this focused script while iterating on the validation fixture contract. Use
 the aggregate smoke suite for branch handoff or CI wiring so the validation
 smoke runs with the workspace format, check, test, projection strategy, and MVP

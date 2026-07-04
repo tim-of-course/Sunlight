@@ -15,6 +15,31 @@ The fixture is a deterministic TypeScript-shaped repo with `README.md`, `docs/gu
 
 Validation creates fresh temporary Git repositories from this fixture for every smoke flow. Each repo starts from one imported Git HEAD and then all mutations must go through `sun` commands or explicit compatibility projection import. The mutable Git working tree is never the source of Sunlight truth after `sun init`.
 
+## First External Validation Target
+
+The first real local repository target is Super Search at `C:\Users\TimothyCardoza\Documents\AI-Apps\Super Search`, available from WSL as `/mnt/c/Users/TimothyCardoza/Documents/AI-Apps/Super Search`. This target is useful because it is an existing mixed Elixir and JavaScript project with a passing local baseline, which gives `sun init` coverage against a real application tree without making that tree part of Sunlight's source of truth.
+
+Baseline commands for the original target repo:
+
+```text
+mix test
+bun run test
+```
+
+Observed manager preflight on July 4, 2026:
+
+- `mix test` passed 1 doctest plus 167 tests.
+- `bun run test` passed 8 Vitest tests.
+
+External validation boundaries:
+
+- This target is optional local validation only, not default smoke coverage and not CI coverage.
+- Do not edit the Super Search target repo.
+- Do not run package install commands or any network work.
+- Require a clean target Git status before validation so baseline results stay stable.
+- Sunlight validation must create a temporary clone or copy of Super Search before running `sun init`.
+- The temporary validation clone may receive `.sunlight` metadata and must be removed after the run.
+
 ## Boundaries
 
 Fixture-backed flows are allowed to use `--fixture basic-app` and stable fixture IDs such as `session_agent_a`, `view_base_0001`, and `checkpoint_auth_profile_ready_0001`. These tests validate command envelopes, identities, policy gates, and provenance links.

@@ -882,8 +882,7 @@ fn status_json_fixture_projection_reports_dirty_content_from_manifest() {
     let status_stdout = stdout(&output);
     assert!(status_stdout.contains("\"command\":\"status.projection\""));
     assert!(status_stdout.contains("\"dirty_local\":true"));
-    assert!(status_stdout
-        .contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
+    assert!(status_stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
     assert!(status_stdout.contains("\"verification_state\":\"present\""));
     assert!(status_stdout.contains("\"content_verification\":\"dirty\""));
     assert!(status_stdout.contains("\"mismatched_files\":1"));
@@ -911,9 +910,7 @@ fn status_json_fixture_projection_reports_dirty_content_from_manifest() {
     assert!(session_stdout.contains("\"command\":\"status.session\""));
     assert!(session_stdout
         .contains("\"ids\":{\"session_id\":\"session_agent_a\",\"write_topic_id\":\"topic_auth_nullability\"}"));
-    assert!(
-        session_stdout.contains("\"resolved_view_id\":\"view_agent_a_after_patch_0001\"")
-    );
+    assert!(session_stdout.contains("\"resolved_view_id\":\"view_agent_a_after_patch_0001\""));
     assert!(session_stdout.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
     assert!(session_stdout.contains("\"last_operation_id\":\"op_auth_trim_guard_0001\""));
     assert!(!session_stdout.contains("\"checkpoint_id\""));

@@ -2517,7 +2517,10 @@ mod tests {
 
         let result = projection_store_integrity_from_manifest_scan(&projection, &manifest, &blobs);
 
-        assert_eq!(result.integrity_status, ProjectionStoreIntegrityStatus::Failed);
+        assert_eq!(
+            result.integrity_status,
+            ProjectionStoreIntegrityStatus::Failed
+        );
         assert_eq!(
             result.reason_code,
             Some(ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed)
@@ -2548,7 +2551,10 @@ mod tests {
 
         let result = projection_store_integrity_from_manifest_scan(&projection, &manifest, &blobs);
 
-        assert_eq!(result.integrity_status, ProjectionStoreIntegrityStatus::Failed);
+        assert_eq!(
+            result.integrity_status,
+            ProjectionStoreIntegrityStatus::Failed
+        );
         assert_eq!(
             result.reason_code,
             Some(ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed)
@@ -2574,7 +2580,10 @@ mod tests {
 
         let result = projection_store_integrity_from_manifest_scan(&projection, &manifest, &blobs);
 
-        assert_eq!(result.integrity_status, ProjectionStoreIntegrityStatus::Failed);
+        assert_eq!(
+            result.integrity_status,
+            ProjectionStoreIntegrityStatus::Failed
+        );
         assert_eq!(
             result.reason_code,
             Some(ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed)

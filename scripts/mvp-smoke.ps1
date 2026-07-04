@@ -153,6 +153,23 @@ try {
         }
     }
 
+    Step 'Checking projection status and inspect local root verification'
+    $out = Invoke-SunOk 'status-projection' @('status', '--projection', 'projection_exec_auth_profile_0001', '--fixture', 'basic-app', '--projection-root', $projectionRoot, '--json')
+    Assert-Contains $out '"command":"status.projection"' 'projection status command'
+    Assert-Contains $out '"projection_id":"projection_exec_auth_profile_0001"' 'projection status id'
+    Assert-Contains $out '"lifecycle_state":"materialized"' 'projection status lifecycle'
+    Assert-Contains $out '"verification_state":"present"' 'projection status verification state'
+    Assert-Contains $out '"files":5' 'projection status file count'
+    Assert-Contains $out '"bytes":222' 'projection status byte count'
+
+    $out = Invoke-SunOk 'inspect-projection' @('inspect', 'projection:projection_exec_auth_profile_0001', '--fixture', 'basic-app', '--projection-root', $projectionRoot, '--json')
+    Assert-Contains $out '"command":"inspect.projection"' 'projection inspect command'
+    Assert-Contains $out '"id":"projection_exec_auth_profile_0001"' 'projection inspect id'
+    Assert-Contains $out '"local_root_verification":{' 'projection inspect local root verification'
+    Assert-Contains $out '"verification_state":"present"' 'projection inspect verification state'
+    Assert-Contains $out '"files":5' 'projection inspect file count'
+    Assert-Contains $out '"bytes":222' 'projection inspect byte count'
+
     Step 'Planning ready projection and running fixture command'
     $out = Invoke-SunOk 'project-execution' @('project', 'materialize', '--view', $viewId, '--purpose', 'execution', '--fixture', 'basic-app', '--json')
     Assert-Contains $out '"command":"projection.materialize"' 'projection command'

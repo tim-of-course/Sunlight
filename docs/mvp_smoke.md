@@ -21,6 +21,7 @@ The smoke builds `sun`, then exercises the `basic-app` fixture end to end:
 - resolves the compatible auth/profile view
 - materializes a base execution projection into an empty temporary projection
   root and verifies the projected fixture files
+- checks projection status and inspect JSON against the materialized local root
 - plans the compatible execution projection
 - records the fixture `cargo test` execution
 - creates the export-ready checkpoint

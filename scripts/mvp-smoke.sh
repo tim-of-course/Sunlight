@@ -128,6 +128,23 @@ if [[ "${OS:-}" != "Windows_NT" ]]; then
     [[ ! -x "$projection_root/src/auth.ts" ]] || fail "src/auth.ts should not be executable"
 fi
 
+step "Checking projection status and inspect local root verification"
+out="$(run_ok status-projection sun status --projection projection_exec_auth_profile_0001 --fixture basic-app --projection-root "$projection_root" --json)"
+assert_contains "$out" '"command":"status.projection"' "projection status command"
+assert_contains "$out" '"projection_id":"projection_exec_auth_profile_0001"' "projection status id"
+assert_contains "$out" '"lifecycle_state":"materialized"' "projection status lifecycle"
+assert_contains "$out" '"verification_state":"present"' "projection status verification state"
+assert_contains "$out" '"files":5' "projection status file count"
+assert_contains "$out" '"bytes":222' "projection status byte count"
+
+out="$(run_ok inspect-projection sun inspect projection:projection_exec_auth_profile_0001 --fixture basic-app --projection-root "$projection_root" --json)"
+assert_contains "$out" '"command":"inspect.projection"' "projection inspect command"
+assert_contains "$out" '"id":"projection_exec_auth_profile_0001"' "projection inspect id"
+assert_contains "$out" '"local_root_verification":{' "projection inspect local root verification"
+assert_contains "$out" '"verification_state":"present"' "projection inspect verification state"
+assert_contains "$out" '"files":5' "projection inspect file count"
+assert_contains "$out" '"bytes":222' "projection inspect byte count"
+
 step "Planning ready projection and running fixture command"
 out="$(run_ok project-execution sun project materialize --view "$view_id" --purpose execution --fixture basic-app --json)"
 assert_contains "$out" '"command":"projection.materialize"' "projection command"

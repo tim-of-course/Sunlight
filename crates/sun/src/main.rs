@@ -23,8 +23,9 @@ use sunlight_core::projection::{
     fixture_compatibility_projection_from_resolved_view,
     fixture_execution_projection_from_resolved_view, fixture_export_projection_from_resolved_view,
     fixture_inspection_projection_from_resolved_view, ProjectionPurpose, ProjectionRecord,
-    ProjectionValidationError, FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
-    FIXTURE_EXPORT_PROJECTION_ID, FIXTURE_INSPECTION_PROJECTION_ID,
+    ProjectionValidationError, FIXTURE_COMPATIBILITY_PROJECTION_ID,
+    FIXTURE_EXECUTION_PROJECTION_ID, FIXTURE_EXPORT_PROJECTION_ID,
+    FIXTURE_INSPECTION_PROJECTION_ID,
 };
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
@@ -419,8 +420,8 @@ fn project_materialize(ctx: &CommandContext) -> Result<(), CliError> {
 
     let view = fixture_resolved_view_by_id(&options.view_id)
         .ok_or_else(|| object_not_found("resolved_view", &options.view_id))?;
-    let projection = fixture_projection_for_purpose(&view, options.purpose)
-        .map_err(projection_error)?;
+    let projection =
+        fixture_projection_for_purpose(&view, options.purpose).map_err(projection_error)?;
 
     if ctx.json {
         println!("{}", projection_materialize_success_envelope(&projection));
@@ -656,8 +657,10 @@ fn parse_projection_purpose(value: &str) -> Result<ProjectionPurpose, CliError> 
         "compatibility" => Ok(ProjectionPurpose::Compatibility),
         "inspection" => Ok(ProjectionPurpose::Inspection),
         "export" => Ok(ProjectionPurpose::Export),
-        _ => Err(invalid_request(format!("unknown projection purpose `{value}`"))
-            .with_detail("purpose", value)),
+        _ => Err(
+            invalid_request(format!("unknown projection purpose `{value}`"))
+                .with_detail("purpose", value),
+        ),
     }
 }
 
@@ -1952,10 +1955,9 @@ fn fixture_projection_for_purpose(
 ) -> Result<ProjectionRecord, ProjectionValidationError> {
     match purpose {
         ProjectionPurpose::Execution => fixture_execution_projection_from_resolved_view(view),
-        ProjectionPurpose::Compatibility => fixture_compatibility_projection_from_resolved_view(
-            view,
-            "gen_agent_a_0001",
-        ),
+        ProjectionPurpose::Compatibility => {
+            fixture_compatibility_projection_from_resolved_view(view, "gen_agent_a_0001")
+        }
         ProjectionPurpose::Inspection => fixture_inspection_projection_from_resolved_view(view),
         ProjectionPurpose::Export => fixture_export_projection_from_resolved_view(view),
     }

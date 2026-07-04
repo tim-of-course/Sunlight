@@ -747,7 +747,9 @@ fn project_materialize_json_fixture_compatibility_records_import_policy() {
     assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
     assert!(stdout.contains("\"purpose\":\"compatibility\""));
     assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0001\""));
-    assert!(stdout.contains("\"baseline_manifest_ref\":\"objects/projection-baselines/repo_fixture_basic_app/"));
+    assert!(stdout.contains(
+        "\"baseline_manifest_ref\":\"objects/projection-baselines/repo_fixture_basic_app/"
+    ));
     assert!(stdout.contains("\"writable_policy\":\"writable_with_explicit_import\""));
     assert!(stdout.contains("\"store_integrity_policy\":\"verify_on_import\""));
 }
@@ -775,9 +777,7 @@ fn project_materialize_json_fixture_conflicted_view_returns_projection_error() {
     assert_failure(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("\"code\":\"projection_conflicted_view\""));
-    assert!(
-        stdout.contains("\"message\":\"resolved view has conflicts and cannot be projected\"")
-    );
+    assert!(stdout.contains("\"message\":\"resolved view has conflicts and cannot be projected\""));
     assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
     assert!(stdout.contains("\"conflict_ids\":[\"conflict_src_auth_ts_0001\"]"));
     assert!(stdout.contains("\"staleness_ids\":[]"));

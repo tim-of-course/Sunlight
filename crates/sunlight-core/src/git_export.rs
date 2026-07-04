@@ -328,7 +328,10 @@ fn validate_exact_ids(failures: &mut Vec<GitExportValidationFailure>, request: &
             "checkpoint.tree_identity.tree_hash",
             request.checkpoint.tree_identity.tree_hash.as_str(),
         ),
-        ("validation_report_id", request.validation_report_id.as_str()),
+        (
+            "validation_report_id",
+            request.validation_report_id.as_str(),
+        ),
     ] {
         validate_exact_ref(failures, field, value);
     }
@@ -499,7 +502,10 @@ mod tests {
             response.export_map.validation_report_id,
             FIXTURE_VALIDATION_REPORT_ID
         );
-        assert_eq!(response.export_map.privacy_class, PrivacyClass::CommitDefault);
+        assert_eq!(
+            response.export_map.privacy_class,
+            PrivacyClass::CommitDefault
+        );
     }
 
     #[test]
@@ -567,22 +573,22 @@ mod tests {
         assert!(report.failures.iter().any(|failure| {
             failure.check == GitExportValidationCheck::UnsafeReference
                 && failure.code == GitExportValidationFailureCode::MovingSelector
-                && failure.field.as_deref()
-                    == Some("checkpoint.topic_frontier.topic_revision_id")
+                && failure.field.as_deref() == Some("checkpoint.topic_frontier.topic_revision_id")
         }));
     }
 
     #[test]
     fn rejects_local_only_evidence_references() {
         let mut request = fixture_git_export_request_from_checkpoint(&fixture_checkpoint());
-        request.checkpoint.evidence_refs.push(EvidenceRef::Execution(
-            ExecutionEvidenceRef {
+        request
+            .checkpoint
+            .evidence_refs
+            .push(EvidenceRef::Execution(ExecutionEvidenceRef {
                 execution_id: ".sunlight/executions/exec_1/raw-logs/stdout.log".to_string(),
                 result: ExecutionStatus::Pass,
                 resolved_view_id: request.checkpoint.resolved_view_id.clone(),
                 tree_identity: request.checkpoint.tree_identity.clone(),
-            },
-        ));
+            }));
 
         let report = validate_git_export_request(&request);
 

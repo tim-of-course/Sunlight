@@ -31,9 +31,10 @@ use sunlight_core::git_export::{
     plan_git_export_writer, GitExportCommitPlan, GitExportContentFile, GitExportError,
     GitExportExecutionError, GitExportExecutionFixture, GitExportExecutionResult,
     GitExportExecutionStep, GitExportExecutionStepFixture, GitExportExecutionSummary,
-    GitExportMapStore, GitExportPlanningError, GitExportRefUpdatePlan, GitExportRepositoryState,
-    GitExportRequest, GitExportResponse, GitExportValidationFailure, GitExportValidationReport,
-    GitExportWriterInput, GitExportWriterPlan, GitRefState, ImportedBaseGitCommit,
+    GeneratedOutputExportRequirement, GitExportMapStore, GitExportPlanningError,
+    GitExportRefUpdatePlan, GitExportRepositoryState, GitExportRequest, GitExportResponse,
+    GitExportValidationFailure, GitExportValidationReport, GitExportWriterInput,
+    GitExportWriterPlan, GitRefState, ImportedBaseGitCommit,
     InMemoryGitExportMapStore, PersistedGitExportMap,
 };
 use sunlight_core::projection::{
@@ -618,6 +619,7 @@ fn git_export(ctx: &CommandContext) -> Result<(), CliError> {
 
     let mut request = GitExportRequest::from_checkpoint(&checkpoint);
     request.git_ref = options.git_ref.clone();
+    apply_fixture_generated_output_export_gate(&mut request);
     if options.execute_local {
         let input = local_fixture_git_export_writer_input(&options, request)?;
         let content_files = fixture_git_export_content_files();
@@ -675,7 +677,13 @@ fn git_export(ctx: &CommandContext) -> Result<(), CliError> {
         return Ok(());
     }
 
-    let response = git_export_checkpoint(request).map_err(git_export_error)?;
+    let response = git_export_checkpoint(request).map_err(|error| {
+        if is_fixture_generated_output_export_ref(&options.git_ref) {
+            generated_output_git_export_error(error)
+        } else {
+            git_export_error(error)
+        }
+    })?;
 
     if ctx.json {
         println!("{}", git_export_success_envelope(&response));
@@ -2954,6 +2962,23 @@ fn fixture_git_export_response() -> Result<FixtureGitExport, CliError> {
     })
 }
 
+fn apply_fixture_generated_output_export_gate(request: &mut GitExportRequest) {
+    if !is_fixture_generated_output_export_ref(&request.git_ref) {
+        return;
+    }
+
+    request
+        .generated_output_requirements
+        .push(GeneratedOutputExportRequirement {
+            path: "src/generated/auth.generated.ts".to_string(),
+            provenance_requirement: "promotion_operation_id".to_string(),
+        });
+}
+
+fn is_fixture_generated_output_export_ref(git_ref: &str) -> bool {
+    git_ref == "refs/heads/sunlight/unpromoted-generated-output"
+}
+
 fn fixture_git_export_writer_input(request: GitExportRequest) -> GitExportWriterInput {
     let mut validation_report = sunlight_core::git_export::validate_git_export_request(&request);
     if request.git_ref == "refs/heads/sunlight/stale-validation" {
@@ -3480,6 +3505,26 @@ fn git_export_error(error: GitExportError) -> CliError {
     };
     CliError::new(error.code.as_str(), message).with_raw_details_json(format!(
         "{{\"validation_report\":{}}}",
+        git_export_validation_report_json(&error.validation_report),
+    ))
+}
+
+fn generated_output_git_export_error(error: GitExportError) -> CliError {
+    CliError::new(
+        error.code.as_str(),
+        "checkpoint failed Git export validation",
+    )
+    .with_raw_details_json(format!(
+        concat!(
+            "{{",
+            "\"validation_report\":{},",
+            "\"git_write\":{{",
+            "\"commit_created\":false,",
+            "\"ref_updated\":false,",
+            "\"export_map_written\":false",
+            "}}",
+            "}}"
+        ),
         git_export_validation_report_json(&error.validation_report),
     ))
 }

@@ -141,6 +141,16 @@ Run these checks for both Git commit validation and checkpoint export unless a r
 | `export_tree` | For checkpoint export only, verify materialized Git files come from the checkpoint tree, not from the mutable Git working tree. |
 | `report_integrity` | Emit a validation report ID and stable JSON report; export-map records must reference the report ID. |
 
+Fixture export validation exposes a narrow generated-output gate for `basic-app`:
+exporting `checkpoint_auth_profile_ready_0001` to
+`refs/heads/sunlight/unpromoted-generated-output` synthesizes a generated
+source output at `src/generated/auth.generated.ts` with no promotion
+provenance. The validator must fail before any Git commit, ref update, or
+export-map write with check `generated_policy` and code
+`generated_output_requires_promotion`. This fixture is only a visible policy
+failure path; it is not a persistent execution store, provenance scanner, or
+filesystem diff inference mechanism.
+
 Failure responses use the standard envelope:
 
 ```json

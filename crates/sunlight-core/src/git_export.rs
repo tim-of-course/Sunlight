@@ -20,6 +20,13 @@ pub struct GitExportRequest {
     pub git_ref: String,
     pub export_shape: ExportShape,
     pub validation_report_id: String,
+    pub generated_output_requirements: Vec<GeneratedOutputExportRequirement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedOutputExportRequirement {
+    pub path: String,
+    pub provenance_requirement: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +64,7 @@ pub enum GitExportValidationCheck {
     ExportShape,
     GitRef,
     ExecutionRawExclusion,
+    GeneratedPolicy,
     ReportIntegrity,
 }
 
@@ -69,6 +77,7 @@ impl GitExportValidationCheck {
             Self::ExportShape => "export_shape",
             Self::GitRef => "git_ref",
             Self::ExecutionRawExclusion => "execution_raw_exclusion",
+            Self::GeneratedPolicy => "generated_policy",
             Self::ReportIntegrity => "report_integrity",
         }
     }
@@ -83,6 +92,7 @@ pub enum GitExportValidationFailureCode {
     MovingSelector,
     LocalOnlyEvidenceReference,
     SecretOrLocalOnlyRecord,
+    GeneratedOutputRequiresPromotion,
     ValidationReportMissing,
 }
 
@@ -96,6 +106,7 @@ impl GitExportValidationFailureCode {
             Self::MovingSelector => "moving_selector",
             Self::LocalOnlyEvidenceReference => "local_only_evidence_reference",
             Self::SecretOrLocalOnlyRecord => "secret_or_local_only_record",
+            Self::GeneratedOutputRequiresPromotion => "generated_output_requires_promotion",
             Self::ValidationReportMissing => "validation_report_missing",
         }
     }
@@ -955,6 +966,7 @@ impl GitExportRequest {
             git_ref: FIXTURE_EXPORTED_GIT_REF.to_string(),
             export_shape: policy_approved_single_checkpoint_shape(),
             validation_report_id: FIXTURE_VALIDATION_REPORT_ID.to_string(),
+            generated_output_requirements: Vec::new(),
         }
     }
 }
@@ -1019,6 +1031,7 @@ pub fn validate_git_export_request(request: &GitExportRequest) -> GitExportValid
     validate_git_ref(&mut failures, &request.git_ref);
     validate_exact_ids(&mut failures, request);
     validate_no_local_only_evidence(&mut failures, &request.checkpoint);
+    validate_generated_output_requirements(&mut failures, request);
 
     let blocked = failures.len() as u32;
     GitExportValidationReport {
@@ -1472,6 +1485,24 @@ fn validate_no_local_only_evidence(
     }
 }
 
+fn validate_generated_output_requirements(
+    failures: &mut Vec<GitExportValidationFailure>,
+    request: &GitExportRequest,
+) {
+    for requirement in &request.generated_output_requirements {
+        failures.push(failure(
+            GitExportValidationCheck::GeneratedPolicy,
+            GitExportValidationFailureCode::GeneratedOutputRequiresPromotion,
+            Some("generated_outputs[].path"),
+            Some(requirement.path.clone()),
+            &format!(
+                "generated source output requires promotion provenance before Git export: {}",
+                requirement.provenance_requirement
+            ),
+        ));
+    }
+}
+
 fn valid_branch_name(branch: &str) -> bool {
     if branch.is_empty()
         || branch.starts_with('/')
@@ -1684,6 +1715,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_generated_output_without_promotion_provenance() {
+        let mut request = fixture_git_export_request_from_checkpoint(&fixture_checkpoint());
+        request
+            .generated_output_requirements
+            .push(GeneratedOutputExportRequirement {
+                path: "src/generated/auth.generated.ts".to_string(),
+                provenance_requirement: "promotion_operation_id".to_string(),
+            });
+
+        let report = validate_git_export_request(&request);
+
+        assert!(!report.ok);
+        assert!(report.failures.iter().any(|failure| {
+            failure.check == GitExportValidationCheck::GeneratedPolicy
+                && failure.code
+                    == GitExportValidationFailureCode::GeneratedOutputRequiresPromotion
+                && failure.field.as_deref() == Some("generated_outputs[].path")
+                && failure.value.as_deref() == Some("src/generated/auth.generated.ts")
+                && failure.reason.contains("promotion_operation_id")
+        }));
+    }
+
+    #[test]
     fn stable_error_codes_match_contract_labels() {
         assert_eq!(
             GitExportErrorCode::ExportPolicyFailed.as_str(),
@@ -1725,7 +1779,15 @@ mod tests {
             GitExportValidationFailureCode::MovingSelector.as_str(),
             "moving_selector"
         );
+        assert_eq!(
+            GitExportValidationFailureCode::GeneratedOutputRequiresPromotion.as_str(),
+            "generated_output_requires_promotion"
+        );
         assert_eq!(GitExportValidationCheck::GitRef.as_str(), "git_ref");
+        assert_eq!(
+            GitExportValidationCheck::GeneratedPolicy.as_str(),
+            "generated_policy"
+        );
         assert_eq!(
             GitExportExecutionLifecycleState::Exported.as_str(),
             "exported"

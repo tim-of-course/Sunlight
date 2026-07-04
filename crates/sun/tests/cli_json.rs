@@ -2477,6 +2477,47 @@ fn git_export_json_fixture_invalid_git_ref_returns_validation_failure() {
 }
 
 #[test]
+fn git_export_json_fixture_unpromoted_generated_output_returns_validation_failure() {
+    let repo = TestRepo::new("git-export-unpromoted-generated-output");
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/unpromoted-generated-output")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export should run");
+
+    assert_failure(&output);
+    assert!(!repo.path().join(".git").exists());
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"export_policy_failed\""));
+    assert!(stdout.contains("\"message\":\"checkpoint failed Git export validation\""));
+    assert!(stdout.contains("\"validation_report\":{"));
+    assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"git_ref\":\"refs/heads/sunlight/unpromoted-generated-output\""));
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"blocked\":1"));
+    assert!(stdout.contains("\"check\":\"generated_policy\""));
+    assert!(stdout.contains("\"code\":\"generated_output_requires_promotion\""));
+    assert!(stdout.contains("\"field\":\"generated_outputs[].path\""));
+    assert!(stdout.contains("\"value\":\"src/generated/auth.generated.ts\""));
+    assert!(stdout.contains("promotion_operation_id"));
+    assert!(stdout.contains(
+        "\"git_write\":{\"commit_created\":false,\"ref_updated\":false,\"export_map_written\":false}"
+    ));
+    assert!(!stdout.contains("\"git_commit_ids\""));
+    assert!(!stdout.contains("\"export_map\""));
+}
+
+#[test]
 fn git_export_write_plan_json_fixture_returns_writer_plan() {
     let repo = TestRepo::new("git-export-write-plan-fixture-ready");
 

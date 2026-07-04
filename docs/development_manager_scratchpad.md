@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 156 tests, and `git diff --check` after projection materialization CLI and compatibility import status/inspect integration. Scratchpad guard must run after this edit.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 160 tests, and `git diff --check` after Git export execution foundation and validation repo plan integration. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -90,9 +90,9 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-materialization-foundation`: integrated as `b58f308`; formatting checkpoint `1ddf6b9`.
 - Completed slice `cli-projection-materialization-fixture`: integrated as `e0b39e9`; formatting checkpoint `02911da`.
 - Completed slice `compat-import-status-inspect`: integrated as `af9d5e2`; formatting checkpoint `02911da`.
-- Active slice `git-export-execution-foundation`: WSL clone `/home/timothycard/code/Sunlight-2-git-export-execution-foundation-20260704-002329`, branch `dm/git-export-execution-foundation`, run artifacts under `C:\tmp\sunlight-manager\20260704-002329`.
-- Active slice `validation-repo-plan`: WSL clone `/home/timothycard/code/Sunlight-2-validation-repo-plan-20260704-002329`, branch `dm/validation-repo-plan`, run artifacts under `C:\tmp\sunlight-manager\20260704-002329`.
-- Next heartbeat should inspect active slice last-message files, verify completed work, integrate acceptable commits, and keep one or two project-wide slices moving.
+- Completed slice `git-export-execution-foundation`: integrated as `988b5cf`; formatting checkpoint `22d55f9`.
+- Completed slice `validation-repo-plan`: integrated as `fb13cef`.
+- Active capacity is open after this integration; next launch should pick non-conflicting implementation or validation slices.
 
 ## Candidate Next Slices
 

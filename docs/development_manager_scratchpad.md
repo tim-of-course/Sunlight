@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 82 tests, `git diff --check`, and scratchpad length guard after CLI run and checkpoint foundation integration.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 93 tests, `git diff --check`, and scratchpad length guard after CLI checkpoint and projection foundation integration.
 
 ## Active Work
 
@@ -74,8 +74,10 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `compat-import-contract`: integrated as `37c9896`.
 - Completed slice `cli-run-fixture`: integrated as `de33d02`; formatting checkpoint `8f0acc0`.
 - Completed slice `checkpoint-foundation`: integrated as `b65a7a9`; formatting checkpoint `8f0acc0`.
-- Active slice `cli-checkpoint-fixture`: WSL clone `/home/timothycard/code/Sunlight-2-cli-checkpoint-fixture-20260703-205307`, branch `dm/cli-checkpoint-fixture`, logs under `C:\tmp\sunlight-manager\20260703-205307`.
-- Active slice `projection-foundation`: WSL clone `/home/timothycard/code/Sunlight-2-projection-foundation-20260703-205307`, branch `dm/projection-foundation`, logs under `C:\tmp\sunlight-manager\20260703-205307`.
+- Completed slice `cli-checkpoint-fixture`: integrated as `9dd2bc3`; formatting checkpoint `9420e57`.
+- Completed slice `projection-foundation`: integrated as `6788680`; formatting checkpoint `9420e57`.
+- Active slice `cli-projection-fixture`: WSL clone `/home/timothycard/code/Sunlight-2-cli-projection-fixture-20260703-213100`, branch `dm/cli-projection-fixture`, logs under `C:\tmp\sunlight-manager\20260703-213100`.
+- Active slice `git-export-foundation`: WSL clone `/home/timothycard/code/Sunlight-2-git-export-foundation-20260703-213100`, branch `dm/git-export-foundation`, logs under `C:\tmp\sunlight-manager\20260703-213100`.
 - Next heartbeat should inspect active slice logs, verify commits, integrate acceptable work, then launch the next one or two slices.
 
 ## Candidate First Slices

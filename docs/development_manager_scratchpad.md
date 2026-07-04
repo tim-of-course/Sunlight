@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran native `scripts/smoke-suite.ps1` with `cargo fmt --check`, `cargo check`, `cargo test` with 77 Windows CLI tests and 128 core tests, validation smoke, projection strategy smoke, and MVP smoke. WSL verification covered Unix-only projection symlink scan tests and manifest error-state fixture tests with 80 CLI tests. Scratchpad guard must run after this edit.
+- Verification: latest integrated pass ran native `scripts/smoke-suite.ps1` after `1bad247` with `cargo fmt --check`, `cargo check`, `cargo test` with 77 Windows CLI tests and 128 core tests, validation smoke, projection strategy smoke, and MVP smoke. WSL verification covered Unix-only projection symlink scan tests, manifest error-state fixture tests with 80 CLI tests, and root-binding contract focused core tests with 26 projection tests. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -117,12 +117,13 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-manifest-dirty-fixture`: integrated as `b08dcf6`; formatting checkpoint `9b36b46`.
 - Completed slice `projection-manifest-executable-fixture`: integrated as `919e04e`.
 - Completed slice `projection-manifest-error-states`: integrated as `a97d7ec`.
-- Active slice `projection-manifest-root-binding-contract`: WSL clone `/home/timothycard/code/Sunlight-2-projection-manifest-root-binding-contract-20260704-140529`, branch `dm/projection-manifest-root-binding-contract`, run artifacts under `C:\tmp\sunlight-manager\20260704-140529`.
+- Completed slice `projection-manifest-root-binding-contract`: integrated as `1bad247`.
+- Active slice `projection-manifest-root-binding-persistence`: WSL clone `/home/timothycard/code/Sunlight-2-projection-manifest-root-binding-persistence-20260704-144029`, branch `dm/projection-manifest-root-binding-persistence`, run artifacts under `C:\tmp\sunlight-manager\20260704-144029`.
 - Next heartbeat should inspect active WSL progress, import verified work if finished, run full smoke-suite validation, and keep project-wide projection manifest verification moving.
 
 ## Candidate Next Slices
 
-- Projection manifest root-binding persistence after active contract slice lands.
+- Projection manifest root-mismatch status/inspect behavior after persisted root binding lands.
 - Validation smoke CI/usage follow-up remains optional after the smoke suite settles.
 
 ## Decisions

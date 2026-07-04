@@ -1105,6 +1105,42 @@ pub fn projection_store_integrity_failed_quarantined(
     }
 }
 
+pub fn projection_store_integrity_from_manifest_scan(
+    projection: &ProjectionRecord,
+    manifest: &ProjectionManifestRecord,
+    blobs: &BTreeMap<String, ContentBlob>,
+) -> ProjectionStoreIntegrityResult {
+    let integrity_failed = || {
+        projection_store_integrity_failed_quarantined(
+            projection,
+            manifest,
+            ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed,
+        )
+    };
+
+    for entry in manifest.entries.iter().filter(|entry| !entry.tombstone) {
+        if entry.kind != ArtifactKind::File {
+            return integrity_failed();
+        }
+
+        let Some(blob) = blobs.get(&entry.content_hash) else {
+            return integrity_failed();
+        };
+
+        if blob.digest != entry.content_hash {
+            return integrity_failed();
+        }
+        if blob.byte_length() as u64 != entry.byte_length {
+            return integrity_failed();
+        }
+        if blob.classification != entry.classification {
+            return integrity_failed();
+        }
+    }
+
+    projection_store_integrity_verified(projection, manifest)
+}
+
 pub fn projection_manifest_from_content_tree(
     projection: &ProjectionRecord,
     view: &ResolvedViewResult,
@@ -2429,6 +2465,121 @@ mod tests {
         );
         assert!(!result.local_filesystem_source_truth);
         assert!(result.quarantine.is_none());
+    }
+
+    #[test]
+    fn projection_store_integrity_manifest_scan_verifies_fixture_blobs() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let projection = fixture_execution_projection_from_resolved_view(&view).unwrap();
+        let manifest = fixture_projection_manifest_from_content_tree(
+            &projection,
+            &view,
+            store.tree(),
+            store.content_blobs(),
+        )
+        .unwrap();
+
+        let result = projection_store_integrity_from_manifest_scan(
+            &projection,
+            &manifest,
+            store.content_blobs(),
+        );
+
+        assert_eq!(
+            result.integrity_status,
+            ProjectionStoreIntegrityStatus::Verified
+        );
+        assert_eq!(result.reason_code, None);
+        assert_eq!(result.privacy_class, PrivacyClass::LocalOnly);
+        assert_eq!(
+            result.source_truth,
+            ProjectionStoreIntegritySourceTruth::ImmutableStoreManifest
+        );
+        assert!(!result.local_filesystem_source_truth);
+        assert!(result.quarantine.is_none());
+    }
+
+    #[test]
+    fn projection_store_integrity_manifest_scan_quarantines_missing_blob() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let projection = fixture_execution_projection_from_resolved_view(&view).unwrap();
+        let manifest = fixture_projection_manifest_from_content_tree(
+            &projection,
+            &view,
+            store.tree(),
+            store.content_blobs(),
+        )
+        .unwrap();
+        let mut blobs = store.content_blobs().clone();
+        blobs.remove(&manifest.entries[0].content_hash);
+
+        let result = projection_store_integrity_from_manifest_scan(&projection, &manifest, &blobs);
+
+        assert_eq!(result.integrity_status, ProjectionStoreIntegrityStatus::Failed);
+        assert_eq!(
+            result.reason_code,
+            Some(ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed)
+        );
+        assert_eq!(
+            result.source_truth,
+            ProjectionStoreIntegritySourceTruth::ImmutableStoreManifest
+        );
+        assert!(!result.local_filesystem_source_truth);
+        assert!(result.quarantine.is_some());
+    }
+
+    #[test]
+    fn projection_store_integrity_manifest_scan_quarantines_digest_mismatch() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let projection = fixture_execution_projection_from_resolved_view(&view).unwrap();
+        let manifest = fixture_projection_manifest_from_content_tree(
+            &projection,
+            &view,
+            store.tree(),
+            store.content_blobs(),
+        )
+        .unwrap();
+        let mut blobs = store.content_blobs().clone();
+        let content_hash = manifest.entries[0].content_hash.clone();
+        blobs.get_mut(&content_hash).unwrap().digest = "sha256:tampered".to_string();
+
+        let result = projection_store_integrity_from_manifest_scan(&projection, &manifest, &blobs);
+
+        assert_eq!(result.integrity_status, ProjectionStoreIntegrityStatus::Failed);
+        assert_eq!(
+            result.reason_code,
+            Some(ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed)
+        );
+        assert!(result.quarantine.is_some());
+    }
+
+    #[test]
+    fn projection_store_integrity_manifest_scan_quarantines_byte_length_mismatch() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let projection = fixture_execution_projection_from_resolved_view(&view).unwrap();
+        let manifest = fixture_projection_manifest_from_content_tree(
+            &projection,
+            &view,
+            store.tree(),
+            store.content_blobs(),
+        )
+        .unwrap();
+        let mut blobs = store.content_blobs().clone();
+        let content_hash = manifest.entries[0].content_hash.clone();
+        blobs.get_mut(&content_hash).unwrap().bytes.push(b'!');
+
+        let result = projection_store_integrity_from_manifest_scan(&projection, &manifest, &blobs);
+
+        assert_eq!(result.integrity_status, ProjectionStoreIntegrityStatus::Failed);
+        assert_eq!(
+            result.reason_code,
+            Some(ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed)
+        );
+        assert!(result.quarantine.is_some());
     }
 
     #[test]

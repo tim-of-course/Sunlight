@@ -1,3 +1,10 @@
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::artifacts::{ArtifactKind, ContentBlob, ContentTree, PathPolicy};
 use crate::records::{PrivacyClass, RECORD_SCHEMA_VERSION};
 use crate::resolver::{ResolvedViewResult, SingleRepoTree};
 
@@ -301,6 +308,24 @@ pub struct ProjectionMaterializationPlan {
     pub local_metadata: ProjectionMaterializationLocalMetadata,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionFilesystemMaterialization {
+    pub plan: ProjectionMaterializationPlan,
+    pub projection_root: PathBuf,
+    pub files_written: usize,
+    pub directories_created: usize,
+    pub bytes_written: u64,
+    pub executable_files: usize,
+    pub cleanup: ProjectionCleanupCheck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionCleanupCheck {
+    pub projection_root: PathBuf,
+    pub exists: bool,
+    pub local_only: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectionMaterializationSource {
     ResolvedContentTree,
@@ -349,6 +374,12 @@ pub enum ProjectionMaterializationErrorCode {
     OverlayCopyupUnsafeForWrites,
     MetadataPolicyUnsupported,
     NoEligibleStrategy,
+    UnsupportedFilesystemStrategy,
+    ContentTreeMismatch,
+    MissingContentBlob,
+    UnsupportedContentEntryKind,
+    ProjectionRootUnavailable,
+    ProjectionWriteFailed,
 }
 
 impl ProjectionMaterializationErrorCode {
@@ -377,8 +408,154 @@ impl ProjectionMaterializationErrorCode {
                 "projection_materialization_metadata_policy_unsupported"
             }
             Self::NoEligibleStrategy => "projection_materialization_no_eligible_strategy",
+            Self::UnsupportedFilesystemStrategy => {
+                "projection_materialization_unsupported_filesystem_strategy"
+            }
+            Self::ContentTreeMismatch => "projection_materialization_content_tree_mismatch",
+            Self::MissingContentBlob => "projection_materialization_missing_content_blob",
+            Self::UnsupportedContentEntryKind => {
+                "projection_materialization_unsupported_content_entry_kind"
+            }
+            Self::ProjectionRootUnavailable => {
+                "projection_materialization_projection_root_unavailable"
+            }
+            Self::ProjectionWriteFailed => "projection_materialization_write_failed",
         }
     }
+}
+
+impl Display for ProjectionMaterializationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.code.as_str())
+    }
+}
+
+impl Error for ProjectionMaterializationError {}
+
+pub fn materialize_fixture_projection_copy(
+    view: &ResolvedViewResult,
+    request: ProjectionMaterializationRequest,
+    content_tree: &ContentTree,
+    blobs: &BTreeMap<String, ContentBlob>,
+    projection_root: impl AsRef<Path>,
+) -> Result<ProjectionFilesystemMaterialization, ProjectionMaterializationError> {
+    let plan = plan_fixture_projection_materialization(view, request)?;
+    materialize_projection_plan_copy(&plan, view, content_tree, blobs, projection_root)
+}
+
+pub fn materialize_projection_plan_copy(
+    plan: &ProjectionMaterializationPlan,
+    view: &ResolvedViewResult,
+    content_tree: &ContentTree,
+    blobs: &BTreeMap<String, ContentBlob>,
+    projection_root: impl AsRef<Path>,
+) -> Result<ProjectionFilesystemMaterialization, ProjectionMaterializationError> {
+    if plan.projection.strategy != ProjectionStrategy::Copy {
+        return Err(materialization_error(
+            ProjectionMaterializationErrorCode::UnsupportedFilesystemStrategy,
+            view,
+            Some(plan.projection.strategy),
+        ));
+    }
+
+    validate_content_tree_matches_view(view, content_tree)?;
+    let root = projection_root.as_ref();
+    prepare_projection_root(root, view)?;
+
+    let mut files_written = 0;
+    let mut directories = Vec::new();
+    let mut bytes_written = 0;
+    let mut executable_files = 0;
+    let path_policy = PathPolicy {
+        id: content_tree.path_policy_id.clone(),
+    };
+    let mut entries = content_tree.entries.clone();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+
+    for entry in entries.iter().filter(|entry| !entry.tombstone) {
+        let relative_path = path_policy
+            .validate(&entry.path)
+            .map_err(|_| materialization_error(
+                ProjectionMaterializationErrorCode::ContentTreeMismatch,
+                view,
+                Some(plan.projection.strategy),
+            ))?;
+        let destination = root.join(&relative_path);
+
+        match entry.kind {
+            ArtifactKind::File => {
+                let blob = blobs.get(&entry.content_ref).ok_or_else(|| {
+                    materialization_error(
+                        ProjectionMaterializationErrorCode::MissingContentBlob,
+                        view,
+                        Some(plan.projection.strategy),
+                    )
+                })?;
+                if let Some(parent) = destination.parent() {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|_| {
+                            materialization_error(
+                                ProjectionMaterializationErrorCode::ProjectionWriteFailed,
+                                view,
+                                Some(plan.projection.strategy),
+                            )
+                        })?;
+                    }
+                }
+                fs::write(&destination, &blob.bytes).map_err(|_| {
+                    materialization_error(
+                        ProjectionMaterializationErrorCode::ProjectionWriteFailed,
+                        view,
+                        Some(plan.projection.strategy),
+                    )
+                })?;
+                set_file_executable(&destination, entry.executable).map_err(|_| {
+                    materialization_error(
+                        ProjectionMaterializationErrorCode::ProjectionWriteFailed,
+                        view,
+                        Some(plan.projection.strategy),
+                    )
+                })?;
+                files_written += 1;
+                bytes_written += blob.bytes.len() as u64;
+                executable_files += usize::from(entry.executable);
+            }
+            ArtifactKind::Directory => directories.push(destination),
+            ArtifactKind::Symlink => {
+                return Err(materialization_error(
+                    ProjectionMaterializationErrorCode::UnsupportedContentEntryKind,
+                    view,
+                    Some(plan.projection.strategy),
+                ));
+            }
+        }
+    }
+
+    for directory in directories {
+        fs::create_dir_all(&directory).map_err(|_| {
+            materialization_error(
+                ProjectionMaterializationErrorCode::ProjectionWriteFailed,
+                view,
+                Some(plan.projection.strategy),
+            )
+        })?;
+    }
+
+    Ok(ProjectionFilesystemMaterialization {
+        plan: plan.clone(),
+        projection_root: root.to_path_buf(),
+        files_written,
+        directories_created: count_directories(root).map_err(|_| {
+            materialization_error(
+                ProjectionMaterializationErrorCode::ProjectionWriteFailed,
+                view,
+                Some(plan.projection.strategy),
+            )
+        })?,
+        bytes_written,
+        executable_files,
+        cleanup: projection_cleanup_check(root),
+    })
 }
 
 pub fn plan_fixture_projection_materialization(
@@ -698,14 +875,152 @@ fn baseline_manifest_ref(view: &ResolvedViewResult) -> String {
     )
 }
 
+fn validate_content_tree_matches_view(
+    view: &ResolvedViewResult,
+    content_tree: &ContentTree,
+) -> Result<(), ProjectionMaterializationError> {
+    let tree_identity = validate_projectable_view(view).map_err(|error| {
+        ProjectionMaterializationError {
+            code: ProjectionMaterializationErrorCode::ProjectionValidationFailed,
+            resolved_view_id: view.resolved_view_id.clone(),
+            strategy: Some(ProjectionStrategy::Copy),
+            validation_error: Some(error),
+        }
+    })?;
+
+    if content_tree.repository_id != view.repository_id
+        || content_tree.repository_id != tree_identity.repository_id
+        || content_tree.tree_hash != tree_identity.tree_hash
+        || content_tree.path_policy_id != view.path_policy_id
+    {
+        return Err(materialization_error(
+            ProjectionMaterializationErrorCode::ContentTreeMismatch,
+            view,
+            Some(ProjectionStrategy::Copy),
+        ));
+    }
+
+    let active_entries = content_tree
+        .entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+
+    if active_entries.len() != view.tree_entries.len() {
+        return Err(materialization_error(
+            ProjectionMaterializationErrorCode::ContentTreeMismatch,
+            view,
+            Some(ProjectionStrategy::Copy),
+        ));
+    }
+
+    for (path, view_entry) in &view.tree_entries {
+        let Some(tree_entry) = active_entries.get(path) else {
+            return Err(materialization_error(
+                ProjectionMaterializationErrorCode::ContentTreeMismatch,
+                view,
+                Some(ProjectionStrategy::Copy),
+            ));
+        };
+        if tree_entry.artifact_id != view_entry.artifact_id
+            || tree_entry.content_ref != view_entry.content_hash
+        {
+            return Err(materialization_error(
+                ProjectionMaterializationErrorCode::ContentTreeMismatch,
+                view,
+                Some(ProjectionStrategy::Copy),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn prepare_projection_root(
+    root: &Path,
+    view: &ResolvedViewResult,
+) -> Result<(), ProjectionMaterializationError> {
+    if root.exists() {
+        if !root.is_dir() || root.read_dir().map_or(true, |mut entries| entries.next().is_some()) {
+            return Err(materialization_error(
+                ProjectionMaterializationErrorCode::ProjectionRootUnavailable,
+                view,
+                Some(ProjectionStrategy::Copy),
+            ));
+        }
+        return Ok(());
+    }
+
+    fs::create_dir_all(root).map_err(|_| {
+        materialization_error(
+            ProjectionMaterializationErrorCode::ProjectionRootUnavailable,
+            view,
+            Some(ProjectionStrategy::Copy),
+        )
+    })
+}
+
+fn projection_cleanup_check(root: &Path) -> ProjectionCleanupCheck {
+    ProjectionCleanupCheck {
+        projection_root: root.to_path_buf(),
+        exists: root.exists(),
+        local_only: true,
+    }
+}
+
+fn count_directories(root: &Path) -> std::io::Result<usize> {
+    let mut count = usize::from(root.is_dir());
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            count += count_directories(&path)?;
+        }
+    }
+    Ok(count)
+}
+
+#[cfg(unix)]
+fn set_file_executable(path: &Path, executable: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = if executable { 0o755 } else { 0o644 };
+    let permissions = fs::Permissions::from_mode(mode);
+    fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn set_file_executable(_path: &Path, _executable: bool) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn materialization_error(
+    code: ProjectionMaterializationErrorCode,
+    view: &ResolvedViewResult,
+    strategy: Option<ProjectionStrategy>,
+) -> ProjectionMaterializationError {
+    ProjectionMaterializationError {
+        code,
+        resolved_view_id: view.resolved_view_id.clone(),
+        strategy,
+        validation_error: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifacts::{InMemoryArtifactStore, FILE_OPERATION_SEMANTICS_VERSION};
     use crate::resolver::{
         fixture_auth_revision, fixture_base_entries, fixture_overlapping_auth_revision,
         fixture_profile_revision, fixture_profile_revision_missing_auth_dependency,
-        fixture_resolver_input, resolve_fixture_view, TopicRevisionSelection,
+        fixture_resolver_input, resolve_fixture_view, DependencyClosure,
+        DeterministicResolverOrder, TopicRevisionSelection, TreeEntryState,
+        FIXTURE_BASE_CHECKPOINT_ID, FIXTURE_BASE_RESOLVED_VIEW_ID,
     };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn execution_projection_records_exact_view_policy_and_local_root() {
@@ -1052,6 +1367,168 @@ mod tests {
         assert!(error.strategy.is_none());
     }
 
+    #[test]
+    fn filesystem_copy_materializes_basic_app_resolved_content_tree() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let root = temp_projection_root("copy-materializes-basic-app");
+
+        let materialization = materialize_fixture_projection_copy(
+            &view,
+            copy_request(),
+            store.tree(),
+            store.content_blobs(),
+            &root,
+        )
+        .unwrap();
+
+        assert_eq!(materialization.plan.projection.strategy, ProjectionStrategy::Copy);
+        assert_eq!(materialization.files_written, 5);
+        assert_eq!(materialization.executable_files, 1);
+        assert!(materialization.cleanup.local_only);
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "# Fixture Basic App\n\nUses User.email for login.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("src/auth.ts")).unwrap(),
+            "export function login(email: string) {\n  return email.trim().toLowerCase();\n}\n"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let script_mode = fs::metadata(root.join("scripts/build.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111;
+            let source_mode = fs::metadata(root.join("src/auth.ts"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111;
+            assert_ne!(script_mode, 0);
+            assert_eq!(source_mode, 0);
+        }
+    }
+
+    #[test]
+    fn filesystem_copy_does_not_read_git_working_tree_source() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let root = temp_projection_root("copy-ignores-working-tree");
+        let working_tree = temp_projection_root("working-tree-source");
+        fs::create_dir_all(&working_tree).unwrap();
+        fs::write(working_tree.join("README.md"), "mutable working tree\n").unwrap();
+
+        materialize_fixture_projection_copy(
+            &view,
+            copy_request(),
+            store.tree(),
+            store.content_blobs(),
+            &root,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "# Fixture Basic App\n\nUses User.email for login.\n"
+        );
+    }
+
+    #[test]
+    fn filesystem_copy_rejects_conflicted_view_before_creating_root() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let auth = fixture_auth_revision();
+        let overlap = fixture_overlapping_auth_revision();
+        let view = resolve_fixture_view(
+            fixture_resolver_input(vec![
+                selection(&auth.topic_id, &auth.revision_id),
+                selection(&overlap.topic_id, &overlap.revision_id),
+            ]),
+            fixture_base_entries(),
+            vec![auth, overlap],
+        );
+        let root = temp_projection_root("copy-conflicted-rejected");
+
+        let error = materialize_fixture_projection_copy(
+            &view,
+            copy_request(),
+            store.tree(),
+            store.content_blobs(),
+            &root,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            ProjectionMaterializationErrorCode::ProjectionValidationFailed
+        );
+        assert_eq!(
+            error.validation_error.unwrap().code,
+            ProjectionValidationErrorCode::ConflictedView
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn filesystem_copy_rejects_stale_view_before_creating_root() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let dependent = fixture_profile_revision_missing_auth_dependency();
+        let required = fixture_auth_revision();
+        let view = resolve_fixture_view(
+            fixture_resolver_input(vec![selection(&dependent.topic_id, &dependent.revision_id)]),
+            fixture_base_entries(),
+            vec![dependent, required],
+        );
+        let root = temp_projection_root("copy-stale-rejected");
+
+        let error = materialize_fixture_projection_copy(
+            &view,
+            copy_request(),
+            store.tree(),
+            store.content_blobs(),
+            &root,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            ProjectionMaterializationErrorCode::ProjectionValidationFailed
+        );
+        assert_eq!(
+            error.validation_error.unwrap().code,
+            ProjectionValidationErrorCode::StaleView
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn filesystem_copy_rejects_mismatched_content_tree_before_creating_root() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let mut content_tree = store.tree().clone();
+        content_tree.tree_hash = "tree_fixture_wrong_0001".to_string();
+        let root = temp_projection_root("copy-tree-mismatch-rejected");
+
+        let error = materialize_fixture_projection_copy(
+            &view,
+            copy_request(),
+            &content_tree,
+            store.content_blobs(),
+            &root,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            ProjectionMaterializationErrorCode::ContentTreeMismatch
+        );
+        assert!(!root.exists());
+    }
+
     fn conflict_free_view() -> ResolvedViewResult {
         let auth = fixture_auth_revision();
         let profile = fixture_profile_revision();
@@ -1070,5 +1547,68 @@ mod tests {
             topic_id: topic_id.to_string(),
             revision_id: revision_id.to_string(),
         }
+    }
+
+    fn view_for_store(store: &InMemoryArtifactStore) -> ResolvedViewResult {
+        let tree_identity = SingleRepoTree {
+            repository_id: store.tree().repository_id.clone(),
+            tree_hash: store.tree().tree_hash.clone(),
+        };
+        let tree_entries = store
+            .tree()
+            .entries
+            .iter()
+            .filter(|entry| !entry.tombstone)
+            .map(|entry| {
+                (
+                    entry.path.clone(),
+                    TreeEntryState {
+                        artifact_id: entry.artifact_id.clone(),
+                        path: entry.path.clone(),
+                        content_hash: entry.content_ref.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        ResolvedViewResult {
+            resolved_view_id: FIXTURE_BASE_RESOLVED_VIEW_ID.to_string(),
+            repository_id: store.tree().repository_id.clone(),
+            base_checkpoint_ids: vec![FIXTURE_BASE_CHECKPOINT_ID.to_string()],
+            topic_frontier: BTreeMap::new(),
+            dependency_closure: DependencyClosure {
+                revision_ids: Vec::new(),
+            },
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            path_policy_id: store.tree().path_policy_id.clone(),
+            resolver_order: DeterministicResolverOrder {
+                operation_ids: Vec::new(),
+            },
+            tree_identity: Some(tree_identity),
+            records: Vec::new(),
+            tree_entries,
+        }
+    }
+
+    fn copy_request() -> ProjectionMaterializationRequest {
+        ProjectionMaterializationRequest {
+            purpose: ProjectionPurpose::Execution,
+            projection_id: FIXTURE_EXECUTION_PROJECTION_ID.to_string(),
+            session_generation_id: None,
+            strategy_preference: vec![ProjectionStrategy::Copy],
+            fallback_to_copy: true,
+            capabilities: ProjectionMaterializationCapabilities::copy_only(),
+        }
+    }
+
+    fn temp_projection_root(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "sunlight-projection-{label}-{}-{unique}",
+            std::process::id()
+        ))
     }
 }

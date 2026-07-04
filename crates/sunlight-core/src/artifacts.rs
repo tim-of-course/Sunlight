@@ -903,6 +903,14 @@ impl InMemoryArtifactStore {
         &self.tree
     }
 
+    pub fn content_blob(&self, content_ref: &str) -> Option<&ContentBlob> {
+        self.blobs.get(content_ref)
+    }
+
+    pub fn content_blobs(&self) -> &BTreeMap<String, ContentBlob> {
+        &self.blobs
+    }
+
     fn accept_mutation(
         &mut self,
         mutation: AcceptMutation,

@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran the default `scripts/smoke-suite.ps1` after `a58f8d6`; it detected CRLF Bash scripts, fell back to the Windows-native lane, and passed `cargo fmt --check`, `cargo check`, `cargo test` with 95 Windows CLI tests and 138 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused WSL/Windows verification for the latest projection integrity CLI scan wiring passed projection-filtered CLI tests, store-integrity-filtered core tests, `git diff --check`, and Windows `cargo fmt --check`. Scratchpad guard must run after this edit.
+- Verification: latest full pass ran the default `scripts/smoke-suite.ps1` after `dfd23bb`; it detected CRLF Bash scripts, fell back to the Windows-native lane, and passed `cargo fmt --check`, `cargo check`, `cargo test` with 98 Windows CLI tests and 138 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused WSL/Windows verification for the latest execution integrity gate passed run fixture tests, CLI integrity tests, store-integrity-filtered core tests, `git diff --check`, and Windows `cargo fmt --check`. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -133,12 +133,13 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-store-integrity-verified-fixture`: integrated as `9f64aed`; formatting checkpoint `851d3e1`.
 - Completed slice `projection-store-integrity-scan-seam`: integrated as `a5a7992`; formatting checkpoint `efc0206`.
 - Completed slice `projection-store-integrity-cli-scan-wiring`: integrated as `e5500af`; formatting checkpoint `a58f8d6`.
+- Completed slice `execution-store-integrity-gate-fixture`: integrated as `9f700c1`; formatting checkpoint `dfd23bb`.
 - No active WSL slice at this checkpoint. Next heartbeat should start the next project-wide slice from the candidate list after confirming `main` is still clean.
 
 ## Candidate Next Slices
 
-- Projection store-integrity next needs materialization/run-path integrity gating and persistence/quarantine follow-through after CLI scan wiring.
-- First external validation repo and exact test command are the next product-level decision once the projection integrity path has one more persistence or run-path slice.
+- Projection store-integrity next needs durable quarantine persistence/cache invalidation follow-through beyond fixture JSON errors.
+- First external validation repo and exact test command are now the next product-level decision once the projection integrity persistence path is stable enough to test against real project files.
 
 ## Decisions
 

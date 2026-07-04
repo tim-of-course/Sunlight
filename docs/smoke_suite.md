@@ -22,8 +22,10 @@ scripts/smoke-suite.ps1
 ```
 
 By default the PowerShell wrapper uses WSL when `wsl.exe` is available, matching
-the focused smoke wrappers. Set `SUNLIGHT_SMOKE_USE_WSL=0` to run the suite in
-native PowerShell mode.
+the focused smoke wrappers, but it falls back to native PowerShell when the
+suite's Bash scripts have CRLF line endings. Set `SUNLIGHT_SMOKE_USE_WSL=0` to
+run the suite in native PowerShell mode, or set it to a non-zero value to
+require the WSL lane.
 
 Platform lanes:
 
@@ -31,7 +33,8 @@ Platform lanes:
   Rust toolchain, `cargo`, and `git` available on `PATH`.
 - Windows native: run `scripts/smoke-suite.ps1` in PowerShell with Rust and
   `git` available on the Windows `PATH`. If WSL is installed, the wrapper
-  delegates to the Linux/WSL lane unless `SUNLIGHT_SMOKE_USE_WSL=0` is set.
+  delegates to the Linux/WSL lane unless `SUNLIGHT_SMOKE_USE_WSL=0` is set or
+  the suite's Bash scripts have CRLF line endings.
 - Current WSL manager caveat: when WSL `rustfmt` is unavailable, use the
   Windows-native lane as the formatting gate because the aggregate suite starts
   with `cargo fmt --check`.

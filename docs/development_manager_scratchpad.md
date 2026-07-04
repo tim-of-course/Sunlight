@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 50 tests, `git diff --check`, and scratchpad length guard after CLI mutation and resolver foundation integration.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 56 tests, `git diff --check`, and scratchpad length guard after status/inspect and checkpoint contract integration.
 
 ## Active Work
 
@@ -66,8 +66,9 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `resolver-conflict-fixtures`: integrated as `ffbc014`.
 - Completed slice `cli-mutation-fixture`: integrated as `6df0fa8`; formatting checkpoint `dde1d62`.
 - Completed slice `resolver-foundation`: integrated as `37c837a`; formatting checkpoint `dde1d62`.
-- Active slice `cli-status-inspect-fixture`: WSL clone `/home/timothycard/code/Sunlight-2-cli-status-inspect-fixture-20260703-183321`, branch `dm/cli-status-inspect-fixture`, logs under `C:\tmp\sunlight-manager\20260703-183321`.
-- Active slice `checkpoint-export-contract`: WSL clone `/home/timothycard/code/Sunlight-2-checkpoint-export-contract-20260703-183321`, branch `dm/checkpoint-export-contract`, logs under `C:\tmp\sunlight-manager\20260703-183321`.
+- Completed slice `cli-status-inspect-fixture`: integrated as `8edfcd8`; formatting checkpoint `aa45ff3`.
+- Completed slice `checkpoint-export-contract`: integrated as `cc7e0ad`.
+- No active WSL slices are currently tracked.
 - Next heartbeat should inspect active slice logs, verify commits, integrate acceptable work, then launch the next one or two slices.
 
 ## Candidate First Slices

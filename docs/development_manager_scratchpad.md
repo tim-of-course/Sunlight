@@ -98,9 +98,10 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `git-export-real-writer-validation`: integrated as `7ac6236`; formatting checkpoint `3680f68`.
 - Completed slice `git-export-real-writer-execution`: integrated as `7eb7c2b`; formatting checkpoint `897d45f`.
 - Completed slice `projection-filesystem-materialization`: integrated as `058b4a0`; formatting checkpoint `897d45f`.
-- Active slice `cli-real-git-export-writer`: WSL clone `/home/timothycard/code/Sunlight-2-cli-real-git-export-writer-20260704-024400`, branch `dm/cli-real-git-export-writer`, run artifacts under `C:\tmp\sunlight-manager\20260704-024400`.
-- Active slice `smoke-suite-runner`: WSL clone `/home/timothycard/code/Sunlight-2-smoke-suite-runner-20260704-024400`, branch `dm/smoke-suite-runner`, run artifacts under `C:\tmp\sunlight-manager\20260704-024400`.
-- Next heartbeat should inspect active WSL progress, import verified work if finished, run full verification, and keep one or two project-wide slices moving.
+- Completed slice `cli-real-git-export-writer`: integrated as `ccc47e5`; formatting checkpoint `3eecbd8`; full smoke verification is pending the active Git index uniqueness fix.
+- Completed slice `smoke-suite-runner`: integrated as `3112952`.
+- Active slice `git-export-index-uniqueness`: WSL clone `/home/timothycard/code/Sunlight-2-git-export-index-uniqueness-20260704-031846`, branch `dm/git-export-index-uniqueness`, run artifacts under `C:\tmp\sunlight-manager\20260704-031846`.
+- Latest verification found a Windows parallel-test flake in the Git export temporary index path while running the new smoke suite; next heartbeat should import the fix if verified and rerun full smoke-suite validation.
 
 ## Candidate Next Slices
 

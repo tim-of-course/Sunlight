@@ -25,6 +25,8 @@ The smoke covers:
 - explicit reflink strategy selection through fixture capabilities
 - local-only projection metadata and local root references with
   `local_only_path` privacy
+- current scan-only local root verification, with persisted projection manifest
+  content verification reserved for the status/inspect contract
 - fallback from an ineligible preferred strategy to copy
 - stable JSON failure for an unsupported required strategy with
   `--no-copy-fallback`

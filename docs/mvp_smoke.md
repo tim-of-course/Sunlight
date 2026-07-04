@@ -53,7 +53,9 @@ Projection status and inspect smoke coverage verifies the local root exists and
 reports file, byte, executable, and sample-path summaries. It does not verify
 projection content hashes yet; the JSON explicitly reports
 `content_verification: not_available_without_persisted_manifest` until
-materialization persists a comparable manifest.
+materialization persists a comparable manifest. The persisted manifest contract
+and future acceptance coverage are defined in
+[sunlight_cli_status_inspect_v0_1.md](sunlight_cli_status_inspect_v0_1.md).
 
 The aggregate smoke suite also runs the validation and projection strategy
 smokes, which cover artifact validation, compatibility import, write-plan

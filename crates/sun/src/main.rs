@@ -39,8 +39,9 @@ use sunlight_core::git_export::{
 use sunlight_core::projection::{
     fixture_compatibility_projection_from_resolved_view,
     fixture_execution_projection_from_resolved_view, fixture_export_projection_from_resolved_view,
-    fixture_inspection_projection_from_resolved_view, materialize_fixture_projection_copy,
-    plan_fixture_projection_materialization, ProjectionFilesystemMaterialization,
+    fixture_inspection_projection_from_resolved_view, fixture_projection_manifest_from_content_tree,
+    materialize_fixture_projection_copy, plan_fixture_projection_materialization,
+    ProjectionFilesystemMaterialization, ProjectionManifestRecord,
     ProjectionMaterializationCapabilities, ProjectionMaterializationError,
     ProjectionMaterializationErrorCode, ProjectionMaterializationLocalMetadata,
     ProjectionMaterializationPlan, ProjectionMaterializationRequest, ProjectionPurpose,
@@ -48,6 +49,7 @@ use sunlight_core::projection::{
     FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
     FIXTURE_EXPORT_PROJECTION_ID, FIXTURE_INSPECTION_PROJECTION_ID,
 };
+use sunlight_core::records::canonical_json_bytes;
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
 };
@@ -459,7 +461,7 @@ fn project_materialize(ctx: &CommandContext) -> Result<(), CliError> {
         if ctx.json {
             println!(
                 "{}",
-                projection_filesystem_materialize_success_envelope(&materialization)
+                projection_filesystem_materialize_success_envelope(&materialization)?
             );
         } else {
             println!(
@@ -674,7 +676,7 @@ fn status(ctx: &CommandContext) -> Result<(), CliError> {
                     .ok_or_else(|| object_not_found("projection", &projection_id))?
                     .map_err(projection_error)?;
                 if ctx.json {
-                    fixture_status_projection_json(&projection, options.projection_root.as_deref())
+                    fixture_status_projection_json(&projection, options.projection_root.as_deref())?
                 } else {
                     format!(
                         "{} {}",
@@ -1619,7 +1621,7 @@ fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliEr
             .ok_or_else(|| object_not_found("projection", projection_id))?
             .map_err(projection_error)?;
         return Ok(if json {
-            fixture_inspect_projection_json(&projection, options.projection_root.as_deref())
+            fixture_inspect_projection_json(&projection, options.projection_root.as_deref())?
         } else {
             format!("projection {}", projection.id)
         });
@@ -1867,9 +1869,10 @@ fn fixture_status_topic_json() -> String {
 fn fixture_status_projection_json(
     projection: &ProjectionRecord,
     projection_root: Option<&std::path::Path>,
-) -> String {
+) -> Result<String, CliError> {
     let lifecycle_state = projection_lifecycle_state(projection, projection_root);
-    format!(
+    let manifest = fixture_local_projection_manifest(projection)?;
+    Ok(format!(
         concat!(
             "{{\"ok\":true,\"data\":{{",
             "\"command\":\"status.projection\",",
@@ -1888,8 +1891,9 @@ fn fixture_status_projection_json(
             "\"tree_identity\":{},",
             "\"retention_state\":\"{}\",",
             "\"integrity_status\":\"not_checked\",",
-            "\"dirty_local\":null,",
             "\"root_ref\":{},",
+            "\"local_projection_manifest\":{},",
+            "\"dirty_local\":{},",
             "\"local_root_verification\":{}",
             "}},",
             "\"native_errors\":[]",
@@ -1908,8 +1912,10 @@ fn fixture_status_projection_json(
         single_repo_tree_json(&projection.tree_identity),
         projection.retention_state.as_str(),
         projection_root_ref_json(projection),
-        local_projection_root_verification_json(projection_root),
-    )
+        local_projection_manifest_json(&manifest),
+        local_projection_root_verification(&manifest, projection_root).dirty_local_json(),
+        local_projection_root_verification_json(&manifest, projection_root),
+    ))
 }
 
 fn fixture_status_checkpoint_json() -> Result<String, CliError> {
@@ -2886,7 +2892,7 @@ fn fixture_projection_session_generation_id(purpose: ProjectionPurpose) -> Optio
 fn fixture_projection_by_id(
     projection_id: &str,
 ) -> Option<Result<ProjectionRecord, ProjectionValidationError>> {
-    let view = fixture_resolved_view(vec![fixture_auth_revision(), fixture_profile_revision()]);
+    let view = fixture_base_resolved_content_view();
     match projection_id {
         FIXTURE_EXECUTION_PROJECTION_ID => {
             Some(fixture_execution_projection_from_resolved_view(&view))
@@ -4304,10 +4310,11 @@ fn projection_materialize_success_envelope(plan: &ProjectionMaterializationPlan)
 
 fn projection_filesystem_materialize_success_envelope(
     materialization: &ProjectionFilesystemMaterialization,
-) -> String {
+) -> Result<String, CliError> {
     let plan = &materialization.plan;
     let projection = &plan.projection;
-    format!(
+    let manifest = fixture_local_projection_manifest(projection)?;
+    Ok(format!(
         concat!(
             "{{\"ok\":true,",
             "\"data\":{{",
@@ -4330,6 +4337,7 @@ fn projection_filesystem_materialize_success_envelope(
             "\"cache_key\":\"{}\",",
             "\"source\":\"{}\",",
             "\"local_materialization\":{},",
+            "\"local_projection_manifest\":{},",
             "\"projection_root\":{},",
             "\"files_written\":{},",
             "\"directories_created\":{},",
@@ -4363,6 +4371,7 @@ fn projection_filesystem_materialize_success_envelope(
         json_escape(&projection.cache_key.stable_string()),
         plan.source.as_str(),
         projection_materialization_local_metadata_json(&plan.local_metadata),
+        local_projection_manifest_json(&manifest),
         local_projection_root_json(&materialization.projection_root),
         materialization.files_written,
         materialization.directories_created,
@@ -4376,7 +4385,7 @@ fn projection_filesystem_materialize_success_envelope(
         projection.store_integrity_policy.as_str(),
         projection.privacy_class.as_str(),
         projection_record_json(projection),
-    )
+    ))
 }
 
 fn projection_materialization_local_metadata_json(
@@ -4438,11 +4447,86 @@ fn projection_cleanup_check_json(materialization: &ProjectionFilesystemMateriali
     )
 }
 
+fn fixture_local_projection_manifest(
+    projection: &ProjectionRecord,
+) -> Result<ProjectionManifestRecord, CliError> {
+    let store = InMemoryArtifactStore::fixture_basic_app();
+    let view = fixture_resolved_view_by_id(&projection.resolved_view_id)
+        .ok_or_else(|| object_not_found("resolved_view", &projection.resolved_view_id))?;
+
+    fixture_projection_manifest_from_content_tree(
+        projection,
+        &view,
+        store.tree(),
+        store.content_blobs(),
+    )
+    .map_err(projection_materialization_error)
+}
+
+fn local_projection_manifest_json(manifest: &ProjectionManifestRecord) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"privacy_class\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"id\":\"{}\",",
+            "\"manifest_ref\":\"{}\",",
+            "\"manifest_digest\":\"{}\",",
+            "\"entry_count\":{},",
+            "\"summary\":{},",
+            "\"manifest\":{}",
+            "}}"
+        ),
+        manifest.privacy_class.as_str(),
+        json_escape(&manifest.projection_id),
+        json_escape(&manifest.id),
+        json_escape(&projection_manifest_ref(manifest)),
+        json_escape(&manifest.manifest_digest),
+        manifest.entries.len(),
+        projection_manifest_summary_json(manifest),
+        projection_manifest_record_json(manifest),
+    )
+}
+
+fn projection_manifest_record_json(manifest: &ProjectionManifestRecord) -> String {
+    let bytes = canonical_json_bytes(&manifest.to_json_value())
+        .expect("projection manifest JSON should serialize canonically");
+    String::from_utf8(bytes).expect("projection manifest JSON should be valid UTF-8")
+}
+
+fn projection_manifest_summary_json(manifest: &ProjectionManifestRecord) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"directories\":{},",
+            "\"files\":{},",
+            "\"bytes\":{},",
+            "\"executable_files\":{}",
+            "}}"
+        ),
+        manifest.summary.directories,
+        manifest.summary.files,
+        manifest.summary.bytes,
+        manifest.summary.executable_files,
+    )
+}
+
+fn projection_manifest_ref(manifest: &ProjectionManifestRecord) -> String {
+    format!(
+        "objects/projection-manifests/sha256/{}",
+        manifest
+            .manifest_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(&manifest.manifest_digest)
+    )
+}
+
 fn fixture_inspect_projection_json(
     projection: &ProjectionRecord,
     projection_root: Option<&std::path::Path>,
-) -> String {
-    format!(
+) -> Result<String, CliError> {
+    let manifest = fixture_local_projection_manifest(projection)?;
+    Ok(format!(
         concat!(
             "{{\"ok\":true,\"data\":{{",
             "\"command\":\"inspect.projection\",",
@@ -4453,6 +4537,7 @@ fn fixture_inspect_projection_json(
             "\"tree_identity\":{}",
             "}},",
             "\"projection\":{},",
+            "\"local_projection_manifest\":{},",
             "\"local_root_verification\":{}",
             "}},\"warnings\":[]}}"
         ),
@@ -4462,8 +4547,9 @@ fn fixture_inspect_projection_json(
         json_escape(&projection.resolved_view_id),
         single_repo_tree_json(&projection.tree_identity),
         projection_record_json(projection),
-        local_projection_root_verification_json(projection_root),
-    )
+        local_projection_manifest_json(&manifest),
+        local_projection_root_verification_json(&manifest, projection_root),
+    ))
 }
 
 fn projection_lifecycle_state(
@@ -4493,12 +4579,109 @@ struct LocalProjectionRootScan {
     bytes: u64,
     executable_files: usize,
     sample_paths: Vec<String>,
+    all_file_paths: Vec<String>,
     scan_error: Option<String>,
 }
 
-fn local_projection_root_verification_json(projection_root: Option<&std::path::Path>) -> String {
+#[derive(Debug)]
+struct LocalProjectionRootVerification {
+    scan: LocalProjectionRootScan,
+    verification_state: &'static str,
+    content_verification: &'static str,
+    manifest_ref: String,
+    manifest_digest: String,
+    dirty_local: Option<bool>,
+    mismatched_files: usize,
+    missing_files: usize,
+    extra_files: usize,
+    metadata_mismatches: usize,
+    verification_errors: Vec<String>,
+}
+
+impl LocalProjectionRootVerification {
+    fn dirty_local_json(&self) -> String {
+        optional_bool_json(self.dirty_local)
+    }
+}
+
+fn local_projection_root_verification_json(
+    manifest: &ProjectionManifestRecord,
+    projection_root: Option<&std::path::Path>,
+) -> String {
     let Some(root) = projection_root else {
         return "null".to_string();
+    };
+    let verification = local_projection_root_verification(manifest, projection_root);
+    let scan = &verification.scan;
+    format!(
+        concat!(
+            "{{",
+            "\"projection_root\":{},",
+            "\"verification_state\":\"{}\",",
+            "\"content_verification\":\"{}\",",
+            "\"manifest_ref\":\"{}\",",
+            "\"manifest_digest\":\"{}\",",
+            "\"exists\":{},",
+            "\"is_dir\":{},",
+            "\"directories\":{},",
+            "\"files\":{},",
+            "\"bytes\":{},",
+            "\"executable_files\":{},",
+            "\"dirty_local\":{},",
+            "\"mismatched_files\":{},",
+            "\"missing_files\":{},",
+            "\"extra_files\":{},",
+            "\"metadata_mismatches\":{},",
+            "\"verification_errors\":{},",
+            "\"sample_paths\":{},",
+            "\"scan_error\":{}",
+            "}}"
+        ),
+        local_projection_root_json(root),
+        verification.verification_state,
+        verification.content_verification,
+        json_escape(&verification.manifest_ref),
+        json_escape(&verification.manifest_digest),
+        scan.exists,
+        scan.is_dir,
+        scan.directories,
+        scan.files,
+        scan.bytes,
+        scan.executable_files,
+        verification.dirty_local_json(),
+        verification.mismatched_files,
+        verification.missing_files,
+        verification.extra_files,
+        verification.metadata_mismatches,
+        string_array_json(
+            verification
+                .verification_errors
+                .iter()
+                .map(String::as_str)
+        ),
+        string_array_json(scan.sample_paths.iter().map(String::as_str)),
+        optional_string_json(scan.scan_error.as_deref()),
+    )
+}
+
+fn local_projection_root_verification(
+    manifest: &ProjectionManifestRecord,
+    projection_root: Option<&std::path::Path>,
+) -> LocalProjectionRootVerification {
+    let Some(root) = projection_root else {
+        return LocalProjectionRootVerification {
+            scan: LocalProjectionRootScan::default(),
+            verification_state: "not_supplied",
+            content_verification: "verification_error",
+            manifest_ref: projection_manifest_ref(manifest),
+            manifest_digest: manifest.manifest_digest.clone(),
+            dirty_local: None,
+            mismatched_files: 0,
+            missing_files: 0,
+            extra_files: 0,
+            metadata_mismatches: 0,
+            verification_errors: vec!["projection_root_not_supplied".to_string()],
+        };
     };
     let scan = scan_local_projection_root(root);
     let state = if !scan.exists {
@@ -4510,34 +4693,90 @@ fn local_projection_root_verification_json(projection_root: Option<&std::path::P
     } else {
         "present"
     };
-    format!(
-        concat!(
-            "{{",
-            "\"projection_root\":{},",
-            "\"verification_state\":\"{}\",",
-            "\"content_verification\":\"not_available_without_persisted_manifest\",",
-            "\"exists\":{},",
-            "\"is_dir\":{},",
-            "\"directories\":{},",
-            "\"files\":{},",
-            "\"bytes\":{},",
-            "\"executable_files\":{},",
-            "\"dirty_local\":null,",
-            "\"sample_paths\":{},",
-            "\"scan_error\":{}",
-            "}}"
-        ),
-        local_projection_root_json(root),
-        state,
-        scan.exists,
-        scan.is_dir,
-        scan.directories,
-        scan.files,
-        scan.bytes,
-        scan.executable_files,
-        string_array_json(scan.sample_paths.iter().map(String::as_str)),
-        optional_string_json(scan.scan_error.as_deref()),
-    )
+    if state != "present" {
+        let error = match state {
+            "missing" => "projection_root_missing",
+            "not_directory" => "projection_root_not_directory",
+            "scan_failed" => "projection_root_scan_failed",
+            _ => "projection_root_unverified",
+        };
+        return LocalProjectionRootVerification {
+            scan,
+            verification_state: state,
+            content_verification: "verification_error",
+            manifest_ref: projection_manifest_ref(manifest),
+            manifest_digest: manifest.manifest_digest.clone(),
+            dirty_local: None,
+            mismatched_files: 0,
+            missing_files: 0,
+            extra_files: 0,
+            metadata_mismatches: 0,
+            verification_errors: vec![error.to_string()],
+        };
+    }
+
+    let fixture_store = InMemoryArtifactStore::fixture_basic_app();
+    let expected_paths = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let local_paths = scan
+        .all_file_paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let missing_files = expected_paths.difference(&local_paths).count();
+    let extra_files = local_paths.difference(&expected_paths).count();
+    let mut mismatched_files = 0;
+    let mut metadata_mismatches = 0;
+    let mut verification_errors = Vec::new();
+
+    for entry in &manifest.entries {
+        let local_path = root.join(&entry.path);
+        if !local_path.is_file() {
+            continue;
+        }
+        match fixture_store.content_blobs().get(&entry.content_hash) {
+            Some(blob) => match fs::read(&local_path) {
+                Ok(bytes) if bytes == blob.bytes => {}
+                Ok(_) => mismatched_files += 1,
+                Err(_) => {
+                    mismatched_files += 1;
+                    verification_errors.push(format!("read_failed:{}", entry.path));
+                }
+            },
+            None => verification_errors.push(format!("missing_fixture_blob:{}", entry.content_hash)),
+        }
+
+        #[cfg(unix)]
+        {
+            if let Ok(metadata) = fs::symlink_metadata(&local_path) {
+                if local_file_is_executable(&metadata) != entry.executable {
+                    metadata_mismatches += 1;
+                }
+            }
+        }
+    }
+
+    let verified = missing_files == 0
+        && extra_files == 0
+        && mismatched_files == 0
+        && metadata_mismatches == 0
+        && verification_errors.is_empty();
+    LocalProjectionRootVerification {
+        scan,
+        verification_state: state,
+        content_verification: if verified { "verified" } else { "dirty" },
+        manifest_ref: projection_manifest_ref(manifest),
+        manifest_digest: manifest.manifest_digest.clone(),
+        dirty_local: Some(!verified),
+        mismatched_files,
+        missing_files,
+        extra_files,
+        metadata_mismatches,
+        verification_errors,
+    }
 }
 
 fn scan_local_projection_root(root: &std::path::Path) -> LocalProjectionRootScan {
@@ -4583,8 +4822,10 @@ fn scan_local_projection_root_inner(
             scan.bytes += metadata.len();
             scan.executable_files += usize::from(local_file_is_executable(&metadata));
             if let Ok(relative_path) = path.strip_prefix(root) {
+                let relative_path = relative_path.display().to_string().replace('\\', "/");
                 scan.sample_paths
-                    .push(relative_path.display().to_string().replace('\\', "/"));
+                    .push(relative_path.clone());
+                scan.all_file_paths.push(relative_path);
             }
         }
     }

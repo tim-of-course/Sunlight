@@ -753,6 +753,13 @@ fn project_materialize_json_projection_root_writes_basic_app_copy() {
     assert!(stdout.contains("\"files_written\":5"));
     assert!(stdout.contains("\"bytes_written\":222"));
     assert!(stdout.contains("\"executable_files\":1"));
+    assert!(stdout.contains("\"local_projection_manifest\":{"));
+    assert!(stdout.contains("\"id\":\"projection_manifest_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"manifest_ref\":\"objects/projection-manifests/sha256/"));
+    assert!(stdout.contains("\"manifest_digest\":\"sha256:"));
+    assert!(stdout.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"summary\":{\"directories\":3,\"files\":5,\"bytes\":222"));
+    assert!(stdout.contains("\"content_hash\":\"sha256:auth_base\""));
     assert!(stdout.contains("\"cleanup\":{\"projection_root\":{"));
     assert!(stdout.contains("\"exists\":true,\"local_only\":true"));
     assert_eq!(
@@ -808,11 +815,18 @@ fn status_json_fixture_projection_reports_local_root_verification() {
     assert!(stdout.contains("\"lifecycle_state\":\"materialized\""));
     assert!(stdout.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
     assert!(stdout.contains("\"integrity_status\":\"not_checked\""));
+    assert!(stdout.contains("\"local_projection_manifest\":{"));
     assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
     assert!(stdout.contains("\"verification_state\":\"present\""));
-    assert!(
-        stdout.contains("\"content_verification\":\"not_available_without_persisted_manifest\"")
-    );
+    assert!(stdout.contains("\"content_verification\":\"verified\""));
+    assert!(stdout.contains("\"dirty_local\":false"));
+    assert!(stdout.contains("\"manifest_ref\":\"objects/projection-manifests/sha256/"));
+    assert!(stdout.contains("\"manifest_digest\":\"sha256:"));
+    assert!(stdout.contains("\"mismatched_files\":0"));
+    assert!(stdout.contains("\"missing_files\":0"));
+    assert!(stdout.contains("\"extra_files\":0"));
+    assert!(stdout.contains("\"metadata_mismatches\":0"));
+    assert!(stdout.contains("\"verification_errors\":[]"));
     assert!(stdout.contains("\"files\":5"));
     assert!(stdout.contains("\"bytes\":222"));
     #[cfg(unix)]
@@ -821,6 +835,54 @@ fn status_json_fixture_projection_reports_local_root_verification() {
     assert!(stdout.contains("\"executable_files\":0"));
     assert!(stdout.contains("\"sample_paths\":[\"README.md\",\"docs/guide.md\""));
     assert!(stdout.contains("\"scan_error\":null"));
+}
+
+#[test]
+fn inspect_json_fixture_projection_verifies_unchanged_materialized_root() {
+    let repo = TestRepo::new("projection-inspect-root");
+    let projection_root = repo.path().join("projection-root");
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    let output = sun()
+        .arg("inspect")
+        .arg("projection:projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.projection\""));
+    assert!(stdout.contains("\"local_projection_manifest\":{"));
+    assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
+    assert!(stdout.contains("\"content_verification\":\"verified\""));
+    assert!(stdout.contains("\"dirty_local\":false"));
+    assert!(stdout.contains("\"mismatched_files\":0"));
+    assert!(stdout.contains("\"missing_files\":0"));
+    assert!(stdout.contains("\"extra_files\":0"));
+    assert!(stdout.contains("\"metadata_mismatches\":0"));
+    assert!(stdout.contains("\"verification_errors\":[]"));
 }
 
 #[test]
@@ -856,9 +918,8 @@ fn status_json_fixture_projection_reports_sorted_nested_local_root_sample() {
     assert!(stdout.contains("\"command\":\"status.projection\""));
     assert!(stdout.contains("\"lifecycle_state\":\"materialized\""));
     assert!(stdout.contains("\"verification_state\":\"present\""));
-    assert!(
-        stdout.contains("\"content_verification\":\"not_available_without_persisted_manifest\"")
-    );
+    assert!(stdout.contains("\"content_verification\":\"dirty\""));
+    assert!(stdout.contains("\"dirty_local\":true"));
     assert!(stdout.contains("\"directories\":5"));
     assert!(stdout.contains("\"files\":10"));
     assert!(stdout.contains("\"bytes\":20"));
@@ -903,9 +964,9 @@ fn status_json_fixture_projection_reports_missing_local_root() {
     assert!(stdout.contains("\"lifecycle_state\":\"removed\""));
     assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
     assert!(stdout.contains("\"verification_state\":\"missing\""));
-    assert!(
-        stdout.contains("\"content_verification\":\"not_available_without_persisted_manifest\"")
-    );
+    assert!(stdout.contains("\"content_verification\":\"verification_error\""));
+    assert!(stdout.contains("\"dirty_local\":null"));
+    assert!(stdout.contains("\"verification_errors\":[\"projection_root_missing\"]"));
     assert!(stdout.contains("\"exists\":false"));
     assert!(stdout.contains("\"is_dir\":false"));
     assert!(stdout.contains("\"files\":0"));
@@ -2429,9 +2490,9 @@ fn inspect_json_fixture_projection_reports_missing_local_root() {
     assert!(stdout.contains("\"id\":\"projection_exec_auth_profile_0001\""));
     assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
     assert!(stdout.contains("\"verification_state\":\"missing\""));
-    assert!(
-        stdout.contains("\"content_verification\":\"not_available_without_persisted_manifest\"")
-    );
+    assert!(stdout.contains("\"content_verification\":\"verification_error\""));
+    assert!(stdout.contains("\"dirty_local\":null"));
+    assert!(stdout.contains("\"verification_errors\":[\"projection_root_missing\"]"));
     assert!(stdout.contains("\"exists\":false"));
     assert!(stdout.contains("\"is_dir\":false"));
     assert!(stdout.contains("\"files\":0"));
@@ -2464,6 +2525,9 @@ fn inspect_json_fixture_projection_reports_file_local_root() {
     assert!(stdout.contains("\"id\":\"projection_exec_auth_profile_0001\""));
     assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
     assert!(stdout.contains("\"verification_state\":\"not_directory\""));
+    assert!(stdout.contains("\"content_verification\":\"verification_error\""));
+    assert!(stdout.contains("\"dirty_local\":null"));
+    assert!(stdout.contains("\"verification_errors\":[\"projection_root_not_directory\"]"));
     assert!(stdout.contains("\"exists\":true"));
     assert!(stdout.contains("\"is_dir\":false"));
     assert!(stdout.contains("\"directories\":0"));

@@ -1529,6 +1529,158 @@ fn git_export_execute_fixture_json_export_map_partial_failure() {
 }
 
 #[test]
+fn git_export_execute_local_json_writes_real_commit_and_ref() {
+    let repo = TestRepo::new("git-export-execute-local-success");
+    let base_commit_id = init_local_git_repo(&repo);
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/local-export")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--execute-local")
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export execute local should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"git.export.execute\""));
+    assert!(stdout.contains("\"lifecycle_state\":\"exported\""));
+    assert!(stdout.contains("\"summary\":{\"commit_created\":true,\"ref_updated\":true,\"export_map_written\":true"));
+    assert!(stdout.contains("\"export_map\":{"));
+
+    let commit_id = json_string_field(&stdout, "created_commit_id");
+    let ref_id = git(repo.path(), &["rev-parse", "refs/heads/sunlight/local-export"]);
+    assert_eq!(ref_id.trim(), commit_id);
+    assert_eq!(git(repo.path(), &["cat-file", "-t", &commit_id]).trim(), "commit");
+    assert_eq!(
+        git(repo.path(), &["rev-parse", &format!("{commit_id}^")]).trim(),
+        base_commit_id
+    );
+}
+
+#[test]
+fn git_export_execute_local_ignores_dirty_worktree_and_index() {
+    let repo = TestRepo::new("git-export-execute-local-dirty");
+    init_local_git_repo(&repo);
+    repo.write_file("dirty-untracked.txt", "untracked\n");
+    repo.write_file("dirty-staged.txt", "staged\n");
+    git(repo.path(), &["add", "dirty-staged.txt"]);
+    repo.write_file("base.txt", "dirty worktree content\n");
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/local-dirty")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--execute-local")
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export execute local should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    let commit_id = json_string_field(&stdout, "created_commit_id");
+    let tree_paths = git(repo.path(), &["ls-tree", "-r", "--name-only", &commit_id]);
+    assert!(tree_paths.contains("src/auth.rs"));
+    assert!(tree_paths.contains("src/profile.rs"));
+    assert!(tree_paths.contains(".sunlight/export-manifest.json"));
+    assert!(!tree_paths.contains("dirty-untracked.txt"));
+    assert!(!tree_paths.contains("dirty-staged.txt"));
+    assert!(!tree_paths.contains("base.txt"));
+}
+
+#[test]
+fn git_export_execute_local_target_ref_conflict_fails() {
+    let repo = TestRepo::new("git-export-execute-local-ref-conflict");
+    init_local_git_repo(&repo);
+    let unrelated_commit_id = git(repo.path(), &["commit-tree", "HEAD^{tree}", "-m", "unrelated"]);
+    let unrelated_commit_id = unrelated_commit_id.trim().to_string();
+    git(
+        repo.path(),
+        &[
+            "update-ref",
+            "refs/heads/sunlight/local-conflict",
+            &unrelated_commit_id,
+        ],
+    );
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/local-conflict")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--execute-local")
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export execute local should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"export_target_ref_conflict\""));
+    assert!(stdout.contains("\"target_ref\":\"refs/heads/sunlight/local-conflict\""));
+    let ref_id = git(repo.path(), &["rev-parse", "refs/heads/sunlight/local-conflict"]);
+    assert_eq!(ref_id.trim(), unrelated_commit_id);
+}
+
+#[test]
+fn git_export_execute_local_export_map_partial_failure() {
+    let repo = TestRepo::new("git-export-execute-local-map-partial");
+    init_local_git_repo(&repo);
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/local-map-partial")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--execute-local")
+        .arg("--simulate-export-map-write-failure")
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export execute local should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"git.export.execute\""));
+    assert!(stdout.contains("\"lifecycle_state\":\"partial\""));
+    assert!(stdout.contains("\"code\":\"export_map_write_failed\""));
+    assert!(stdout.contains("\"failed_step\":\"export_map_written\""));
+    assert!(stdout.contains("\"export_map\":null"));
+    let commit_id = json_string_field(&stdout, "created_commit_id");
+    let ref_id = git(repo.path(), &["rev-parse", "refs/heads/sunlight/local-map-partial"]);
+    assert_eq!(ref_id.trim(), commit_id);
+}
+
+#[test]
 fn git_export_write_plan_json_fixture_target_ref_conflict_returns_planner_error() {
     let repo = TestRepo::new("git-export-write-plan-ref-conflict");
 
@@ -1973,6 +2125,36 @@ fn resolve_fixture_view_id(repo: &Path, include: &str) -> String {
         .expect("sun view resolve should run");
     assert_success(&output);
     resolved_view_id(&stdout(&output))
+}
+
+fn init_local_git_repo(repo: &TestRepo) -> String {
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    repo.write_file("base.txt", "base\n");
+    git(repo.path(), &["add", "base.txt"]);
+    git(repo.path(), &["commit", "-m", "base"]);
+    git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string()
+}
+
+fn git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run git {}: {error}", args.join(" ")));
+    assert!(
+        output.status.success(),
+        "git {} failed\nstdout:\n{}\nstderr:\n{}",
+        args.join(" "),
+        stdout(&output),
+        stderr(&output)
+    );
+    stdout(&output)
 }
 
 struct TestRepo {

@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 
 use sunlight_core::artifacts::{
     ArtifactIoError, ExpectedHash, InMemoryArtifactStore, ListResponse, MutationArtifactView,
@@ -27,13 +27,14 @@ use sunlight_core::execution::{
     OutputClassification, OutputKind, PromotionCandidateProvenance,
 };
 use sunlight_core::git_export::{
-    execute_git_export_writer_plan_fixture, git_export_checkpoint, plan_git_export_writer,
-    GitExportCommitPlan, GitExportError, GitExportExecutionError, GitExportExecutionFixture,
-    GitExportExecutionResult, GitExportExecutionStep, GitExportExecutionStepFixture,
-    GitExportExecutionSummary, GitExportPlanningError, GitExportRefUpdatePlan,
-    GitExportRepositoryState, GitExportRequest, GitExportResponse, GitExportValidationFailure,
-    GitExportValidationReport, GitExportWriterInput, GitExportWriterPlan, GitRefState,
-    ImportedBaseGitCommit,
+    execute_git_export_writer_plan_fixture, execute_local_git_export_writer, git_export_checkpoint,
+    plan_git_export_writer, GitExportCommitPlan, GitExportContentFile, GitExportError,
+    GitExportExecutionError, GitExportExecutionFixture, GitExportExecutionResult,
+    GitExportExecutionStep, GitExportExecutionStepFixture, GitExportExecutionSummary,
+    GitExportMapStore, GitExportPlanningError, GitExportRefUpdatePlan, GitExportRepositoryState,
+    GitExportRequest, GitExportResponse, GitExportValidationFailure, GitExportValidationReport,
+    GitExportWriterInput, GitExportWriterPlan, GitRefState, ImportedBaseGitCommit,
+    InMemoryGitExportMapStore, PersistedGitExportMap,
 };
 use sunlight_core::projection::{
     fixture_compatibility_projection_from_resolved_view,
@@ -499,7 +500,33 @@ fn git_export(ctx: &CommandContext) -> Result<(), CliError> {
     }
 
     let mut request = GitExportRequest::from_checkpoint(&checkpoint);
-    request.git_ref = options.git_ref;
+    request.git_ref = options.git_ref.clone();
+    if options.execute_local {
+        let input = local_fixture_git_export_writer_input(&options, request)?;
+        let content_files = fixture_git_export_content_files();
+        let result = if options.simulate_export_map_write_failure {
+            let mut store = FailingGitExportMapStore;
+            execute_local_git_export_writer(input, content_files, &mut store)
+                .map_err(git_export_planning_error)?
+        } else {
+            let mut store = InMemoryGitExportMapStore::default();
+            execute_local_git_export_writer(input, content_files, &mut store)
+                .map_err(git_export_planning_error)?
+        };
+
+        if ctx.json {
+            println!("{}", git_export_execute_success_envelope(&result));
+        } else {
+            println!(
+                "{} {}",
+                result.checkpoint_id,
+                result.lifecycle_state.as_str()
+            );
+        }
+
+        return Ok(());
+    }
+
     if let Some(execution_fixture) = options.execute_fixture {
         let input = fixture_git_export_writer_input(request);
         let plan = plan_git_export_writer(input).map_err(git_export_planning_error)?;
@@ -730,6 +757,9 @@ struct GitExportOptions {
     git_ref: String,
     write_plan: bool,
     execute_fixture: Option<GitExportExecutionFixtureMode>,
+    execute_local: bool,
+    repo: Option<PathBuf>,
+    simulate_export_map_write_failure: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -996,6 +1026,9 @@ fn parse_git_export_options(ctx: &CommandContext) -> Result<GitExportOptions, Cl
     let mut git_ref = None;
     let mut write_plan = false;
     let mut execute_fixture = None;
+    let mut execute_local = false;
+    let mut repo = None;
+    let mut simulate_export_map_write_failure = false;
     let mut args = ctx.args.iter().skip(2);
 
     while let Some(arg) = args.next() {
@@ -1028,6 +1061,18 @@ fn parse_git_export_options(ctx: &CommandContext) -> Result<GitExportOptions, Cl
                     )
                 })?;
                 execute_fixture = Some(parse_git_export_execution_fixture(value)?);
+            }
+            "--execute-local" => {
+                execute_local = true;
+            }
+            "--repo" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun git export --repo requires <path>")
+                })?;
+                repo = Some(PathBuf::from(value));
+            }
+            "--simulate-export-map-write-failure" => {
+                simulate_export_map_write_failure = true;
             }
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
@@ -1062,6 +1107,21 @@ fn parse_git_export_options(ctx: &CommandContext) -> Result<GitExportOptions, Cl
             "sun git export cannot use --write-plan and --execute-fixture together",
         ));
     }
+    if write_plan && execute_local {
+        return Err(invalid_request(
+            "sun git export cannot use --write-plan and --execute-local together",
+        ));
+    }
+    if execute_fixture.is_some() && execute_local {
+        return Err(invalid_request(
+            "sun git export cannot use --execute-fixture and --execute-local together",
+        ));
+    }
+    if simulate_export_map_write_failure && !execute_local {
+        return Err(invalid_request(
+            "sun git export --simulate-export-map-write-failure requires --execute-local",
+        ));
+    }
 
     Ok(GitExportOptions {
         fixture,
@@ -1069,6 +1129,9 @@ fn parse_git_export_options(ctx: &CommandContext) -> Result<GitExportOptions, Cl
         git_ref,
         write_plan,
         execute_fixture,
+        execute_local,
+        repo,
+        simulate_export_map_write_failure,
     })
 }
 
@@ -2501,6 +2564,119 @@ fn fixture_git_export_writer_input(request: GitExportRequest) -> GitExportWriter
     }
 }
 
+fn local_fixture_git_export_writer_input(
+    options: &GitExportOptions,
+    request: GitExportRequest,
+) -> Result<GitExportWriterInput, CliError> {
+    let repo_root = options.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+    let repo_root = fs::canonicalize(&repo_root).map_err(|error| {
+        invalid_request(format!(
+            "failed to resolve local Git repository path `{}`: {error}",
+            repo_root.display()
+        ))
+    })?;
+    let repo_root_string = repo_root.display().to_string();
+    let base_commit_id = run_git_capture(&repo_root, &["rev-parse", "--verify", "HEAD^{commit}"])
+        .map_err(|message| {
+            invalid_request(format!(
+                "sun git export --execute-local requires a local Git repository with HEAD: {message}"
+            ))
+        })?
+        .trim()
+        .to_string();
+
+    let target_ref_commit_id =
+        run_git_capture(&repo_root, &["rev-parse", "--verify", &options.git_ref])
+            .ok()
+            .map(|commit_id| commit_id.trim().to_string())
+            .filter(|commit_id| !commit_id.is_empty());
+    let refs = target_ref_commit_id
+        .map(|commit_id| GitRefState {
+            git_ref: options.git_ref.clone(),
+            commit_id,
+        })
+        .into_iter()
+        .collect();
+
+    let mut validation_report = sunlight_core::git_export::validate_git_export_request(&request);
+    validation_report.git_ref = options.git_ref.clone();
+
+    Ok(GitExportWriterInput {
+        base_checkpoint_ids: vec![FIXTURE_BASE_CHECKPOINT_ID.to_string()],
+        imported_base_commits: vec![ImportedBaseGitCommit {
+            checkpoint_id: FIXTURE_BASE_CHECKPOINT_ID.to_string(),
+            git_commit_id: base_commit_id.clone(),
+        }],
+        prior_export_maps: Vec::new(),
+        planned_commit_id: "planned_commit_id_replaced_by_real_git".to_string(),
+        export_map_id: FIXTURE_EXPORT_MAP_ID.to_string(),
+        exported_at: FIXTURE_CREATED_AT.to_string(),
+        request,
+        validation_report,
+        repository: GitExportRepositoryState {
+            repository_id: FIXTURE_REPOSITORY_ID.to_string(),
+            git_root: repo_root_string.clone(),
+            sunlight_repo_root: repo_root_string,
+            reachable_commit_ids: vec![base_commit_id],
+            refs,
+        },
+    })
+}
+
+fn fixture_git_export_content_files() -> Vec<GitExportContentFile> {
+    vec![
+        git_export_content_file("src/auth.rs", b"pub fn auth() {}\n", false),
+        git_export_content_file("src/profile.rs", b"pub fn profile() {}\n", false),
+        git_export_content_file("bin/run-auth-check", b"#!/bin/sh\n", true),
+        git_export_content_file(
+            ".sunlight/export-manifest.json",
+            b"{\"policy\":\"approved_manifest_only\"}\n",
+            false,
+        ),
+    ]
+}
+
+fn git_export_content_file(
+    path: &str,
+    bytes: &[u8],
+    executable: bool,
+) -> GitExportContentFile {
+    GitExportContentFile {
+        path: path.to_string(),
+        bytes: bytes.to_vec(),
+        executable,
+    }
+}
+
+#[derive(Debug)]
+struct FailingGitExportMapStore;
+
+impl GitExportMapStore for FailingGitExportMapStore {
+    fn persist_git_export_map(
+        &mut self,
+        _export_map: GitExportMapRecord,
+    ) -> Result<PersistedGitExportMap, String> {
+        Err("fixture export map write failed".to_string())
+    }
+}
+
+fn run_git_capture(repo_root: &PathBuf, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("failed to start git {}: {error}", args.join(" ")))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("git {} failed: {}", args.join(" "), stderr.trim()))
+    }
+}
+
 fn fixture_base_git_commit_id() -> String {
     "git_sha1_base_parent_0001".to_string()
 }
@@ -3073,11 +3249,22 @@ fn git_export_write_plan_success_envelope(plan: &GitExportWriterPlan) -> String 
 }
 
 fn git_export_execute_fixture_success_envelope(result: &GitExportExecutionResult) -> String {
+    git_export_execution_success_envelope(result, "git.export.execute_fixture")
+}
+
+fn git_export_execute_success_envelope(result: &GitExportExecutionResult) -> String {
+    git_export_execution_success_envelope(result, "git.export.execute")
+}
+
+fn git_export_execution_success_envelope(
+    result: &GitExportExecutionResult,
+    command: &str,
+) -> String {
     format!(
         concat!(
             "{{\"ok\":true,",
             "\"data\":{{",
-            "\"command\":\"git.export.execute_fixture\",",
+            "\"command\":\"{}\",",
             "\"checkpoint_id\":\"{}\",",
             "\"ids\":{{",
             "\"checkpoint_id\":\"{}\",",
@@ -3094,6 +3281,7 @@ fn git_export_execute_fixture_success_envelope(result: &GitExportExecutionResult
             "\"warnings\":[]",
             "}}"
         ),
+        json_escape(command),
         json_escape(&result.checkpoint_id),
         json_escape(&result.checkpoint_id),
         json_escape(&result.validation_report_id),
@@ -4993,7 +5181,7 @@ Usage:
   sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app [--json]
   sun run --view <resolved-view-id> --fixture basic-app --json -- cargo test
   sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
-  sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan|--execute-fixture success|ref-update-failure|export-map-failure] --json
+  sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan|--execute-fixture success|ref-update-failure|export-map-failure|--execute-local --repo <path>] --json
 
 Commands:
   init       Create the conservative local .sunlight repository layout

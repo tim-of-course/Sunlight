@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 93 tests, `git diff --check`, and scratchpad length guard after CLI checkpoint and projection foundation integration.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 109 tests, and `git diff --check` after CLI Git export and projection strategy spike integration. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -76,27 +76,28 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `checkpoint-foundation`: integrated as `b65a7a9`; formatting checkpoint `8f0acc0`.
 - Completed slice `cli-checkpoint-fixture`: integrated as `9dd2bc3`; formatting checkpoint `9420e57`.
 - Completed slice `projection-foundation`: integrated as `6788680`; formatting checkpoint `9420e57`.
-- Active slice `cli-projection-fixture`: WSL clone `/home/timothycard/code/Sunlight-2-cli-projection-fixture-20260703-213100`, branch `dm/cli-projection-fixture`, logs under `C:\tmp\sunlight-manager\20260703-213100`.
-- Active slice `git-export-foundation`: WSL clone `/home/timothycard/code/Sunlight-2-git-export-foundation-20260703-213100`, branch `dm/git-export-foundation`, logs under `C:\tmp\sunlight-manager\20260703-213100`.
-- Next heartbeat should inspect active slice logs, verify commits, integrate acceptable work, then launch the next one or two slices.
+- Completed slice `cli-projection-fixture`: integrated as `7e79f66`; formatting checkpoint `626ca41`.
+- Completed slice `git-export-foundation`: integrated as `6bb6727`; formatting checkpoint `626ca41`.
+- Completed slice `cli-git-export-fixture`: integrated as `7947b05`; formatting checkpoint `bfa5053`.
+- Completed slice `projection-strategy-spike-plan`: integrated as `07302b9`.
+- Active slice `operator-status-matrix`: WSL clone `/home/timothycard/code/Sunlight-2-operator-status-matrix-20260703-222016`, branch `dm/operator-status-matrix`, run artifacts under `C:\tmp\sunlight-manager\20260703-222016`.
+- Active slice `git-export-writer-contract`: WSL clone `/home/timothycard/code/Sunlight-2-git-export-writer-contract-20260703-222016`, branch `dm/git-export-writer-contract`, run artifacts under `C:\tmp\sunlight-manager\20260703-222016`.
+- Next heartbeat should inspect active slice last-message files, verify completed work, integrate acceptable commits, and keep one or two project-wide slices moving.
 
-## Candidate First Slices
+## Candidate Next Slices
 
-- Slice D: canonical record envelope and canonicalization helpers.
-- Slice E: topic/session data model and command skeleton.
-- Slice F: `.sunlight` commit/export policy validator foundation.
-- Slice G: artifact store/read/list/search foundation.
-- Slice H: operation transaction and patch/write foundation.
-- Slice I: CLI JSON envelope, status, and inspect response contract.
-- Slice J: resolver conflict fixture plan.
+- Real Git export writer implementation after the writer contract settles.
+- Projection strategy implementation after the spike plan selects the first materialization path.
+- Compatibility import foundation after export/projection contracts settle.
 
 ## Decisions
 
 - Scratchpad length budget is enforced at 20,000 characters.
 - Direct implementation edits should be delegated to WSL Codex agents.
+- WSL `rustfmt` is currently unavailable, so manager-side Windows `cargo fmt` remains the formatting gate after WSL imports.
 
 ## Open Questions
 
 - First validation repo and exact test command are not yet selected.
-- Git export shape remains undecided.
+- Real Git export writer scope remains undecided.
 - Projection platform target likely starts on WSL/Linux unless product priority changes.

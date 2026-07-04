@@ -98,12 +98,14 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `git-export-real-writer-validation`: integrated as `7ac6236`; formatting checkpoint `3680f68`.
 - Completed slice `git-export-real-writer-execution`: integrated as `7eb7c2b`; formatting checkpoint `897d45f`.
 - Completed slice `projection-filesystem-materialization`: integrated as `058b4a0`; formatting checkpoint `897d45f`.
-- Active capacity is open after this integration; next launch should pick non-conflicting implementation or validation slices.
+- Active slice `cli-real-git-export-writer`: WSL clone `/home/timothycard/code/Sunlight-2-cli-real-git-export-writer-20260704-024400`, branch `dm/cli-real-git-export-writer`, run artifacts under `C:\tmp\sunlight-manager\20260704-024400`.
+- Active slice `smoke-suite-runner`: WSL clone `/home/timothycard/code/Sunlight-2-smoke-suite-runner-20260704-024400`, branch `dm/smoke-suite-runner`, run artifacts under `C:\tmp\sunlight-manager\20260704-024400`.
+- Next heartbeat should inspect active WSL progress, import verified work if finished, run full verification, and keep one or two project-wide slices moving.
 
 ## Candidate Next Slices
 
-- CLI wiring for real Git export writer after active execution foundation lands.
-- Projection CLI wiring after active filesystem materialization foundation lands.
+- Projection CLI wiring after filesystem materialization foundation lands.
+- End-to-end MVP smoke after real Git export CLI wiring lands.
 - Validation smoke CI/usage follow-up remains optional after script lands.
 
 ## Decisions

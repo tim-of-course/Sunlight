@@ -411,6 +411,137 @@ fn write_json_fixture_basic_app_existing_with_new_returns_precondition_failure()
 }
 
 #[test]
+fn view_resolve_json_reversed_frontier_order_produces_same_tree_identity() {
+    let repo = TestRepo::new("view-resolve-reversed");
+
+    let left = sun()
+        .arg("view")
+        .arg("resolve")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--include")
+        .arg("topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun view resolve should run");
+    assert_success(&left);
+
+    let right = sun()
+        .arg("view")
+        .arg("resolve")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--include")
+        .arg("topic_profile_ui:rev_profile_ui_0001,topic_auth_nullability:rev_auth_nullability_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun view resolve should run");
+    assert_success(&right);
+
+    let left_stdout = stdout(&left);
+    let right_stdout = stdout(&right);
+    assert_eq!(tree_hash(&left_stdout), tree_hash(&right_stdout));
+    assert!(left_stdout.contains("\"command\":\"view.resolve\""));
+    assert!(left_stdout.contains("\"conflict_ids\":[]"));
+    assert!(left_stdout.contains("\"staleness_ids\":[]"));
+    assert!(left_stdout.contains("\"resolver_order\":{\"operation_ids\":[\"op_auth_trim_guard_0001\",\"op_profile_write_0001\"]}"));
+    assert!(left_stdout.contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_0001\",\"topic_profile_ui\":\"rev_profile_ui_0001\"}"));
+    assert_eq!(resolved_view_id(&left_stdout), resolved_view_id(&right_stdout));
+}
+
+#[test]
+fn view_resolve_json_independent_files_returns_conflict_free_tree() {
+    let repo = TestRepo::new("view-resolve-independent");
+
+    let output = sun()
+        .arg("view")
+        .arg("resolve")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--include")
+        .arg("topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun view resolve should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"repository_id\":\"repo_fixture_basic_app\""));
+    assert!(stdout.contains("\"ids\":{\"resolved_view_id\":\"view_fixture_"));
+    assert!(stdout.contains("\"base_checkpoint_ids\":[\"checkpoint_base_0001\"]"));
+    assert!(stdout.contains("\"dependency_closure\":{\"revision_ids\":[\"rev_auth_nullability_0001\",\"rev_profile_ui_0001\"]}"));
+    assert!(stdout.contains("\"tree_identity\":{\"kind\":\"SingleRepoTree\",\"repository_id\":\"repo_fixture_basic_app\",\"tree_hash\":\"tree_fixture_"));
+    assert!(stdout.contains("\"conflicts\":[]"));
+    assert!(stdout.contains("\"staleness\":[]"));
+}
+
+#[test]
+fn view_resolve_json_overlapping_same_artifact_returns_conflict_summary() {
+    let repo = TestRepo::new("view-resolve-conflict");
+
+    let output = sun()
+        .arg("view")
+        .arg("resolve")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--include")
+        .arg("topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_auth_overlap_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun view resolve should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"view.resolve\""));
+    assert!(stdout.contains("\"view\":null"));
+    assert!(stdout.contains("\"tree_identity\":null"));
+    assert!(stdout.contains("\"conflict_ids\":[\"conflict_src_auth_ts_0001\"]"));
+    assert!(stdout.contains("\"staleness_ids\":[]"));
+    assert!(stdout.contains("\"record_type\":\"conflict\""));
+    assert!(stdout.contains("\"kind\":\"same_artifact_conflict\""));
+    assert!(stdout.contains("\"artifact_ids\":[\"artifact_src_auth_ts\"]"));
+    assert!(stdout
+        .contains("\"operation_ids\":[\"op_auth_trim_guard_0001\",\"op_profile_auth_null_guard_0001\"]"));
+    assert!(stdout.contains("\"path_refs\":[{\"path\":\"src/auth.ts\",\"path_state\":\"active\"}]"));
+    assert!(stdout.contains(
+        "\"policy_reason\":\"same artifact operations are not proven commutative under file_ops_v1\""
+    ));
+}
+
+#[test]
+fn view_resolve_json_missing_dependency_returns_staleness_summary() {
+    let repo = TestRepo::new("view-resolve-staleness");
+
+    let output = sun()
+        .arg("view")
+        .arg("resolve")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--include")
+        .arg("topic_profile_ui:rev_profile_ui_0002")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun view resolve should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"view.resolve\""));
+    assert!(stdout.contains("\"view\":null"));
+    assert!(stdout.contains("\"tree_identity\":null"));
+    assert!(stdout.contains("\"conflict_ids\":[]"));
+    assert!(stdout.contains("\"staleness_ids\":[\"stale_missing_dependency_rev_auth_nullability_0001\"]"));
+    assert!(stdout.contains("\"record_type\":\"staleness\""));
+    assert!(stdout.contains("\"kind\":\"missing_dependency\""));
+    assert!(stdout.contains("\"candidate_refs\":{\"dependent_revision_ids\":[\"rev_profile_ui_0002\"],\"required_revision_ids\":[\"rev_auth_nullability_0001\"]}"));
+    assert!(stdout.contains("\"dependency_closure\":{\"revision_ids\":[\"rev_auth_nullability_0001\",\"rev_profile_ui_0002\"]}"));
+}
+
+#[test]
 fn status_json_fixture_basic_app_returns_repository_snapshot() {
     let repo = TestRepo::new("status-fixture-repository");
 
@@ -596,6 +727,26 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn tree_hash(stdout: &str) -> String {
+    json_string_field(stdout, "tree_hash")
+}
+
+fn resolved_view_id(stdout: &str) -> String {
+    json_string_field(stdout, "resolved_view_id")
+}
+
+fn json_string_field(stdout: &str, field: &str) -> String {
+    let needle = format!("\"{field}\":\"");
+    let start = stdout
+        .find(&needle)
+        .unwrap_or_else(|| panic!("missing field `{field}` in stdout:\n{stdout}"))
+        + needle.len();
+    let end = stdout[start..]
+        .find('"')
+        .unwrap_or_else(|| panic!("unterminated field `{field}` in stdout:\n{stdout}"));
+    stdout[start..start + end].to_string()
 }
 
 struct TestRepo {

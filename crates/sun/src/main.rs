@@ -14,6 +14,13 @@ use sunlight_core::artifacts::{
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
 };
+use sunlight_core::resolver::{
+    fixture_auth_revision, fixture_base_entries, fixture_overlapping_auth_revision,
+    fixture_profile_revision, fixture_profile_revision_missing_auth_dependency,
+    fixture_resolver_input, resolve_fixture_view, DependencyClosure, DeterministicResolverOrder,
+    ResolverConflictOrStalenessRecord, ResolverRecordKind, ResolvedViewResult, SingleRepoTree,
+    TopicRevisionRef, TopicRevisionSelection,
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -100,6 +107,7 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
                 "sun session start is parsed, but session records are not persisted yet",
             ))
         }
+        [scope, command, ..] if scope == "view" && command == "resolve" => view_resolve(&ctx),
         [command, ..] if command == "read" => artifact_read(&ctx),
         [command, ..] if command == "list" => artifact_list(&ctx),
         [command, ..] if command == "search" => artifact_search(&ctx),
@@ -276,6 +284,65 @@ fn artifact_write(ctx: &CommandContext) -> Result<(), CliError> {
     Ok(())
 }
 
+fn view_resolve(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_view_resolve_options(ctx)?;
+    if options.fixture != "basic-app" {
+        return Err(invalid_request(format!(
+            "unknown fixture `{}`",
+            options.fixture
+        ))
+        .with_detail("fixture", options.fixture));
+    }
+
+    if let Some(base_checkpoint_id) = &options.base_checkpoint_id {
+        if base_checkpoint_id != "checkpoint_base_0001" {
+            return Err(invalid_request(format!(
+                "unknown fixture base checkpoint `{base_checkpoint_id}`"
+            ))
+            .with_detail("base_checkpoint_id", base_checkpoint_id));
+        }
+    }
+
+    let revisions = fixture_resolver_revisions();
+    let mut frontier = Vec::new();
+    for selection in options.include {
+        let revision = revisions
+            .iter()
+            .find(|revision| revision.revision_id == selection.revision_id)
+            .ok_or_else(|| object_not_found("revision", &selection.revision_id))?;
+        if revision.topic_id != selection.topic_id {
+            return Err(invalid_request(format!(
+                "revision `{}` does not belong to topic `{}`",
+                selection.revision_id, selection.topic_id
+            ))
+            .with_detail("topic_id", selection.topic_id)
+            .with_detail("topic_revision_id", selection.revision_id));
+        }
+        frontier.push(selection);
+    }
+
+    let result = resolve_fixture_view(
+        fixture_resolver_input(frontier),
+        fixture_base_entries(),
+        revisions,
+    );
+
+    if ctx.json {
+        println!("{}", view_resolve_success_envelope(&result));
+    } else if result.conflict_free() {
+        let tree_hash = result
+            .tree_identity
+            .as_ref()
+            .map(|tree| tree.tree_hash.as_str())
+            .unwrap_or("unavailable");
+        println!("{} {}", result.resolved_view_id, tree_hash);
+    } else {
+        println!("{} blocked", result.resolved_view_id);
+    }
+
+    Ok(())
+}
+
 fn status(ctx: &CommandContext) -> Result<(), CliError> {
     if let Some(options) = parse_status_options(ctx)? {
         if options.fixture != "basic-app" {
@@ -367,6 +434,100 @@ struct InspectOptions {
     fixture: String,
     selector: String,
     session_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct ViewResolveOptions {
+    fixture: String,
+    include: Vec<TopicRevisionSelection>,
+    base_checkpoint_id: Option<String>,
+}
+
+fn parse_view_resolve_options(ctx: &CommandContext) -> Result<ViewResolveOptions, CliError> {
+    let mut fixture = None;
+    let mut include = None;
+    let mut base_checkpoint_id = None;
+    let mut args = ctx.args.iter().skip(2);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun view resolve requires --fixture basic-app")
+                })?;
+                fixture = Some(value.clone());
+            }
+            "--include" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun view resolve requires --include topic:revision[,topic:revision]",
+                    )
+                })?;
+                include = Some(parse_view_include(value)?);
+            }
+            "--base" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun view resolve --base <checkpoint>")
+                })?;
+                base_checkpoint_id = Some(value.clone());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun view resolve"
+                )));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected view resolve argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    let fixture = fixture.ok_or_else(|| {
+        invalid_request("usage: sun view resolve requires --fixture basic-app")
+    })?;
+    let include = include.ok_or_else(|| {
+        invalid_request(
+            "usage: sun view resolve requires --include topic:revision[,topic:revision]",
+        )
+    })?;
+
+    Ok(ViewResolveOptions {
+        fixture,
+        include,
+        base_checkpoint_id,
+    })
+}
+
+fn parse_view_include(value: &str) -> Result<Vec<TopicRevisionSelection>, CliError> {
+    if value.trim().is_empty() {
+        return Err(invalid_request(
+            "usage: sun view resolve requires --include topic:revision[,topic:revision]",
+        ));
+    }
+
+    value
+        .split(',')
+        .map(|selection| {
+            let (topic_id, revision_id) = selection.split_once(':').ok_or_else(|| {
+                invalid_request(
+                    "view resolve include entries must use topic:revision fixture selectors",
+                )
+                .with_detail("selector", selection)
+            })?;
+            if topic_id.is_empty() || revision_id.is_empty() {
+                return Err(invalid_request(
+                    "view resolve include entries must use topic:revision fixture selectors",
+                )
+                .with_detail("selector", selection));
+            }
+            Ok(TopicRevisionSelection {
+                topic_id: topic_id.to_string(),
+                revision_id: revision_id.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, CliError> {
@@ -1294,6 +1455,15 @@ fn fixture_store(fixture: &str) -> Result<InMemoryArtifactStore, CliError> {
     }
 }
 
+fn fixture_resolver_revisions() -> Vec<TopicRevisionRef> {
+    vec![
+        fixture_auth_revision(),
+        fixture_profile_revision(),
+        fixture_overlapping_auth_revision(),
+        fixture_profile_revision_missing_auth_dependency(),
+    ]
+}
+
 fn artifact_error(error: ArtifactIoError) -> CliError {
     let message = match &error {
         ArtifactIoError::PathPolicyViolation { .. } => {
@@ -1551,6 +1721,185 @@ fn mutation_success_envelope(response: &MutationResponse) -> String {
         operation_json(response),
         topic_revision_json(response),
         session_generation_json(response),
+    )
+}
+
+fn view_resolve_success_envelope(result: &ResolvedViewResult) -> String {
+    let conflict_ids = result
+        .conflicts()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+    let staleness_ids = result
+        .staleness()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"view.resolve\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"resolved_view_id\":\"{}\",\"base_checkpoint_id\":\"{}\"}},",
+            "\"view\":{},",
+            "\"resolved_view_id\":\"{}\",",
+            "\"base_checkpoint_ids\":{},",
+            "\"topic_frontier\":{},",
+            "\"dependency_closure\":{},",
+            "\"operation_semantics_version\":\"{}\",",
+            "\"path_policy_id\":\"{}\",",
+            "\"resolver_order\":{},",
+            "\"tree_identity\":{},",
+            "\"conflict_ids\":{},",
+            "\"staleness_ids\":{},",
+            "\"conflicts\":[{}],",
+            "\"staleness\":[{}]",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(&result.repository_id),
+        json_escape(&result.resolved_view_id),
+        json_escape(&result.base_checkpoint_ids[0]),
+        view_resolve_view_json(result),
+        json_escape(&result.resolved_view_id),
+        string_array_json(result.base_checkpoint_ids.iter().map(String::as_str)),
+        topic_frontier_json(result),
+        dependency_closure_json(&result.dependency_closure),
+        json_escape(&result.operation_semantics_version),
+        json_escape(&result.path_policy_id),
+        resolver_order_json(&result.resolver_order),
+        optional_single_repo_tree_json(result.tree_identity.as_ref()),
+        string_array_json(conflict_ids.iter().copied()),
+        string_array_json(staleness_ids.iter().copied()),
+        result
+            .conflicts()
+            .map(resolver_record_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        result
+            .staleness()
+            .map(resolver_record_json)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn view_resolve_view_json(result: &ResolvedViewResult) -> String {
+    let Some(tree_identity) = &result.tree_identity else {
+        return "null".to_string();
+    };
+
+    format!(
+        concat!(
+            "{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"topic_frontier\":{},",
+            "\"tree_identity\":{}",
+            "}}"
+        ),
+        json_escape(&result.resolved_view_id),
+        topic_frontier_json(result),
+        single_repo_tree_json(tree_identity),
+    )
+}
+
+fn topic_frontier_json(result: &ResolvedViewResult) -> String {
+    let fields = result
+        .topic_frontier
+        .iter()
+        .map(|(topic_id, revision_id)| {
+            format!(
+                "\"{}\":\"{}\"",
+                json_escape(topic_id),
+                json_escape(revision_id)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{fields}}}")
+}
+
+fn dependency_closure_json(closure: &DependencyClosure) -> String {
+    format!(
+        "{{\"revision_ids\":{}}}",
+        string_array_json(closure.revision_ids.iter().map(String::as_str))
+    )
+}
+
+fn resolver_order_json(order: &DeterministicResolverOrder) -> String {
+    format!(
+        "{{\"operation_ids\":{}}}",
+        string_array_json(order.operation_ids.iter().map(String::as_str))
+    )
+}
+
+fn optional_single_repo_tree_json(tree_identity: Option<&SingleRepoTree>) -> String {
+    tree_identity
+        .map(single_repo_tree_json)
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn single_repo_tree_json(tree_identity: &SingleRepoTree) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"kind\":\"SingleRepoTree\",",
+            "\"repository_id\":\"{}\",",
+            "\"tree_hash\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&tree_identity.repository_id),
+        json_escape(&tree_identity.tree_hash),
+    )
+}
+
+fn resolver_record_json(record: &ResolverConflictOrStalenessRecord) -> String {
+    let record_type = match record.kind {
+        ResolverRecordKind::SameArtifactConflict | ResolverRecordKind::FrontierInconsistent => {
+            "conflict"
+        }
+        ResolverRecordKind::MissingDependency | ResolverRecordKind::StaleDependency => "staleness",
+    };
+
+    format!(
+        concat!(
+            "{{",
+            "\"id\":\"{}\",",
+            "\"record_type\":\"{}\",",
+            "\"kind\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"artifact_ids\":{},",
+            "\"path_refs\":[{}],",
+            "\"operation_ids\":{},",
+            "\"authored_context_ids\":{},",
+            "\"policy_reason\":\"{}\",",
+            "\"candidate_refs\":{},",
+            "\"resolution_operation_id\":{}",
+            "}}"
+        ),
+        json_escape(&record.id),
+        record_type,
+        record.kind.as_str(),
+        json_escape(&record.resolved_view_id),
+        string_array_json(record.artifact_ids.iter().map(String::as_str)),
+        record
+            .path_refs
+            .iter()
+            .map(|path_ref| {
+                format!(
+                    "{{\"path\":\"{}\",\"path_state\":\"{}\"}}",
+                    json_escape(&path_ref.path),
+                    json_escape(&path_ref.path_state),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        string_array_json(record.operation_ids.iter().map(String::as_str)),
+        string_array_json(record.authored_context_ids.iter().map(String::as_str)),
+        json_escape(&record.policy_reason),
+        string_array_map_json(&record.candidate_refs),
+        optional_string_json(record.resolution_operation_id.as_deref()),
     )
 }
 
@@ -1848,6 +2197,30 @@ fn mutation_artifact_json(artifact: &MutationArtifactView) -> String {
     )
 }
 
+fn string_array_json<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+    let items = values
+        .into_iter()
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+fn string_array_map_json(map: &std::collections::BTreeMap<String, Vec<String>>) -> String {
+    let fields = map
+        .iter()
+        .map(|(key, values)| {
+            format!(
+                "\"{}\":{}",
+                json_escape(key),
+                string_array_json(values.iter().map(String::as_str))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{fields}}}")
+}
+
 fn optional_string_json(value: Option<&str>) -> String {
     value
         .map(|value| format!("\"{}\"", json_escape(value)))
@@ -1921,6 +2294,7 @@ Usage:
   sun search <query> --session <session> --fixture basic-app [--json]
   sun patch <path> --session <session> --fixture basic-app --expect-hash <hash> --patch-file <file> [--json]
   sun write <path> --session <session> --fixture basic-app --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]
+  sun view resolve --fixture basic-app --include topic:revision[,topic:revision] [--json]
 
 Commands:
   init       Create the conservative local .sunlight repository layout
@@ -1931,6 +2305,7 @@ Commands:
   search     Search fixture artifact text literally
   patch      Apply a fixture-only unified diff to one artifact
   write      Write fixture-only content to one artifact path
+  view       Resolve fixture topic revisions into a candidate view
 "
     );
 }

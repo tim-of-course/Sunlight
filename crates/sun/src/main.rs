@@ -19,6 +19,7 @@ use sunlight_core::checkpoint::{
 use sunlight_core::compat_import::{
     fixture_basic_app_candidate_deltas, plan_fixture_basic_app_import, CompatImportErrorCode,
     CompatImportRequest, CompatImportResponse, CompatImportValidationError, CompatImportedArtifact,
+    FIXTURE_COMPAT_IMPORT_OPERATION_ID,
 };
 use sunlight_core::execution::{
     fixture_failing_execution_from_resolved_view, fixture_passing_execution_from_resolved_view,
@@ -612,6 +613,14 @@ fn status(ctx: &CommandContext) -> Result<(), CliError> {
                     )
                 }
             }
+            StatusScope::CompatImport(operation_id) => {
+                let response = fixture_compat_import_response_by_operation_id(&operation_id)?;
+                if ctx.json {
+                    fixture_status_compat_import_json(&response)
+                } else {
+                    format!("{} {}", response.operation_id, response.topic_revision_id)
+                }
+            }
         };
         println!("{output}");
         return Ok(());
@@ -666,6 +675,7 @@ enum StatusScope {
     Topic(String),
     Checkpoint(String),
     ExportMap(String),
+    CompatImport(String),
 }
 
 #[derive(Debug)]
@@ -1200,6 +1210,12 @@ fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, C
                 })?;
                 scope = StatusScope::ExportMap(value.clone());
             }
+            "--compat-import" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun status --compat-import <operation-id>")
+                })?;
+                scope = StatusScope::CompatImport(value.clone());
+            }
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
                     "unknown flag `{flag}` for sun status"
@@ -1308,6 +1324,14 @@ fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliEr
     }
 
     if let Some(operation_id) = selector.strip_prefix("operation:") {
+        if operation_id == FIXTURE_COMPAT_IMPORT_OPERATION_ID {
+            let response = fixture_compat_import_response_by_operation_id(operation_id)?;
+            return Ok(if json {
+                fixture_inspect_compat_operation_json(&response)
+            } else {
+                format!("operation {} compat_import", response.operation_id)
+            });
+        }
         if operation_id == "op_auth_trim_guard_0001" {
             return Ok(if json {
                 fixture_inspect_operation_json()
@@ -1316,6 +1340,17 @@ fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliEr
             });
         }
         return Err(object_not_found("operation", operation_id));
+    }
+    if let Some(operation_id) = selector
+        .strip_prefix("compat_import:")
+        .or_else(|| selector.strip_prefix("compat-import:"))
+    {
+        let response = fixture_compat_import_response_by_operation_id(operation_id)?;
+        return Ok(if json {
+            fixture_inspect_compat_import_json(&response)
+        } else {
+            format!("compat_import {}", response.operation_id)
+        });
     }
     if let Some(session_id) = selector.strip_prefix("session:") {
         ensure_fixture_session(session_id)?;
@@ -2470,6 +2505,35 @@ fn fixture_compat_import_view_for_projection(projection: &ProjectionRecord) -> R
     }
 }
 
+fn fixture_compat_import_response_by_operation_id(
+    operation_id: &str,
+) -> Result<CompatImportResponse, CliError> {
+    if operation_id != FIXTURE_COMPAT_IMPORT_OPERATION_ID {
+        return Err(object_not_found("compat_import", operation_id));
+    }
+
+    let projection = fixture_compat_import_projection_by_id(FIXTURE_COMPATIBILITY_PROJECTION_ID)
+        .ok_or_else(|| object_not_found("projection", FIXTURE_COMPATIBILITY_PROJECTION_ID))?
+        .map_err(projection_error)?;
+    let current_view = fixture_compat_import_view_for_projection(&projection);
+
+    plan_fixture_basic_app_import(
+        &projection,
+        &current_view,
+        CompatImportRequest {
+            projection_id: FIXTURE_COMPATIBILITY_PROJECTION_ID.to_string(),
+            session_id: FIXTURE_SESSION_ID.to_string(),
+            session_generation_id: FIXTURE_SESSION_GENERATION_ID.to_string(),
+            resolved_view_id: current_view.resolved_view_id.clone(),
+            write_topic_id: FIXTURE_WRITE_TOPIC_ID.to_string(),
+            parent_topic_revision_id: None,
+            selected_candidate_delta_ids: vec!["compat_delta_src_auth_ts_0001".to_string()],
+        },
+        &fixture_basic_app_candidate_deltas(),
+    )
+    .map_err(compat_import_error)
+}
+
 fn artifact_error(error: ArtifactIoError) -> CliError {
     let message = match &error {
         ArtifactIoError::PathPolicyViolation { .. } => {
@@ -3007,6 +3071,203 @@ fn compat_import_success_envelope(response: &CompatImportResponse) -> String {
     )
 }
 
+fn fixture_status_compat_import_json(response: &CompatImportResponse) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"status.compat_import\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"compat_import_operation_id\":\"{}\",",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"topic_revision_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"lifecycle_state\":\"imported\",",
+            "\"projection_id\":\"{}\",",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"topic_revision_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"imported_artifact_count\":{},",
+            "\"selected_delta_count\":{},",
+            "\"quarantine_count\":{},",
+            "\"imported_artifacts\":[{}],",
+            "\"selected_deltas\":[{}],",
+            "\"operation_plan\":{},",
+            "\"topic_revision\":{},",
+            "\"session_generation\":{}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&response.repository_id),
+        json_escape(&response.operation_id),
+        json_escape(&response.operation_id),
+        json_escape(&response.projection_id),
+        json_escape(&response.topic_revision_id),
+        json_escape(&response.session_generation_id),
+        json_escape(&response.resolved_view_id),
+        json_escape(&response.session_generation_id),
+        single_repo_tree_json(&response.tree_identity),
+        json_escape(&response.projection_id),
+        json_escape(&response.operation_id),
+        json_escape(&response.topic_revision_id),
+        json_escape(&response.session_generation_id),
+        response.imported_artifacts.len(),
+        response.plan.operation.mutation_payload.selected_deltas.len(),
+        response.quarantine_refs.len(),
+        response
+            .imported_artifacts
+            .iter()
+            .map(compat_imported_artifact_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        compat_selected_deltas_json(response),
+        compat_operation_json(response),
+        compat_topic_revision_json(response),
+        compat_session_generation_json(response),
+    )
+}
+
+fn fixture_inspect_compat_import_json(response: &CompatImportResponse) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.compat_import\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"compat_import_operation_id\":\"{}\",",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"topic_revision_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"import_provenance\":{{",
+            "\"projection_id\":\"{}\",",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"topic_revision_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\"",
+            "}},",
+            "\"imported_artifacts\":[{}],",
+            "\"selected_deltas\":[{}],",
+            "\"ignored_candidate_delta_ids\":{},",
+            "\"quarantine_refs\":{},",
+            "\"operation_plan\":{},",
+            "\"topic_revision\":{},",
+            "\"session_generation\":{}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&response.repository_id),
+        json_escape(&response.operation_id),
+        json_escape(&response.operation_id),
+        json_escape(&response.projection_id),
+        json_escape(&response.topic_revision_id),
+        json_escape(&response.session_generation_id),
+        json_escape(&response.resolved_view_id),
+        json_escape(&response.session_generation_id),
+        single_repo_tree_json(&response.tree_identity),
+        json_escape(&response.projection_id),
+        json_escape(&response.operation_id),
+        json_escape(&response.topic_revision_id),
+        json_escape(&response.session_generation_id),
+        json_escape(&response.resolved_view_id),
+        response
+            .imported_artifacts
+            .iter()
+            .map(compat_imported_artifact_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        compat_selected_deltas_json(response),
+        string_array_json(
+            response
+                .ignored_candidate_delta_ids
+                .iter()
+                .map(String::as_str)
+        ),
+        string_array_json(response.quarantine_refs.iter().map(String::as_str)),
+        compat_operation_json(response),
+        compat_topic_revision_json(response),
+        compat_session_generation_json(response),
+    )
+}
+
+fn fixture_inspect_compat_operation_json(response: &CompatImportResponse) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.operation\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"topic_revision_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"operation\":{},",
+            "\"projection_provenance\":{{",
+            "\"projection_id\":\"{}\",",
+            "\"baseline_manifest_digest\":\"{}\",",
+            "\"selected_candidate_delta_ids\":{}",
+            "}},",
+            "\"imported_artifacts\":[{}],",
+            "\"selected_deltas\":[{}],",
+            "\"created_revision\":{},",
+            "\"session_generation\":{}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&response.repository_id),
+        json_escape(&response.operation_id),
+        json_escape(&response.projection_id),
+        json_escape(&response.topic_revision_id),
+        json_escape(&response.session_generation_id),
+        json_escape(&response.resolved_view_id),
+        json_escape(&response.session_generation_id),
+        single_repo_tree_json(&response.tree_identity),
+        compat_operation_json(response),
+        json_escape(&response.projection_id),
+        json_escape(
+            &response
+                .plan
+                .operation
+                .mutation_payload
+                .baseline_manifest_digest
+        ),
+        string_array_json(
+            response
+                .plan
+                .operation
+                .preconditions
+                .selected_candidate_delta_ids
+                .iter()
+                .map(String::as_str)
+        ),
+        response
+            .imported_artifacts
+            .iter()
+            .map(compat_imported_artifact_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        compat_selected_deltas_json(response),
+        compat_topic_revision_json(response),
+        compat_session_generation_json(response),
+    )
+}
+
 fn compat_imported_artifact_json(artifact: &CompatImportedArtifact) -> String {
     format!(
         concat!(
@@ -3030,6 +3291,41 @@ fn compat_imported_artifact_json(artifact: &CompatImportedArtifact) -> String {
         json_escape(&artifact.classification),
         artifact.privacy_class.as_str(),
     )
+}
+
+fn compat_selected_deltas_json(response: &CompatImportResponse) -> String {
+    response
+        .plan
+        .operation
+        .mutation_payload
+        .selected_deltas
+        .iter()
+        .map(|delta| {
+            format!(
+                concat!(
+                    "{{",
+                    "\"candidate_delta_id\":\"{}\",",
+                    "\"operation_kind\":\"{}\",",
+                    "\"path\":\"{}\",",
+                    "\"patch_digest\":{},",
+                    "\"base_content_hash\":{},",
+                    "\"result_content_hash\":{},",
+                    "\"classification\":\"{}\",",
+                    "\"privacy_class\":\"{}\"",
+                    "}}"
+                ),
+                json_escape(&delta.candidate_delta_id),
+                delta.operation_kind.as_str(),
+                json_escape(&delta.path),
+                optional_string_json(delta.patch_digest.as_deref()),
+                optional_string_json(delta.base_content_hash.as_deref()),
+                optional_string_json(delta.result_content_hash.as_deref()),
+                json_escape(&delta.classification),
+                delta.privacy_class.as_str(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn compat_operation_json(response: &CompatImportResponse) -> String {

@@ -5,6 +5,10 @@ use crate::checkpoint::{
 };
 use crate::records::PrivacyClass;
 use crate::resolver::SingleRepoTree;
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitExportRequest {
@@ -238,6 +242,40 @@ pub struct GitExportExecutionResult {
     pub error: Option<GitExportExecutionError>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitExportContentFile {
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub executable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedGitExportMap {
+    pub export_map: GitExportMapRecord,
+}
+
+pub trait GitExportMapStore {
+    fn persist_git_export_map(
+        &mut self,
+        export_map: GitExportMapRecord,
+    ) -> Result<PersistedGitExportMap, String>;
+}
+
+#[derive(Debug, Default)]
+pub struct InMemoryGitExportMapStore {
+    pub export_maps: Vec<GitExportMapRecord>,
+}
+
+impl GitExportMapStore for InMemoryGitExportMapStore {
+    fn persist_git_export_map(
+        &mut self,
+        export_map: GitExportMapRecord,
+    ) -> Result<PersistedGitExportMap, String> {
+        self.export_maps.push(export_map.clone());
+        Ok(PersistedGitExportMap { export_map })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitExportExecutionLifecycleState {
     Exported,
@@ -452,6 +490,307 @@ pub fn execute_git_export_writer_plan_fixture(
         export_map: Some(plan.export_map.clone()),
         error: None,
     }
+}
+
+pub fn execute_local_git_export_writer(
+    input: GitExportWriterInput,
+    content_files: Vec<GitExportContentFile>,
+    export_map_store: &mut impl GitExportMapStore,
+) -> Result<GitExportExecutionResult, GitExportPlanningError> {
+    validate_local_git_repository_root(&input)?;
+    let git_root = input.repository.git_root.clone();
+    let plan = plan_git_export_writer(input)?;
+    execute_local_git_export_writer_plan_with_root(
+        &git_root,
+        &plan,
+        &content_files,
+        export_map_store,
+    )
+}
+
+pub fn execute_local_git_export_writer_plan_with_root(
+    git_root: impl AsRef<Path>,
+    plan: &GitExportWriterPlan,
+    content_files: &[GitExportContentFile],
+    export_map_store: &mut impl GitExportMapStore,
+) -> Result<GitExportExecutionResult, GitExportPlanningError> {
+    let git_root = git_root.as_ref();
+    let base = GitExportExecutionResultBuilder::new(plan);
+
+    let tree_id = match write_git_tree(git_root, content_files) {
+        Ok(tree_id) => tree_id,
+        Err(message) => {
+            return Ok(base.failed(
+                GitExportExecutionStep::CommitCreated,
+                GitExportErrorCode::ExportGitFailed,
+                None,
+                summary(false, false, false),
+                message,
+            ));
+        }
+    };
+
+    let created_commit_id = match create_git_commit(git_root, plan, &tree_id) {
+        Ok(commit_id) => commit_id,
+        Err(message) => {
+            return Ok(base.failed(
+                GitExportExecutionStep::CommitCreated,
+                GitExportErrorCode::ExportGitFailed,
+                None,
+                summary(false, false, false),
+                message,
+            ));
+        }
+    };
+
+    if let Err(message) = update_git_ref(git_root, plan, &created_commit_id) {
+        return Ok(base.partial(
+            GitExportExecutionStep::RefUpdated,
+            GitExportErrorCode::ExportRefUpdateFailed,
+            Some(created_commit_id),
+            summary(true, false, false),
+            message,
+        ));
+    }
+
+    let mut export_map = plan.export_map.clone();
+    export_map.git_commit_ids = vec![created_commit_id.clone()];
+    match export_map_store.persist_git_export_map(export_map) {
+        Ok(persisted) => Ok(GitExportExecutionResult {
+            lifecycle_state: GitExportExecutionLifecycleState::Exported,
+            checkpoint_id: plan.commit.checkpoint_id.clone(),
+            validation_report_id: plan.commit.validation_report_id.clone(),
+            target_ref: plan.ref_update.git_ref.clone(),
+            parent_commit_id: plan.commit.parent_commit_id.clone(),
+            created_commit_id: Some(created_commit_id),
+            summary: summary(true, true, true),
+            export_map: Some(persisted.export_map),
+            error: None,
+        }),
+        Err(message) => Ok(base.partial(
+            GitExportExecutionStep::ExportMapWritten,
+            GitExportErrorCode::ExportMapWriteFailed,
+            Some(created_commit_id),
+            summary(true, true, false),
+            message,
+        )),
+    }
+}
+
+fn validate_local_git_repository_root(
+    input: &GitExportWriterInput,
+) -> Result<(), GitExportPlanningError> {
+    let git_root = Path::new(&input.repository.git_root);
+    let sunlight_root = Path::new(&input.repository.sunlight_repo_root);
+    let discovered = run_git(git_root, &["rev-parse", "--show-toplevel"], None, &[])
+        .map_err(|message| {
+            planning_error(
+                GitExportErrorCode::ExportRepositoryInvalid,
+                input,
+                None,
+                None,
+                &message,
+            )
+        })?;
+
+    let discovered_root = std::fs::canonicalize(discovered.trim()).map_err(|error| {
+        planning_error(
+            GitExportErrorCode::ExportRepositoryInvalid,
+            input,
+            None,
+            None,
+            &format!("failed to resolve discovered Git root: {error}"),
+        )
+    })?;
+    let configured_git_root = std::fs::canonicalize(git_root).map_err(|error| {
+        planning_error(
+            GitExportErrorCode::ExportRepositoryInvalid,
+            input,
+            None,
+            None,
+            &format!("failed to resolve configured Git root: {error}"),
+        )
+    })?;
+    let configured_sunlight_root = std::fs::canonicalize(sunlight_root).map_err(|error| {
+        planning_error(
+            GitExportErrorCode::ExportRepositoryInvalid,
+            input,
+            None,
+            None,
+            &format!("failed to resolve configured Sunlight root: {error}"),
+        )
+    })?;
+
+    if discovered_root != configured_git_root || configured_git_root != configured_sunlight_root {
+        return Err(planning_error(
+            GitExportErrorCode::ExportRepositoryInvalid,
+            input,
+            None,
+            None,
+            "Git repository root must match the configured Sunlight repository scope",
+        ));
+    }
+
+    Ok(())
+}
+
+fn write_git_tree(
+    git_root: &Path,
+    content_files: &[GitExportContentFile],
+) -> Result<String, String> {
+    let mut entries = content_files.to_vec();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let index_path = temporary_git_index_path();
+    let index_path_string = index_path.to_string_lossy().to_string();
+    let index_env = [("GIT_INDEX_FILE", index_path_string.as_str())];
+    let mut index_info = Vec::new();
+    for entry in entries {
+        validate_export_file_path(&entry.path)?;
+        let object_id = run_git(
+            git_root,
+            &["hash-object", "-w", "--stdin"],
+            Some(&entry.bytes),
+            &[],
+        )?;
+        let mode = if entry.executable { "100755" } else { "100644" };
+        index_info.extend_from_slice(mode.as_bytes());
+        index_info.extend_from_slice(b" blob ");
+        index_info.extend_from_slice(object_id.trim().as_bytes());
+        index_info.push(b'\t');
+        index_info.extend_from_slice(entry.path.as_bytes());
+        index_info.push(b'\n');
+    }
+
+    let result = run_git(
+        git_root,
+        &["update-index", "--index-info"],
+        Some(&index_info),
+        &index_env,
+    )
+    .and_then(|_| run_git(git_root, &["write-tree"], None, &index_env))
+    .map(|tree_id| tree_id.trim().to_string());
+    let _ = std::fs::remove_file(index_path);
+    result
+}
+
+fn temporary_git_index_path() -> std::path::PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "sunlight-git-export-index-{}-{unique}",
+        std::process::id()
+    ))
+}
+
+fn create_git_commit(
+    git_root: &Path,
+    plan: &GitExportWriterPlan,
+    tree_id: &str,
+) -> Result<String, String> {
+    let env = [
+        ("GIT_AUTHOR_NAME", "Sunlight Export Writer"),
+        ("GIT_AUTHOR_EMAIL", "sunlight-export@example.invalid"),
+        ("GIT_AUTHOR_DATE", plan.export_map.exported_at.as_str()),
+        ("GIT_COMMITTER_NAME", "Sunlight Export Writer"),
+        ("GIT_COMMITTER_EMAIL", "sunlight-export@example.invalid"),
+        ("GIT_COMMITTER_DATE", plan.export_map.exported_at.as_str()),
+    ];
+    run_git(
+        git_root,
+        &["commit-tree", tree_id, "-p", &plan.commit.parent_commit_id],
+        Some(plan.commit.message.as_bytes()),
+        &env,
+    )
+    .map(|commit_id| commit_id.trim().to_string())
+}
+
+fn update_git_ref(
+    git_root: &Path,
+    plan: &GitExportWriterPlan,
+    created_commit_id: &str,
+) -> Result<(), String> {
+    let zero = "0000000000000000000000000000000000000000";
+    let expected_old = plan.ref_update.expected_old_commit_id.as_deref().unwrap_or(zero);
+    run_git(
+        git_root,
+        &[
+            "update-ref",
+            &plan.ref_update.git_ref,
+            created_commit_id,
+            expected_old,
+        ],
+        None,
+        &[],
+    )
+    .map(|_| ())
+}
+
+fn validate_export_file_path(path: &str) -> Result<(), String> {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err("export file paths must be normalized repository-relative paths".to_string());
+    }
+
+    Ok(())
+}
+
+fn run_git(
+    git_root: &Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    env: &[(&str, &str)],
+) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(git_root)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    for (key, value) in env {
+        command.env(key, value);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to start git {}: {error}", args.join(" ")))?;
+
+    if let Some(input) = stdin {
+        let mut child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "failed to open git stdin".to_string())?;
+        child_stdin
+            .write_all(input)
+            .map_err(|error| format!("failed to write git stdin: {error}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to wait for git {}: {error}", args.join(" ")))?;
+    if output.status.success() {
+        return String::from_utf8(output.stdout)
+            .map_err(|error| format!("git output was not UTF-8: {error}"));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!("git {} failed: {}", args.join(" "), stderr.trim()))
 }
 
 pub fn export_map_write_failed_error(
@@ -1204,6 +1543,9 @@ mod tests {
         fixture_resolver_input, resolve_fixture_view, TopicRevisionSelection,
         FIXTURE_BASE_CHECKPOINT_ID,
     };
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn validates_policy_approved_metadata_only_export() {
@@ -1870,6 +2212,176 @@ mod tests {
         assert_eq!(error.code, GitExportErrorCode::ExportRepositoryInvalid);
     }
 
+    #[test]
+    fn git_export_writes_real_commit_and_persists_map() {
+        let repo = LocalGitRepo::new();
+        let base_commit_id = repo.create_commit("base", fixture_base_files(), None);
+        let unrelated_commit_id =
+            repo.create_commit("unrelated", vec![file("unrelated.txt", b"keep\n", false)], None);
+        repo.update_ref("refs/heads/unrelated", &unrelated_commit_id);
+        let mut input = writer_input_for_repo(&repo, &base_commit_id);
+        input.repository.refs.clear();
+        let mut store = InMemoryGitExportMapStore::default();
+
+        let result =
+            execute_local_git_export_writer(input, fixture_checkpoint_files(), &mut store).unwrap();
+
+        assert_eq!(
+            result.lifecycle_state,
+            GitExportExecutionLifecycleState::Exported
+        );
+        let commit_id = result.created_commit_id.as_deref().unwrap();
+        assert_eq!(repo.rev_parse(FIXTURE_EXPORTED_GIT_REF), commit_id);
+        assert_eq!(repo.rev_parse("refs/heads/unrelated"), unrelated_commit_id);
+        assert_eq!(store.export_maps.len(), 1);
+        assert_eq!(store.export_maps[0].git_commit_ids, vec![commit_id]);
+        assert_eq!(result.export_map.unwrap(), store.export_maps[0]);
+    }
+
+    #[test]
+    fn git_export_commit_tree_matches_checkpoint_files() {
+        let repo = LocalGitRepo::new();
+        let base_commit_id = repo.create_commit("base", fixture_base_files(), None);
+        repo.update_ref(FIXTURE_EXPORTED_GIT_REF, &base_commit_id);
+        let input = writer_input_for_repo(&repo, &base_commit_id);
+        let mut store = InMemoryGitExportMapStore::default();
+
+        let result =
+            execute_local_git_export_writer(input, fixture_checkpoint_files(), &mut store).unwrap();
+        let commit_id = result.created_commit_id.unwrap();
+
+        assert_eq!(
+            repo.ls_tree(&commit_id),
+            vec![
+                "100644 .sunlight/export-manifest.json".to_string(),
+                "100644 src/auth.rs".to_string(),
+                "100644 src/profile.rs".to_string(),
+                "100755 bin/run-auth-check".to_string(),
+            ]
+        );
+        assert_eq!(
+            repo.cat_file(&commit_id, ".sunlight/export-manifest.json"),
+            b"{\"policy\":\"approved_manifest_only\"}\n"
+        );
+        assert_eq!(repo.cat_file(&commit_id, "src/auth.rs"), b"pub fn auth() {}\n");
+        assert_eq!(
+            repo.cat_file(&commit_id, "src/profile.rs"),
+            b"pub fn profile() {}\n"
+        );
+        assert_eq!(repo.cat_file(&commit_id, "bin/run-auth-check"), b"#!/bin/sh\n");
+    }
+
+    #[test]
+    fn git_export_ignores_working_tree_and_index_files() {
+        let repo = LocalGitRepo::new();
+        let base_commit_id = repo.create_commit("base", fixture_base_files(), None);
+        repo.update_ref(FIXTURE_EXPORTED_GIT_REF, &base_commit_id);
+        repo.update_ref("refs/heads/main", &base_commit_id);
+        repo.git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        repo.git(&["checkout", "--quiet", "HEAD"]);
+        repo.write_worktree_file("untracked.txt", b"untracked\n");
+        repo.write_worktree_file("staged.txt", b"staged\n");
+        repo.git(&["add", "staged.txt"]);
+        repo.write_worktree_file("src/base.rs", b"dirty tracked worktree\n");
+        let input = writer_input_for_repo(&repo, &base_commit_id);
+        let mut store = InMemoryGitExportMapStore::default();
+
+        let result =
+            execute_local_git_export_writer(input, fixture_checkpoint_files(), &mut store).unwrap();
+
+        let tree = repo.ls_tree(result.created_commit_id.as_deref().unwrap());
+        assert!(!tree.iter().any(|entry| entry.contains("untracked.txt")));
+        assert!(!tree.iter().any(|entry| entry.contains("staged.txt")));
+        assert!(!tree.iter().any(|entry| entry.contains("src/base.rs")));
+    }
+
+    #[test]
+    fn git_export_selects_base_parent() {
+        let repo = LocalGitRepo::new();
+        let base_commit_id = repo.create_commit("base", fixture_base_files(), None);
+        repo.update_ref(FIXTURE_EXPORTED_GIT_REF, &base_commit_id);
+        let input = writer_input_for_repo(&repo, &base_commit_id);
+        let mut store = InMemoryGitExportMapStore::default();
+
+        let result =
+            execute_local_git_export_writer(input, fixture_checkpoint_files(), &mut store).unwrap();
+
+        assert_eq!(
+            repo.commit_parent(result.created_commit_id.as_deref().unwrap()),
+            base_commit_id
+        );
+    }
+
+    #[test]
+    fn git_export_missing_parent_fails_without_ref_update() {
+        let repo = LocalGitRepo::new();
+        let base_commit_id = repo.create_commit("base", fixture_base_files(), None);
+        let mut input = writer_input_for_repo(&repo, &base_commit_id);
+        input.imported_base_commits.clear();
+        input.repository.refs.clear();
+        let mut store = InMemoryGitExportMapStore::default();
+
+        let error =
+            execute_local_git_export_writer(input, fixture_checkpoint_files(), &mut store)
+                .unwrap_err();
+
+        assert_eq!(error.code, GitExportErrorCode::ExportParentNotFound);
+        assert_eq!(repo.try_rev_parse(FIXTURE_EXPORTED_GIT_REF), None);
+        assert!(store.export_maps.is_empty());
+    }
+
+    #[test]
+    fn git_export_ref_conflict_fails_and_leaves_ref_unchanged() {
+        let repo = LocalGitRepo::new();
+        let base_commit_id = repo.create_commit("base", fixture_base_files(), None);
+        let conflict_commit_id =
+            repo.create_commit("conflict", vec![file("other.txt", b"other\n", false)], None);
+        repo.update_ref(FIXTURE_EXPORTED_GIT_REF, &conflict_commit_id);
+        let mut input = writer_input_for_repo(&repo, &base_commit_id);
+        input.repository.refs = vec![GitRefState {
+            git_ref: FIXTURE_EXPORTED_GIT_REF.to_string(),
+            commit_id: conflict_commit_id.clone(),
+        }];
+        let mut store = InMemoryGitExportMapStore::default();
+
+        let error =
+            execute_local_git_export_writer(input, fixture_checkpoint_files(), &mut store)
+                .unwrap_err();
+
+        assert_eq!(error.code, GitExportErrorCode::ExportTargetRefConflict);
+        assert_eq!(repo.rev_parse(FIXTURE_EXPORTED_GIT_REF), conflict_commit_id);
+        assert!(store.export_maps.is_empty());
+    }
+
+    #[test]
+    fn git_export_map_failure_remains_partial() {
+        let repo = LocalGitRepo::new();
+        let base_commit_id = repo.create_commit("base", fixture_base_files(), None);
+        repo.update_ref(FIXTURE_EXPORTED_GIT_REF, &base_commit_id);
+        let input = writer_input_for_repo(&repo, &base_commit_id);
+        let mut store = FailingGitExportMapStore;
+
+        let result =
+            execute_local_git_export_writer(input, fixture_checkpoint_files(), &mut store).unwrap();
+
+        assert_eq!(
+            result.lifecycle_state,
+            GitExportExecutionLifecycleState::Partial
+        );
+        assert_eq!(result.summary.commit_created, true);
+        assert_eq!(result.summary.ref_updated, true);
+        assert_eq!(result.summary.export_map_written, false);
+        assert_eq!(result.export_map, None);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            GitExportErrorCode::ExportMapWriteFailed
+        );
+        assert_eq!(
+            repo.rev_parse(FIXTURE_EXPORTED_GIT_REF),
+            result.created_commit_id.unwrap()
+        );
+    }
+
     fn writer_input() -> GitExportWriterInput {
         let checkpoint = fixture_checkpoint();
         let request = fixture_git_export_request_from_checkpoint(&checkpoint);
@@ -1927,6 +2439,226 @@ mod tests {
 
     fn fixture_base_commit_id() -> String {
         "git_sha1_base_parent_0001".to_string()
+    }
+
+    fn writer_input_for_repo(repo: &LocalGitRepo, base_commit_id: &str) -> GitExportWriterInput {
+        let mut input = writer_input();
+        let root = repo.path().to_string_lossy().to_string();
+        input.repository.git_root = root.clone();
+        input.repository.sunlight_repo_root = root;
+        input.repository.reachable_commit_ids = vec![base_commit_id.to_string()];
+        input.repository.refs = vec![GitRefState {
+            git_ref: FIXTURE_EXPORTED_GIT_REF.to_string(),
+            commit_id: base_commit_id.to_string(),
+        }];
+        input.imported_base_commits = vec![ImportedBaseGitCommit {
+            checkpoint_id: FIXTURE_BASE_CHECKPOINT_ID.to_string(),
+            git_commit_id: base_commit_id.to_string(),
+        }];
+        input.planned_commit_id = "planned_commit_id_replaced_by_real_git".to_string();
+        input
+    }
+
+    fn fixture_base_files() -> Vec<GitExportContentFile> {
+        vec![file("src/base.rs", b"pub fn base() {}\n", false)]
+    }
+
+    fn fixture_checkpoint_files() -> Vec<GitExportContentFile> {
+        vec![
+            file("src/auth.rs", b"pub fn auth() {}\n", false),
+            file("src/profile.rs", b"pub fn profile() {}\n", false),
+            file("bin/run-auth-check", b"#!/bin/sh\n", true),
+            file(
+                ".sunlight/export-manifest.json",
+                b"{\"policy\":\"approved_manifest_only\"}\n",
+                false,
+            ),
+        ]
+    }
+
+    fn file(path: &str, bytes: &[u8], executable: bool) -> GitExportContentFile {
+        GitExportContentFile {
+            path: path.to_string(),
+            bytes: bytes.to_vec(),
+            executable,
+        }
+    }
+
+    struct FailingGitExportMapStore;
+
+    impl GitExportMapStore for FailingGitExportMapStore {
+        fn persist_git_export_map(
+            &mut self,
+            _export_map: GitExportMapRecord,
+        ) -> Result<PersistedGitExportMap, String> {
+            Err("simulated export-map write failure".to_string())
+        }
+    }
+
+    struct LocalGitRepo {
+        _tempdir: TestTempDir,
+        path: PathBuf,
+    }
+
+    impl LocalGitRepo {
+        fn new() -> Self {
+            let tempdir = TestTempDir::new();
+            let path = tempdir.path().to_path_buf();
+            run_command(&path, &["git", "init", "--quiet"]);
+            Self {
+                _tempdir: tempdir,
+                path,
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn create_commit(
+            &self,
+            message: &str,
+            files: Vec<GitExportContentFile>,
+            parent: Option<&str>,
+        ) -> String {
+            let tree_id = write_git_tree(&self.path, &files).unwrap();
+            let mut args = vec!["commit-tree", tree_id.as_str()];
+            if let Some(parent) = parent {
+                args.push("-p");
+                args.push(parent);
+            }
+            let env = [
+                ("GIT_AUTHOR_NAME", "Test Author"),
+                ("GIT_AUTHOR_EMAIL", "test@example.invalid"),
+                ("GIT_AUTHOR_DATE", "2026-07-04T00:00:00Z"),
+                ("GIT_COMMITTER_NAME", "Test Author"),
+                ("GIT_COMMITTER_EMAIL", "test@example.invalid"),
+                ("GIT_COMMITTER_DATE", "2026-07-04T00:00:00Z"),
+            ];
+            run_git(&self.path, &args, Some(message.as_bytes()), &env)
+                .unwrap()
+                .trim()
+                .to_string()
+        }
+
+        fn update_ref(&self, git_ref: &str, commit_id: &str) {
+            self.git(&["update-ref", git_ref, commit_id]);
+        }
+
+        fn rev_parse(&self, rev: &str) -> String {
+            self.git(&["rev-parse", rev]).trim().to_string()
+        }
+
+        fn try_rev_parse(&self, rev: &str) -> Option<String> {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.path)
+                .args(["rev-parse", rev])
+                .output()
+                .unwrap();
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8(output.stdout).unwrap().trim().to_string())
+        }
+
+        fn ls_tree(&self, commit_id: &str) -> Vec<String> {
+            let mut entries = self
+                .git(&[
+                    "ls-tree",
+                    "-r",
+                    "--format=%(objectmode) %(path)",
+                    commit_id,
+                ])
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        }
+
+        fn cat_file(&self, commit_id: &str, path: &str) -> Vec<u8> {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.path)
+                .args(["show", &format!("{commit_id}:{path}")])
+                .output()
+                .unwrap()
+                .stdout
+        }
+
+        fn commit_parent(&self, commit_id: &str) -> String {
+            self.git(&["show", "-s", "--format=%P", commit_id])
+                .trim()
+                .to_string()
+        }
+
+        fn write_worktree_file(&self, path: &str, bytes: &[u8]) {
+            let path = self.path.join(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, bytes).unwrap();
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .current_dir(&self.path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        }
+    }
+
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "sunlight-git-export-test-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn run_command(git_root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new(args[0])
+            .current_dir(git_root)
+            .args(&args[1..])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
     }
 
     fn fixture_checkpoint() -> CheckpointRecord {

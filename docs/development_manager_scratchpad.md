@@ -136,7 +136,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `execution-store-integrity-gate-fixture`: integrated as `9f700c1`; formatting checkpoint `dfd23bb`.
 - Completed slice `projection-quarantine-durable-record`: integrated as `24feb6e`; formatting checkpoint `2f8b533`.
 - Completed slice `external-validation-super-search`: integrated as `5800c0b`; envelope assertion fix checkpoint `2f1da1e`.
-- No active WSL slice.
+- Active WSL slice `projection-quarantine-record-persistence`: persist an inspectable local quarantine JSON record matching the existing `local://.sunlight/quarantine/projections/...` ref when projection store integrity fails; keep scope to filesystem persistence and focused tests, with GC left as a follow-up unless already trivial.
 
 ## Candidate Next Slices
 

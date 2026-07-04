@@ -39,15 +39,16 @@ use sunlight_core::git_export::{
 use sunlight_core::projection::{
     fixture_compatibility_projection_from_resolved_view,
     fixture_execution_projection_from_resolved_view, fixture_export_projection_from_resolved_view,
-    fixture_inspection_projection_from_resolved_view, fixture_projection_manifest_from_content_tree,
-    materialize_fixture_projection_copy, plan_fixture_projection_materialization,
-    ProjectionFilesystemMaterialization, ProjectionManifestRecord,
-    ProjectionMaterializationCapabilities, ProjectionMaterializationError,
-    ProjectionMaterializationErrorCode, ProjectionMaterializationLocalMetadata,
-    ProjectionMaterializationPlan, ProjectionMaterializationRequest, ProjectionPurpose,
-    ProjectionRecord, ProjectionRootRef, ProjectionStrategy, ProjectionValidationError,
-    FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
-    FIXTURE_EXPORT_PROJECTION_ID, FIXTURE_INSPECTION_PROJECTION_ID,
+    fixture_inspection_projection_from_resolved_view,
+    fixture_projection_manifest_from_content_tree, materialize_fixture_projection_copy,
+    plan_fixture_projection_materialization, ProjectionFilesystemMaterialization,
+    ProjectionManifestRecord, ProjectionMaterializationCapabilities,
+    ProjectionMaterializationError, ProjectionMaterializationErrorCode,
+    ProjectionMaterializationLocalMetadata, ProjectionMaterializationPlan,
+    ProjectionMaterializationRequest, ProjectionPurpose, ProjectionRecord, ProjectionRootRef,
+    ProjectionStrategy, ProjectionValidationError, FIXTURE_COMPATIBILITY_PROJECTION_ID,
+    FIXTURE_EXECUTION_PROJECTION_ID, FIXTURE_EXPORT_PROJECTION_ID,
+    FIXTURE_INSPECTION_PROJECTION_ID,
 };
 use sunlight_core::records::canonical_json_bytes;
 use sunlight_core::repository::{
@@ -4653,12 +4654,7 @@ fn local_projection_root_verification_json(
         verification.missing_files,
         verification.extra_files,
         verification.metadata_mismatches,
-        string_array_json(
-            verification
-                .verification_errors
-                .iter()
-                .map(String::as_str)
-        ),
+        string_array_json(verification.verification_errors.iter().map(String::as_str)),
         string_array_json(scan.sample_paths.iter().map(String::as_str)),
         optional_string_json(scan.scan_error.as_deref()),
     )
@@ -4746,7 +4742,9 @@ fn local_projection_root_verification(
                     verification_errors.push(format!("read_failed:{}", entry.path));
                 }
             },
-            None => verification_errors.push(format!("missing_fixture_blob:{}", entry.content_hash)),
+            None => {
+                verification_errors.push(format!("missing_fixture_blob:{}", entry.content_hash))
+            }
         }
 
         #[cfg(unix)]
@@ -4823,8 +4821,7 @@ fn scan_local_projection_root_inner(
             scan.executable_files += usize::from(local_file_is_executable(&metadata));
             if let Ok(relative_path) = path.strip_prefix(root) {
                 let relative_path = relative_path.display().to_string().replace('\\', "/");
-                scan.sample_paths
-                    .push(relative_path.clone());
+                scan.sample_paths.push(relative_path.clone());
                 scan.all_file_paths.push(relative_path);
             }
         }

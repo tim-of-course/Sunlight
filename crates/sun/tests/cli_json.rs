@@ -930,9 +930,15 @@ fn status_json_fixture_compat_import_returns_lifecycle_snapshot() {
     assert!(stdout.contains("\"lifecycle_state\":\"imported\""));
     assert!(stdout.contains("\"imported_artifact_count\":1"));
     assert!(stdout.contains("\"selected_delta_count\":1"));
-    assert!(stdout.contains("\"operation_plan\":{\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
-    assert!(stdout.contains("\"selected_deltas\":[{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""));
-    assert!(stdout.contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_compat_0001\"}"));
+    assert!(stdout.contains(
+        "\"operation_plan\":{\"operation_transaction_id\":\"op_compat_import_auth_0001\""
+    ));
+    assert!(stdout.contains(
+        "\"selected_deltas\":[{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""
+    ));
+    assert!(stdout.contains(
+        "\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_compat_0001\"}"
+    ));
 }
 
 #[test]
@@ -952,14 +958,24 @@ fn inspect_json_fixture_compat_import_selector_returns_import_detail() {
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("\"command\":\"inspect.compat_import\""));
-    assert!(stdout.contains("\"import_provenance\":{\"projection_id\":\"projection_compat_agent_a_0001\""));
-    assert!(stdout.contains("\"imported_artifacts\":[{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""));
+    assert!(stdout
+        .contains("\"import_provenance\":{\"projection_id\":\"projection_compat_agent_a_0001\""));
+    assert!(stdout.contains(
+        "\"imported_artifacts\":[{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""
+    ));
     assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
-    assert!(stdout.contains("\"selected_deltas\":[{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""));
-    assert!(stdout.contains("\"operation_plan\":{\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
+    assert!(stdout.contains(
+        "\"selected_deltas\":[{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""
+    ));
+    assert!(stdout.contains(
+        "\"operation_plan\":{\"operation_transaction_id\":\"op_compat_import_auth_0001\""
+    ));
     assert!(stdout.contains("\"payload\":{\"kind\":\"compat_import\""));
-    assert!(stdout.contains("\"topic_revision\":{\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
-    assert!(stdout.contains("\"session_generation\":{\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+    assert!(stdout.contains(
+        "\"topic_revision\":{\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""
+    ));
+    assert!(stdout
+        .contains("\"session_generation\":{\"session_generation_id\":\"gen_agent_a_compat_0002\""));
 }
 
 #[test]
@@ -980,13 +996,19 @@ fn inspect_json_fixture_operation_selector_returns_compat_import_payload() {
     let stdout = stdout(&output);
     assert!(stdout.contains("\"command\":\"inspect.operation\""));
     assert!(stdout.contains("\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
-    assert!(stdout.contains("\"operation\":{\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
+    assert!(stdout
+        .contains("\"operation\":{\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
     assert!(stdout.contains("\"mutation\":\"compat_import\""));
     assert!(stdout.contains("\"payload\":{\"kind\":\"compat_import\""));
     assert!(stdout.contains("\"baseline_manifest_digest\":\"sha256:compat_baseline\""));
-    assert!(stdout.contains("\"projection_provenance\":{\"projection_id\":\"projection_compat_agent_a_0001\""));
-    assert!(stdout.contains("\"created_revision\":{\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
-    assert!(stdout.contains("\"session_generation\":{\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+    assert!(stdout.contains(
+        "\"projection_provenance\":{\"projection_id\":\"projection_compat_agent_a_0001\""
+    ));
+    assert!(stdout.contains(
+        "\"created_revision\":{\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""
+    ));
+    assert!(stdout
+        .contains("\"session_generation\":{\"session_generation_id\":\"gen_agent_a_compat_0002\""));
 }
 
 #[test]

@@ -447,10 +447,7 @@ fn project_materialize(ctx: &CommandContext) -> Result<(), CliError> {
     if ctx.json {
         println!("{}", projection_materialize_success_envelope(&plan));
     } else {
-        println!(
-            "{} {}",
-            plan.projection.id, plan.projection.root_ref.value
-        );
+        println!("{} {}", plan.projection.id, plan.projection.root_ref.value);
     }
 
     Ok(())
@@ -888,10 +885,10 @@ fn parse_projection_strategy(value: &str) -> Result<ProjectionStrategy, CliError
         "reflink" => Ok(ProjectionStrategy::Reflink),
         "hardlink_readonly" => Ok(ProjectionStrategy::HardlinkReadonly),
         "overlay_copyup" => Ok(ProjectionStrategy::OverlayCopyup),
-        _ => Err(
-            invalid_request(format!("unknown projection materialization strategy `{value}`"))
-                .with_detail("strategy", value),
-        ),
+        _ => Err(invalid_request(format!(
+            "unknown projection materialization strategy `{value}`"
+        ))
+        .with_detail("strategy", value)),
     }
 }
 
@@ -3118,7 +3115,12 @@ fn fixture_status_compat_import_json(response: &CompatImportResponse) -> String 
         json_escape(&response.topic_revision_id),
         json_escape(&response.session_generation_id),
         response.imported_artifacts.len(),
-        response.plan.operation.mutation_payload.selected_deltas.len(),
+        response
+            .plan
+            .operation
+            .mutation_payload
+            .selected_deltas
+            .len(),
         response.quarantine_refs.len(),
         response
             .imported_artifacts

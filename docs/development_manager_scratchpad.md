@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `2f1da1e`. Optional `scripts/external-validation-super-search.ps1` passed against local Super Search with `mix test`, `bun run test`, temp clone, and `sun init --json`. Default `scripts/smoke-suite.ps1` also passed via the Windows-native fallback with 98 CLI tests, 138 core tests, validation smoke, projection strategy smoke, and MVP smoke. Scratchpad guard must run after this edit.
+- Verification: latest full pass ran after `9bd5e0f`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 102 CLI tests, 141 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional `scripts/external-validation-super-search.ps1` passed earlier this heartbeat against local Super Search with `mix test`, `bun run test`, temp clone, and `sun init --json`. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -136,12 +136,13 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `execution-store-integrity-gate-fixture`: integrated as `9f700c1`; formatting checkpoint `dfd23bb`.
 - Completed slice `projection-quarantine-durable-record`: integrated as `24feb6e`; formatting checkpoint `2f8b533`.
 - Completed slice `external-validation-super-search`: integrated as `5800c0b`; envelope assertion fix checkpoint `2f1da1e`.
-- Active WSL slice `projection-quarantine-record-persistence`: persist an inspectable local quarantine JSON record matching the existing `local://.sunlight/quarantine/projections/...` ref when projection store integrity fails; keep scope to filesystem persistence and focused tests, with GC left as a follow-up unless already trivial.
+- Completed slice `projection-quarantine-record-persistence`: integrated as `0849e94`; formatting checkpoint `7aa4c6a`; scan-count fix `b384f03`; formatting checkpoint `9bd5e0f`.
+- No active WSL slice.
 
 ## Candidate Next Slices
 
 - External validation can deepen from init-only Super Search coverage toward compatibility import/export planning against a temp clone when the product is ready.
-- Projection integrity still needs actual local quarantine record filesystem persistence/GC beyond the durable local record reference.
+- Projection quarantine retention/GC remains after local record persistence.
 
 ## Decisions
 

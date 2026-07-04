@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran the default `scripts/smoke-suite.ps1` after `2f8b533`; it detected CRLF Bash scripts, fell back to the Windows-native lane, and passed `cargo fmt --check`, `cargo check`, `cargo test` with 98 Windows CLI tests and 138 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused WSL/Windows verification for the latest durable quarantine metadata passed CLI integrity tests, run fixture tests, store-integrity-filtered core tests, `git diff --check`, and Windows `cargo fmt --check`. Scratchpad guard must run after this edit.
+- Verification: latest full pass ran after `2f1da1e`. Optional `scripts/external-validation-super-search.ps1` passed against local Super Search with `mix test`, `bun run test`, temp clone, and `sun init --json`. Default `scripts/smoke-suite.ps1` also passed via the Windows-native fallback with 98 CLI tests, 138 core tests, validation smoke, projection strategy smoke, and MVP smoke. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -135,11 +135,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-store-integrity-cli-scan-wiring`: integrated as `e5500af`; formatting checkpoint `a58f8d6`.
 - Completed slice `execution-store-integrity-gate-fixture`: integrated as `9f700c1`; formatting checkpoint `dfd23bb`.
 - Completed slice `projection-quarantine-durable-record`: integrated as `24feb6e`; formatting checkpoint `2f8b533`.
-- Active WSL slice `external-validation-super-search`: target repo `C:\Users\TimothyCardoza\Documents\AI-Apps\Super Search`; baseline commands `mix test` and `bun run test`; local preflight passed before launch.
+- Completed slice `external-validation-super-search`: integrated as `5800c0b`; envelope assertion fix checkpoint `2f1da1e`.
+- No active WSL slice.
 
 ## Candidate Next Slices
 
-- First external validation repo decision is active: `Super Search`, with `mix test` and `bun run test`.
+- External validation can deepen from init-only Super Search coverage toward compatibility import/export planning against a temp clone when the product is ready.
 - Projection integrity still needs actual local quarantine record filesystem persistence/GC beyond the durable local record reference.
 
 ## Decisions
@@ -150,5 +151,5 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 
 ## Open Questions
 
-- First external validation repo and exact test command are not yet selected.
+- Whether the next external validation step should remain an optional local harness or become a broader non-default suite is still open.
 - Projection platform target still starts on WSL/Linux unless product priority changes.

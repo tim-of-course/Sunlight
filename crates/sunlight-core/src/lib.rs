@@ -1,4 +1,5 @@
 pub mod artifacts;
+pub mod checkpoint;
 pub mod execution;
 pub mod identity;
 pub mod policy;

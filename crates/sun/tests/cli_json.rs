@@ -1192,6 +1192,9 @@ fn status_json_fixture_projection_reports_file_local_root() {
     assert!(stdout.contains("\"lifecycle_state\":\"materialized\""));
     assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
     assert!(stdout.contains("\"verification_state\":\"not_directory\""));
+    assert!(stdout.contains("\"content_verification\":\"verification_error\""));
+    assert!(stdout.contains("\"dirty_local\":null"));
+    assert!(stdout.contains("\"verification_errors\":[\"projection_root_not_directory\"]"));
     assert!(stdout.contains("\"exists\":true"));
     assert!(stdout.contains("\"is_dir\":false"));
     assert!(stdout.contains("\"directories\":0"));
@@ -1229,6 +1232,9 @@ fn status_json_fixture_projection_does_not_follow_symlink_local_root() {
     assert!(stdout.contains("\"command\":\"status.projection\""));
     assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
     assert!(stdout.contains("\"verification_state\":\"not_directory\""));
+    assert!(stdout.contains("\"content_verification\":\"verification_error\""));
+    assert!(stdout.contains("\"dirty_local\":null"));
+    assert!(stdout.contains("\"verification_errors\":[\"projection_root_not_directory\"]"));
     assert!(stdout.contains("\"exists\":true"));
     assert!(stdout.contains("\"is_dir\":false"));
     assert!(stdout.contains("\"directories\":0"));

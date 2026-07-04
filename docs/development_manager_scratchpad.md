@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran the default `scripts/smoke-suite.ps1` after `92cae33`; it detected CRLF Bash scripts, fell back to the Windows-native lane, and passed `cargo fmt --check`, `cargo check`, `cargo test` with 86 Windows CLI tests and 129 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused WSL verification for projection quarantine passed 89 CLI JSON tests plus `git diff --check`. Scratchpad guard must run after this edit.
+- Verification: latest full pass ran the default `scripts/smoke-suite.ps1` after `49910ec`; it detected CRLF Bash scripts, fell back to the Windows-native lane, and passed `cargo fmt --check`, `cargo check`, `cargo test` with 87 Windows CLI tests and 130 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused WSL verification for generated-output export validation passed 90 CLI JSON tests, 42 core Git-export tests, and `git diff --check`. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -126,13 +126,14 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `cli-execution-promotion-fixture`: integrated as `cbae54c`; formatting checkpoint `32e0625`.
 - Completed slice `smoke-suite-wsl-crlf-hardening`: integrated as `9948d50`.
 - Completed slice `store-integrity-quarantine-fixture`: integrated as `c1e0030`; formatting checkpoint `92cae33`.
-- Active slice `export-validation-generated-promotion`: WSL clone `/home/timothycard/code/Sunlight-2-export-validation-generated-promotion-20260704-184533`, branch `dm/export-validation-generated-promotion`, run artifacts under `C:\tmp\sunlight-manager\20260704-184533`.
-- Next heartbeat should inspect active WSL progress, import verified work if finished, and keep project-wide export validation and generated-output promotion policy moving.
+- Completed slice `export-validation-generated-promotion`: integrated as `64d1490`; formatting checkpoint `49910ec`.
+- Active slice `projection-store-integrity-foundation`: WSL clone `/home/timothycard/code/Sunlight-2-projection-store-integrity-foundation-20260704-192034`, branch `dm/projection-store-integrity-foundation`, run artifacts under `C:\tmp\sunlight-manager\20260704-192034`.
+- Next heartbeat should inspect active WSL progress, import verified work if finished, and keep project-wide projection integrity moving.
 
 ## Candidate Next Slices
 
 - Execution-output promotion still needs a later persistent store path after the fixture-level command proves the envelope.
-- Store-integrity quarantine still needs a real verification/persistence path after the fixture-level status/inspect envelope.
+- First external validation repo and exact test command remain the next product-level decision once the local fixture path is stable.
 
 ## Decisions
 

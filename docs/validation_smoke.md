@@ -27,3 +27,8 @@ preconditions, compatible and conflicted view resolution, projection
 materialization with the current `sun project materialize` spelling, fixture
 `sun run -- cargo test`, checkpoint creation, compatibility import, and Git
 export write planning with `--write-plan`.
+
+For focused projection strategy coverage, run
+`scripts/projection-strategy-smoke.sh`. It verifies copy fallback, explicit
+strategy selection JSON, local-only materialization metadata, and unsupported
+required strategy errors without depending on real reflink support.

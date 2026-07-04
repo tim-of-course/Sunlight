@@ -1,5 +1,6 @@
 pub mod artifacts;
 pub mod checkpoint;
+pub mod compat_import;
 pub mod execution;
 pub mod git_export;
 pub mod identity;

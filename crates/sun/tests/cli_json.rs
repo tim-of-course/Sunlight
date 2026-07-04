@@ -707,9 +707,7 @@ fn checkpoint_create_json_fixture_ready_view_returns_checkpoint_envelope() {
     let stdout = stdout(&output);
     assert!(stdout.contains("\"command\":\"checkpoint.create\""));
     assert!(stdout.contains("\"repository_id\":\"repo_fixture_basic_app\""));
-    assert!(stdout.contains(
-        "\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""
-    ));
+    assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
     assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
     assert!(stdout.contains(
         "\"tree_identity\":{\"kind\":\"SingleRepoTree\",\"repository_id\":\"repo_fixture_basic_app\",\"tree_hash\":\"tree_fixture_"
@@ -748,9 +746,9 @@ fn checkpoint_create_json_fixture_conflicted_view_returns_stable_error() {
     assert_failure(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("\"code\":\"checkpoint_conflicted_view\""));
-    assert!(stdout.contains(
-        "\"message\":\"resolved view has conflicts and cannot be checkpointed\""
-    ));
+    assert!(
+        stdout.contains("\"message\":\"resolved view has conflicts and cannot be checkpointed\"")
+    );
     assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
     assert!(stdout.contains("\"conflict_ids\":[\"conflict_src_auth_ts_0001\"]"));
     assert!(stdout.contains("\"staleness_ids\":[]"));
@@ -833,9 +831,7 @@ fn status_json_fixture_checkpoint_returns_checkpoint_snapshot() {
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("\"command\":\"status.checkpoint\""));
-    assert!(stdout.contains(
-        "\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""
-    ));
+    assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
     assert!(stdout.contains("\"conflict_free\":true"));
     assert!(stdout.contains("\"evidence_ready\":true"));
     assert!(stdout.contains("\"export_ready\":true"));

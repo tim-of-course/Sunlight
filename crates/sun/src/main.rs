@@ -12,8 +12,7 @@ use sunlight_core::artifacts::{
     FIXTURE_WRITE_TOPIC_ID, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
 };
 use sunlight_core::checkpoint::{
-    fixture_checkpoint_from_resolved_view, CheckpointRecord, CheckpointValidationError,
-    EvidenceRef,
+    fixture_checkpoint_from_resolved_view, CheckpointRecord, CheckpointValidationError, EvidenceRef,
 };
 use sunlight_core::execution::{
     fixture_failing_execution_from_resolved_view, fixture_passing_execution_from_resolved_view,
@@ -584,10 +583,14 @@ fn parse_checkpoint_create_options(
     }
 
     let fixture = fixture.ok_or_else(|| {
-        invalid_request("usage: sun checkpoint create --view <resolved-view-id> --fixture basic-app")
+        invalid_request(
+            "usage: sun checkpoint create --view <resolved-view-id> --fixture basic-app",
+        )
     })?;
     let view_id = view_id.ok_or_else(|| {
-        invalid_request("usage: sun checkpoint create --view <resolved-view-id> --fixture basic-app")
+        invalid_request(
+            "usage: sun checkpoint create --view <resolved-view-id> --fixture basic-app",
+        )
     })?;
 
     Ok(CheckpointCreateOptions { fixture, view_id })

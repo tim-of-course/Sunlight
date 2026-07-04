@@ -409,7 +409,10 @@ mod tests {
             projection.store_integrity_policy,
             StoreIntegrityPolicy::VerifyBeforeReuse
         );
-        assert_eq!(projection.root_ref.privacy.privacy_class(), PrivacyClass::LocalOnly);
+        assert_eq!(
+            projection.root_ref.privacy.privacy_class(),
+            PrivacyClass::LocalOnly
+        );
         assert_eq!(projection.privacy_class, PrivacyClass::LocalOnly);
     }
 
@@ -418,8 +421,7 @@ mod tests {
         let view = conflict_free_view();
 
         let projection =
-            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001")
-                .unwrap();
+            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001").unwrap();
 
         assert_eq!(projection.purpose, ProjectionPurpose::Compatibility);
         assert_eq!(

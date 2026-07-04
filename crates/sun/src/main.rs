@@ -24,7 +24,7 @@ use sunlight_core::compat_import::{
 use sunlight_core::execution::{
     fixture_failing_execution_from_resolved_view, fixture_passing_execution_from_resolved_view,
     fixture_promotion_candidate_provenance, ExecutionFoundationError, ExecutionRecord,
-    OutputClassification, OutputKind, PromotionCandidateProvenance,
+    OutputClassification, OutputKind, PromotionCandidateProvenance, FIXTURE_PASSING_EXECUTION_ID,
 };
 use sunlight_core::git_export::{
     execute_git_export_writer_plan_fixture, execute_local_git_export_writer, git_export_checkpoint,
@@ -168,6 +168,9 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         }
         [scope, command, ..] if scope == "git" && command == "export" => git_export(&ctx),
         [scope, command, ..] if scope == "compat" && command == "import" => compat_import(&ctx),
+        [scope, command, ..] if scope == "execution" && command == "promote-output" => {
+            execution_promote_output(&ctx)
+        }
         [command, ..] if command == "run" => execution_run(&ctx),
         [command, ..] if command == "read" => artifact_read(&ctx),
         [command, ..] if command == "list" => artifact_list(&ctx),
@@ -432,6 +435,86 @@ fn execution_run(ctx: &CommandContext) -> Result<(), CliError> {
         println!("{}", execution_run_success_envelope(&execution));
     } else {
         println!("{} {}", execution.id, execution.result.status.as_str());
+    }
+
+    Ok(())
+}
+
+fn execution_promote_output(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_execution_promote_output_options(ctx)?;
+    if options.fixture != "basic-app" {
+        return Err(
+            invalid_request(format!("unknown fixture `{}`", options.fixture))
+                .with_detail("fixture", options.fixture),
+        );
+    }
+    if options.execution_id != FIXTURE_PASSING_EXECUTION_ID {
+        return Err(promotion_error(
+            "promotion_precondition_failed",
+            "execution output promotion requires the passing fixture execution",
+            &options.execution_id,
+            options.path.as_deref(),
+            options.session_id.as_deref(),
+            options.classification.as_deref(),
+        ));
+    }
+
+    let view = fixture_resolved_view(vec![fixture_auth_revision(), fixture_profile_revision()]);
+    let execution = fixture_passing_execution_from_resolved_view(&view).map_err(execution_error)?;
+    let candidate = fixture_promotion_candidate_provenance(&execution);
+
+    if options.path.as_deref() != Some(candidate.output_path.as_str()) {
+        return Err(promotion_error(
+            "promotion_precondition_failed",
+            "execution output path is not a declared fixture promotion candidate",
+            &options.execution_id,
+            options.path.as_deref(),
+            options.session_id.as_deref(),
+            options.classification.as_deref(),
+        ));
+    }
+    if options.session_id.as_deref() != Some(FIXTURE_SESSION_ID) {
+        return Err(promotion_error(
+            "promotion_precondition_failed",
+            "execution output promotion requires fixture session `session_agent_a`",
+            &options.execution_id,
+            options.path.as_deref(),
+            options.session_id.as_deref(),
+            options.classification.as_deref(),
+        ));
+    }
+    if options.classification.as_deref() != Some(candidate.classification.as_str()) {
+        return Err(promotion_error(
+            "promotion_policy_failed",
+            "execution output promotion classification does not match the candidate",
+            &options.execution_id,
+            options.path.as_deref(),
+            options.session_id.as_deref(),
+            options.classification.as_deref(),
+        ));
+    }
+
+    let mut store = fixture_store(&options.fixture)?;
+    let mut response = store
+        .write(WriteRequest {
+            session_id: options.session_id.expect("validated session"),
+            path: candidate.output_path.clone(),
+            expected_hash: ExpectedHash::New,
+            content: fixture_promoted_generated_auth_bytes(),
+            classification: "source".to_string(),
+            executable: false,
+            media_type: "text/typescript; charset=utf-8".to_string(),
+        })
+        .map_err(artifact_error)?;
+    normalize_promotion_mutation_response(&mut response, &candidate);
+
+    if ctx.json {
+        println!("{}", promotion_success_envelope(&response, &candidate));
+    } else {
+        println!(
+            "promoted {} {}",
+            response.artifact.path, response.artifact.after_hash
+        );
     }
 
     Ok(())
@@ -1366,6 +1449,92 @@ fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptio
         fixture,
         view_id,
         command_argv,
+    })
+}
+
+fn parse_execution_promote_output_options(
+    ctx: &CommandContext,
+) -> Result<ExecutionPromoteOutputOptions, CliError> {
+    let mut execution_id = None;
+    let mut fixture = None;
+    let mut path = None;
+    let mut session_id = None;
+    let mut classification = None;
+    let mut args = ctx.args.iter().skip(2);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun execution promote-output requires --fixture basic-app")
+                })?;
+                fixture = Some(value.clone());
+            }
+            "--path" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun execution promote-output requires --path <path>")
+                })?;
+                path = Some(value.clone());
+            }
+            "--session" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun execution promote-output requires --session <session>",
+                    )
+                })?;
+                session_id = Some(value.clone());
+            }
+            "--classification" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun execution promote-output requires --classification <class>",
+                    )
+                })?;
+                classification = Some(value.clone());
+            }
+            "--topic" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun execution promote-output --topic <topic>")
+                })?;
+                if value != FIXTURE_WRITE_TOPIC_ID {
+                    return Err(CliError::new(
+                        "promotion_topic_not_found",
+                        "promotion target topic was not found",
+                    )
+                    .with_detail("topic_id", value.clone()));
+                }
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun execution promote-output"
+                )));
+            }
+            value => {
+                if execution_id.is_some() {
+                    return Err(invalid_request(format!(
+                        "unexpected execution promote-output argument `{value}`"
+                    )));
+                }
+                execution_id = Some(value.to_string());
+            }
+        }
+    }
+
+    let execution_id = execution_id.ok_or_else(|| {
+        invalid_request(
+            "usage: sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> --fixture basic-app",
+        )
+    })?;
+    let fixture = fixture.ok_or_else(|| {
+        invalid_request("usage: sun execution promote-output requires --fixture basic-app")
+    })?;
+
+    Ok(ExecutionPromoteOutputOptions {
+        execution_id,
+        fixture,
+        path,
+        session_id,
+        classification,
     })
 }
 
@@ -2433,6 +2602,15 @@ struct MutationCommandOptions {
     classification: Option<String>,
 }
 
+#[derive(Debug)]
+struct ExecutionPromoteOutputOptions {
+    execution_id: String,
+    fixture: String,
+    path: Option<String>,
+    session_id: Option<String>,
+    classification: Option<String>,
+}
+
 fn parse_artifact_options(
     ctx: &CommandContext,
     command: &'static str,
@@ -3193,6 +3371,32 @@ fn execution_error(error: ExecutionFoundationError) -> CliError {
         json_escape(&error.resolved_view_id),
         string_array_json(error.conflict_ids.iter().map(String::as_str)),
         string_array_json(error.staleness_ids.iter().map(String::as_str)),
+    ))
+}
+
+fn promotion_error(
+    code: &'static str,
+    message: &'static str,
+    execution_id: &str,
+    path: Option<&str>,
+    session_id: Option<&str>,
+    classification: Option<&str>,
+) -> CliError {
+    CliError::new(code, message).with_raw_details_json(format!(
+        concat!(
+            "{{",
+            "\"execution_id\":\"{}\",",
+            "\"path\":{},",
+            "\"session_id\":{},",
+            "\"classification\":{},",
+            "\"operation_transaction_id\":null,",
+            "\"topic_revision_id\":null",
+            "}}"
+        ),
+        json_escape(execution_id),
+        optional_string_json(path),
+        optional_string_json(session_id),
+        optional_string_json(classification),
     ))
 }
 
@@ -5221,6 +5425,48 @@ fn mutation_success_envelope(response: &MutationResponse) -> String {
     )
 }
 
+fn promotion_success_envelope(
+    response: &MutationResponse,
+    candidate: &PromotionCandidateProvenance,
+) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"execution.promote_output\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"session_id\":\"{}\",",
+            "\"execution_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"topic_revision_id\":\"{}\"",
+            "}},",
+            "\"view\":{},",
+            "\"artifacts\":[{}],",
+            "\"promotion_source\":{},",
+            "\"operation\":{},",
+            "\"topic_revision\":{},",
+            "\"session_generation\":{}",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(&response.repository_id),
+        json_escape(&response.session_id),
+        json_escape(&candidate.execution_id),
+        json_escape(&candidate.projection_id),
+        json_escape(&response.operation.id),
+        json_escape(&response.topic_revision.id),
+        view_json(&response.view),
+        mutation_artifact_json(&response.artifact),
+        promotion_source_json(candidate),
+        promotion_operation_json(response, candidate),
+        topic_revision_json(response),
+        session_generation_json(response),
+    )
+}
+
 fn view_resolve_success_envelope(result: &ResolvedViewResult) -> String {
     let conflict_ids = result
         .conflicts()
@@ -5632,6 +5878,105 @@ fn resolver_record_json(record: &ResolverConflictOrStalenessRecord) -> String {
     )
 }
 
+fn normalize_promotion_mutation_response(
+    response: &mut MutationResponse,
+    candidate: &PromotionCandidateProvenance,
+) {
+    const OPERATION_ID: &str = "op_promote_generated_auth_0001";
+    const TOPIC_REVISION_ID: &str = "rev_auth_nullability_promotion_0001";
+    const SESSION_GENERATION_ID: &str = "gen_agent_a_promotion_0001";
+    const RESOLVED_VIEW_ID: &str = "view_agent_a_after_promotion_0001";
+    const TREE_HASH: &str = "tree_after_generated_auth_promotion_0001";
+
+    response.artifact.artifact_id = "artifact_src_generated_auth_generated_ts".to_string();
+    response.artifact.after_hash = candidate.after_hash.clone();
+    response.view.resolved_view_id = RESOLVED_VIEW_ID.to_string();
+    response.view.session_generation_id = SESSION_GENERATION_ID.to_string();
+    response.view.tree_identity.tree_hash = TREE_HASH.to_string();
+    response.operation.id = OPERATION_ID.to_string();
+    response.operation.authored_context_id =
+        format!("execution:{}:{}", candidate.execution_id, candidate.output_path);
+    response.operation.write_set[0].artifact_id = response.artifact.artifact_id.clone();
+    response.operation.preconditions.expected_path = candidate.output_path.clone();
+    response.operation.before_refs.tree_identity.tree_hash = candidate
+        .before_hash
+        .clone()
+        .unwrap_or_else(|| FIXTURE_TREE_HASH.to_string());
+    response.operation.after_refs.tree_identity.tree_hash = TREE_HASH.to_string();
+    response.operation.before_refs.artifacts[0].artifact_id = None;
+    response.operation.before_refs.artifacts[0].content_hash = candidate.before_hash.clone();
+    response.operation.after_refs.artifacts[0].artifact_id =
+        Some(response.artifact.artifact_id.clone());
+    response.operation.after_refs.artifacts[0].content_hash = Some(candidate.after_hash.clone());
+    if let MutationPayload::Write { content_hash, .. } = &mut response.operation.mutation_payload {
+        *content_hash = candidate.after_hash.clone();
+    }
+    response.topic_revision.id = TOPIC_REVISION_ID.to_string();
+    response.topic_revision.operation_transaction_id = OPERATION_ID.to_string();
+    response.topic_revision.tree_delta_ref = "delta_promote_generated_auth_0001".to_string();
+    response.session_generation.id = SESSION_GENERATION_ID.to_string();
+    response.session_generation.resolved_view_id = RESOLVED_VIEW_ID.to_string();
+    response
+        .session_generation
+        .topic_frontier
+        .insert(FIXTURE_WRITE_TOPIC_ID.to_string(), TOPIC_REVISION_ID.to_string());
+    response.session_generation.created_by_operation_id = OPERATION_ID.to_string();
+}
+
+fn fixture_promoted_generated_auth_bytes() -> Vec<u8> {
+    b"export const generatedAuthPolicy = \"strict\";\n".to_vec()
+}
+
+fn promotion_source_json(candidate: &PromotionCandidateProvenance) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"execution_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"output_path\":\"{}\",",
+            "\"target_topic_id\":\"{}\",",
+            "\"classification\":\"{}\",",
+            "\"before_hash\":{},",
+            "\"after_hash\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&candidate.execution_id),
+        json_escape(&candidate.projection_id),
+        json_escape(&candidate.output_path),
+        json_escape(&candidate.target_topic_id),
+        candidate.classification.as_str(),
+        optional_string_json(candidate.before_hash.as_deref()),
+        json_escape(&candidate.after_hash),
+    )
+}
+
+fn promotion_operation_json(
+    response: &MutationResponse,
+    candidate: &PromotionCandidateProvenance,
+) -> String {
+    let mut operation = operation_json(response);
+    operation.pop();
+    format!(
+        concat!(
+            "{},",
+            "\"promotion_source\":{},",
+            "\"execution_provenance\":{{",
+            "\"execution_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"output_path\":\"{}\",",
+            "\"classification\":\"{}\"",
+            "}}",
+            "}}"
+        ),
+        operation,
+        promotion_source_json(candidate),
+        json_escape(&candidate.execution_id),
+        json_escape(&candidate.projection_id),
+        json_escape(&candidate.output_path),
+        candidate.classification.as_str(),
+    )
+}
+
 fn operation_json(response: &MutationResponse) -> String {
     let operation = &response.operation;
     let payload = mutation_payload_json(&operation.mutation_payload);
@@ -6031,6 +6376,7 @@ Usage:
   sun view resolve --fixture basic-app --include topic:revision[,topic:revision] [--json]
   sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app [--projection-root <empty-path>] [--json]
   sun run --view <resolved-view-id> --fixture basic-app --json -- cargo test
+  sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> --fixture basic-app [--json]
   sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
   sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan|--execute-fixture success|ref-update-failure|export-map-failure|--execute-local --repo <path>] --json
 
@@ -6046,6 +6392,7 @@ Commands:
   view       Resolve fixture topic revisions into a candidate view
   project    Materialize fixture projections for exact resolved views
   run        Record a fixture execution for an exact resolved view
+  execution  Promote a declared fixture execution output into a topic operation
   checkpoint Freeze a fixture resolved view as an in-memory checkpoint
   git        Export a fixture checkpoint to a Git ref
 "

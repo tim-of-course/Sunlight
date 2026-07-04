@@ -167,8 +167,10 @@ The execution record remains separate from the checkpoint. Checkpoints select ev
 Tool-produced source changes are promoted with an explicit command:
 
 ```text
-sun execution promote-output <execution-id> --path <sandbox-path> --topic <topic> --classification <class> --json
+sun execution promote-output <execution-id> --path <sandbox-path> --session <session-id> --classification <class> --fixture basic-app --json
 ```
+
+The current CLI fixture accepts only the declared passing execution candidate for `basic-app`.
 
 Promotion rules:
 
@@ -239,7 +241,7 @@ Use existing fixture IDs where possible:
 | Projection | `projection_exec_auth_profile_0001` |
 | Passing execution | `exec_auth_profile_tests_0001` |
 | Failing execution | `exec_auth_profile_tests_fail_0001` |
-| Promotion operation | `op_promote_formatter_output_0001` |
+| Promotion operation | `op_promote_generated_auth_0001` |
 
 ## Acceptance Tests
 

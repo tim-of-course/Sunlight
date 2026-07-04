@@ -623,6 +623,86 @@ fn run_json_fixture_failure_result_still_returns_execution_record() {
 }
 
 #[test]
+fn execution_promote_output_json_fixture_returns_mutation_with_execution_provenance() {
+    let repo = TestRepo::new("execution-promote-output");
+
+    let output = sun()
+        .arg("execution")
+        .arg("promote-output")
+        .arg("exec_auth_profile_tests_0001")
+        .arg("--path")
+        .arg("src/generated/auth.generated.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--classification")
+        .arg("source_like_delta")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun execution promote-output should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"execution.promote_output\""));
+    assert!(stdout.contains("\"repository_id\":\"repo_fixture_basic_app\""));
+    assert!(stdout.contains("\"execution_id\":\"exec_auth_profile_tests_0001\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_promote_generated_auth_0001\""));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_promotion_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_promotion_0001\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_promotion_0001\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_generated_auth_generated_ts\""));
+    assert!(stdout.contains("\"path\":\"src/generated/auth.generated.ts\""));
+    assert!(stdout.contains("\"before_hash\":null"));
+    assert!(stdout.contains("\"after_hash\":\"sha256:generated_auth_after\""));
+    assert!(stdout.contains("\"mutation\":\"write\""));
+    assert!(stdout.contains("\"expected_hash\":\"new\""));
+    assert!(stdout.contains("\"authored_context_id\":\"execution:exec_auth_profile_tests_0001:src/generated/auth.generated.ts\""));
+    assert!(stdout.contains("\"promotion_source\":{\"execution_id\":\"exec_auth_profile_tests_0001\",\"projection_id\":\"projection_exec_auth_profile_0001\",\"output_path\":\"src/generated/auth.generated.ts\""));
+    assert!(stdout.contains("\"target_topic_id\":\"topic_auth_nullability\""));
+    assert!(stdout.contains("\"classification\":\"source_like_delta\""));
+    assert!(stdout.contains("\"execution_provenance\":{\"execution_id\":\"exec_auth_profile_tests_0001\",\"projection_id\":\"projection_exec_auth_profile_0001\",\"output_path\":\"src/generated/auth.generated.ts\",\"classification\":\"source_like_delta\"}"));
+    assert!(stdout.contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_promotion_0001\"}"));
+}
+
+#[test]
+fn execution_promote_output_json_unknown_execution_returns_stable_failure() {
+    let repo = TestRepo::new("execution-promote-output-unknown");
+
+    let output = sun()
+        .arg("execution")
+        .arg("promote-output")
+        .arg("exec_stale_0001")
+        .arg("--path")
+        .arg("src/generated/auth.generated.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--classification")
+        .arg("source_like_delta")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun execution promote-output should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"promotion_precondition_failed\""));
+    assert!(stdout.contains("\"execution_id\":\"exec_stale_0001\""));
+    assert!(stdout.contains("\"path\":\"src/generated/auth.generated.ts\""));
+    assert!(stdout.contains("\"session_id\":\"session_agent_a\""));
+    assert!(stdout.contains("\"classification\":\"source_like_delta\""));
+    assert!(stdout.contains("\"operation_transaction_id\":null"));
+    assert!(stdout.contains("\"topic_revision_id\":null"));
+    assert!(!stdout.contains("\"ok\":true"));
+    assert!(!stdout.contains("\"command\":\"execution.promote_output\""));
+}
+
+#[test]
 fn run_json_fixture_conflicted_view_rejects_before_projection() {
     let repo = TestRepo::new("run-fixture-conflicted");
     let view_id = resolve_fixture_view_id(

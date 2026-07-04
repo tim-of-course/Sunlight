@@ -790,12 +790,11 @@ fn compat_import_json_fixture_candidate_returns_operation_plan() {
     assert!(stdout.contains("\"after_hash\":\"sha256:auth_projection_after\""));
     assert!(stdout.contains("\"mutation\":\"compat_import\""));
     assert!(stdout.contains("\"projection_purpose\":\"compatibility\""));
-    assert!(stdout.contains(
-        "\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"
-    ));
+    assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
     assert!(stdout.contains("\"baseline_manifest_digest\":\"sha256:compat_baseline\""));
-    assert!(stdout
-        .contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_compat_0001\"}"));
+    assert!(stdout.contains(
+        "\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_compat_0001\"}"
+    ));
 }
 
 #[test]
@@ -848,8 +847,9 @@ fn compat_import_json_fixture_missing_candidate_returns_diff_failed() {
     assert!(stdout.contains("\"code\":\"compat_diff_failed\""));
     assert!(stdout.contains("\"message\":\"selected compatibility candidate was not found\""));
     assert!(stdout.contains("\"candidate_delta_ids\":[\"compat_delta_missing_0001\"]"));
-    assert!(stdout
-        .contains("\"reason\":\"selected candidate delta was not present in fixture diff output\""));
+    assert!(stdout.contains(
+        "\"reason\":\"selected candidate delta was not present in fixture diff output\""
+    ));
     assert!(stdout.contains("\"operation_transaction_id\":null"));
 }
 

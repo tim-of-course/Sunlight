@@ -17,8 +17,7 @@ use sunlight_core::checkpoint::{
 };
 use sunlight_core::compat_import::{
     fixture_basic_app_candidate_deltas, plan_fixture_basic_app_import, CompatImportErrorCode,
-    CompatImportRequest, CompatImportResponse, CompatImportValidationError,
-    CompatImportedArtifact,
+    CompatImportRequest, CompatImportResponse, CompatImportValidationError, CompatImportedArtifact,
 };
 use sunlight_core::execution::{
     fixture_failing_execution_from_resolved_view, fixture_passing_execution_from_resolved_view,
@@ -714,7 +713,9 @@ fn parse_compat_import_options(ctx: &CommandContext) -> Result<CompatImportOptio
             }
             "--projection" => {
                 let value = args.next().ok_or_else(|| {
-                    invalid_request("usage: sun compat import requires --projection <projection-id>")
+                    invalid_request(
+                        "usage: sun compat import requires --projection <projection-id>",
+                    )
                 })?;
                 projection_id = Some(value.clone());
             }
@@ -2528,18 +2529,34 @@ fn compat_import_error(error: CompatImportValidationError) -> CliError {
     let message = match error.code {
         CompatImportErrorCode::NoSelectedChanges => "no compatibility import candidates selected",
         CompatImportErrorCode::DiffFailed => "selected compatibility candidate was not found",
-        CompatImportErrorCode::SecretDetected => "selected compatibility candidate contains secrets",
-        CompatImportErrorCode::CacheBlocked => "selected compatibility candidate is cache or build output",
+        CompatImportErrorCode::SecretDetected => {
+            "selected compatibility candidate contains secrets"
+        }
+        CompatImportErrorCode::CacheBlocked => {
+            "selected compatibility candidate is cache or build output"
+        }
         CompatImportErrorCode::ProjectionNotFound => "compatibility projection was not found",
-        CompatImportErrorCode::ProjectionInvalid => "projection is not valid for compatibility import",
+        CompatImportErrorCode::ProjectionInvalid => {
+            "projection is not valid for compatibility import"
+        }
         CompatImportErrorCode::ProjectionStale => "compatibility projection is stale",
-        CompatImportErrorCode::ProjectionIntegrityFailed => "compatibility projection integrity check failed",
-        CompatImportErrorCode::PathPolicyFailed => "selected compatibility candidate failed path policy",
+        CompatImportErrorCode::ProjectionIntegrityFailed => {
+            "compatibility projection integrity check failed"
+        }
+        CompatImportErrorCode::PathPolicyFailed => {
+            "selected compatibility candidate failed path policy"
+        }
         CompatImportErrorCode::PreconditionFailed => "compatibility import precondition failed",
         CompatImportErrorCode::ConflictedDelta => "selected compatibility candidate is conflicted",
-        CompatImportErrorCode::AmbiguousRename => "selected compatibility candidate has ambiguous rename identity",
-        CompatImportErrorCode::PolicyFailed => "selected compatibility candidate failed import policy",
-        CompatImportErrorCode::PartialWriteBlocked => "compatibility import partial write is blocked",
+        CompatImportErrorCode::AmbiguousRename => {
+            "selected compatibility candidate has ambiguous rename identity"
+        }
+        CompatImportErrorCode::PolicyFailed => {
+            "selected compatibility candidate failed import policy"
+        }
+        CompatImportErrorCode::PartialWriteBlocked => {
+            "compatibility import partial write is blocked"
+        }
     };
 
     CliError::new(error.code.as_str(), message).with_raw_details_json(format!(

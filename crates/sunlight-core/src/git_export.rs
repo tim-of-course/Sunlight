@@ -219,9 +219,7 @@ impl GitExportRefUpdateReason {
         match self {
             Self::CreateRef => "create_ref",
             Self::ReplaceSelectedParent => "replace_selected_parent",
-            Self::ReplacePriorExportForSameCheckpoint => {
-                "replace_prior_export_for_same_checkpoint"
-            }
+            Self::ReplacePriorExportForSameCheckpoint => "replace_prior_export_for_same_checkpoint",
         }
     }
 }
@@ -1105,7 +1103,9 @@ mod tests {
     #[test]
     fn writer_plan_ambiguous_parent_fails() {
         let mut input = writer_input();
-        input.base_checkpoint_ids.push("checkpoint_base_0002".to_string());
+        input
+            .base_checkpoint_ids
+            .push("checkpoint_base_0002".to_string());
         input.imported_base_commits.push(ImportedBaseGitCommit {
             checkpoint_id: "checkpoint_base_0002".to_string(),
             git_commit_id: "git_sha1_base_2".to_string(),

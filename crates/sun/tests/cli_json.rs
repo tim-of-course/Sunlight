@@ -553,6 +553,135 @@ fn view_resolve_json_missing_dependency_returns_staleness_summary() {
 }
 
 #[test]
+fn run_json_fixture_ready_view_returns_execution_projection_envelope() {
+    let repo = TestRepo::new("run-fixture-ready");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+
+    let output = sun()
+        .arg("run")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .arg("--")
+        .arg("cargo")
+        .arg("test")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"execution.run\""));
+    assert!(stdout.contains("\"repository_id\":\"repo_fixture_basic_app\""));
+    assert!(stdout.contains("\"execution_id\":\"exec_auth_profile_tests_0001\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(stdout.contains("\"result\":{\"status\":\"pass\",\"exit_code\":0,\"timed_out\":false}"));
+    assert!(stdout.contains("\"output_summary_counts\":{\"total\":1,\"stdout_summary\":1,\"stderr_summary\":0,\"file_delta\":0,\"source_like_delta\":0}"));
+    assert!(stdout.contains("\"tree_identity\":{\"kind\":\"SingleRepoTree\",\"repository_id\":\"repo_fixture_basic_app\",\"tree_hash\":\"tree_fixture_"));
+    assert!(stdout.contains("\"promotion_candidates\":[{\"execution_id\":\"exec_auth_profile_tests_0001\",\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"output_path\":\"src/generated/auth.generated.ts\""));
+    assert!(stdout.contains("\"classification\":\"source_like_delta\""));
+}
+
+#[test]
+fn run_json_fixture_failure_result_still_returns_execution_record() {
+    let repo = TestRepo::new("run-fixture-fail");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+
+    let output = sun()
+        .arg("run")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .arg("--")
+        .arg("cargo")
+        .arg("test")
+        .arg("--fixture-fail")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"execution_id\":\"exec_auth_profile_tests_fail_0001\""));
+    assert!(stdout.contains("\"result\":{\"status\":\"fail\",\"exit_code\":101,\"timed_out\":false}"));
+    assert!(stdout.contains("\"output_summary_counts\":{\"total\":2,\"stdout_summary\":1,\"stderr_summary\":1,\"file_delta\":0,\"source_like_delta\":0}"));
+    assert!(stdout.contains("\"promotion_candidates\":[]"));
+}
+
+#[test]
+fn run_json_fixture_conflicted_view_rejects_before_projection() {
+    let repo = TestRepo::new("run-fixture-conflicted");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_auth_overlap_0001",
+    );
+
+    let output = sun()
+        .arg("run")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .arg("--")
+        .arg("cargo")
+        .arg("test")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"execution_conflicted_view\""));
+    assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(stdout.contains("\"conflict_ids\":[\"conflict_src_auth_ts_0001\"]"));
+    assert!(stdout.contains("\"staleness_ids\":[]"));
+    assert!(stdout.contains("\"projection_id\":null"));
+    assert!(stdout.contains("\"execution_id\":null"));
+}
+
+#[test]
+fn run_json_fixture_stale_view_rejects_before_projection() {
+    let repo = TestRepo::new("run-fixture-stale");
+    let view_id = resolve_fixture_view_id(repo.path(), "topic_profile_ui:rev_profile_ui_0002");
+
+    let output = sun()
+        .arg("run")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .arg("--")
+        .arg("cargo")
+        .arg("test")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"execution_conflicted_view\""));
+    assert!(stdout.contains("\"conflict_ids\":[]"));
+    assert!(stdout
+        .contains("\"staleness_ids\":[\"stale_missing_dependency_rev_auth_nullability_0001\"]"));
+    assert!(stdout.contains("\"projection_id\":null"));
+    assert!(stdout.contains("\"execution_id\":null"));
+}
+
+#[test]
 fn status_json_fixture_basic_app_returns_repository_snapshot() {
     let repo = TestRepo::new("status-fixture-repository");
 
@@ -758,6 +887,22 @@ fn json_string_field(stdout: &str, field: &str) -> String {
         .find('"')
         .unwrap_or_else(|| panic!("unterminated field `{field}` in stdout:\n{stdout}"));
     stdout[start..start + end].to_string()
+}
+
+fn resolve_fixture_view_id(repo: &Path, include: &str) -> String {
+    let output = sun()
+        .arg("view")
+        .arg("resolve")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--include")
+        .arg(include)
+        .arg("--json")
+        .current_dir(repo)
+        .output()
+        .expect("sun view resolve should run");
+    assert_success(&output);
+    resolved_view_id(&stdout(&output))
 }
 
 struct TestRepo {

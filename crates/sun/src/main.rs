@@ -11,6 +11,11 @@ use sunlight_core::artifacts::{
     FIXTURE_RESOLVED_VIEW_ID, FIXTURE_SESSION_GENERATION_ID, FIXTURE_SESSION_ID, FIXTURE_TREE_HASH,
     FIXTURE_WRITE_TOPIC_ID, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
 };
+use sunlight_core::execution::{
+    fixture_failing_execution_from_resolved_view, fixture_passing_execution_from_resolved_view,
+    fixture_promotion_candidate_provenance, ExecutionFoundationError, ExecutionRecord,
+    OutputClassification, OutputKind, PromotionCandidateProvenance,
+};
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
 };
@@ -50,6 +55,7 @@ struct CliError {
     code: &'static str,
     message: String,
     details: Vec<(&'static str, String)>,
+    raw_details_json: Option<String>,
 }
 
 impl CliError {
@@ -58,11 +64,17 @@ impl CliError {
             code,
             message: message.into(),
             details: Vec::new(),
+            raw_details_json: None,
         }
     }
 
     fn with_detail(mut self, key: &'static str, value: impl Into<String>) -> Self {
         self.details.push((key, value.into()));
+        self
+    }
+
+    fn with_raw_details_json(mut self, value: impl Into<String>) -> Self {
+        self.raw_details_json = Some(value.into());
         self
     }
 }
@@ -108,6 +120,7 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
             ))
         }
         [scope, command, ..] if scope == "view" && command == "resolve" => view_resolve(&ctx),
+        [command, ..] if command == "run" => execution_run(&ctx),
         [command, ..] if command == "read" => artifact_read(&ctx),
         [command, ..] if command == "list" => artifact_list(&ctx),
         [command, ..] if command == "search" => artifact_search(&ctx),
@@ -342,6 +355,44 @@ fn view_resolve(ctx: &CommandContext) -> Result<(), CliError> {
     Ok(())
 }
 
+fn execution_run(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_execution_run_options(ctx)?;
+    if options.fixture != "basic-app" {
+        return Err(
+            invalid_request(format!("unknown fixture `{}`", options.fixture))
+                .with_detail("fixture", options.fixture),
+        );
+    }
+    if options.command_argv.as_slice() != ["cargo", "test"]
+        && options.command_argv.as_slice() != ["cargo", "test", "--fixture-fail"]
+    {
+        return Err(invalid_request(
+            "fixture execution supports only `-- cargo test` or `-- cargo test --fixture-fail`",
+        ));
+    }
+
+    let view = fixture_resolved_view_by_id(&options.view_id)
+        .ok_or_else(|| object_not_found("resolved_view", &options.view_id))?;
+    let execution = if options.command_argv.as_slice() == ["cargo", "test", "--fixture-fail"] {
+        fixture_failing_execution_from_resolved_view(&view)
+    } else {
+        fixture_passing_execution_from_resolved_view(&view)
+    }
+    .map_err(execution_error)?;
+
+    if ctx.json {
+        println!("{}", execution_run_success_envelope(&execution));
+    } else {
+        println!(
+            "{} {}",
+            execution.id,
+            execution.result.status.as_str()
+        );
+    }
+
+    Ok(())
+}
+
 fn status(ctx: &CommandContext) -> Result<(), CliError> {
     if let Some(options) = parse_status_options(ctx)? {
         if options.fixture != "basic-app" {
@@ -442,6 +493,13 @@ struct ViewResolveOptions {
     base_checkpoint_id: Option<String>,
 }
 
+#[derive(Debug)]
+struct ExecutionRunOptions {
+    fixture: String,
+    view_id: String,
+    command_argv: Vec<String>,
+}
+
 fn parse_view_resolve_options(ctx: &CommandContext) -> Result<ViewResolveOptions, CliError> {
     let mut fixture = None;
     let mut include = None;
@@ -526,6 +584,77 @@ fn parse_view_include(value: &str) -> Result<Vec<TopicRevisionSelection>, CliErr
             })
         })
         .collect()
+}
+
+fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptions, CliError> {
+    let mut fixture = None;
+    let mut view_id = None;
+    let mut command_argv = Vec::new();
+    let mut args = ctx.args.iter().skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun run requires --fixture basic-app")
+                })?;
+                fixture = Some(value.clone());
+            }
+            "--view" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| invalid_request("usage: sun run requires --view <view>"))?;
+                view_id = Some(value.clone());
+            }
+            "--cwd" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| invalid_request("usage: sun run --cwd <repo-relative-path>"))?;
+                if value != "." {
+                    return Err(invalid_request("fixture execution supports only --cwd .")
+                        .with_detail("cwd", value.clone()));
+                }
+            }
+            "--timeout" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| invalid_request("usage: sun run --timeout <duration>"))?;
+                if value != "fixture" {
+                    return Err(invalid_request(
+                        "fixture execution accepts only --timeout fixture",
+                    )
+                    .with_detail("timeout", value.clone()));
+                }
+            }
+            "--" => {
+                command_argv.extend(args.cloned());
+                break;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!("unknown flag `{flag}` for sun run")));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected run argument `{value}`; put commands after --"
+                )));
+            }
+        }
+    }
+
+    let fixture =
+        fixture.ok_or_else(|| invalid_request("usage: sun run requires --fixture basic-app"))?;
+    let view_id = view_id.ok_or_else(|| invalid_request("usage: sun run requires --view <view>"))?;
+    if command_argv.is_empty() {
+        return Err(invalid_request(
+            "usage: sun run --view <view> --fixture basic-app -- <command> [args...]",
+        ));
+    }
+
+    Ok(ExecutionRunOptions {
+        fixture,
+        view_id,
+        command_argv,
+    })
 }
 
 fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, CliError> {
@@ -1462,6 +1591,47 @@ fn fixture_resolver_revisions() -> Vec<TopicRevisionRef> {
     ]
 }
 
+fn fixture_resolved_view_by_id(view_id: &str) -> Option<ResolvedViewResult> {
+    fixture_known_resolved_views()
+        .into_iter()
+        .find(|view| view.resolved_view_id == view_id)
+}
+
+fn fixture_known_resolved_views() -> Vec<ResolvedViewResult> {
+    vec![
+        fixture_resolved_view(vec![fixture_auth_revision(), fixture_profile_revision()]),
+        fixture_resolved_view(vec![
+            fixture_auth_revision(),
+            fixture_overlapping_auth_revision(),
+        ]),
+        fixture_resolved_view(vec![fixture_profile_revision_missing_auth_dependency()]),
+    ]
+}
+
+fn fixture_resolved_view(revisions: Vec<TopicRevisionRef>) -> ResolvedViewResult {
+    let frontier = revisions
+        .iter()
+        .map(|revision| TopicRevisionSelection {
+            topic_id: revision.topic_id.clone(),
+            revision_id: revision.revision_id.clone(),
+        })
+        .collect();
+    let mut available_revisions = fixture_resolver_revisions();
+    for revision in revisions {
+        if !available_revisions
+            .iter()
+            .any(|candidate| candidate.revision_id == revision.revision_id)
+        {
+            available_revisions.push(revision);
+        }
+    }
+    resolve_fixture_view(
+        fixture_resolver_input(frontier),
+        fixture_base_entries(),
+        available_revisions,
+    )
+}
+
 fn artifact_error(error: ArtifactIoError) -> CliError {
     let message = match &error {
         ArtifactIoError::PathPolicyViolation { .. } => {
@@ -1545,6 +1715,30 @@ fn artifact_error(error: ArtifactIoError) -> CliError {
         }
     }
     cli_error
+}
+
+fn execution_error(error: ExecutionFoundationError) -> CliError {
+    let message = match error.code.as_str() {
+        "execution_conflicted_view" => {
+            "resolved view has conflicts or staleness and cannot be executed"
+        }
+        "execution_missing_tree" => "resolved view has no executable tree identity",
+        _ => "execution fixture could not be prepared",
+    };
+    CliError::new(error.code.as_str(), message).with_raw_details_json(format!(
+        concat!(
+            "{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"conflict_ids\":{},",
+            "\"staleness_ids\":{},",
+            "\"projection_id\":null,",
+            "\"execution_id\":null",
+            "}}"
+        ),
+        json_escape(&error.resolved_view_id),
+        string_array_json(error.conflict_ids.iter().map(String::as_str)),
+        string_array_json(error.staleness_ids.iter().map(String::as_str)),
+    ))
 }
 
 fn init_success_envelope(
@@ -1780,6 +1974,138 @@ fn view_resolve_success_envelope(result: &ResolvedViewResult) -> String {
             .map(resolver_record_json)
             .collect::<Vec<_>>()
             .join(","),
+    )
+}
+
+fn execution_run_success_envelope(execution: &ExecutionRecord) -> String {
+    let promotion_candidates = if execution.result.status.as_str() == "pass" {
+        vec![fixture_promotion_candidate_provenance(execution)]
+    } else {
+        Vec::new()
+    };
+
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"execution.run\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"execution_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"execution_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"result\":{},",
+            "\"output_summary_counts\":{},",
+            "\"promotion_candidates\":[{}]",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(&execution.repository_id),
+        json_escape(&execution.id),
+        json_escape(&execution.projection_id),
+        json_escape(&execution.resolved_view_id),
+        json_escape(&execution.resolved_view_id),
+        single_repo_tree_json(&execution.tree_identity),
+        json_escape(&execution.id),
+        json_escape(&execution.projection_id),
+        single_repo_tree_json(&execution.tree_identity),
+        execution_result_json(execution),
+        output_summary_counts_json(execution),
+        promotion_candidates
+            .iter()
+            .map(promotion_candidate_json)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn execution_result_json(execution: &ExecutionRecord) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"status\":\"{}\",",
+            "\"exit_code\":{},",
+            "\"timed_out\":{}",
+            "}}"
+        ),
+        execution.result.status.as_str(),
+        execution
+            .result
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        execution.result.timed_out,
+    )
+}
+
+fn output_summary_counts_json(execution: &ExecutionRecord) -> String {
+    let stdout = execution
+        .outputs
+        .iter()
+        .filter(|output| output.kind == OutputKind::StdoutSummary)
+        .count();
+    let stderr = execution
+        .outputs
+        .iter()
+        .filter(|output| output.kind == OutputKind::StderrSummary)
+        .count();
+    let file_delta = execution
+        .outputs
+        .iter()
+        .filter(|output| output.kind == OutputKind::FileDelta)
+        .count();
+    let source_like = execution
+        .outputs
+        .iter()
+        .filter(|output| output.classification == OutputClassification::SourceLikeDelta)
+        .count();
+    format!(
+        concat!(
+            "{{",
+            "\"total\":{},",
+            "\"stdout_summary\":{},",
+            "\"stderr_summary\":{},",
+            "\"file_delta\":{},",
+            "\"source_like_delta\":{}",
+            "}}"
+        ),
+        execution.outputs.len(),
+        stdout,
+        stderr,
+        file_delta,
+        source_like,
+    )
+}
+
+fn promotion_candidate_json(candidate: &PromotionCandidateProvenance) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"execution_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"output_path\":\"{}\",",
+            "\"target_topic_id\":\"{}\",",
+            "\"classification\":\"{}\",",
+            "\"before_hash\":{},",
+            "\"after_hash\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&candidate.execution_id),
+        json_escape(&candidate.projection_id),
+        json_escape(&candidate.output_path),
+        json_escape(&candidate.target_topic_id),
+        candidate.classification.as_str(),
+        optional_string_json(candidate.before_hash.as_deref()),
+        json_escape(&candidate.after_hash),
     )
 }
 
@@ -2240,11 +2566,16 @@ fn write_mode_json(write_mode: &WriteMode) -> &'static str {
 }
 
 fn failure_envelope(error: &CliError) -> String {
+    let details = error
+        .raw_details_json
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| details_json(&error.details));
     format!(
         "{{\"ok\":false,\"error\":{{\"code\":\"{}\",\"message\":\"{}\",\"details\":{}}}}}",
         json_escape(error.code),
         json_escape(&error.message),
-        details_json(&error.details),
+        details,
     )
 }
 
@@ -2293,6 +2624,7 @@ Usage:
   sun patch <path> --session <session> --fixture basic-app --expect-hash <hash> --patch-file <file> [--json]
   sun write <path> --session <session> --fixture basic-app --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]
   sun view resolve --fixture basic-app --include topic:revision[,topic:revision] [--json]
+  sun run --view <resolved-view-id> --fixture basic-app --json -- cargo test
 
 Commands:
   init       Create the conservative local .sunlight repository layout
@@ -2304,6 +2636,7 @@ Commands:
   patch      Apply a fixture-only unified diff to one artifact
   write      Write fixture-only content to one artifact path
   view       Resolve fixture topic revisions into a candidate view
+  run        Record a fixture execution for an exact resolved view
 "
     );
 }

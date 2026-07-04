@@ -946,6 +946,89 @@ fn status_json_fixture_projection_reports_file_local_root() {
     assert!(stdout.contains("\"scan_error\":null"));
 }
 
+#[cfg(unix)]
+#[test]
+fn status_json_fixture_projection_does_not_follow_symlink_local_root() {
+    use std::os::unix::fs::symlink;
+
+    let repo = TestRepo::new("projection-status-root-symlink");
+    let target_root = repo.path().join("target-root");
+    write_nested_file(&target_root, "target-only.txt", "do not scan\n");
+    let projection_root = repo.path().join("projection-root-link");
+    symlink(&target_root, &projection_root).unwrap();
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.projection\""));
+    assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
+    assert!(stdout.contains("\"verification_state\":\"not_directory\""));
+    assert!(stdout.contains("\"exists\":true"));
+    assert!(stdout.contains("\"is_dir\":false"));
+    assert!(stdout.contains("\"directories\":0"));
+    assert!(stdout.contains("\"files\":0"));
+    assert!(stdout.contains("\"bytes\":0"));
+    assert!(stdout.contains("\"sample_paths\":[]"));
+    assert!(stdout.contains("\"scan_error\":null"));
+    assert!(!stdout.contains("target-only.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn status_json_fixture_projection_scan_skips_symlink_entries_inside_local_root() {
+    use std::os::unix::fs::symlink;
+
+    let repo = TestRepo::new("projection-status-root-nested-symlink");
+    let projection_root = repo.path().join("projection-root");
+    write_nested_file(&projection_root, "actual.txt", "ok\n");
+    let outside_root = repo.path().join("outside-root");
+    write_nested_file(&outside_root, "outside.txt", "do not scan\n");
+    symlink(&outside_root, projection_root.join("linked-dir")).unwrap();
+    symlink(
+        outside_root.join("outside.txt"),
+        projection_root.join("linked-file.txt"),
+    )
+    .unwrap();
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.projection\""));
+    assert!(stdout.contains("\"verification_state\":\"present\""));
+    assert!(stdout.contains("\"directories\":1"));
+    assert!(stdout.contains("\"files\":1"));
+    assert!(stdout.contains("\"bytes\":3"));
+    assert!(stdout.contains("\"sample_paths\":[\"actual.txt\"]"));
+    assert!(stdout.contains("\"scan_error\":null"));
+    assert!(!stdout.contains("linked-dir"));
+    assert!(!stdout.contains("linked-file.txt"));
+    assert!(!stdout.contains("outside.txt"));
+}
+
 #[test]
 fn project_materialize_json_projection_root_requires_empty_directory() {
     let repo = TestRepo::new("projection-fixture-copy-nonempty");

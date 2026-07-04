@@ -4574,12 +4574,11 @@ fn scan_local_projection_root_inner(
 
     for entry in entries {
         let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
             scan.directories += 1;
             scan_local_projection_root_inner(root, &path, scan)?;
-        } else if file_type.is_file() {
-            let metadata = fs::symlink_metadata(&path)?;
+        } else if metadata.is_file() {
             scan.files += 1;
             scan.bytes += metadata.len();
             scan.executable_files += usize::from(local_file_is_executable(&metadata));

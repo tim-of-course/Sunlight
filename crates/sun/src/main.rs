@@ -2280,12 +2280,8 @@ fn fixture_status_projection_json(
         .map(|quarantine| quarantine.state.as_str())
         .unwrap_or_else(|| projection.retention_state.as_str());
     let quarantine_json = projection_quarantine_json(&store_integrity);
-    let native_errors_json = projection_native_errors_json(
-        projection,
-        &manifest,
-        &store_integrity,
-        integrity_fixture,
-    );
+    let native_errors_json =
+        projection_native_errors_json(projection, &manifest, &store_integrity, integrity_fixture);
     Ok(format!(
         concat!(
             "{{\"ok\":true,\"data\":{{",

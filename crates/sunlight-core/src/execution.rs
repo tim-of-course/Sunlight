@@ -1,3 +1,4 @@
+use crate::artifacts::MutationResponse;
 use crate::records::PrivacyClass;
 use crate::resolver::{ResolvedViewResult, SingleRepoTree};
 
@@ -7,6 +8,12 @@ pub const FIXTURE_FAILING_EXECUTION_ID: &str = "exec_auth_profile_tests_fail_000
 pub const FIXTURE_ENVIRONMENT_SUMMARY_ID: &str = "env_summary_wsl_rust_0001";
 pub const FIXTURE_STARTED_AT: &str = "2026-07-03T00:00:00Z";
 pub const FIXTURE_FINISHED_AT: &str = "2026-07-03T00:00:05Z";
+pub const FIXTURE_PROMOTION_OPERATION_TRANSACTION_ID: &str = "op_promote_generated_auth_0001";
+pub const FIXTURE_PROMOTION_TOPIC_REVISION_ID: &str = "rev_auth_nullability_promotion_0001";
+pub const FIXTURE_PROMOTION_SESSION_GENERATION_ID: &str = "gen_agent_a_promotion_0001";
+pub const FIXTURE_PROMOTION_RESOLVED_VIEW_ID: &str = "view_agent_a_after_promotion_0001";
+pub const FIXTURE_PROMOTION_TREE_HASH: &str = "tree_after_generated_auth_promotion_0001";
+pub const FIXTURE_PROMOTION_ARTIFACT_ID: &str = "artifact_src_generated_auth_generated_ts";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionMetadata {
@@ -249,6 +256,49 @@ pub struct PromotionCandidateProvenance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionOutputPromotionRecord {
+    pub execution_id: String,
+    pub projection_id: String,
+    pub output_path: String,
+    pub target_topic_id: String,
+    pub classification: OutputClassification,
+    pub before_hash: Option<String>,
+    pub after_hash: String,
+    pub operation_transaction_id: String,
+    pub topic_revision_id: String,
+    pub session_generation_id: String,
+    pub authored_context_id: String,
+    pub provenance_refs: Vec<ExecutionOutputPromotionProvenanceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionOutputPromotionProvenanceRef {
+    pub kind: ExecutionOutputPromotionProvenanceRefKind,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionOutputPromotionProvenanceRefKind {
+    Execution,
+    Projection,
+    OperationTransaction,
+    TopicRevision,
+    SessionGeneration,
+}
+
+impl ExecutionOutputPromotionProvenanceRefKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Execution => "execution",
+            Self::Projection => "projection",
+            Self::OperationTransaction => "operation_transaction",
+            Self::TopicRevision => "topic_revision",
+            Self::SessionGeneration => "session_generation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionFoundationError {
     pub code: ExecutionErrorCode,
     pub resolved_view_id: String,
@@ -349,6 +399,80 @@ pub fn fixture_promotion_candidate_provenance(
         classification: OutputClassification::SourceLikeDelta,
         before_hash: None,
         after_hash: "sha256:generated_auth_after".to_string(),
+    }
+}
+
+pub fn promotion_authored_context_id(candidate: &PromotionCandidateProvenance) -> String {
+    format!(
+        "execution:{}:{}",
+        candidate.execution_id, candidate.output_path
+    )
+}
+
+pub fn fixture_execution_output_promotion_record(
+    candidate: &PromotionCandidateProvenance,
+) -> ExecutionOutputPromotionRecord {
+    execution_output_promotion_record_from_ids(
+        candidate,
+        FIXTURE_PROMOTION_OPERATION_TRANSACTION_ID,
+        FIXTURE_PROMOTION_TOPIC_REVISION_ID,
+        FIXTURE_PROMOTION_SESSION_GENERATION_ID,
+    )
+}
+
+pub fn execution_output_promotion_record_from_mutation_response(
+    candidate: &PromotionCandidateProvenance,
+    response: &MutationResponse,
+) -> ExecutionOutputPromotionRecord {
+    execution_output_promotion_record_from_ids(
+        candidate,
+        &response.operation.id,
+        &response.topic_revision.id,
+        &response.session_generation.id,
+    )
+}
+
+pub fn execution_output_promotion_record_from_ids(
+    candidate: &PromotionCandidateProvenance,
+    operation_transaction_id: &str,
+    topic_revision_id: &str,
+    session_generation_id: &str,
+) -> ExecutionOutputPromotionRecord {
+    let authored_context_id = promotion_authored_context_id(candidate);
+    ExecutionOutputPromotionRecord {
+        execution_id: candidate.execution_id.clone(),
+        projection_id: candidate.projection_id.clone(),
+        output_path: candidate.output_path.clone(),
+        target_topic_id: candidate.target_topic_id.clone(),
+        classification: candidate.classification,
+        before_hash: candidate.before_hash.clone(),
+        after_hash: candidate.after_hash.clone(),
+        operation_transaction_id: operation_transaction_id.to_string(),
+        topic_revision_id: topic_revision_id.to_string(),
+        session_generation_id: session_generation_id.to_string(),
+        authored_context_id,
+        provenance_refs: vec![
+            ExecutionOutputPromotionProvenanceRef {
+                kind: ExecutionOutputPromotionProvenanceRefKind::Execution,
+                id: candidate.execution_id.clone(),
+            },
+            ExecutionOutputPromotionProvenanceRef {
+                kind: ExecutionOutputPromotionProvenanceRefKind::Projection,
+                id: candidate.projection_id.clone(),
+            },
+            ExecutionOutputPromotionProvenanceRef {
+                kind: ExecutionOutputPromotionProvenanceRefKind::OperationTransaction,
+                id: operation_transaction_id.to_string(),
+            },
+            ExecutionOutputPromotionProvenanceRef {
+                kind: ExecutionOutputPromotionProvenanceRefKind::TopicRevision,
+                id: topic_revision_id.to_string(),
+            },
+            ExecutionOutputPromotionProvenanceRef {
+                kind: ExecutionOutputPromotionProvenanceRefKind::SessionGeneration,
+                id: session_generation_id.to_string(),
+            },
+        ],
     }
 }
 
@@ -479,6 +603,12 @@ fn fixture_cache_key(view: &ResolvedViewResult, strategy: ProjectionStrategy) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifacts::{
+        ExpectedHash, MutationArtifactView, MutationKind, MutationPayload, MutationPreconditions,
+        MutationRefs, OperationTransactionRecord, SessionGenerationMutationRecord, SessionView,
+        TopicRevisionRecord, TreeIdentityView, WriteMode, WriteSetEntry, FIXTURE_ACTOR_ID,
+        FIXTURE_REPOSITORY_ID, FIXTURE_SESSION_ID,
+    };
     use crate::resolver::{
         fixture_auth_revision, fixture_base_entries, fixture_overlapping_auth_revision,
         fixture_profile_revision, fixture_profile_revision_missing_auth_dependency,
@@ -550,6 +680,81 @@ mod tests {
         );
         assert_eq!(promotion.before_hash, None);
         assert_eq!(promotion.after_hash, "sha256:generated_auth_after");
+    }
+
+    #[test]
+    fn fixture_promotion_record_links_candidate_to_operation_topic_and_session() {
+        let view = conflict_free_view();
+        let execution = fixture_passing_execution_from_resolved_view(&view).unwrap();
+        let candidate = fixture_promotion_candidate_provenance(&execution);
+
+        let record = fixture_execution_output_promotion_record(&candidate);
+
+        assert_eq!(record.execution_id, execution.id);
+        assert_eq!(record.projection_id, FIXTURE_EXECUTION_PROJECTION_ID);
+        assert_eq!(record.output_path, "src/generated/auth.generated.ts");
+        assert_eq!(record.target_topic_id, "topic_auth_nullability");
+        assert_eq!(
+            record.classification,
+            OutputClassification::SourceLikeDelta
+        );
+        assert_eq!(record.before_hash, None);
+        assert_eq!(record.after_hash, "sha256:generated_auth_after");
+        assert_eq!(
+            record.operation_transaction_id,
+            FIXTURE_PROMOTION_OPERATION_TRANSACTION_ID
+        );
+        assert_eq!(
+            record.topic_revision_id,
+            FIXTURE_PROMOTION_TOPIC_REVISION_ID
+        );
+        assert_eq!(
+            record.session_generation_id,
+            FIXTURE_PROMOTION_SESSION_GENERATION_ID
+        );
+        assert_eq!(
+            record.authored_context_id,
+            "execution:exec_auth_profile_tests_0001:src/generated/auth.generated.ts"
+        );
+        assert_eq!(
+            record
+                .provenance_refs
+                .iter()
+                .map(|reference| (reference.kind.as_str(), reference.id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("execution", FIXTURE_PASSING_EXECUTION_ID),
+                ("projection", FIXTURE_EXECUTION_PROJECTION_ID),
+                (
+                    "operation_transaction",
+                    FIXTURE_PROMOTION_OPERATION_TRANSACTION_ID
+                ),
+                ("topic_revision", FIXTURE_PROMOTION_TOPIC_REVISION_ID),
+                ("session_generation", FIXTURE_PROMOTION_SESSION_GENERATION_ID),
+            ]
+        );
+    }
+
+    #[test]
+    fn promotion_record_can_be_derived_from_mutation_response_ids() {
+        let view = conflict_free_view();
+        let execution = fixture_passing_execution_from_resolved_view(&view).unwrap();
+        let candidate = fixture_promotion_candidate_provenance(&execution);
+        let response = fixture_promotion_mutation_response(&candidate);
+
+        let record = execution_output_promotion_record_from_mutation_response(&candidate, &response);
+
+        assert_eq!(record.operation_transaction_id, response.operation.id);
+        assert_eq!(record.topic_revision_id, response.topic_revision.id);
+        assert_eq!(record.session_generation_id, response.session_generation.id);
+        assert_eq!(
+            record.authored_context_id,
+            response.operation.authored_context_id
+        );
+        assert_eq!(
+            record.classification,
+            OutputClassification::SourceLikeDelta
+        );
     }
 
     #[test]
@@ -651,6 +856,102 @@ mod tests {
         TopicRevisionSelection {
             topic_id: topic_id.to_string(),
             revision_id: revision_id.to_string(),
+        }
+    }
+
+    fn fixture_promotion_mutation_response(
+        candidate: &PromotionCandidateProvenance,
+    ) -> MutationResponse {
+        let tree_identity = TreeIdentityView {
+            kind: "SingleRepoTree".to_string(),
+            repository_id: FIXTURE_REPOSITORY_ID.to_string(),
+            tree_hash: FIXTURE_PROMOTION_TREE_HASH.to_string(),
+        };
+        MutationResponse {
+            command: "write",
+            repository_id: FIXTURE_REPOSITORY_ID.to_string(),
+            session_id: FIXTURE_SESSION_ID.to_string(),
+            view: SessionView {
+                resolved_view_id: FIXTURE_PROMOTION_RESOLVED_VIEW_ID.to_string(),
+                session_generation_id: FIXTURE_PROMOTION_SESSION_GENERATION_ID.to_string(),
+                tree_identity: tree_identity.clone(),
+            },
+            artifact: MutationArtifactView {
+                artifact_id: FIXTURE_PROMOTION_ARTIFACT_ID.to_string(),
+                path: candidate.output_path.clone(),
+                kind: crate::artifacts::ArtifactKind::File,
+                before_hash: candidate.before_hash.clone(),
+                after_hash: candidate.after_hash.clone(),
+                classification: "source".to_string(),
+                executable: false,
+            },
+            operation: OperationTransactionRecord {
+                id: FIXTURE_PROMOTION_OPERATION_TRANSACTION_ID.to_string(),
+                repository_id: FIXTURE_REPOSITORY_ID.to_string(),
+                topic_id: candidate.target_topic_id.clone(),
+                session_id: FIXTURE_SESSION_ID.to_string(),
+                session_generation_id: FIXTURE_PROMOTION_SESSION_GENERATION_ID.to_string(),
+                actor_id: FIXTURE_ACTOR_ID.to_string(),
+                authored_context_id: promotion_authored_context_id(candidate),
+                preconditions: MutationPreconditions {
+                    resolved_view_id: "view_base_0001".to_string(),
+                    session_generation_id: "gen_agent_a_0001".to_string(),
+                    write_topic_id: candidate.target_topic_id.clone(),
+                    parent_topic_revision_id: None,
+                    path_policy_id: "path_policy_posix_case_sensitive_v1".to_string(),
+                    operation_semantics_version: "file_ops_v1".to_string(),
+                    expected_path: candidate.output_path.clone(),
+                    expected_hash: ExpectedHash::New,
+                },
+                read_set: "full_authored_context".to_string(),
+                write_set: vec![WriteSetEntry {
+                    artifact_id: FIXTURE_PROMOTION_ARTIFACT_ID.to_string(),
+                    path: candidate.output_path.clone(),
+                    mutation: MutationKind::Write,
+                }],
+                mutation_payload: MutationPayload::Write {
+                    write_mode: WriteMode::Create,
+                    content_hash: candidate.after_hash.clone(),
+                    byte_length: 43,
+                    media_type: "text/typescript; charset=utf-8".to_string(),
+                    executable: false,
+                    classification: "source".to_string(),
+                },
+                before_refs: MutationRefs {
+                    artifacts: Vec::new(),
+                    tree_identity: tree_identity.clone(),
+                },
+                after_refs: MutationRefs {
+                    artifacts: Vec::new(),
+                    tree_identity: tree_identity.clone(),
+                },
+                classification: "source".to_string(),
+                parent_topic_revision_id: None,
+                next_topic_revision_number: 1,
+                parents: Vec::new(),
+            },
+            topic_revision: TopicRevisionRecord {
+                id: FIXTURE_PROMOTION_TOPIC_REVISION_ID.to_string(),
+                repository_id: FIXTURE_REPOSITORY_ID.to_string(),
+                topic_id: candidate.target_topic_id.clone(),
+                revision_number: 1,
+                parent_revision_id: None,
+                operation_transaction_id: FIXTURE_PROMOTION_OPERATION_TRANSACTION_ID.to_string(),
+                tree_delta_ref: "delta_promote_generated_auth_0001".to_string(),
+                dependency_revision_ids: Vec::new(),
+            },
+            session_generation: SessionGenerationMutationRecord {
+                id: FIXTURE_PROMOTION_SESSION_GENERATION_ID.to_string(),
+                repository_id: FIXTURE_REPOSITORY_ID.to_string(),
+                session_id: FIXTURE_SESSION_ID.to_string(),
+                write_topic_id: candidate.target_topic_id.clone(),
+                base_resolved_view_id: "view_base_0001".to_string(),
+                resolved_view_id: FIXTURE_PROMOTION_RESOLVED_VIEW_ID.to_string(),
+                topic_frontier: Default::default(),
+                generation_number: 2,
+                refresh_policy: "fixture_refresh".to_string(),
+                created_by_operation_id: FIXTURE_PROMOTION_OPERATION_TRANSACTION_ID.to_string(),
+            },
         }
     }
 }

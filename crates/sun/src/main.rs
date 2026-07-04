@@ -23,8 +23,12 @@ use sunlight_core::compat_import::{
 };
 use sunlight_core::execution::{
     fixture_failing_execution_from_resolved_view, fixture_passing_execution_from_resolved_view,
-    fixture_promotion_candidate_provenance, ExecutionFoundationError, ExecutionRecord,
-    OutputClassification, OutputKind, PromotionCandidateProvenance, FIXTURE_PASSING_EXECUTION_ID,
+    fixture_promotion_candidate_provenance, promotion_authored_context_id,
+    ExecutionFoundationError, ExecutionRecord, OutputClassification, OutputKind,
+    PromotionCandidateProvenance, FIXTURE_PASSING_EXECUTION_ID, FIXTURE_PROMOTION_ARTIFACT_ID,
+    FIXTURE_PROMOTION_OPERATION_TRANSACTION_ID, FIXTURE_PROMOTION_RESOLVED_VIEW_ID,
+    FIXTURE_PROMOTION_SESSION_GENERATION_ID, FIXTURE_PROMOTION_TOPIC_REVISION_ID,
+    FIXTURE_PROMOTION_TREE_HASH,
 };
 use sunlight_core::git_export::{
     execute_git_export_writer_plan_fixture, execute_local_git_export_writer, git_export_checkpoint,
@@ -6166,29 +6170,20 @@ fn normalize_promotion_mutation_response(
     response: &mut MutationResponse,
     candidate: &PromotionCandidateProvenance,
 ) {
-    const OPERATION_ID: &str = "op_promote_generated_auth_0001";
-    const TOPIC_REVISION_ID: &str = "rev_auth_nullability_promotion_0001";
-    const SESSION_GENERATION_ID: &str = "gen_agent_a_promotion_0001";
-    const RESOLVED_VIEW_ID: &str = "view_agent_a_after_promotion_0001";
-    const TREE_HASH: &str = "tree_after_generated_auth_promotion_0001";
-
-    response.artifact.artifact_id = "artifact_src_generated_auth_generated_ts".to_string();
+    response.artifact.artifact_id = FIXTURE_PROMOTION_ARTIFACT_ID.to_string();
     response.artifact.after_hash = candidate.after_hash.clone();
-    response.view.resolved_view_id = RESOLVED_VIEW_ID.to_string();
-    response.view.session_generation_id = SESSION_GENERATION_ID.to_string();
-    response.view.tree_identity.tree_hash = TREE_HASH.to_string();
-    response.operation.id = OPERATION_ID.to_string();
-    response.operation.authored_context_id = format!(
-        "execution:{}:{}",
-        candidate.execution_id, candidate.output_path
-    );
+    response.view.resolved_view_id = FIXTURE_PROMOTION_RESOLVED_VIEW_ID.to_string();
+    response.view.session_generation_id = FIXTURE_PROMOTION_SESSION_GENERATION_ID.to_string();
+    response.view.tree_identity.tree_hash = FIXTURE_PROMOTION_TREE_HASH.to_string();
+    response.operation.id = FIXTURE_PROMOTION_OPERATION_TRANSACTION_ID.to_string();
+    response.operation.authored_context_id = promotion_authored_context_id(candidate);
     response.operation.write_set[0].artifact_id = response.artifact.artifact_id.clone();
     response.operation.preconditions.expected_path = candidate.output_path.clone();
     response.operation.before_refs.tree_identity.tree_hash = candidate
         .before_hash
         .clone()
         .unwrap_or_else(|| FIXTURE_TREE_HASH.to_string());
-    response.operation.after_refs.tree_identity.tree_hash = TREE_HASH.to_string();
+    response.operation.after_refs.tree_identity.tree_hash = FIXTURE_PROMOTION_TREE_HASH.to_string();
     response.operation.before_refs.artifacts[0].artifact_id = None;
     response.operation.before_refs.artifacts[0].content_hash = candidate.before_hash.clone();
     response.operation.after_refs.artifacts[0].artifact_id =
@@ -6197,16 +6192,18 @@ fn normalize_promotion_mutation_response(
     if let MutationPayload::Write { content_hash, .. } = &mut response.operation.mutation_payload {
         *content_hash = candidate.after_hash.clone();
     }
-    response.topic_revision.id = TOPIC_REVISION_ID.to_string();
-    response.topic_revision.operation_transaction_id = OPERATION_ID.to_string();
+    response.topic_revision.id = FIXTURE_PROMOTION_TOPIC_REVISION_ID.to_string();
+    response.topic_revision.operation_transaction_id =
+        FIXTURE_PROMOTION_OPERATION_TRANSACTION_ID.to_string();
     response.topic_revision.tree_delta_ref = "delta_promote_generated_auth_0001".to_string();
-    response.session_generation.id = SESSION_GENERATION_ID.to_string();
-    response.session_generation.resolved_view_id = RESOLVED_VIEW_ID.to_string();
+    response.session_generation.id = FIXTURE_PROMOTION_SESSION_GENERATION_ID.to_string();
+    response.session_generation.resolved_view_id = FIXTURE_PROMOTION_RESOLVED_VIEW_ID.to_string();
     response.session_generation.topic_frontier.insert(
         FIXTURE_WRITE_TOPIC_ID.to_string(),
-        TOPIC_REVISION_ID.to_string(),
+        FIXTURE_PROMOTION_TOPIC_REVISION_ID.to_string(),
     );
-    response.session_generation.created_by_operation_id = OPERATION_ID.to_string();
+    response.session_generation.created_by_operation_id =
+        FIXTURE_PROMOTION_OPERATION_TRANSACTION_ID.to_string();
 }
 
 fn fixture_promoted_generated_auth_bytes() -> Vec<u8> {

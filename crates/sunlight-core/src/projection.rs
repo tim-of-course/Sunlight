@@ -204,6 +204,8 @@ pub struct ProjectionQuarantineResult {
     pub source_truth: ProjectionStoreIntegritySourceTruth,
     pub local_filesystem_source_truth: bool,
     pub durable_record: Option<String>,
+    pub cache_reuse_allowed: bool,
+    pub cache_invalidation_reason: ProjectionStoreIntegrityReasonCode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1084,7 +1086,12 @@ pub fn projection_store_integrity_failed_quarantined(
         },
         source_truth: ProjectionStoreIntegritySourceTruth::ImmutableStoreManifest,
         local_filesystem_source_truth: false,
-        durable_record: None,
+        durable_record: Some(projection_quarantine_durable_record_ref(
+            &projection.id,
+            reason_code,
+        )),
+        cache_reuse_allowed: false,
+        cache_invalidation_reason: reason_code,
     };
 
     ProjectionStoreIntegrityResult {
@@ -1103,6 +1110,17 @@ pub fn projection_store_integrity_failed_quarantined(
         local_filesystem_source_truth: false,
         quarantine: Some(quarantine),
     }
+}
+
+fn projection_quarantine_durable_record_ref(
+    projection_id: &str,
+    reason_code: ProjectionStoreIntegrityReasonCode,
+) -> String {
+    format!(
+        "local://.sunlight/quarantine/projections/{}/{}.json",
+        projection_id,
+        reason_code.as_str()
+    )
 }
 
 pub fn projection_store_integrity_from_manifest_scan(
@@ -2649,7 +2667,17 @@ mod tests {
             ProjectionStoreIntegritySourceTruth::ImmutableStoreManifest
         );
         assert!(!quarantine.local_filesystem_source_truth);
-        assert!(quarantine.durable_record.is_none());
+        assert_eq!(
+            quarantine.durable_record.as_deref(),
+            Some(
+                "local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json"
+            )
+        );
+        assert!(!quarantine.cache_reuse_allowed);
+        assert_eq!(
+            quarantine.cache_invalidation_reason,
+            ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed
+        );
     }
 
     #[test]

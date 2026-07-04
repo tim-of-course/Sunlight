@@ -637,6 +637,9 @@ fn run_json_fixture_scan_missing_blob_integrity_rejects_before_execution_record(
     assert!(stdout.contains(
         "\"native_error\":\"native-error:execution_store_integrity_failed:projection_exec_auth_profile_0001\""
     ));
+    assert!(stdout.contains("\"durable_record\":\"local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json\""));
+    assert!(stdout.contains("\"cache_reuse_allowed\":false"));
+    assert!(stdout.contains("\"cache_invalidation_reason\":\"execution_store_integrity_failed\""));
     assert!(stdout.contains("\"local_store_integrity\":{\"privacy_class\":\"local_only\""));
     assert!(stdout.contains("\"local_quarantine\":{\"privacy_class\":\"local_only\""));
     assert!(!stdout.contains("\"exec_auth_profile_tests_0001\""));
@@ -687,6 +690,9 @@ fn run_json_fixture_store_mismatch_integrity_rejects_before_execution_record() {
         "\"quarantine_refs\":{\"projection\":\"projection:projection_exec_auth_profile_0001\""
     ));
     assert!(stdout.contains("\"cache\":\"projection-cache:repo_fixture_basic_app:"));
+    assert!(stdout.contains("\"durable_record\":\"local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json\""));
+    assert!(stdout.contains("\"cache_reuse_allowed\":false"));
+    assert!(stdout.contains("\"cache_invalidation_reason\":\"execution_store_integrity_failed\""));
     assert!(stdout.contains("\"local_store_integrity\":{\"privacy_class\":\"local_only\""));
     assert!(stdout.contains("\"local_quarantine\":{\"privacy_class\":\"local_only\""));
     assert!(!stdout.contains("\"exec_auth_profile_tests_0001\""));
@@ -1193,6 +1199,9 @@ fn status_json_fixture_projection_store_mismatch_reports_quarantine() {
     ));
     assert!(stdout.contains("\"source_truth\":\"immutable_store_manifest\""));
     assert!(stdout.contains("\"local_filesystem_source_truth\":false"));
+    assert!(stdout.contains("\"durable_record\":\"local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json\""));
+    assert!(stdout.contains("\"cache_reuse_allowed\":false"));
+    assert!(stdout.contains("\"cache_invalidation_reason\":\"execution_store_integrity_failed\""));
     assert!(stdout.contains("\"native_errors\":[{\"code\":\"execution_store_integrity_failed\""));
     assert!(stdout.contains("\"local_root_verification\":null"));
     assert!(!stdout.contains("\"content_verification\":\"verified\""));
@@ -1231,6 +1240,9 @@ fn status_json_fixture_projection_scan_missing_blob_reports_quarantine() {
     ));
     assert!(stdout.contains("\"source_truth\":\"immutable_store_manifest\""));
     assert!(stdout.contains("\"local_filesystem_source_truth\":false"));
+    assert!(stdout.contains("\"durable_record\":\"local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json\""));
+    assert!(stdout.contains("\"cache_reuse_allowed\":false"));
+    assert!(stdout.contains("\"cache_invalidation_reason\":\"execution_store_integrity_failed\""));
     assert!(stdout.contains("\"native_errors\":[{\"code\":\"execution_store_integrity_failed\""));
     assert!(stdout.contains(
         "\"message\":\"projection store integrity verification failed for fixture scan-missing-blob\""
@@ -3496,7 +3508,9 @@ fn inspect_json_fixture_projection_store_mismatch_reports_local_quarantine_metad
         "\"local_quarantine\":{\"privacy_class\":\"local_only\",\"state\":\"quarantined\""
     ));
     assert!(stdout.contains("\"reason_code\":\"execution_store_integrity_failed\""));
-    assert!(stdout.contains("\"durable_record\":null"));
+    assert!(stdout.contains("\"durable_record\":\"local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json\""));
+    assert!(stdout.contains("\"cache_reuse_allowed\":false"));
+    assert!(stdout.contains("\"cache_invalidation_reason\":\"execution_store_integrity_failed\""));
     assert!(stdout.contains("\"local_root_verification\":null"));
     assert!(!stdout.contains("\"content_verification\":\"verified\""));
 }
@@ -3529,7 +3543,9 @@ fn inspect_json_fixture_projection_scan_missing_blob_reports_local_quarantine_me
     ));
     assert!(stdout.contains("\"reason\":\"store_integrity_mismatch\""));
     assert!(stdout.contains("\"reason_code\":\"execution_store_integrity_failed\""));
-    assert!(stdout.contains("\"durable_record\":null"));
+    assert!(stdout.contains("\"durable_record\":\"local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json\""));
+    assert!(stdout.contains("\"cache_reuse_allowed\":false"));
+    assert!(stdout.contains("\"cache_invalidation_reason\":\"execution_store_integrity_failed\""));
     assert!(stdout.contains("\"local_root_verification\":null"));
     assert!(!stdout.contains("\"content_verification\":\"verified\""));
 }

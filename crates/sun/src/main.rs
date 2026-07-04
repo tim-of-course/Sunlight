@@ -2280,8 +2280,12 @@ fn fixture_status_projection_json(
         .map(|quarantine| quarantine.state.as_str())
         .unwrap_or_else(|| projection.retention_state.as_str());
     let quarantine_json = projection_quarantine_json(&store_integrity);
-    let native_errors_json =
-        projection_native_errors_json(projection, &manifest, integrity_fixture);
+    let native_errors_json = projection_native_errors_json(
+        projection,
+        &manifest,
+        &store_integrity,
+        integrity_fixture,
+    );
     Ok(format!(
         concat!(
             "{{\"ok\":true,\"data\":{{",
@@ -3683,6 +3687,9 @@ fn execution_store_integrity_error(
             "\"manifest_digest\":\"{}\",",
             "\"cache_key\":\"{}\",",
             "\"quarantine_refs\":{},",
+            "\"durable_record\":{},",
+            "\"cache_reuse_allowed\":{},",
+            "\"cache_invalidation_reason\":\"{}\",",
             "\"local_store_integrity\":{},",
             "\"local_quarantine\":{}",
             "}}"
@@ -3697,6 +3704,9 @@ fn execution_store_integrity_error(
         json_escape(integrity.manifest_digest.as_deref().unwrap_or("")),
         json_escape(&integrity.cache_key),
         quarantine_refs,
+        projection_quarantine_durable_record_json(integrity),
+        projection_quarantine_cache_reuse_allowed_json(integrity),
+        json_escape(&projection_quarantine_cache_invalidation_reason(integrity)),
         projection_local_store_integrity_json(integrity),
         projection_quarantine_json(integrity),
     ))
@@ -5336,7 +5346,9 @@ fn projection_quarantine_json(integrity: &ProjectionStoreIntegrityResult) -> Str
                 "}},",
                 "\"source_truth\":\"immutable_store_manifest\",",
                 "\"local_filesystem_source_truth\":false,",
-                "\"durable_record\":null",
+                "\"durable_record\":{},",
+                "\"cache_reuse_allowed\":{},",
+                "\"cache_invalidation_reason\":\"{}\"",
                 "}}"
             ),
             quarantine.reason_code.reason(),
@@ -5354,14 +5366,48 @@ fn projection_quarantine_json(integrity: &ProjectionStoreIntegrityResult) -> Str
             single_repo_tree_json(&quarantine.provenance.tree_identity),
             json_escape(&quarantine.provenance.created_from_content_tree),
             quarantine.provenance.store_integrity_policy.as_str(),
+            optional_string_json(quarantine.durable_record.as_deref()),
+            quarantine.cache_reuse_allowed,
+            quarantine.cache_invalidation_reason.as_str(),
         ),
         None => "null".to_string(),
     }
 }
 
+fn projection_quarantine_durable_record_json(integrity: &ProjectionStoreIntegrityResult) -> String {
+    optional_string_json(
+        integrity
+            .quarantine
+            .as_ref()
+            .and_then(|quarantine| quarantine.durable_record.as_deref()),
+    )
+}
+
+fn projection_quarantine_cache_reuse_allowed_json(
+    integrity: &ProjectionStoreIntegrityResult,
+) -> bool {
+    integrity
+        .quarantine
+        .as_ref()
+        .map(|quarantine| quarantine.cache_reuse_allowed)
+        .unwrap_or(true)
+}
+
+fn projection_quarantine_cache_invalidation_reason(
+    integrity: &ProjectionStoreIntegrityResult,
+) -> String {
+    integrity
+        .quarantine
+        .as_ref()
+        .map(|quarantine| quarantine.cache_invalidation_reason.as_str())
+        .unwrap_or("none")
+        .to_string()
+}
+
 fn projection_native_errors_json(
     projection: &ProjectionRecord,
     manifest: &ProjectionManifestRecord,
+    integrity: &ProjectionStoreIntegrityResult,
     integrity_fixture: Option<StoreIntegrityFixture>,
 ) -> String {
     match integrity_fixture {
@@ -5380,6 +5426,9 @@ fn projection_native_errors_json(
                     "\"cache_key\":\"{}\",",
                     "\"manifest_ref\":\"{}\",",
                     "\"manifest_digest\":\"{}\",",
+                    "\"durable_record\":{},",
+                    "\"cache_reuse_allowed\":{},",
+                    "\"cache_invalidation_reason\":\"{}\",",
                     "\"privacy_class\":\"local_only\"",
                     "}}]"
                 ),
@@ -5392,6 +5441,9 @@ fn projection_native_errors_json(
                 json_escape(&projection.cache_key.stable_string()),
                 json_escape(&projection_manifest_ref(manifest)),
                 json_escape(&manifest.manifest_digest),
+                projection_quarantine_durable_record_json(integrity),
+                projection_quarantine_cache_reuse_allowed_json(integrity),
+                json_escape(&projection_quarantine_cache_invalidation_reason(integrity)),
             )
         }
         Some(StoreIntegrityFixture::Verified) | None => "[]".to_string(),

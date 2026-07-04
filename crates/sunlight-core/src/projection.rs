@@ -2450,7 +2450,10 @@ mod tests {
             ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed,
         );
 
-        assert_eq!(result.integrity_status, ProjectionStoreIntegrityStatus::Failed);
+        assert_eq!(
+            result.integrity_status,
+            ProjectionStoreIntegrityStatus::Failed
+        );
         assert_eq!(
             result.reason_code,
             Some(ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed)
@@ -2467,10 +2470,7 @@ mod tests {
         let quarantine = result.quarantine.as_ref().unwrap();
         assert_eq!(quarantine.privacy_class, PrivacyClass::LocalOnly);
         assert_eq!(quarantine.state, ProjectionRetentionState::Quarantined);
-        assert_eq!(
-            quarantine.reason_code.reason(),
-            "store_integrity_mismatch"
-        );
+        assert_eq!(quarantine.reason_code.reason(), "store_integrity_mismatch");
         assert_eq!(
             quarantine.quarantine_refs.projection,
             "projection:projection_exec_auth_profile_0001"

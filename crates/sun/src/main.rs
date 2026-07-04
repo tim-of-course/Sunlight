@@ -44,13 +44,13 @@ use sunlight_core::projection::{
     materialize_fixture_projection_copy, plan_fixture_projection_materialization,
     projection_manifest_local_record_path, projection_manifest_ref,
     projection_store_integrity_failed_quarantined, projection_store_integrity_not_checked,
-    ProjectionFilesystemMaterialization,
-    ProjectionManifestRecord, ProjectionMaterializationCapabilities,
-    ProjectionMaterializationError, ProjectionMaterializationErrorCode,
-    ProjectionMaterializationLocalMetadata, ProjectionMaterializationPlan,
-    ProjectionMaterializationRequest, ProjectionPurpose, ProjectionRecord, ProjectionRootRef,
-    ProjectionStoreIntegrityReasonCode, ProjectionStoreIntegrityResult, ProjectionStrategy,
-    ProjectionValidationError, FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
+    ProjectionFilesystemMaterialization, ProjectionManifestRecord,
+    ProjectionMaterializationCapabilities, ProjectionMaterializationError,
+    ProjectionMaterializationErrorCode, ProjectionMaterializationLocalMetadata,
+    ProjectionMaterializationPlan, ProjectionMaterializationRequest, ProjectionPurpose,
+    ProjectionRecord, ProjectionRootRef, ProjectionStoreIntegrityReasonCode,
+    ProjectionStoreIntegrityResult, ProjectionStrategy, ProjectionValidationError,
+    FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
     FIXTURE_EXPORT_PROJECTION_ID, FIXTURE_INSPECTION_PROJECTION_ID,
 };
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
@@ -4901,18 +4901,18 @@ fn fixture_projection_store_integrity_result(
     integrity_fixture: Option<StoreIntegrityFixture>,
 ) -> ProjectionStoreIntegrityResult {
     match integrity_fixture {
-        Some(StoreIntegrityFixture::StoreMismatch) => projection_store_integrity_failed_quarantined(
-            projection,
-            manifest,
-            ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed,
-        ),
+        Some(StoreIntegrityFixture::StoreMismatch) => {
+            projection_store_integrity_failed_quarantined(
+                projection,
+                manifest,
+                ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed,
+            )
+        }
         None => projection_store_integrity_not_checked(projection),
     }
 }
 
-fn projection_local_store_integrity_json(
-    integrity: &ProjectionStoreIntegrityResult,
-) -> String {
+fn projection_local_store_integrity_json(integrity: &ProjectionStoreIntegrityResult) -> String {
     match integrity.reason_code {
         Some(reason_code) => format!(
             concat!(

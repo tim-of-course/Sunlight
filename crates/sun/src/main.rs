@@ -1,15 +1,17 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 
 use sunlight_core::artifacts::{
-    ArtifactIoError, ExpectedHash, InMemoryArtifactStore, ListResponse, MutationArtifactView,
-    MutationPayload, MutationRefs, MutationResponse, PatchRequest, ReadResponse, SearchResponse,
-    SessionView, SessionVisibleArtifactView, TreeIdentityView, WriteMode, WriteRequest,
-    FILE_OPERATION_SEMANTICS_VERSION, FIXTURE_ACTOR_ID, FIXTURE_REPOSITORY_ID,
-    FIXTURE_RESOLVED_VIEW_ID, FIXTURE_SESSION_GENERATION_ID, FIXTURE_SESSION_ID, FIXTURE_TREE_HASH,
-    FIXTURE_WRITE_TOPIC_ID, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
+    ArtifactIoError, ArtifactKind, ContentBlob, ContentTree, ExpectedHash, InMemoryArtifactStore,
+    ListResponse, MutationArtifactView, MutationPayload, MutationRefs, MutationResponse,
+    PatchRequest, ReadResponse, SearchResponse, SessionView, SessionVisibleArtifactView,
+    TreeEntry, TreeIdentityView, WriteMode, WriteRequest, FILE_OPERATION_SEMANTICS_VERSION,
+    FIXTURE_ACTOR_ID, FIXTURE_REPOSITORY_ID, FIXTURE_RESOLVED_VIEW_ID,
+    FIXTURE_SESSION_GENERATION_ID, FIXTURE_SESSION_ID, FIXTURE_TREE_HASH, FIXTURE_WRITE_TOPIC_ID,
+    POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
 };
 use sunlight_core::checkpoint::{
     fixture_checkpoint_from_resolved_view, CheckpointRecord, CheckpointValidationError,
@@ -433,6 +435,31 @@ fn execution_run(ctx: &CommandContext) -> Result<(), CliError> {
 
     let view = fixture_resolved_view_by_id(&options.view_id)
         .ok_or_else(|| object_not_found("resolved_view", &options.view_id))?;
+    if let Some(integrity_fixture) = options.integrity_fixture {
+        let projection =
+            fixture_execution_projection_from_resolved_view(&view).map_err(projection_error)?;
+        ensure_store_integrity_fixture_scope(&projection, options.integrity_fixture)?;
+        let (manifest, blobs) = fixture_execution_projection_manifest_for_view(&projection, &view)?;
+        let integrity = match integrity_fixture {
+            StoreIntegrityFixture::Verified => {
+                projection_store_integrity_from_manifest_scan(&projection, &manifest, &blobs)
+            }
+            StoreIntegrityFixture::ScanMissingBlob | StoreIntegrityFixture::StoreMismatch => {
+                fixture_projection_store_integrity_result(
+                    &projection,
+                    &manifest,
+                    Some(integrity_fixture),
+                )
+            }
+        };
+        if integrity.integrity_status == ProjectionStoreIntegrityStatus::Failed {
+            return Err(execution_store_integrity_error(
+                &projection,
+                &integrity,
+                integrity_fixture,
+            ));
+        }
+    }
     let execution = if options.command_argv.as_slice() == ["cargo", "test", "--fixture-fail"] {
         fixture_failing_execution_from_resolved_view(&view)
     } else {
@@ -921,6 +948,7 @@ struct ExecutionRunOptions {
     fixture: String,
     view_id: String,
     command_argv: Vec<String>,
+    integrity_fixture: Option<StoreIntegrityFixture>,
 }
 
 #[derive(Debug)]
@@ -1426,6 +1454,7 @@ fn parse_view_include(value: &str) -> Result<Vec<TopicRevisionSelection>, CliErr
 fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptions, CliError> {
     let mut fixture = None;
     let mut view_id = None;
+    let mut integrity_fixture = None;
     let mut command_argv = Vec::new();
     let mut args = ctx.args.iter().skip(1);
 
@@ -1463,6 +1492,14 @@ fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptio
                     .with_detail("timeout", value.clone()));
                 }
             }
+            "--integrity-fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun run --integrity-fixture store-mismatch|scan-missing-blob|verified",
+                    )
+                })?;
+                integrity_fixture = Some(parse_store_integrity_fixture(value)?);
+            }
             "--" => {
                 command_argv.extend(args.cloned());
                 break;
@@ -1494,6 +1531,7 @@ fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptio
         fixture,
         view_id,
         command_argv,
+        integrity_fixture,
     })
 }
 
@@ -3597,6 +3635,73 @@ fn execution_error(error: ExecutionFoundationError) -> CliError {
     ))
 }
 
+fn execution_store_integrity_error(
+    projection: &ProjectionRecord,
+    integrity: &ProjectionStoreIntegrityResult,
+    integrity_fixture: StoreIntegrityFixture,
+) -> CliError {
+    let reason_code = integrity
+        .reason_code
+        .unwrap_or(ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed);
+    let quarantine_refs = integrity
+        .quarantine
+        .as_ref()
+        .map(|quarantine| {
+            format!(
+                concat!(
+                    "{{",
+                    "\"projection\":\"{}\",",
+                    "\"cache\":\"{}\",",
+                    "\"native_error\":\"{}\"",
+                    "}}"
+                ),
+                json_escape(&quarantine.quarantine_refs.projection),
+                json_escape(&quarantine.quarantine_refs.cache),
+                json_escape(&quarantine.quarantine_refs.native_error),
+            )
+        })
+        .unwrap_or_else(|| "null".to_string());
+
+    CliError::new(
+        "execution_store_integrity_failed",
+        format!(
+            "projection store integrity verification failed for fixture {}",
+            integrity_fixture.as_str()
+        ),
+    )
+    .with_raw_details_json(format!(
+        concat!(
+            "{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"execution_id\":null,",
+            "\"integrity_fixture\":\"{}\",",
+            "\"integrity_status\":\"{}\",",
+            "\"quarantine_reason\":\"{}\",",
+            "\"reason_code\":\"{}\",",
+            "\"manifest_ref\":\"{}\",",
+            "\"manifest_digest\":\"{}\",",
+            "\"cache_key\":\"{}\",",
+            "\"quarantine_refs\":{},",
+            "\"local_store_integrity\":{},",
+            "\"local_quarantine\":{}",
+            "}}"
+        ),
+        json_escape(&projection.resolved_view_id),
+        json_escape(&projection.id),
+        json_escape(integrity_fixture.as_str()),
+        integrity.integrity_status.as_str(),
+        reason_code.reason(),
+        reason_code.as_str(),
+        json_escape(integrity.manifest_ref.as_deref().unwrap_or("")),
+        json_escape(integrity.manifest_digest.as_deref().unwrap_or("")),
+        json_escape(&integrity.cache_key),
+        quarantine_refs,
+        projection_local_store_integrity_json(integrity),
+        projection_quarantine_json(integrity),
+    ))
+}
+
 fn promotion_error(
     code: &'static str,
     message: &'static str,
@@ -4913,6 +5018,76 @@ fn fixture_local_projection_manifest(
         store.content_blobs(),
     )
     .map_err(projection_materialization_error)
+}
+
+fn fixture_execution_projection_manifest_for_view(
+    projection: &ProjectionRecord,
+    view: &ResolvedViewResult,
+) -> Result<(ProjectionManifestRecord, BTreeMap<String, ContentBlob>), CliError> {
+    let store = InMemoryArtifactStore::fixture_basic_app();
+    let mut blobs = store.content_blobs().clone();
+    let mut entries = view
+        .tree_entries
+        .values()
+        .map(|entry| {
+            if !blobs.contains_key(&entry.content_hash) {
+                blobs.insert(
+                    entry.content_hash.clone(),
+                    ContentBlob {
+                        id: format!("blob_fixture_{}", entry.content_hash.replace(':', "_")),
+                        repository_id: view.repository_id.clone(),
+                        digest: entry.content_hash.clone(),
+                        bytes: entry.content_hash.as_bytes().to_vec(),
+                        media_type: "application/octet-stream".to_string(),
+                        classification: "source".to_string(),
+                        storage_ref: format!(
+                            "objects/blobs/fixture/{}",
+                            entry.content_hash.replace(':', "/")
+                        ),
+                        privacy_class: "policy_gated".to_string(),
+                        created_at: FIXTURE_CREATED_AT.to_string(),
+                    },
+                );
+            }
+
+            let executable = store
+                .tree()
+                .entries
+                .iter()
+                .find(|candidate| candidate.path == entry.path)
+                .map(|candidate| candidate.executable)
+                .unwrap_or(false);
+
+            TreeEntry {
+                path: entry.path.clone(),
+                artifact_id: entry.artifact_id.clone(),
+                content_ref: entry.content_hash.clone(),
+                kind: ArtifactKind::File,
+                executable,
+                tombstone: false,
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let tree_identity = view
+        .tree_identity
+        .as_ref()
+        .ok_or_else(|| object_not_found("resolved_view", &view.resolved_view_id))?;
+    let content_tree = ContentTree {
+        id: tree_identity.tree_hash.clone(),
+        repository_id: view.repository_id.clone(),
+        tree_hash: tree_identity.tree_hash.clone(),
+        path_policy_id: view.path_policy_id.clone(),
+        entries,
+        privacy_class: "policy_gated".to_string(),
+        created_at: FIXTURE_CREATED_AT.to_string(),
+    };
+
+    let manifest =
+        fixture_projection_manifest_from_content_tree(projection, view, &content_tree, &blobs)
+            .map_err(projection_materialization_error)?;
+    Ok((manifest, blobs))
 }
 
 fn local_projection_manifest_json(manifest: &ProjectionManifestRecord) -> String {
@@ -7045,7 +7220,7 @@ Usage:
   sun write <path> --session <session> --fixture basic-app --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]
   sun view resolve --fixture basic-app --include topic:revision[,topic:revision] [--json]
   sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app [--projection-root <empty-path>] [--json]
-  sun run --view <resolved-view-id> --fixture basic-app --json -- cargo test
+  sun run --view <resolved-view-id> --fixture basic-app [--integrity-fixture store-mismatch|scan-missing-blob|verified] --json -- cargo test
   sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> --fixture basic-app [--json]
   sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
   sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan|--execute-fixture success|ref-update-failure|export-map-failure|--execute-local --repo <path>] --json

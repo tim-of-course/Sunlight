@@ -590,6 +590,143 @@ fn run_json_fixture_ready_view_returns_execution_projection_envelope() {
 }
 
 #[test]
+fn run_json_fixture_scan_missing_blob_integrity_rejects_before_execution_record() {
+    let repo = TestRepo::new("run-fixture-integrity-scan-missing-blob");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+
+    let output = sun()
+        .arg("run")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--integrity-fixture")
+        .arg("scan-missing-blob")
+        .arg("--json")
+        .arg("--")
+        .arg("cargo")
+        .arg("test")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"execution_store_integrity_failed\""));
+    assert!(stdout.contains(
+        "\"message\":\"projection store integrity verification failed for fixture scan-missing-blob\""
+    ));
+    assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(stdout.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"execution_id\":null"));
+    assert!(stdout.contains("\"integrity_fixture\":\"scan-missing-blob\""));
+    assert!(stdout.contains("\"integrity_status\":\"failed\""));
+    assert!(stdout.contains("\"quarantine_reason\":\"store_integrity_mismatch\""));
+    assert!(stdout.contains("\"reason_code\":\"execution_store_integrity_failed\""));
+    assert!(stdout.contains("\"manifest_ref\":\"objects/projection-manifests/sha256/"));
+    assert!(stdout.contains("\"manifest_digest\":\"sha256:"));
+    assert!(stdout.contains("\"cache_key\":\"projection-cache:repo_fixture_basic_app:"));
+    assert!(stdout.contains(
+        "\"quarantine_refs\":{\"projection\":\"projection:projection_exec_auth_profile_0001\""
+    ));
+    assert!(stdout.contains("\"cache\":\"projection-cache:repo_fixture_basic_app:"));
+    assert!(stdout.contains(
+        "\"native_error\":\"native-error:execution_store_integrity_failed:projection_exec_auth_profile_0001\""
+    ));
+    assert!(stdout.contains("\"local_store_integrity\":{\"privacy_class\":\"local_only\""));
+    assert!(stdout.contains("\"local_quarantine\":{\"privacy_class\":\"local_only\""));
+    assert!(!stdout.contains("\"exec_auth_profile_tests_0001\""));
+}
+
+#[test]
+fn run_json_fixture_store_mismatch_integrity_rejects_before_execution_record() {
+    let repo = TestRepo::new("run-fixture-integrity-store-mismatch");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+
+    let output = sun()
+        .arg("run")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--integrity-fixture")
+        .arg("store-mismatch")
+        .arg("--json")
+        .arg("--")
+        .arg("cargo")
+        .arg("test")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"execution_store_integrity_failed\""));
+    assert!(stdout.contains(
+        "\"message\":\"projection store integrity verification failed for fixture store-mismatch\""
+    ));
+    assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(stdout.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"execution_id\":null"));
+    assert!(stdout.contains("\"integrity_fixture\":\"store-mismatch\""));
+    assert!(stdout.contains("\"integrity_status\":\"failed\""));
+    assert!(stdout.contains("\"quarantine_reason\":\"store_integrity_mismatch\""));
+    assert!(stdout.contains("\"reason_code\":\"execution_store_integrity_failed\""));
+    assert!(stdout.contains("\"manifest_ref\":\"objects/projection-manifests/sha256/"));
+    assert!(stdout.contains("\"manifest_digest\":\"sha256:"));
+    assert!(stdout.contains("\"cache_key\":\"projection-cache:repo_fixture_basic_app:"));
+    assert!(stdout.contains(
+        "\"quarantine_refs\":{\"projection\":\"projection:projection_exec_auth_profile_0001\""
+    ));
+    assert!(stdout.contains("\"cache\":\"projection-cache:repo_fixture_basic_app:"));
+    assert!(stdout.contains("\"local_store_integrity\":{\"privacy_class\":\"local_only\""));
+    assert!(stdout.contains("\"local_quarantine\":{\"privacy_class\":\"local_only\""));
+    assert!(!stdout.contains("\"exec_auth_profile_tests_0001\""));
+}
+
+#[test]
+fn run_json_fixture_verified_integrity_still_returns_execution_projection_envelope() {
+    let repo = TestRepo::new("run-fixture-integrity-verified");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+
+    let output = sun()
+        .arg("run")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--integrity-fixture")
+        .arg("verified")
+        .arg("--json")
+        .arg("--")
+        .arg("cargo")
+        .arg("test")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"execution.run\""));
+    assert!(stdout.contains("\"execution_id\":\"exec_auth_profile_tests_0001\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(stdout.contains("\"result\":{\"status\":\"pass\",\"exit_code\":0,\"timed_out\":false}"));
+    assert!(stdout.contains("\"promotion_candidates\":[{\"execution_id\":\"exec_auth_profile_tests_0001\",\"projection_id\":\"projection_exec_auth_profile_0001\""));
+}
+
+#[test]
 fn run_json_fixture_failure_result_still_returns_execution_record() {
     let repo = TestRepo::new("run-fixture-fail");
     let view_id = resolve_fixture_view_id(

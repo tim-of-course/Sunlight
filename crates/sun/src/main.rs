@@ -4731,7 +4731,7 @@ fn local_projection_root_verification(
         };
     }
 
-    match persisted_local_manifest_binding(root, projection) {
+    match persisted_local_manifest_binding(root, projection, manifest) {
         PersistedLocalManifestBinding::Available {
             normalized_root_ref,
         } if normalized_root_ref != projection.root_ref.value => {
@@ -4840,6 +4840,7 @@ fn local_projection_root_verification(
 fn persisted_local_manifest_binding(
     projection_root: &std::path::Path,
     projection: &ProjectionRecord,
+    manifest: &ProjectionManifestRecord,
 ) -> PersistedLocalManifestBinding {
     let path = projection_manifest_local_record_path(projection_root, projection);
     let bytes = match fs::read(&path) {
@@ -4852,19 +4853,48 @@ fn persisted_local_manifest_binding(
     let Ok(record) = parse_json_record(&bytes) else {
         return PersistedLocalManifestBinding::Invalid;
     };
-    parse_persisted_local_manifest_binding(&record)
+    parse_persisted_local_manifest_binding(&record, projection, manifest)
 }
 
-fn parse_persisted_local_manifest_binding(record: &JsonValue) -> PersistedLocalManifestBinding {
+fn parse_persisted_local_manifest_binding(
+    record: &JsonValue,
+    projection: &ProjectionRecord,
+    expected_manifest: &ProjectionManifestRecord,
+) -> PersistedLocalManifestBinding {
     let JsonValue::Object(envelope) = record else {
         return PersistedLocalManifestBinding::Invalid;
     };
+    match envelope.get("privacy_class") {
+        Some(JsonValue::String(value)) if value == "local_only" => {}
+        _ => return PersistedLocalManifestBinding::Invalid,
+    }
     let Some(JsonValue::Object(manifest)) = envelope.get("manifest") else {
         return PersistedLocalManifestBinding::Invalid;
     };
-    match manifest.get("manifest_digest") {
-        Some(JsonValue::String(value)) if value.starts_with("sha256:") => {}
-        _ => return PersistedLocalManifestBinding::Invalid,
+    if !manifest_string_field_matches(
+        manifest,
+        "manifest_digest",
+        &expected_manifest.manifest_digest,
+    )
+        || !manifest_string_field_matches(manifest, "projection_id", &projection.id)
+        || !manifest_string_field_matches(
+            manifest,
+            "resolved_view_id",
+            &projection.resolved_view_id,
+        )
+        || !manifest_number_field_matches(
+            manifest,
+            "materialization_generation",
+            expected_manifest.materialization_generation,
+        )
+    {
+        return PersistedLocalManifestBinding::Invalid;
+    }
+    let Some(JsonValue::Object(manifest_root_ref)) = manifest.get("root_ref") else {
+        return PersistedLocalManifestBinding::Invalid;
+    };
+    if !root_ref_matches(manifest_root_ref, &projection.root_ref.value) {
+        return PersistedLocalManifestBinding::Invalid;
     }
     let Some(JsonValue::Object(root_binding)) = envelope.get("root_binding") else {
         return PersistedLocalManifestBinding::Invalid;
@@ -4893,6 +4923,37 @@ fn parse_persisted_local_manifest_binding(record: &JsonValue) -> PersistedLocalM
     PersistedLocalManifestBinding::Available {
         normalized_root_ref: value.clone(),
     }
+}
+
+fn manifest_string_field_matches(
+    manifest: &std::collections::BTreeMap<String, JsonValue>,
+    field: &str,
+    expected: &str,
+) -> bool {
+    matches!(manifest.get(field), Some(JsonValue::String(value)) if value == expected)
+}
+
+fn manifest_number_field_matches(
+    manifest: &std::collections::BTreeMap<String, JsonValue>,
+    field: &str,
+    expected: u64,
+) -> bool {
+    matches!(manifest.get(field), Some(JsonValue::Number(value)) if value == &expected.to_string())
+}
+
+fn root_ref_matches(
+    root_ref: &std::collections::BTreeMap<String, JsonValue>,
+    expected: &str,
+) -> bool {
+    matches!(root_ref.get("value"), Some(JsonValue::String(value)) if value == expected)
+        && matches!(
+            root_ref.get("privacy"),
+            Some(JsonValue::String(value)) if value == "local_only_path"
+        )
+        && matches!(
+            root_ref.get("privacy_class"),
+            Some(JsonValue::String(value)) if value == "local_only"
+        )
 }
 
 fn scan_local_projection_root(root: &std::path::Path) -> LocalProjectionRootScan {

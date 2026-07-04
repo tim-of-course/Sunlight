@@ -959,14 +959,18 @@ fn status_json_fixture_projection_reports_root_mismatch_from_persisted_binding()
         .join(".sunlight/projections/execution/projection_exec_auth_profile_0001")
         .join("projection-manifest-local.json");
     let local_record = fs::read_to_string(&local_record_path).unwrap();
-    fs::write(
-        &local_record_path,
-        local_record.replace(
+    let root_binding_start = local_record
+        .find("\"root_binding\":")
+        .expect("local manifest record should include root binding");
+    let rebound_record = format!(
+        "{}{}",
+        &local_record[..root_binding_start],
+        local_record[root_binding_start..].replace(
             "local://.sunlight/projections/execution/projection_exec_auth_profile_0001",
             "local://.sunlight/projections/compatibility/projection_compat_agent_a_0001",
-        ),
-    )
-    .unwrap();
+        )
+    );
+    fs::write(&local_record_path, rebound_record).unwrap();
 
     let output = sun()
         .arg("status")
@@ -1088,6 +1092,71 @@ fn status_json_fixture_projection_reports_invalid_persisted_manifest_not_root_mi
     assert!(stdout.contains("\"content_verification\":\"manifest_invalid\""));
     assert!(stdout.contains("\"dirty_local\":null"));
     assert!(stdout.contains("\"verification_errors\":[\"projection_manifest_local_invalid\"]"));
+    assert!(!stdout.contains("\"content_verification\":\"root_mismatch\""));
+}
+
+#[test]
+fn status_json_fixture_projection_reports_stale_persisted_manifest_projection_id_invalid() {
+    let repo = TestRepo::new("projection-status-root-stale-projection-id");
+    let projection_root = repo.path().join("projection-root");
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    fs::write(
+        projection_root.join("src/auth.ts"),
+        "export function login(email: string) {\n  return email;\n}\n",
+    )
+    .unwrap();
+    let local_record_path = projection_root
+        .join(".sunlight/projections/execution/projection_exec_auth_profile_0001")
+        .join("projection-manifest-local.json");
+    let local_record = fs::read_to_string(&local_record_path).unwrap();
+    fs::write(
+        &local_record_path,
+        local_record.replace(
+            "\"projection_id\":\"projection_exec_auth_profile_0001\"",
+            "\"projection_id\":\"projection_compat_agent_a_0001\"",
+        ),
+    )
+    .unwrap();
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.projection\""));
+    assert!(stdout.contains("\"verification_state\":\"present\""));
+    assert!(stdout.contains("\"content_verification\":\"manifest_invalid\""));
+    assert!(stdout.contains("\"dirty_local\":null"));
+    assert!(stdout.contains("\"mismatched_files\":0"));
+    assert!(stdout.contains("\"verification_errors\":[\"projection_manifest_local_invalid\"]"));
+    assert!(!stdout.contains("\"content_verification\":\"dirty\""));
     assert!(!stdout.contains("\"content_verification\":\"root_mismatch\""));
 }
 
@@ -1250,6 +1319,74 @@ fn inspect_json_fixture_projection_verifies_unchanged_materialized_root() {
     assert!(stdout.contains("\"extra_files\":0"));
     assert!(stdout.contains("\"metadata_mismatches\":0"));
     assert!(stdout.contains("\"verification_errors\":[]"));
+}
+
+#[test]
+fn inspect_json_fixture_projection_reports_stale_persisted_manifest_digest_invalid() {
+    let repo = TestRepo::new("projection-inspect-root-stale-digest");
+    let projection_root = repo.path().join("projection-root");
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    fs::write(
+        projection_root.join("src/auth.ts"),
+        "export function login(email: string) {\n  return email;\n}\n",
+    )
+    .unwrap();
+    let local_record_path = projection_root
+        .join(".sunlight/projections/execution/projection_exec_auth_profile_0001")
+        .join("projection-manifest-local.json");
+    let local_record = fs::read_to_string(&local_record_path).unwrap();
+    let digest_start = local_record
+        .find("\"manifest_digest\":\"sha256:")
+        .expect("local manifest record should include manifest digest");
+    let digest_value_start = digest_start + "\"manifest_digest\":\"".len();
+    let digest_value_end = digest_value_start + "sha256:".len() + 64;
+    let stale_record = format!(
+        "{}sha256:{}{}",
+        &local_record[..digest_value_start],
+        "0".repeat(64),
+        &local_record[digest_value_end..]
+    );
+    fs::write(&local_record_path, stale_record).unwrap();
+
+    let output = sun()
+        .arg("inspect")
+        .arg("projection:projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.projection\""));
+    assert!(stdout.contains("\"verification_state\":\"present\""));
+    assert!(stdout.contains("\"content_verification\":\"manifest_invalid\""));
+    assert!(stdout.contains("\"dirty_local\":null"));
+    assert!(stdout.contains("\"mismatched_files\":0"));
+    assert!(stdout.contains("\"verification_errors\":[\"projection_manifest_local_invalid\"]"));
+    assert!(!stdout.contains("\"content_verification\":\"dirty\""));
+    assert!(!stdout.contains("\"content_verification\":\"root_mismatch\""));
 }
 
 #[test]

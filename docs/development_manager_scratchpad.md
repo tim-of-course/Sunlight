@@ -135,11 +135,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-store-integrity-cli-scan-wiring`: integrated as `e5500af`; formatting checkpoint `a58f8d6`.
 - Completed slice `execution-store-integrity-gate-fixture`: integrated as `9f700c1`; formatting checkpoint `dfd23bb`.
 - Completed slice `projection-quarantine-durable-record`: integrated as `24feb6e`; formatting checkpoint `2f8b533`.
-- No active WSL slice at this checkpoint. Next heartbeat should choose the first external validation repo/command or start actual quarantine record filesystem persistence.
+- Active WSL slice `external-validation-super-search`: target repo `C:\Users\TimothyCardoza\Documents\AI-Apps\Super Search`; baseline commands `mix test` and `bun run test`; local preflight passed before launch.
 
 ## Candidate Next Slices
 
-- First external validation repo and exact test command are now the next product-level decision.
+- First external validation repo decision is active: `Super Search`, with `mix test` and `bun run test`.
 - Projection integrity still needs actual local quarantine record filesystem persistence/GC beyond the durable local record reference.
 
 ## Decisions

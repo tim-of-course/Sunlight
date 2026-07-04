@@ -174,6 +174,37 @@ pub struct ImportedBaseGitCommit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitExportTargetRef {
+    pub full_name: String,
+    pub branch_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitExportParentSelectionInput {
+    pub base_checkpoint_ids: Vec<String>,
+    pub imported_base_commits: Vec<ImportedBaseGitCommit>,
+    pub reachable_commit_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitExportTargetRefUpdateInput {
+    pub checkpoint_id: String,
+    pub target_ref: String,
+    pub selected_parent_commit_id: String,
+    pub planned_commit_id: String,
+    pub existing_target_ref: Option<GitRefState>,
+    pub prior_export_maps: Vec<GitExportMapRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitExportWriterValidationError {
+    pub code: GitExportErrorCode,
+    pub target_ref: Option<String>,
+    pub parent_commit_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitExportWriterPlan {
     pub parent: GitExportParentPlan,
     pub commit: GitExportCommitPlan,
@@ -716,17 +747,8 @@ fn validate_writer_repository(input: &GitExportWriterInput) -> Result<(), GitExp
         ));
     }
 
-    let mut failures = Vec::new();
-    validate_git_ref(&mut failures, &input.request.git_ref);
-    if !failures.is_empty() {
-        return Err(planning_error(
-            GitExportErrorCode::ExportTargetRefInvalid,
-            input,
-            None,
-            None,
-            "target ref is not an allowed local refs/heads/* Git ref",
-        ));
-    }
+    validate_git_export_target_ref(&input.request.git_ref)
+        .map_err(|error| planning_error_from_validation(error, input, None))?;
 
     Ok(())
 }
@@ -754,6 +776,54 @@ fn validate_writer_report(input: &GitExportWriterInput) -> Result<(), GitExportP
 fn select_base_parent(
     input: &GitExportWriterInput,
 ) -> Result<GitExportParentPlan, GitExportPlanningError> {
+    select_git_export_base_parent(GitExportParentSelectionInput {
+        base_checkpoint_ids: input.base_checkpoint_ids.clone(),
+        imported_base_commits: input.imported_base_commits.clone(),
+        reachable_commit_ids: input.repository.reachable_commit_ids.clone(),
+    })
+    .map_err(|error| planning_error_from_validation(error, input, None))
+}
+
+pub fn validate_git_export_target_ref(
+    git_ref: &str,
+) -> Result<GitExportTargetRef, GitExportWriterValidationError> {
+    if is_moving_selector(git_ref) {
+        return Err(GitExportWriterValidationError {
+            code: GitExportErrorCode::ExportTargetRefInvalid,
+            target_ref: Some(git_ref.to_string()),
+            parent_commit_id: None,
+            message: "Git export target must be an exact refs/heads/* ref, not a moving selector"
+                .to_string(),
+        });
+    }
+
+    let Some(branch_name) = git_ref.strip_prefix("refs/heads/") else {
+        return Err(GitExportWriterValidationError {
+            code: GitExportErrorCode::ExportTargetRefInvalid,
+            target_ref: Some(git_ref.to_string()),
+            parent_commit_id: None,
+            message: "Git export target must use refs/heads/<name>".to_string(),
+        });
+    };
+
+    if !valid_branch_name(branch_name) {
+        return Err(GitExportWriterValidationError {
+            code: GitExportErrorCode::ExportTargetRefInvalid,
+            target_ref: Some(git_ref.to_string()),
+            parent_commit_id: None,
+            message: "Git export target ref contains an invalid branch name".to_string(),
+        });
+    }
+
+    Ok(GitExportTargetRef {
+        full_name: git_ref.to_string(),
+        branch_name: branch_name.to_string(),
+    })
+}
+
+pub fn select_git_export_base_parent(
+    input: GitExportParentSelectionInput,
+) -> Result<GitExportParentPlan, GitExportWriterValidationError> {
     let mut candidates = input
         .imported_base_commits
         .iter()
@@ -766,26 +836,26 @@ fn select_base_parent(
     });
 
     match candidates.as_slice() {
-        [] => Err(planning_error(
-            GitExportErrorCode::ExportParentNotFound,
-            input,
-            None,
-            None,
-            "no imported base checkpoint Git commit is available for this export",
-        )),
+        [] => Err(GitExportWriterValidationError {
+            code: GitExportErrorCode::ExportParentNotFound,
+            target_ref: None,
+            parent_commit_id: None,
+            message: "no imported base checkpoint Git commit is available for this export"
+                .to_string(),
+        }),
         [candidate] => {
             if !input
-                .repository
                 .reachable_commit_ids
                 .contains(&candidate.git_commit_id)
             {
-                return Err(planning_error(
-                    GitExportErrorCode::ExportRepositoryInvalid,
-                    input,
-                    Some(candidate.git_commit_id.clone()),
-                    None,
-                    "selected parent commit is not reachable in the target repository object database",
-                ));
+                return Err(GitExportWriterValidationError {
+                    code: GitExportErrorCode::ExportRepositoryInvalid,
+                    target_ref: None,
+                    parent_commit_id: Some(candidate.git_commit_id.clone()),
+                    message:
+                        "selected parent commit is not reachable in the target repository object database"
+                            .to_string(),
+                });
             }
 
             Ok(GitExportParentPlan {
@@ -793,13 +863,13 @@ fn select_base_parent(
                 commit_id: candidate.git_commit_id.clone(),
             })
         }
-        _ => Err(planning_error(
-            GitExportErrorCode::ExportParentAmbiguous,
-            input,
-            None,
-            None,
-            "more than one imported base checkpoint Git commit matches and no policy selected one",
-        )),
+        _ => Err(GitExportWriterValidationError {
+            code: GitExportErrorCode::ExportParentAmbiguous,
+            target_ref: None,
+            parent_commit_id: None,
+            message: "more than one imported base checkpoint Git commit matches and no policy selected one"
+                .to_string(),
+        }),
     }
 }
 
@@ -807,47 +877,64 @@ fn plan_ref_update(
     input: &GitExportWriterInput,
     parent: &GitExportParentPlan,
 ) -> Result<GitExportRefUpdatePlan, GitExportPlanningError> {
-    let existing = input
+    let existing_target_ref = input
         .repository
         .refs
         .iter()
-        .find(|state| state.git_ref == input.request.git_ref);
-    let (expected_old_commit_id, allowed_reason) = match existing {
+        .find(|state| state.git_ref == input.request.git_ref)
+        .cloned();
+
+    plan_git_export_target_ref_update(GitExportTargetRefUpdateInput {
+        checkpoint_id: input.request.checkpoint.id.clone(),
+        target_ref: input.request.git_ref.clone(),
+        selected_parent_commit_id: parent.commit_id.clone(),
+        planned_commit_id: input.planned_commit_id.clone(),
+        existing_target_ref,
+        prior_export_maps: input.prior_export_maps.clone(),
+    })
+    .map_err(|error| planning_error_from_validation(error, input, None))
+}
+
+pub fn plan_git_export_target_ref_update(
+    input: GitExportTargetRefUpdateInput,
+) -> Result<GitExportRefUpdatePlan, GitExportWriterValidationError> {
+    validate_git_export_target_ref(&input.target_ref)?;
+
+    let (expected_old_commit_id, allowed_reason) = match input.existing_target_ref.as_ref() {
         None => (None, GitExportRefUpdateReason::CreateRef),
-        Some(state) if state.commit_id == parent.commit_id => (
+        Some(state) if state.commit_id == input.selected_parent_commit_id => (
             Some(state.commit_id.clone()),
             GitExportRefUpdateReason::ReplaceSelectedParent,
         ),
-        Some(state) if prior_export_matches(input, &state.commit_id) => (
+        Some(state) if prior_export_matches(&input, &state.commit_id) => (
             Some(state.commit_id.clone()),
             GitExportRefUpdateReason::ReplacePriorExportForSameCheckpoint,
         ),
         Some(state) => {
-            return Err(planning_error(
-                GitExportErrorCode::ExportTargetRefConflict,
-                input,
-                Some(parent.commit_id.clone()),
-                None,
-                &format!(
+            return Err(GitExportWriterValidationError {
+                code: GitExportErrorCode::ExportTargetRefConflict,
+                target_ref: Some(input.target_ref.clone()),
+                parent_commit_id: Some(input.selected_parent_commit_id.clone()),
+                message: format!(
                     "existing target ref points at `{}` instead of the selected parent or a prior export for this checkpoint",
                     state.commit_id
                 ),
-            ));
+            });
         }
     };
 
     Ok(GitExportRefUpdatePlan {
-        git_ref: input.request.git_ref.clone(),
+        git_ref: input.target_ref,
         expected_old_commit_id,
-        new_commit_id: input.planned_commit_id.clone(),
+        new_commit_id: input.planned_commit_id,
         allowed_reason,
     })
 }
 
-fn prior_export_matches(input: &GitExportWriterInput, commit_id: &str) -> bool {
+fn prior_export_matches(input: &GitExportTargetRefUpdateInput, commit_id: &str) -> bool {
     input.prior_export_maps.iter().any(|export_map| {
-        export_map.checkpoint_id == input.request.checkpoint.id
-            && export_map.git_ref == input.request.git_ref
+        export_map.checkpoint_id == input.checkpoint_id
+            && export_map.git_ref == input.target_ref
             && export_map.git_commit_ids.iter().any(|id| id == commit_id)
     })
 }
@@ -878,6 +965,24 @@ fn planning_error(
         parent_commit_id,
         created_commit_id,
         message: message.to_string(),
+    }
+}
+
+fn planning_error_from_validation(
+    error: GitExportWriterValidationError,
+    input: &GitExportWriterInput,
+    created_commit_id: Option<String>,
+) -> GitExportPlanningError {
+    GitExportPlanningError {
+        code: error.code,
+        checkpoint_id: Some(input.request.checkpoint.id.clone()),
+        validation_report_id: Some(input.validation_report.id.clone()),
+        target_ref: error
+            .target_ref
+            .or_else(|| Some(input.request.git_ref.clone())),
+        parent_commit_id: error.parent_commit_id,
+        created_commit_id,
+        message: error.message,
     }
 }
 
@@ -1025,6 +1130,7 @@ fn valid_branch_name(branch: &str) -> bool {
         || branch.starts_with('/')
         || branch.ends_with('/')
         || branch.contains("//")
+        || branch.contains("..")
         || branch.contains("@{")
         || branch.ends_with(".lock")
     {
@@ -1037,6 +1143,7 @@ fn valid_branch_name(branch: &str) -> bool {
             && part != ".."
             && !part.starts_with('.')
             && !part.ends_with('.')
+            && !part.ends_with(".lock")
             && !part.chars().any(|ch| {
                 ch.is_ascii_control()
                     || matches!(ch, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
@@ -1312,6 +1419,140 @@ mod tests {
             plan.export_map.validation_report_id,
             FIXTURE_VALIDATION_REPORT_ID
         );
+    }
+
+    #[test]
+    fn target_ref_validation_accepts_full_local_branch_ref() {
+        let target = validate_git_export_target_ref("refs/heads/sunlight/auth-profile-ready")
+            .unwrap();
+
+        assert_eq!(target.full_name, "refs/heads/sunlight/auth-profile-ready");
+        assert_eq!(target.branch_name, "sunlight/auth-profile-ready");
+    }
+
+    #[test]
+    fn target_ref_validation_rejects_invalid_ref_without_git_side_effects() {
+        for git_ref in [
+            "main",
+            "refs/tags/v1",
+            "refs/heads/feature..bad",
+            "refs/heads/feature/bad.lock/child",
+            "refs/heads/feature@{1}",
+        ] {
+            let error = validate_git_export_target_ref(git_ref).unwrap_err();
+
+            assert_eq!(error.code, GitExportErrorCode::ExportTargetRefInvalid);
+            assert_eq!(error.target_ref.as_deref(), Some(git_ref));
+            assert_eq!(error.parent_commit_id, None);
+        }
+    }
+
+    #[test]
+    fn parent_selection_helper_selects_single_reachable_base_parent() {
+        let parent = select_git_export_base_parent(parent_selection_input()).unwrap();
+
+        assert_eq!(parent.checkpoint_id, FIXTURE_BASE_CHECKPOINT_ID);
+        assert_eq!(parent.commit_id, fixture_base_commit_id());
+    }
+
+    #[test]
+    fn parent_selection_helper_missing_parent_reports_policy_error() {
+        let mut input = parent_selection_input();
+        input.imported_base_commits.clear();
+
+        let error = select_git_export_base_parent(input).unwrap_err();
+
+        assert_eq!(error.code, GitExportErrorCode::ExportParentNotFound);
+        assert_eq!(error.parent_commit_id, None);
+    }
+
+    #[test]
+    fn parent_selection_helper_ambiguous_parent_reports_policy_error() {
+        let mut input = parent_selection_input();
+        input
+            .base_checkpoint_ids
+            .push("checkpoint_base_0002".to_string());
+        input.imported_base_commits.push(ImportedBaseGitCommit {
+            checkpoint_id: "checkpoint_base_0002".to_string(),
+            git_commit_id: "git_sha1_base_2".to_string(),
+        });
+        input
+            .reachable_commit_ids
+            .push("git_sha1_base_2".to_string());
+
+        let error = select_git_export_base_parent(input).unwrap_err();
+
+        assert_eq!(error.code, GitExportErrorCode::ExportParentAmbiguous);
+        assert_eq!(error.parent_commit_id, None);
+    }
+
+    #[test]
+    fn parent_selection_helper_rejects_parent_outside_repository() {
+        let mut input = parent_selection_input();
+        input.reachable_commit_ids.clear();
+
+        let error = select_git_export_base_parent(input).unwrap_err();
+
+        assert_eq!(error.code, GitExportErrorCode::ExportRepositoryInvalid);
+        assert_eq!(error.parent_commit_id, Some(fixture_base_commit_id()));
+    }
+
+    #[test]
+    fn target_ref_update_policy_allows_create_and_parent_replacement() {
+        let create = plan_git_export_target_ref_update(ref_update_input(None)).unwrap();
+        assert_eq!(create.expected_old_commit_id, None);
+        assert_eq!(create.allowed_reason, GitExportRefUpdateReason::CreateRef);
+
+        let replace_parent = plan_git_export_target_ref_update(ref_update_input(Some(
+            fixture_base_commit_id(),
+        )))
+        .unwrap();
+        assert_eq!(
+            replace_parent.expected_old_commit_id,
+            Some(fixture_base_commit_id())
+        );
+        assert_eq!(
+            replace_parent.allowed_reason,
+            GitExportRefUpdateReason::ReplaceSelectedParent
+        );
+    }
+
+    #[test]
+    fn target_ref_update_policy_allows_prior_export_for_same_checkpoint() {
+        let mut input = ref_update_input(Some("git_sha1_prior_export".to_string()));
+        let checkpoint = fixture_checkpoint();
+        input.prior_export_maps = vec![GitExportMapRecord {
+            id: "export_map_prior".to_string(),
+            repository_id: checkpoint.repository_id,
+            checkpoint_id: FIXTURE_CHECKPOINT_ID.to_string(),
+            tree_identity: checkpoint.tree_identity,
+            git_remote: None,
+            git_ref: FIXTURE_EXPORTED_GIT_REF.to_string(),
+            git_commit_ids: vec!["git_sha1_prior_export".to_string()],
+            export_shape: policy_approved_single_checkpoint_shape(),
+            validation_report_id: FIXTURE_VALIDATION_REPORT_ID.to_string(),
+            exported_at: FIXTURE_CREATED_AT.to_string(),
+            privacy_class: PrivacyClass::CommitDefault,
+        }];
+
+        let plan = plan_git_export_target_ref_update(input).unwrap();
+
+        assert_eq!(
+            plan.allowed_reason,
+            GitExportRefUpdateReason::ReplacePriorExportForSameCheckpoint
+        );
+    }
+
+    #[test]
+    fn target_ref_update_policy_rejects_conflicting_existing_tip() {
+        let error = plan_git_export_target_ref_update(ref_update_input(Some(
+            "git_sha1_unrelated".to_string(),
+        )))
+        .unwrap_err();
+
+        assert_eq!(error.code, GitExportErrorCode::ExportTargetRefConflict);
+        assert_eq!(error.target_ref.as_deref(), Some(FIXTURE_EXPORTED_GIT_REF));
+        assert_eq!(error.parent_commit_id, Some(fixture_base_commit_id()));
     }
 
     #[test]
@@ -1657,6 +1898,31 @@ mod tests {
             planned_commit_id: FIXTURE_GIT_COMMIT_ID.to_string(),
             export_map_id: FIXTURE_EXPORT_MAP_ID.to_string(),
             exported_at: FIXTURE_CREATED_AT.to_string(),
+        }
+    }
+
+    fn parent_selection_input() -> GitExportParentSelectionInput {
+        GitExportParentSelectionInput {
+            base_checkpoint_ids: vec![FIXTURE_BASE_CHECKPOINT_ID.to_string()],
+            imported_base_commits: vec![ImportedBaseGitCommit {
+                checkpoint_id: FIXTURE_BASE_CHECKPOINT_ID.to_string(),
+                git_commit_id: fixture_base_commit_id(),
+            }],
+            reachable_commit_ids: vec![fixture_base_commit_id()],
+        }
+    }
+
+    fn ref_update_input(existing_commit_id: Option<String>) -> GitExportTargetRefUpdateInput {
+        GitExportTargetRefUpdateInput {
+            checkpoint_id: FIXTURE_CHECKPOINT_ID.to_string(),
+            target_ref: FIXTURE_EXPORTED_GIT_REF.to_string(),
+            selected_parent_commit_id: fixture_base_commit_id(),
+            planned_commit_id: FIXTURE_GIT_COMMIT_ID.to_string(),
+            existing_target_ref: existing_commit_id.map(|commit_id| GitRefState {
+                git_ref: FIXTURE_EXPORTED_GIT_REF.to_string(),
+                commit_id,
+            }),
+            prior_export_maps: Vec::new(),
         }
     }
 

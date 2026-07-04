@@ -1,11 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest as ShaDigest, Sha256};
+
 use crate::artifacts::{ArtifactKind, ContentBlob, ContentTree, PathPolicy};
-use crate::records::{PrivacyClass, RECORD_SCHEMA_VERSION};
+use crate::records::{canonical_json_bytes, JsonValue, PrivacyClass, RECORD_SCHEMA_VERSION};
 use crate::resolver::{ResolvedViewResult, SingleRepoTree};
 
 pub const FIXTURE_EXECUTION_PROJECTION_ID: &str = "projection_exec_auth_profile_0001";
@@ -13,6 +15,7 @@ pub const FIXTURE_COMPATIBILITY_PROJECTION_ID: &str = "projection_compat_agent_a
 pub const FIXTURE_INSPECTION_PROJECTION_ID: &str = "projection_inspect_auth_profile_0001";
 pub const FIXTURE_EXPORT_PROJECTION_ID: &str = "projection_export_auth_profile_0001";
 pub const FIXTURE_CREATED_AT: &str = "2026-07-03T00:00:00Z";
+pub const FIXTURE_MANIFEST_MATERIALIZATION_GENERATION: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionRecord {
@@ -354,6 +357,195 @@ pub struct ProjectionMaterializationLocalMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionManifestRecord {
+    pub schema_version: u32,
+    pub record_type: &'static str,
+    pub id: String,
+    pub manifest_digest: String,
+    pub projection_id: String,
+    pub repository_id: String,
+    pub purpose: ProjectionPurpose,
+    pub strategy: ProjectionStrategy,
+    pub resolved_view_id: String,
+    pub session_generation_id: Option<String>,
+    pub tree_identity: SingleRepoTree,
+    pub path_policy_id: String,
+    pub operation_semantics_version: String,
+    pub materialization_generation: u64,
+    pub root_ref: ProjectionRootRef,
+    pub entries: Vec<ProjectionManifestEntry>,
+    pub summary: ProjectionManifestSummary,
+    pub privacy_class: PrivacyClass,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionManifestEntry {
+    pub path: String,
+    pub kind: ArtifactKind,
+    pub artifact_id: String,
+    pub content_hash: String,
+    pub byte_length: u64,
+    pub executable: bool,
+    pub tombstone: bool,
+    pub classification: String,
+    pub path_policy_result: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionManifestSummary {
+    pub directories: usize,
+    pub files: usize,
+    pub bytes: u64,
+    pub executable_files: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionManifestIdentityInputs {
+    pub projection_id: String,
+    pub purpose: ProjectionPurpose,
+    pub strategy: ProjectionStrategy,
+    pub repository_id: String,
+    pub resolved_view_id: String,
+    pub session_generation_id: Option<String>,
+    pub tree_identity: SingleRepoTree,
+    pub path_policy_id: String,
+    pub operation_semantics_version: String,
+    pub materialization_generation: u64,
+}
+
+impl ProjectionManifestRecord {
+    pub fn identity_inputs(&self) -> ProjectionManifestIdentityInputs {
+        ProjectionManifestIdentityInputs {
+            projection_id: self.projection_id.clone(),
+            purpose: self.purpose,
+            strategy: self.strategy,
+            repository_id: self.repository_id.clone(),
+            resolved_view_id: self.resolved_view_id.clone(),
+            session_generation_id: self.session_generation_id.clone(),
+            tree_identity: self.tree_identity.clone(),
+            path_policy_id: self.path_policy_id.clone(),
+            operation_semantics_version: self.operation_semantics_version.clone(),
+            materialization_generation: self.materialization_generation,
+        }
+    }
+
+    pub fn digest_payload_json(&self) -> JsonValue {
+        projection_manifest_digest_payload(&self.identity_inputs(), &self.entries, &self.summary)
+    }
+
+    pub fn digest(&self) -> Result<String, ProjectionManifestDigestError> {
+        Ok(sha256_digest(&canonical_json_bytes(&self.digest_payload_json())?))
+    }
+
+    pub fn to_json_value(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "schema_version".to_string(),
+            JsonValue::Number(self.schema_version.to_string()),
+        );
+        object.insert(
+            "record_type".to_string(),
+            JsonValue::String(self.record_type.to_string()),
+        );
+        object.insert("id".to_string(), JsonValue::String(self.id.clone()));
+        object.insert(
+            "manifest_digest".to_string(),
+            JsonValue::String(self.manifest_digest.clone()),
+        );
+        object.insert(
+            "projection_id".to_string(),
+            JsonValue::String(self.projection_id.clone()),
+        );
+        object.insert(
+            "repository_id".to_string(),
+            JsonValue::String(self.repository_id.clone()),
+        );
+        object.insert(
+            "purpose".to_string(),
+            JsonValue::String(self.purpose.as_str().to_string()),
+        );
+        object.insert(
+            "strategy".to_string(),
+            JsonValue::String(self.strategy.as_str().to_string()),
+        );
+        object.insert(
+            "resolved_view_id".to_string(),
+            JsonValue::String(self.resolved_view_id.clone()),
+        );
+        object.insert(
+            "session_generation_id".to_string(),
+            optional_string_json(self.session_generation_id.as_deref()),
+        );
+        object.insert(
+            "tree_identity".to_string(),
+            tree_identity_json(&self.tree_identity),
+        );
+        object.insert(
+            "path_policy_id".to_string(),
+            JsonValue::String(self.path_policy_id.clone()),
+        );
+        object.insert(
+            "operation_semantics_version".to_string(),
+            JsonValue::String(self.operation_semantics_version.clone()),
+        );
+        object.insert(
+            "materialization_generation".to_string(),
+            JsonValue::Number(self.materialization_generation.to_string()),
+        );
+        object.insert("root_ref".to_string(), root_ref_json(&self.root_ref));
+        object.insert(
+            "entries".to_string(),
+            JsonValue::Array(
+                self.entries
+                    .iter()
+                    .map(projection_manifest_entry_json)
+                    .collect(),
+            ),
+        );
+        object.insert("summary".to_string(), manifest_summary_json(&self.summary));
+        object.insert(
+            "privacy_class".to_string(),
+            JsonValue::String(self.privacy_class.as_str().to_string()),
+        );
+        object.insert(
+            "created_at".to_string(),
+            JsonValue::String(self.created_at.clone()),
+        );
+        JsonValue::Object(object)
+    }
+}
+
+impl ProjectionManifestIdentityInputs {
+    pub fn from_projection(
+        projection: &ProjectionRecord,
+        materialization_generation: u64,
+    ) -> Self {
+        Self {
+            projection_id: projection.id.clone(),
+            purpose: projection.purpose,
+            strategy: projection.strategy,
+            repository_id: projection.repository_id.clone(),
+            resolved_view_id: projection.resolved_view_id.clone(),
+            session_generation_id: projection.session_generation_id.clone(),
+            tree_identity: projection.tree_identity.clone(),
+            path_policy_id: projection.path_policy_id.clone(),
+            operation_semantics_version: projection.operation_semantics_version.clone(),
+            materialization_generation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionManifestDigestError;
+
+impl From<crate::records::RecordError> for ProjectionManifestDigestError {
+    fn from(_: crate::records::RecordError) -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionMaterializationError {
     pub code: ProjectionMaterializationErrorCode,
     pub resolved_view_id: String,
@@ -610,6 +802,133 @@ pub fn plan_fixture_projection_materialization(
         projection,
         source: ProjectionMaterializationSource::ResolvedContentTree,
         local_metadata,
+    })
+}
+
+pub fn fixture_projection_manifest_from_content_tree(
+    projection: &ProjectionRecord,
+    view: &ResolvedViewResult,
+    content_tree: &ContentTree,
+    blobs: &BTreeMap<String, ContentBlob>,
+) -> Result<ProjectionManifestRecord, ProjectionMaterializationError> {
+    projection_manifest_from_content_tree(
+        projection,
+        view,
+        content_tree,
+        blobs,
+        FIXTURE_MANIFEST_MATERIALIZATION_GENERATION,
+        FIXTURE_CREATED_AT,
+    )
+}
+
+pub fn projection_manifest_from_content_tree(
+    projection: &ProjectionRecord,
+    view: &ResolvedViewResult,
+    content_tree: &ContentTree,
+    blobs: &BTreeMap<String, ContentBlob>,
+    materialization_generation: u64,
+    created_at: impl Into<String>,
+) -> Result<ProjectionManifestRecord, ProjectionMaterializationError> {
+    validate_projection_matches_view(projection, view)?;
+    validate_content_tree_matches_view(view, content_tree)?;
+
+    let path_policy = PathPolicy {
+        id: projection.path_policy_id.clone(),
+    };
+    let mut source_entries = content_tree.entries.clone();
+    source_entries.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let mut manifest_entries = Vec::new();
+    let mut directories = BTreeSet::new();
+    let mut files = 0;
+    let mut bytes = 0;
+    let mut executable_files = 0;
+
+    for entry in source_entries.iter().filter(|entry| !entry.tombstone) {
+        let path = path_policy.validate(&entry.path).map_err(|_| {
+            materialization_error(
+                ProjectionMaterializationErrorCode::ContentTreeMismatch,
+                view,
+                Some(projection.strategy),
+            )
+        })?;
+
+        match entry.kind {
+            ArtifactKind::File => {
+                let blob = blobs.get(&entry.content_ref).ok_or_else(|| {
+                    materialization_error(
+                        ProjectionMaterializationErrorCode::MissingContentBlob,
+                        view,
+                        Some(projection.strategy),
+                    )
+                })?;
+                record_parent_directories(&path, &mut directories);
+                files += 1;
+                bytes += blob.byte_length() as u64;
+                executable_files += usize::from(entry.executable);
+                manifest_entries.push(ProjectionManifestEntry {
+                    path,
+                    kind: ArtifactKind::File,
+                    artifact_id: entry.artifact_id.clone(),
+                    content_hash: blob.digest.clone(),
+                    byte_length: blob.byte_length() as u64,
+                    executable: entry.executable,
+                    tombstone: false,
+                    classification: blob.classification.clone(),
+                    path_policy_result: "accepted".to_string(),
+                });
+            }
+            ArtifactKind::Directory => {
+                directories.insert(path);
+            }
+            ArtifactKind::Symlink => {
+                return Err(materialization_error(
+                    ProjectionMaterializationErrorCode::UnsupportedContentEntryKind,
+                    view,
+                    Some(projection.strategy),
+                ));
+            }
+        }
+    }
+
+    let summary = ProjectionManifestSummary {
+        directories: directories.len(),
+        files,
+        bytes,
+        executable_files,
+    };
+    let identity_inputs =
+        ProjectionManifestIdentityInputs::from_projection(projection, materialization_generation);
+    let digest_payload =
+        projection_manifest_digest_payload(&identity_inputs, &manifest_entries, &summary);
+    let manifest_digest = sha256_digest(&canonical_json_bytes(&digest_payload).map_err(|_| {
+        materialization_error(
+            ProjectionMaterializationErrorCode::ProjectionWriteFailed,
+            view,
+            Some(projection.strategy),
+        )
+    })?);
+
+    Ok(ProjectionManifestRecord {
+        schema_version: RECORD_SCHEMA_VERSION,
+        record_type: "projection_manifest",
+        id: fixture_projection_manifest_id(projection, materialization_generation),
+        manifest_digest,
+        projection_id: projection.id.clone(),
+        repository_id: projection.repository_id.clone(),
+        purpose: projection.purpose,
+        strategy: projection.strategy,
+        resolved_view_id: projection.resolved_view_id.clone(),
+        session_generation_id: projection.session_generation_id.clone(),
+        tree_identity: projection.tree_identity.clone(),
+        path_policy_id: projection.path_policy_id.clone(),
+        operation_semantics_version: projection.operation_semantics_version.clone(),
+        materialization_generation,
+        root_ref: projection.root_ref.clone(),
+        entries: manifest_entries,
+        summary,
+        privacy_class: PrivacyClass::LocalOnly,
+        created_at: created_at.into(),
     })
 }
 
@@ -873,6 +1192,249 @@ fn baseline_manifest_ref(view: &ResolvedViewResult) -> String {
         "objects/projection-baselines/{}/{}",
         view.repository_id, view.resolved_view_id
     )
+}
+
+fn fixture_projection_manifest_id(
+    projection: &ProjectionRecord,
+    materialization_generation: u64,
+) -> String {
+    if materialization_generation == FIXTURE_MANIFEST_MATERIALIZATION_GENERATION {
+        format!(
+            "projection_manifest_{}",
+            projection
+                .id
+                .strip_prefix("projection_")
+                .unwrap_or(projection.id.as_str())
+        )
+    } else {
+        format!(
+            "projection_manifest_{}_gen_{}",
+            projection
+                .id
+                .strip_prefix("projection_")
+                .unwrap_or(projection.id.as_str()),
+            materialization_generation
+        )
+    }
+}
+
+fn validate_projection_matches_view(
+    projection: &ProjectionRecord,
+    view: &ResolvedViewResult,
+) -> Result<(), ProjectionMaterializationError> {
+    let tree_identity =
+        validate_projectable_view(view).map_err(|error| ProjectionMaterializationError {
+            code: ProjectionMaterializationErrorCode::ProjectionValidationFailed,
+            resolved_view_id: view.resolved_view_id.clone(),
+            strategy: Some(projection.strategy),
+            validation_error: Some(error),
+        })?;
+
+    if projection.repository_id != view.repository_id
+        || projection.resolved_view_id != view.resolved_view_id
+        || projection.tree_identity != tree_identity
+        || projection.path_policy_id != view.path_policy_id
+        || projection.operation_semantics_version != view.operation_semantics_version
+    {
+        return Err(materialization_error(
+            ProjectionMaterializationErrorCode::ContentTreeMismatch,
+            view,
+            Some(projection.strategy),
+        ));
+    }
+
+    Ok(())
+}
+
+fn record_parent_directories(path: &str, directories: &mut BTreeSet<String>) {
+    let mut parts = path.split('/').collect::<Vec<_>>();
+    parts.pop();
+    let mut current = String::new();
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(part);
+        directories.insert(current.clone());
+    }
+}
+
+fn projection_manifest_digest_payload(
+    identity_inputs: &ProjectionManifestIdentityInputs,
+    entries: &[ProjectionManifestEntry],
+    summary: &ProjectionManifestSummary,
+) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "schema_version".to_string(),
+        JsonValue::Number(RECORD_SCHEMA_VERSION.to_string()),
+    );
+    object.insert(
+        "record_type".to_string(),
+        JsonValue::String("projection_manifest_digest_payload".to_string()),
+    );
+    object.insert(
+        "identity_inputs".to_string(),
+        manifest_identity_inputs_json(identity_inputs),
+    );
+    object.insert(
+        "entries".to_string(),
+        JsonValue::Array(entries.iter().map(projection_manifest_entry_json).collect()),
+    );
+    object.insert("summary".to_string(), manifest_summary_json(summary));
+    object.insert(
+        "privacy_class".to_string(),
+        JsonValue::String(PrivacyClass::LocalOnly.as_str().to_string()),
+    );
+    JsonValue::Object(object)
+}
+
+fn manifest_identity_inputs_json(inputs: &ProjectionManifestIdentityInputs) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "projection_id".to_string(),
+        JsonValue::String(inputs.projection_id.clone()),
+    );
+    object.insert(
+        "purpose".to_string(),
+        JsonValue::String(inputs.purpose.as_str().to_string()),
+    );
+    object.insert(
+        "strategy".to_string(),
+        JsonValue::String(inputs.strategy.as_str().to_string()),
+    );
+    object.insert(
+        "repository_id".to_string(),
+        JsonValue::String(inputs.repository_id.clone()),
+    );
+    object.insert(
+        "resolved_view_id".to_string(),
+        JsonValue::String(inputs.resolved_view_id.clone()),
+    );
+    object.insert(
+        "session_generation_id".to_string(),
+        optional_string_json(inputs.session_generation_id.as_deref()),
+    );
+    object.insert(
+        "tree_identity".to_string(),
+        tree_identity_json(&inputs.tree_identity),
+    );
+    object.insert(
+        "path_policy_id".to_string(),
+        JsonValue::String(inputs.path_policy_id.clone()),
+    );
+    object.insert(
+        "operation_semantics_version".to_string(),
+        JsonValue::String(inputs.operation_semantics_version.clone()),
+    );
+    object.insert(
+        "materialization_generation".to_string(),
+        JsonValue::Number(inputs.materialization_generation.to_string()),
+    );
+    JsonValue::Object(object)
+}
+
+fn projection_manifest_entry_json(entry: &ProjectionManifestEntry) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert("path".to_string(), JsonValue::String(entry.path.clone()));
+    object.insert(
+        "kind".to_string(),
+        JsonValue::String(entry.kind.as_str().to_string()),
+    );
+    object.insert(
+        "artifact_id".to_string(),
+        JsonValue::String(entry.artifact_id.clone()),
+    );
+    object.insert(
+        "content_hash".to_string(),
+        JsonValue::String(entry.content_hash.clone()),
+    );
+    object.insert(
+        "byte_length".to_string(),
+        JsonValue::Number(entry.byte_length.to_string()),
+    );
+    object.insert("executable".to_string(), JsonValue::Bool(entry.executable));
+    object.insert("tombstone".to_string(), JsonValue::Bool(entry.tombstone));
+    object.insert(
+        "classification".to_string(),
+        JsonValue::String(entry.classification.clone()),
+    );
+    object.insert(
+        "path_policy_result".to_string(),
+        JsonValue::String(entry.path_policy_result.clone()),
+    );
+    JsonValue::Object(object)
+}
+
+fn manifest_summary_json(summary: &ProjectionManifestSummary) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "directories".to_string(),
+        JsonValue::Number(summary.directories.to_string()),
+    );
+    object.insert(
+        "files".to_string(),
+        JsonValue::Number(summary.files.to_string()),
+    );
+    object.insert(
+        "bytes".to_string(),
+        JsonValue::Number(summary.bytes.to_string()),
+    );
+    object.insert(
+        "executable_files".to_string(),
+        JsonValue::Number(summary.executable_files.to_string()),
+    );
+    JsonValue::Object(object)
+}
+
+fn tree_identity_json(tree_identity: &SingleRepoTree) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "kind".to_string(),
+        JsonValue::String("SingleRepoTree".to_string()),
+    );
+    object.insert(
+        "repository_id".to_string(),
+        JsonValue::String(tree_identity.repository_id.clone()),
+    );
+    object.insert(
+        "tree_hash".to_string(),
+        JsonValue::String(tree_identity.tree_hash.clone()),
+    );
+    JsonValue::Object(object)
+}
+
+fn root_ref_json(root_ref: &ProjectionRootRef) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert("value".to_string(), JsonValue::String(root_ref.value.clone()));
+    object.insert(
+        "privacy".to_string(),
+        JsonValue::String(root_ref.privacy.as_str().to_string()),
+    );
+    object.insert(
+        "privacy_class".to_string(),
+        JsonValue::String(root_ref.privacy.privacy_class().as_str().to_string()),
+    );
+    JsonValue::Object(object)
+}
+
+fn optional_string_json(value: Option<&str>) -> JsonValue {
+    value
+        .map(|value| JsonValue::String(value.to_string()))
+        .unwrap_or(JsonValue::Null)
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity("sha256:".len() + digest.len() * 2);
+    output.push_str("sha256:");
+    for byte in digest {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
 }
 
 fn validate_content_tree_matches_view(
@@ -1368,6 +1930,139 @@ mod tests {
             ProjectionValidationErrorCode::ConflictedView
         );
         assert!(error.strategy.is_none());
+    }
+
+    #[test]
+    fn fixture_projection_manifest_records_basic_app_entries_and_summary() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let projection = fixture_execution_projection_from_resolved_view(&view).unwrap();
+
+        let manifest = fixture_projection_manifest_from_content_tree(
+            &projection,
+            &view,
+            store.tree(),
+            store.content_blobs(),
+        )
+        .unwrap();
+
+        assert_eq!(manifest.record_type, "projection_manifest");
+        assert_eq!(manifest.schema_version, RECORD_SCHEMA_VERSION);
+        assert_eq!(manifest.id, "projection_manifest_exec_auth_profile_0001");
+        assert_eq!(manifest.projection_id, FIXTURE_EXECUTION_PROJECTION_ID);
+        assert_eq!(manifest.repository_id, store.tree().repository_id);
+        assert_eq!(manifest.purpose, ProjectionPurpose::Execution);
+        assert_eq!(manifest.strategy, ProjectionStrategy::Copy);
+        assert_eq!(manifest.privacy_class, PrivacyClass::LocalOnly);
+        assert_eq!(
+            manifest.identity_inputs(),
+            ProjectionManifestIdentityInputs::from_projection(
+                &projection,
+                FIXTURE_MANIFEST_MATERIALIZATION_GENERATION
+            )
+        );
+        assert_eq!(
+            manifest
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "README.md",
+                "docs/guide.md",
+                "scripts/build.sh",
+                "src/auth.ts",
+                "src/profile.ts"
+            ]
+        );
+        assert_eq!(
+            manifest.summary,
+            ProjectionManifestSummary {
+                directories: 3,
+                files: 5,
+                bytes: 222,
+                executable_files: 1,
+            }
+        );
+        assert_eq!(manifest.entries[2].artifact_id, "artifact_scripts_build_sh");
+        assert_eq!(manifest.entries[2].content_hash, "sha256:build_base");
+        assert_eq!(manifest.entries[2].byte_length, 29);
+        assert!(manifest.entries[2].executable);
+        assert_eq!(manifest.entries[2].classification, "source");
+        assert_eq!(manifest.entries[2].path_policy_result, "accepted");
+        assert_eq!(manifest.digest().unwrap(), manifest.manifest_digest);
+    }
+
+    #[test]
+    fn projection_manifest_entry_ordering_and_digest_are_deterministic() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let projection = fixture_execution_projection_from_resolved_view(&view).unwrap();
+        let mut reordered_tree = store.tree().clone();
+        reordered_tree.entries.reverse();
+
+        let manifest = fixture_projection_manifest_from_content_tree(
+            &projection,
+            &view,
+            store.tree(),
+            store.content_blobs(),
+        )
+        .unwrap();
+        let reordered_manifest = fixture_projection_manifest_from_content_tree(
+            &projection,
+            &view,
+            &reordered_tree,
+            store.content_blobs(),
+        )
+        .unwrap();
+
+        assert_eq!(reordered_manifest.entries, manifest.entries);
+        assert_eq!(reordered_manifest.summary, manifest.summary);
+        assert_eq!(reordered_manifest.manifest_digest, manifest.manifest_digest);
+        assert_eq!(
+            canonical_json_bytes(&reordered_manifest.digest_payload_json()).unwrap(),
+            canonical_json_bytes(&manifest.digest_payload_json()).unwrap()
+        );
+    }
+
+    #[test]
+    fn projection_manifest_digest_tracks_identity_inputs_not_storage_metadata() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let projection = fixture_execution_projection_from_resolved_view(&view).unwrap();
+        let manifest = fixture_projection_manifest_from_content_tree(
+            &projection,
+            &view,
+            store.tree(),
+            store.content_blobs(),
+        )
+        .unwrap();
+
+        let mut moved_manifest = manifest.clone();
+        moved_manifest.root_ref.value =
+            "local://.sunlight/projections/execution/moved-root".to_string();
+        moved_manifest.created_at = "2026-07-04T00:00:00Z".to_string();
+        assert_eq!(moved_manifest.digest().unwrap(), manifest.manifest_digest);
+
+        let next_generation_manifest = projection_manifest_from_content_tree(
+            &projection,
+            &view,
+            store.tree(),
+            store.content_blobs(),
+            2,
+            FIXTURE_CREATED_AT,
+        )
+        .unwrap();
+        assert_eq!(
+            next_generation_manifest
+                .identity_inputs()
+                .materialization_generation,
+            2
+        );
+        assert_ne!(
+            next_generation_manifest.manifest_digest,
+            manifest.manifest_digest
+        );
     }
 
     #[test]

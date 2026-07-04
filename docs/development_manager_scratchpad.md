@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 163 tests, `git diff --check HEAD~3 HEAD`, and native `scripts/validation-smoke.ps1` after CLI Git export execution fixture and validation smoke integration. Scratchpad guard must run after this edit.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 172 tests, `git diff --check HEAD~4 HEAD`, native `scripts/validation-smoke.ps1`, and native `scripts/projection-strategy-smoke.ps1` after projection smoke and Git export validation integration. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -94,14 +94,14 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `validation-repo-plan`: integrated as `fb13cef`.
 - Completed slice `cli-git-export-execution-fixture`: integrated as `5347921`; formatting checkpoint `d553789`.
 - Completed slice `validation-smoke-script`: integrated as `20a1c13`.
-- Active slice `projection-strategy-smoke-harness`: WSL clone `/home/timothycard/code/Sunlight-2-projection-strategy-smoke-harness-20260704-013618`, branch `dm/projection-strategy-smoke-harness`, run artifacts under `C:\tmp\sunlight-manager\20260704-013618`.
-- Active slice `git-export-real-writer-validation`: WSL clone `/home/timothycard/code/Sunlight-2-git-export-real-writer-validation-20260704-013618`, branch `dm/git-export-real-writer-validation`, run artifacts under `C:\tmp\sunlight-manager\20260704-013618`.
-- Next heartbeat should inspect active WSL progress, import verified work if finished, run full verification, and keep one or two project-wide slices moving.
+- Completed slice `projection-strategy-smoke-harness`: integrated as `b2c0cd6`; wrapper fix checkpoint `a9a4471`.
+- Completed slice `git-export-real-writer-validation`: integrated as `7ac6236`; formatting checkpoint `3680f68`.
+- Active capacity is open after this integration; next launch should pick non-conflicting implementation or validation slices.
 
 ## Candidate Next Slices
 
 - Real Git export writer execution after validation foundation lands.
-- Projection strategy implementation after the spike plan selects the first materialization path.
+- Projection strategy implementation can advance from fixture planning toward filesystem-aware execution.
 - Validation smoke CI/usage follow-up remains optional after script lands.
 
 ## Decisions

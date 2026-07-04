@@ -370,7 +370,9 @@ pub fn fixture_basic_app_candidate_deltas() -> Vec<CompatCandidateDelta> {
                 normalized_path: Some(".env".to_string()),
                 reason: None,
             },
-            quarantine_ref: Some("quarantine://compat/projection_compat_agent_a_0001/env".to_string()),
+            quarantine_ref: Some(
+                "quarantine://compat/projection_compat_agent_a_0001/env".to_string(),
+            ),
         },
     ]
 }
@@ -729,7 +731,10 @@ fn build_response(
     let before_refs = selected
         .iter()
         .map(|candidate| MutationArtifactRef {
-            artifact_id: candidate.before_hash.as_ref().map(|_| artifact_id_for_candidate(candidate)),
+            artifact_id: candidate
+                .before_hash
+                .as_ref()
+                .map(|_| artifact_id_for_candidate(candidate)),
             path: candidate.path.clone(),
             path_state: if candidate.before_hash.is_some() {
                 "active".to_string()
@@ -921,8 +926,7 @@ mod tests {
     fn fixture_import_modified_file_creates_one_operation_plan() {
         let view = base_view();
         let projection =
-            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001")
-                .unwrap();
+            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001").unwrap();
         let response = plan_fixture_basic_app_import(
             &projection,
             &view,
@@ -955,10 +959,7 @@ mod tests {
                 .selected_candidate_delta_ids,
             vec!["compat_delta_src_auth_ts_0001"]
         );
-        assert_eq!(
-            response.plan.operation.read_set.mode,
-            "projection_baseline"
-        );
+        assert_eq!(response.plan.operation.read_set.mode, "projection_baseline");
         assert_eq!(response.plan.topic_revision.revision_number, 1);
         assert_eq!(response.plan.session_generation.generation_number, 2);
     }
@@ -967,8 +968,7 @@ mod tests {
     fn fixture_import_multiple_safe_deltas_is_one_transaction() {
         let view = base_view();
         let projection =
-            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001")
-                .unwrap();
+            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001").unwrap();
         let response = plan_fixture_basic_app_import(
             &projection,
             &view,
@@ -1002,8 +1002,7 @@ mod tests {
     fn import_rejects_non_compatibility_projection() {
         let view = base_view();
         let mut projection =
-            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001")
-                .unwrap();
+            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001").unwrap();
         projection.purpose = ProjectionPurpose::Execution;
 
         let error = plan_fixture_basic_app_import(
@@ -1022,8 +1021,7 @@ mod tests {
     fn import_rejects_no_selected_changes() {
         let view = base_view();
         let projection =
-            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001")
-                .unwrap();
+            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001").unwrap();
 
         let error = plan_fixture_basic_app_import(
             &projection,
@@ -1040,8 +1038,7 @@ mod tests {
     fn import_rejects_stale_session_generation() {
         let view = base_view();
         let projection =
-            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001")
-                .unwrap();
+            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001").unwrap();
         let mut request = request(vec!["compat_delta_src_auth_ts_0001"]);
         request.session_generation_id = "gen_agent_a_9999".to_string();
 
@@ -1060,8 +1057,7 @@ mod tests {
     fn import_rejects_path_policy_failure_before_planning() {
         let view = base_view();
         let projection =
-            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001")
-                .unwrap();
+            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001").unwrap();
         let mut candidates = fixture_basic_app_candidate_deltas();
         candidates.push(CompatCandidateDelta {
             candidate_delta_id: "compat_delta_reserved_sunlight_0001".to_string(),
@@ -1099,8 +1095,7 @@ mod tests {
     fn import_rejects_secret_and_cache_candidates_atomically() {
         let view = base_view();
         let projection =
-            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001")
-                .unwrap();
+            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001").unwrap();
 
         let secret_error = plan_fixture_basic_app_import(
             &projection,
@@ -1136,8 +1131,7 @@ mod tests {
             },
         );
         let projection =
-            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001")
-                .unwrap();
+            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001").unwrap();
 
         let error = plan_fixture_basic_app_import(
             &projection,
@@ -1151,7 +1145,11 @@ mod tests {
     }
 
     fn base_view() -> ResolvedViewResult {
-        resolve_fixture_view(fixture_resolver_input(Vec::new()), fixture_base_entries(), [])
+        resolve_fixture_view(
+            fixture_resolver_input(Vec::new()),
+            fixture_base_entries(),
+            [],
+        )
     }
 
     fn request(selected: Vec<&str>) -> CompatImportRequest {

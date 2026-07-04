@@ -1084,14 +1084,14 @@ fn status_json_fixture_export_map_returns_git_export_lifecycle_snapshot() {
     assert!(stdout.contains("\"command\":\"status.export_map\""));
     assert!(stdout.contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
     assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
-    assert!(stdout
-        .contains("\"validation_report_id\":\"validation_export_auth_profile_ready_0001\""));
+    assert!(
+        stdout.contains("\"validation_report_id\":\"validation_export_auth_profile_ready_0001\"")
+    );
     assert!(stdout.contains("\"resolved_view_id\":\"view_fixture_"));
     assert!(stdout.contains("\"git_export\":{\"lifecycle_state\":\"exported\""));
     assert!(stdout.contains("\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\""));
-    assert!(stdout.contains(
-        "\"git_commit_ids\":[\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"
-    ));
+    assert!(stdout
+        .contains("\"git_commit_ids\":[\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"));
     assert!(stdout.contains("\"partial_failure_marker\":null"));
     assert!(stdout.contains("\"validation_report\":{"));
     assert!(stdout.contains("\"ok\":true"));
@@ -1193,9 +1193,8 @@ fn inspect_json_fixture_export_map_returns_mapping_record() {
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("\"command\":\"inspect.export_map\""));
-    assert!(stdout.contains(
-        "\"ids\":{\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""
-    ));
+    assert!(stdout
+        .contains("\"ids\":{\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
     assert!(stdout.contains("\"record_type\":\"git_export_map\""));
     assert!(stdout.contains("\"id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
     assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));

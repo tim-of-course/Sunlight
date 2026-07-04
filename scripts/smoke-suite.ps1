@@ -49,6 +49,7 @@ try {
 
     Invoke-Checked 'scripts/validation-smoke.ps1' { & (Join-Path $PSScriptRoot 'validation-smoke.ps1') }
     Invoke-Checked 'scripts/projection-strategy-smoke.ps1' { & (Join-Path $PSScriptRoot 'projection-strategy-smoke.ps1') }
+    Invoke-Checked 'scripts/mvp-smoke.ps1' { & (Join-Path $PSScriptRoot 'mvp-smoke.ps1') }
 
     Step 'Smoke suite passed'
 } finally {

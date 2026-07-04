@@ -26,3 +26,7 @@ The suite runs, in order:
 - `cargo test`
 - `scripts/validation-smoke`
 - `scripts/projection-strategy-smoke`
+- `scripts/mvp-smoke`
+
+`scripts/mvp-smoke` covers the end-to-end fixture path through real local Git
+export with `--execute-local`. See [mvp_smoke.md](mvp_smoke.md) for details.

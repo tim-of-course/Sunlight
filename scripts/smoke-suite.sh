@@ -34,5 +34,6 @@ run_in_repo "$cargo_bin" check
 run_in_repo "$cargo_bin" test
 run_script scripts/validation-smoke.sh
 run_script scripts/projection-strategy-smoke.sh
+run_script scripts/mvp-smoke.sh
 
 step "Smoke suite passed"

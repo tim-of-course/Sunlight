@@ -2267,6 +2267,73 @@ fn inspect_json_fixture_projection_returns_local_only_metadata() {
 }
 
 #[test]
+fn inspect_json_fixture_projection_reports_missing_local_root() {
+    let repo = TestRepo::new("inspect-fixture-projection-root-missing");
+    let projection_root = repo.path().join("missing-projection-root");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("projection:projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.projection\""));
+    assert!(stdout.contains("\"record_type\":\"projection\""));
+    assert!(stdout.contains("\"id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
+    assert!(stdout.contains("\"verification_state\":\"missing\""));
+    assert!(
+        stdout.contains("\"content_verification\":\"not_available_without_persisted_manifest\"")
+    );
+    assert!(stdout.contains("\"exists\":false"));
+    assert!(stdout.contains("\"is_dir\":false"));
+    assert!(stdout.contains("\"files\":0"));
+    assert!(stdout.contains("\"bytes\":0"));
+    assert!(stdout.contains("\"sample_paths\":[]"));
+    assert!(stdout.contains("\"scan_error\":null"));
+}
+
+#[test]
+fn inspect_json_fixture_projection_reports_file_local_root() {
+    let repo = TestRepo::new("inspect-fixture-projection-root-file");
+    let projection_root = repo.write_file("projection-root-file", "not a directory\n");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("projection:projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.projection\""));
+    assert!(stdout.contains("\"record_type\":\"projection\""));
+    assert!(stdout.contains("\"id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
+    assert!(stdout.contains("\"verification_state\":\"not_directory\""));
+    assert!(stdout.contains("\"exists\":true"));
+    assert!(stdout.contains("\"is_dir\":false"));
+    assert!(stdout.contains("\"directories\":0"));
+    assert!(stdout.contains("\"files\":0"));
+    assert!(stdout.contains("\"bytes\":0"));
+    assert!(stdout.contains("\"scan_error\":null"));
+}
+
+#[test]
 fn inspect_json_fixture_basic_app_path_returns_artifact_snapshot() {
     let repo = TestRepo::new("inspect-fixture-artifact");
 

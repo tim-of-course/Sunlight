@@ -3,6 +3,7 @@ pub mod checkpoint;
 pub mod execution;
 pub mod identity;
 pub mod policy;
+pub mod projection;
 pub mod records;
 pub mod repository;
 pub mod resolver;

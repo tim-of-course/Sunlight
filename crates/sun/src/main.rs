@@ -11,6 +11,10 @@ use sunlight_core::artifacts::{
     FIXTURE_RESOLVED_VIEW_ID, FIXTURE_SESSION_GENERATION_ID, FIXTURE_SESSION_ID, FIXTURE_TREE_HASH,
     FIXTURE_WRITE_TOPIC_ID, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
 };
+use sunlight_core::checkpoint::{
+    fixture_checkpoint_from_resolved_view, CheckpointRecord, CheckpointValidationError,
+    EvidenceRef,
+};
 use sunlight_core::execution::{
     fixture_failing_execution_from_resolved_view, fixture_passing_execution_from_resolved_view,
     fixture_promotion_candidate_provenance, ExecutionFoundationError, ExecutionRecord,
@@ -120,6 +124,9 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
             ))
         }
         [scope, command, ..] if scope == "view" && command == "resolve" => view_resolve(&ctx),
+        [scope, command, ..] if scope == "checkpoint" && command == "create" => {
+            checkpoint_create(&ctx)
+        }
         [command, ..] if command == "run" => execution_run(&ctx),
         [command, ..] if command == "read" => artifact_read(&ctx),
         [command, ..] if command == "list" => artifact_list(&ctx),
@@ -389,6 +396,34 @@ fn execution_run(ctx: &CommandContext) -> Result<(), CliError> {
     Ok(())
 }
 
+fn checkpoint_create(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_checkpoint_create_options(ctx)?;
+    if options.fixture != "basic-app" {
+        return Err(
+            invalid_request(format!("unknown fixture `{}`", options.fixture))
+                .with_detail("fixture", options.fixture),
+        );
+    }
+
+    let view = fixture_resolved_view_by_id(&options.view_id)
+        .ok_or_else(|| object_not_found("resolved_view", &options.view_id))?;
+    let execution = if view.conflict_free() {
+        Some(fixture_passing_execution_from_resolved_view(&view).map_err(execution_error)?)
+    } else {
+        None
+    };
+    let checkpoint = fixture_checkpoint_from_resolved_view(&view, execution.as_ref())
+        .map_err(checkpoint_error)?;
+
+    if ctx.json {
+        println!("{}", checkpoint_create_success_envelope(&checkpoint));
+    } else {
+        println!("{} {}", checkpoint.id, checkpoint.resolved_view_id);
+    }
+
+    Ok(())
+}
+
 fn status(ctx: &CommandContext) -> Result<(), CliError> {
     if let Some(options) = parse_status_options(ctx)? {
         if options.fixture != "basic-app" {
@@ -419,6 +454,14 @@ fn status(ctx: &CommandContext) -> Result<(), CliError> {
                     fixture_status_topic_json()
                 } else {
                     fixture_status_topic_text()
+                }
+            }
+            StatusScope::Checkpoint(checkpoint_id) => {
+                ensure_fixture_checkpoint(&checkpoint_id)?;
+                if ctx.json {
+                    fixture_status_checkpoint_json()?
+                } else {
+                    format!("{checkpoint_id} export_ready=true")
                 }
             }
         };
@@ -473,6 +516,7 @@ enum StatusScope {
     Repository,
     Session(String),
     Topic(String),
+    Checkpoint(String),
 }
 
 #[derive(Debug)]
@@ -494,6 +538,59 @@ struct ExecutionRunOptions {
     fixture: String,
     view_id: String,
     command_argv: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CheckpointCreateOptions {
+    fixture: String,
+    view_id: String,
+}
+
+fn parse_checkpoint_create_options(
+    ctx: &CommandContext,
+) -> Result<CheckpointCreateOptions, CliError> {
+    let mut fixture = None;
+    let mut view_id = None;
+    let mut args = ctx.args.iter().skip(2);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun checkpoint create requires --fixture basic-app")
+                })?;
+                fixture = Some(value.clone());
+            }
+            "--view" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun checkpoint create requires --view <resolved-view-id>",
+                    )
+                })?;
+                view_id = Some(value.clone());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun checkpoint create"
+                )));
+            }
+            value if view_id.is_none() => view_id = Some(value.to_string()),
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected checkpoint create argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    let fixture = fixture.ok_or_else(|| {
+        invalid_request("usage: sun checkpoint create --view <resolved-view-id> --fixture basic-app")
+    })?;
+    let view_id = view_id.ok_or_else(|| {
+        invalid_request("usage: sun checkpoint create --view <resolved-view-id> --fixture basic-app")
+    })?;
+
+    Ok(CheckpointCreateOptions { fixture, view_id })
 }
 
 fn parse_view_resolve_options(ctx: &CommandContext) -> Result<ViewResolveOptions, CliError> {
@@ -681,6 +778,12 @@ fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, C
                     .ok_or_else(|| invalid_request("usage: sun status --topic <topic>"))?;
                 scope = StatusScope::Topic(value.clone());
             }
+            "--checkpoint" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun status --checkpoint <checkpoint>")
+                })?;
+                scope = StatusScope::Checkpoint(value.clone());
+            }
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
                     "unknown flag `{flag}` for sun status"
@@ -765,6 +868,14 @@ fn ensure_fixture_topic(topic: &str) -> Result<(), CliError> {
     }
 }
 
+fn ensure_fixture_checkpoint(checkpoint_id: &str) -> Result<(), CliError> {
+    if fixture_checkpoint().map(|checkpoint| checkpoint.id == checkpoint_id)? {
+        Ok(())
+    } else {
+        Err(object_not_found("checkpoint", checkpoint_id))
+    }
+}
+
 fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliError> {
     let selector = options.selector.as_str();
     if let Some(session_id) = &options.session_id {
@@ -805,6 +916,14 @@ fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliEr
             fixture_inspect_topic_json()
         } else {
             fixture_status_topic_text()
+        });
+    }
+    if let Some(checkpoint_id) = selector.strip_prefix("checkpoint:") {
+        ensure_fixture_checkpoint(checkpoint_id)?;
+        return Ok(if json {
+            fixture_inspect_checkpoint_json()?
+        } else {
+            format!("checkpoint {checkpoint_id}")
         });
     }
 
@@ -1047,6 +1166,41 @@ fn fixture_status_topic_json() -> String {
     )
 }
 
+fn fixture_status_checkpoint_json() -> Result<String, CliError> {
+    let checkpoint = fixture_checkpoint()?;
+    Ok(format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"status.checkpoint\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\"}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"topic_frontier\":{},",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"checkpoint\":{},",
+            "\"conflict_free\":{},",
+            "\"evidence_ready\":{},",
+            "\"export_ready\":{},",
+            "\"validation_report\":null,",
+            "\"export_refs\":{}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&checkpoint.repository_id),
+        json_escape(&checkpoint.id),
+        json_escape(&checkpoint.resolved_view_id),
+        json_escape(&checkpoint.resolved_view_id),
+        checkpoint_topic_frontier_json(&checkpoint),
+        single_repo_tree_json(&checkpoint.tree_identity),
+        checkpoint_json(&checkpoint),
+        checkpoint.conflict_free,
+        !checkpoint.evidence_refs.is_empty(),
+        checkpoint.conflict_free,
+        export_refs_json(&checkpoint),
+    ))
+}
+
 fn fixture_inspect_artifact_json(artifact: FixtureArtifact) -> String {
     let provenance = if let Some(operation_id) = artifact.latest_operation_id {
         format!(
@@ -1127,6 +1281,32 @@ fn fixture_inspect_artifact_json(artifact: FixtureArtifact) -> String {
         before_refs,
         after_refs,
     )
+}
+
+fn fixture_inspect_checkpoint_json() -> Result<String, CliError> {
+    let checkpoint = fixture_checkpoint()?;
+    Ok(format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.checkpoint\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\"}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"topic_frontier\":{},",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"checkpoint\":{}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&checkpoint.repository_id),
+        json_escape(&checkpoint.id),
+        json_escape(&checkpoint.resolved_view_id),
+        json_escape(&checkpoint.resolved_view_id),
+        checkpoint_topic_frontier_json(&checkpoint),
+        single_repo_tree_json(&checkpoint.tree_identity),
+        checkpoint_json(&checkpoint),
+    ))
 }
 
 fn fixture_inspect_operation_json() -> String {
@@ -1631,6 +1811,12 @@ fn fixture_resolved_view(revisions: Vec<TopicRevisionRef>) -> ResolvedViewResult
     )
 }
 
+fn fixture_checkpoint() -> Result<CheckpointRecord, CliError> {
+    let view = fixture_resolved_view(vec![fixture_auth_revision(), fixture_profile_revision()]);
+    let execution = fixture_passing_execution_from_resolved_view(&view).map_err(execution_error)?;
+    fixture_checkpoint_from_resolved_view(&view, Some(&execution)).map_err(checkpoint_error)
+}
+
 fn artifact_error(error: ArtifactIoError) -> CliError {
     let message = match &error {
         ArtifactIoError::PathPolicyViolation { .. } => {
@@ -1716,6 +1902,37 @@ fn artifact_error(error: ArtifactIoError) -> CliError {
     cli_error
 }
 
+fn checkpoint_error(error: CheckpointValidationError) -> CliError {
+    let message = match error.code.as_str() {
+        "checkpoint_conflicted_view" => "resolved view has conflicts and cannot be checkpointed",
+        "checkpoint_stale_view" => "resolved view has staleness and cannot be checkpointed",
+        "checkpoint_missing_tree" => "resolved view has no checkpointable tree identity",
+        "checkpoint_evidence_failed" => "checkpoint evidence did not pass",
+        "checkpoint_evidence_view_mismatch" => "checkpoint evidence references a different view",
+        "checkpoint_evidence_tree_mismatch" => "checkpoint evidence references a different tree",
+        _ => "checkpoint fixture could not be prepared",
+    };
+    CliError::new(error.code.as_str(), message).with_raw_details_json(format!(
+        concat!(
+            "{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"conflict_ids\":{},",
+            "\"staleness_ids\":{},",
+            "\"checkpoint_id\":null,",
+            "\"execution_id\":{},",
+            "\"expected_tree_identity\":{},",
+            "\"actual_tree_identity\":{}",
+            "}}"
+        ),
+        json_escape(&error.resolved_view_id),
+        string_array_json(error.conflict_ids.iter().map(String::as_str)),
+        string_array_json(error.staleness_ids.iter().map(String::as_str)),
+        optional_string_json(error.execution_id.as_deref()),
+        optional_single_repo_tree_json(error.expected_tree_identity.as_ref()),
+        optional_single_repo_tree_json(error.actual_tree_identity.as_ref()),
+    ))
+}
+
 fn execution_error(error: ExecutionFoundationError) -> CliError {
     let message = match error.code.as_str() {
         "execution_conflicted_view" => {
@@ -1782,6 +1999,55 @@ fn init_success_envelope(
         created_config,
         created_gitignore,
         created_directories,
+    )
+}
+
+fn checkpoint_create_success_envelope(checkpoint: &CheckpointRecord) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"checkpoint.create\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"checkpoint_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"topic_frontier\":{},",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"checkpoint\":{},",
+            "\"checkpoint_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"topic_frontier\":{},",
+            "\"evidence_refs\":[{}],",
+            "\"export_refs\":{},",
+            "\"export_ready\":true",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(&checkpoint.repository_id),
+        json_escape(&checkpoint.id),
+        json_escape(&checkpoint.resolved_view_id),
+        json_escape(&checkpoint.resolved_view_id),
+        checkpoint_topic_frontier_json(checkpoint),
+        single_repo_tree_json(&checkpoint.tree_identity),
+        checkpoint_json(checkpoint),
+        json_escape(&checkpoint.id),
+        json_escape(&checkpoint.resolved_view_id),
+        single_repo_tree_json(&checkpoint.tree_identity),
+        checkpoint_topic_frontier_json(checkpoint),
+        checkpoint
+            .evidence_refs
+            .iter()
+            .map(evidence_ref_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        export_refs_json(checkpoint),
     )
 }
 
@@ -2024,6 +2290,100 @@ fn execution_run_success_envelope(execution: &ExecutionRecord) -> String {
             .map(promotion_candidate_json)
             .collect::<Vec<_>>()
             .join(","),
+    )
+}
+
+fn checkpoint_json(checkpoint: &CheckpointRecord) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"schema_version\":1,",
+            "\"record_type\":\"checkpoint\",",
+            "\"id\":\"{}\",",
+            "\"repository_scope\":{{\"kind\":\"single\",\"repository_id\":\"{}\"}},",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"topic_frontier\":{},",
+            "\"evidence_refs\":[{}],",
+            "\"conflict_free\":{},",
+            "\"created_by\":{{\"actor_id\":\"{}\",\"command\":\"{}\"}},",
+            "\"created_at\":\"{}\",",
+            "\"retention_class\":\"{}\",",
+            "\"export_refs\":{},",
+            "\"privacy_class\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&checkpoint.id),
+        json_escape(&checkpoint.repository_id),
+        json_escape(&checkpoint.resolved_view_id),
+        single_repo_tree_json(&checkpoint.tree_identity),
+        checkpoint_topic_frontier_json(checkpoint),
+        checkpoint
+            .evidence_refs
+            .iter()
+            .map(evidence_ref_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        checkpoint.conflict_free,
+        json_escape(&checkpoint.created_by.actor_id),
+        json_escape(&checkpoint.created_by.command),
+        json_escape(&checkpoint.created_at),
+        checkpoint.retention_class.as_str(),
+        export_refs_json(checkpoint),
+        checkpoint.privacy_class.as_str(),
+    )
+}
+
+fn checkpoint_topic_frontier_json(checkpoint: &CheckpointRecord) -> String {
+    let fields = checkpoint
+        .topic_frontier
+        .iter()
+        .map(|entry| {
+            format!(
+                "\"{}\":\"{}\"",
+                json_escape(&entry.topic_id),
+                json_escape(&entry.topic_revision_id)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{fields}}}")
+}
+
+fn evidence_ref_json(evidence: &EvidenceRef) -> String {
+    match evidence {
+        EvidenceRef::Execution(execution) => format!(
+            concat!(
+                "{{",
+                "\"kind\":\"execution\",",
+                "\"execution_id\":\"{}\",",
+                "\"result\":\"{}\",",
+                "\"resolved_view_id\":\"{}\",",
+                "\"tree_identity\":{}",
+                "}}"
+            ),
+            json_escape(&execution.execution_id),
+            execution.result.as_str(),
+            json_escape(&execution.resolved_view_id),
+            single_repo_tree_json(&execution.tree_identity),
+        ),
+    }
+}
+
+fn export_refs_json(checkpoint: &CheckpointRecord) -> String {
+    format!(
+        "[{}]",
+        checkpoint
+            .export_refs
+            .iter()
+            .map(|export_ref| {
+                format!(
+                    "{{\"export_map_id\":\"{}\"}}",
+                    json_escape(&export_ref.export_map_id)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     )
 }
 
@@ -2624,6 +2984,7 @@ Usage:
   sun write <path> --session <session> --fixture basic-app --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]
   sun view resolve --fixture basic-app --include topic:revision[,topic:revision] [--json]
   sun run --view <resolved-view-id> --fixture basic-app --json -- cargo test
+  sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
 
 Commands:
   init       Create the conservative local .sunlight repository layout
@@ -2636,6 +2997,7 @@ Commands:
   write      Write fixture-only content to one artifact path
   view       Resolve fixture topic revisions into a candidate view
   run        Record a fixture execution for an exact resolved view
+  checkpoint Freeze a fixture resolved view as an in-memory checkpoint
 "
     );
 }

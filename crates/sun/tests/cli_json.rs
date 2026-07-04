@@ -684,6 +684,109 @@ fn run_json_fixture_stale_view_rejects_before_projection() {
 }
 
 #[test]
+fn checkpoint_create_json_fixture_ready_view_returns_checkpoint_envelope() {
+    let repo = TestRepo::new("checkpoint-fixture-ready");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+
+    let output = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun checkpoint create should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"checkpoint.create\""));
+    assert!(stdout.contains("\"repository_id\":\"repo_fixture_basic_app\""));
+    assert!(stdout.contains(
+        "\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""
+    ));
+    assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(stdout.contains(
+        "\"tree_identity\":{\"kind\":\"SingleRepoTree\",\"repository_id\":\"repo_fixture_basic_app\",\"tree_hash\":\"tree_fixture_"
+    ));
+    assert!(stdout.contains(
+        "\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_0001\",\"topic_profile_ui\":\"rev_profile_ui_0001\"}"
+    ));
+    assert!(stdout.contains(
+        "\"evidence_refs\":[{\"kind\":\"execution\",\"execution_id\":\"exec_auth_profile_tests_0001\",\"result\":\"pass\""
+    ));
+    assert!(stdout.contains("\"export_refs\":[]"));
+    assert!(stdout.contains("\"export_ready\":true"));
+    assert!(stdout.contains("\"conflict_free\":true"));
+}
+
+#[test]
+fn checkpoint_create_json_fixture_conflicted_view_returns_stable_error() {
+    let repo = TestRepo::new("checkpoint-fixture-conflicted");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_auth_overlap_0001",
+    );
+
+    let output = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun checkpoint create should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"checkpoint_conflicted_view\""));
+    assert!(stdout.contains(
+        "\"message\":\"resolved view has conflicts and cannot be checkpointed\""
+    ));
+    assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(stdout.contains("\"conflict_ids\":[\"conflict_src_auth_ts_0001\"]"));
+    assert!(stdout.contains("\"staleness_ids\":[]"));
+    assert!(stdout.contains("\"checkpoint_id\":null"));
+}
+
+#[test]
+fn checkpoint_create_json_fixture_stale_view_returns_stable_error() {
+    let repo = TestRepo::new("checkpoint-fixture-stale");
+    let view_id = resolve_fixture_view_id(repo.path(), "topic_profile_ui:rev_profile_ui_0002");
+
+    let output = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun checkpoint create should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"checkpoint_stale_view\""));
+    assert!(
+        stdout.contains("\"message\":\"resolved view has staleness and cannot be checkpointed\"")
+    );
+    assert!(stdout.contains("\"conflict_ids\":[]"));
+    assert!(stdout
+        .contains("\"staleness_ids\":[\"stale_missing_dependency_rev_auth_nullability_0001\"]"));
+    assert!(stdout.contains("\"checkpoint_id\":null"));
+}
+
+#[test]
 fn status_json_fixture_basic_app_returns_repository_snapshot() {
     let repo = TestRepo::new("status-fixture-repository");
 
@@ -713,6 +816,33 @@ fn status_json_fixture_basic_app_returns_repository_snapshot() {
 }
 
 #[test]
+fn status_json_fixture_checkpoint_returns_checkpoint_snapshot() {
+    let repo = TestRepo::new("status-fixture-checkpoint");
+
+    let output = sun()
+        .arg("status")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status checkpoint should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.checkpoint\""));
+    assert!(stdout.contains(
+        "\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""
+    ));
+    assert!(stdout.contains("\"conflict_free\":true"));
+    assert!(stdout.contains("\"evidence_ready\":true"));
+    assert!(stdout.contains("\"export_ready\":true"));
+    assert!(stdout.contains("\"export_refs\":[]"));
+}
+
+#[test]
 fn status_json_fixture_basic_app_returns_session_snapshot() {
     let repo = TestRepo::new("status-fixture-session");
 
@@ -739,6 +869,32 @@ fn status_json_fixture_basic_app_returns_session_snapshot() {
     assert!(stdout.contains("\"before_hash\":\"sha256:auth_base\""));
     assert!(stdout.contains("\"after_hash\":\"sha256:auth_trim_guard\""));
     assert!(stdout.contains("\"last_operation_id\":\"op_auth_trim_guard_0001\""));
+}
+
+#[test]
+fn inspect_json_fixture_checkpoint_returns_frozen_record() {
+    let repo = TestRepo::new("inspect-fixture-checkpoint");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("checkpoint:checkpoint_auth_profile_ready_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect checkpoint should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.checkpoint\""));
+    assert!(stdout.contains("\"record_type\":\"checkpoint\""));
+    assert!(stdout.contains("\"id\":\"checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"retention_class\":\"landable\""));
+    assert!(stdout.contains("\"privacy_class\":\"commit_default\""));
+    assert!(stdout.contains(
+        "\"evidence_refs\":[{\"kind\":\"execution\",\"execution_id\":\"exec_auth_profile_tests_0001\""
+    ));
 }
 
 #[test]

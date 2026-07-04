@@ -208,7 +208,7 @@ Phase 4 extends the existing CLI JSON envelope without changing its success/fail
 
 | Command | Required exposure |
 | --- | --- |
-| `sun checkpoint create <view> --json` | Returns `command: "checkpoint.create"`, checkpoint ID, resolved view ID, tree identity, selected evidence refs, and `export_ready: true/false`. |
+| `sun checkpoint create --view <resolved-view-id> --fixture basic-app --json` | Returns `command: "checkpoint.create"`, checkpoint ID, resolved view ID, tree identity, selected evidence refs, and `export_ready: true/false`. |
 | `sun policy check-export --checkpoint <checkpoint-id> --json` | Returns validation report ID, candidate summary, checked record/payload counts, warnings, and hard failures. |
 | `sun git export <checkpoint-id> --branch <ref> --json` | Returns `command: "git.export"`, checkpoint ID, validation report ID, Git ref, Git commit IDs, and export-map ID. |
 | `sun status --checkpoint <checkpoint-id> --json` | Shows checkpoint record, conflict/evidence/export readiness, validation report summary, and export refs. |

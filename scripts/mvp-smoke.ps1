@@ -22,6 +22,12 @@ try {
         $process = Start-Process -FilePath $script:sunBin -ArgumentList $Arguments -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
         $out = Get-Content -Raw -LiteralPath $stdout
         $err = Get-Content -Raw -LiteralPath $stderr
+        if ($null -eq $out) {
+            $out = ''
+        }
+        if ($null -eq $err) {
+            $err = ''
+        }
         if ($process.ExitCode -ne 0) {
             throw "Command failed for ${Label} with status $($process.ExitCode)`nargs: $($Arguments -join ' ')`nstdout:`n$out`nstderr:`n$err"
         }
@@ -34,6 +40,12 @@ try {
         $process = Start-Process -FilePath 'git' -ArgumentList $Arguments -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
         $out = Get-Content -Raw -LiteralPath $stdout
         $err = Get-Content -Raw -LiteralPath $stderr
+        if ($null -eq $out) {
+            $out = ''
+        }
+        if ($null -eq $err) {
+            $err = ''
+        }
         if ($process.ExitCode -ne 0) {
             throw "git $($Arguments -join ' ') failed with status $($process.ExitCode)`nstdout:`n$out`nstderr:`n$err"
         }

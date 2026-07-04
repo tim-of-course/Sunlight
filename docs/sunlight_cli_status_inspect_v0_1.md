@@ -4,7 +4,7 @@
 | --- | --- |
 | Status | Phase 1 response contract |
 | Date | July 3, 2026 |
-| Scope | CLI JSON envelope, command names, status snapshots, inspect snapshots, and acceptance tests |
+| Scope | CLI JSON envelope, command names, status snapshots, inspect snapshots, projection local-root verification, and acceptance tests |
 | Sources | `docs/sunlight_consolidated_architecture_v0_3.md`, `docs/sunlight_implementation_backlog_v0_1.md`, `docs/sunlight_schema_contracts_v0_1.md`, `docs/sunlight_native_io_phase1_spec_v0_1.md`, `docs/sunlight_artifact_io_fixtures_v0_1.md`, `docs/sunlight_operation_transactions_v0_1.md` |
 
 ## Purpose
@@ -12,6 +12,8 @@
 This file locks the Phase 1 JSON response contract for `sun status` and `sun inspect`. It is narrower than the native IO spec: implementers should use this as the snapshot shape for provenance and state queries after `init`, `topic create`, `session start`, `read/list/search`, `patch`, and `write`.
 
 Phase 1 status and inspect must not rely on `git status`, filesystem projections, or inferred working tree changes. They report native Sunlight objects: repository, topic, session, session generation, resolved view, operation transaction, topic revision, and artifact records.
+
+Projection status and inspect are operator diagnostics over a projection record plus optional caller-supplied local root verification. Local root paths are local-only metadata and are never source truth.
 
 ## Common JSON Envelope
 
@@ -110,11 +112,13 @@ Use stable dotted command names in `data.command`. The left side names the objec
 | `sun status --json` | `status.repository` |
 | `sun status --session <session> --json` | `status.session` |
 | `sun status --topic <topic> --json` | `status.topic` |
+| `sun status --projection <projection> --json` | `status.projection` |
 | `sun inspect <path-or-artifact> --session <session> --json` | `inspect.artifact` |
 | `sun inspect topic:<topic> --json` | `inspect.topic` |
 | `sun inspect session:<session> --json` | `inspect.session` |
 | `sun inspect operation:<operation> --json` | `inspect.operation` |
 | `sun inspect revision:<revision> --json` | `inspect.revision` |
+| `sun inspect projection:<projection> --json` | `inspect.projection` |
 
 Selectors should be explicit when IDs can overlap. Bare path/artifact inspect is allowed only with `--session` or another explicit view selector.
 
@@ -156,6 +160,39 @@ Any session-scoped response includes the current exact view block.
 ```
 
 Repository-level status uses `view: null` unless a default current view selector is explicitly requested in a later phase.
+
+### Local Root Verification Block
+
+Projection status and inspect may include `local_root_verification` when the caller supplies `--projection-root`. The block verifies only the local filesystem root state and summary counts.
+
+```json
+{
+  "projection_root": {
+    "path": "/tmp/sun-projection-root",
+    "privacy": "local_only_path",
+    "privacy_class": "local_only"
+  },
+  "verification_state": "present",
+  "content_verification": "not_available_without_persisted_manifest",
+  "exists": true,
+  "is_dir": true,
+  "directories": 3,
+  "files": 5,
+  "bytes": 222,
+  "executable_files": 1,
+  "dirty_local": null,
+  "sample_paths": ["README.md", "docs/guide.md"],
+  "scan_error": null
+}
+```
+
+Required rules:
+
+- `projection_root.path` is a local-only path and must not be exported or stored in commit-default records.
+- `verification_state` is `present` when the root exists and is a directory, `missing` when it does not exist, and `not_directory` when the supplied path is a non-directory.
+- `content_verification` remains `not_available_without_persisted_manifest` until projection materialization persists a manifest that can be compared against the local root.
+- Counts and `sample_paths` are scan summaries for operator visibility, not native provenance and not proof of content correctness.
+- Without `--projection-root`, projection status embeds no local root verification details and projection inspect returns `local_root_verification: null`.
 
 ### Artifact Summary
 
@@ -370,6 +407,68 @@ Snapshot shape:
 ```
 
 Topic status is revision-oriented. It should be usable even when there is no active session.
+
+### Projection Status
+
+Command:
+
+```text
+sun status --projection projection_exec_auth_profile_0001 --projection-root <local-root> --json
+```
+
+Snapshot shape:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "command": "status.projection",
+    "repository_id": "repo_fixture_basic_app",
+    "ids": {
+      "projection_id": "projection_exec_auth_profile_0001",
+      "resolved_view_id": "view_base_0001"
+    },
+    "view": {
+      "resolved_view_id": "view_base_0001",
+      "tree_identity": {
+        "kind": "SingleRepoTree",
+        "repository_id": "repo_fixture_basic_app",
+        "tree_hash": "tree_fixture_base_0001"
+      }
+    },
+    "projection": {
+      "lifecycle_state": "materialized",
+      "projection_id": "projection_exec_auth_profile_0001",
+      "purpose": "execution",
+      "strategy": "copy",
+      "resolved_view_id": "view_base_0001",
+      "tree_identity": {
+        "kind": "SingleRepoTree",
+        "repository_id": "repo_fixture_basic_app",
+        "tree_hash": "tree_fixture_base_0001"
+      },
+      "retention_state": "active",
+      "integrity_status": "not_checked",
+      "dirty_local": null,
+      "root_ref": {
+        "value": "local://.sunlight/projections/execution/projection_exec_auth_profile_0001",
+        "privacy": "local_only_path",
+        "privacy_class": "local_only"
+      },
+      "local_root_verification": {
+        "verification_state": "present",
+        "content_verification": "not_available_without_persisted_manifest",
+        "files": 5,
+        "bytes": 222
+      }
+    },
+    "native_errors": []
+  },
+  "warnings": []
+}
+```
+
+Projection status reports the projection record, lifecycle, strategy, tree refs, and optional local-root verification. It must not infer native changes from projection filesystem contents.
 
 ## Inspect Contracts
 
@@ -697,6 +796,60 @@ Snapshot shape:
 
 Revision inspect is the stable selectable-boundary view. It should not require an active session.
 
+### Projection Inspect
+
+Command:
+
+```text
+sun inspect projection:projection_exec_auth_profile_0001 --projection-root <local-root> --json
+```
+
+Snapshot shape:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "command": "inspect.projection",
+    "repository_id": "repo_fixture_basic_app",
+    "ids": {
+      "projection_id": "projection_exec_auth_profile_0001",
+      "resolved_view_id": "view_base_0001"
+    },
+    "view": {
+      "resolved_view_id": "view_base_0001",
+      "tree_identity": {
+        "kind": "SingleRepoTree",
+        "repository_id": "repo_fixture_basic_app",
+        "tree_hash": "tree_fixture_base_0001"
+      }
+    },
+    "projection": {
+      "record_type": "projection",
+      "id": "projection_exec_auth_profile_0001",
+      "purpose": "execution",
+      "strategy": "copy",
+      "root_ref": {
+        "value": "local://.sunlight/projections/execution/projection_exec_auth_profile_0001",
+        "privacy": "local_only_path",
+        "privacy_class": "local_only"
+      },
+      "retention_state": "active",
+      "privacy_class": "local_only"
+    },
+    "local_root_verification": {
+      "verification_state": "present",
+      "content_verification": "not_available_without_persisted_manifest",
+      "files": 5,
+      "bytes": 222
+    }
+  },
+  "warnings": []
+}
+```
+
+Projection inspect is the detailed record view. It may show the local-only root reference and scan summary, but local root contents remain outside native source verification until a persisted projection manifest exists.
+
 ## Acceptance Tests
 
 Use the `fixture-basic-app` repository and stable labels from the artifact IO and operation transaction fixture specs.
@@ -708,7 +861,11 @@ Use the `fixture-basic-app` repository and stable labels from the artifact IO an
 | `status_repository_snapshot` | Init, create topic, start session, patch once, run `sun status --json`. | Shows base checkpoint, open topic head, active session, current generation, native errors array, and no Git working tree dependency. |
 | `status_session_read_after_write` | Patch `src/auth.ts`, then run `sun status --session session_agent_a --json`. | Shows `gen_agent_a_0002`, `view_agent_a_after_patch_0001`, topic head `rev_auth_nullability_0001`, and changed artifact after hash. |
 | `status_topic_without_session` | Create topic and patch, then inspect topic status without passing a session. | Shows topic metadata, head revision, revision count, and changed artifacts. |
+| `status_projection_local_root_present` | Materialize the fixture projection, then run projection status with its local root. | Shows `status.projection`, lifecycle `materialized`, `verification_state: present`, local-only root path metadata, count summaries, and no content verification before a persisted manifest exists. |
+| `status_projection_local_root_missing` | Run projection status with a missing local root. | Shows `verification_state: missing`, zero counts, and unchanged native projection refs. |
+| `status_projection_local_root_not_directory` | Run projection status with a file path as the local root. | Shows `verification_state: not_directory`, no file content verification, and no native mutation. |
 | `inspect_artifact_after_patch` | Patch `src/auth.ts`, then inspect it through the same session. | Shows current after hash, path history, latest operation, topic, revision, session, and before/after refs. |
+| `inspect_projection_local_root` | Inspect `projection:projection_exec_auth_profile_0001` with a local root. | Shows projection record metadata, `local_only_path` root refs, and the same local-root verification block used by projection status. |
 | `inspect_operation_authored_context` | Inspect `operation:op_auth_trim_guard_0001`. | View block is the prior authored context `gen_agent_a_0001`/`view_base_0001`; operation includes preconditions, write set, before refs, after refs, and created revision. |
 | `inspect_topic_revision_chain` | Inspect `topic:auth-nullability` after two revisions. | Revisions are ordered by revision number and each links to operation, parent revision, and changed artifacts. |
 | `inspect_session_generations` | Inspect `session:session_agent_a` after patch and write. | Generation list includes session start plus each accepted mutation; current view is the latest generation. |
@@ -723,6 +880,8 @@ Use the `fixture-basic-app` repository and stable labels from the artifact IO an
 - Do not implement Phase 2 multi-topic resolver composition for this contract.
 - Do not read Git working tree status to populate native status.
 - Do not infer provenance from filesystem diffs or projections.
+- Do not treat projection root scans as content verification until a persisted manifest exists.
+- Do not expose local projection roots except as `local_only_path` / `local_only` metadata.
 - Do not require executions, checkpoints, Git export, or conflict objects for these snapshots.
 - Do not expose raw secret bytes or raw operation payload bytes in status/inspect; use content hashes, refs, and policy classes.
 - Keep this contract compatible with future `RepoTreeMap` by preserving the `tree_identity.kind` union shape.

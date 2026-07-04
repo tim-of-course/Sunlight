@@ -34,5 +34,5 @@ export write planning with `--write-plan`.
 
 For focused projection strategy coverage, run
 `scripts/projection-strategy-smoke.sh`. It verifies copy fallback, explicit
-strategy selection JSON, local-only materialization metadata, and unsupported
-required strategy errors without depending on real reflink support.
+strategy selection JSON, local-only materialization metadata and root refs, and
+unsupported required strategy errors without depending on real reflink support.

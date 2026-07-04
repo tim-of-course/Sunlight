@@ -23,7 +23,8 @@ The smoke covers:
 - exact resolved-view materialization from `resolved_content_tree`
 - full-copy correctness fallback and cache-key selection
 - explicit reflink strategy selection through fixture capabilities
-- local-only projection metadata and local root references
+- local-only projection metadata and local root references with
+  `local_only_path` privacy
 - fallback from an ineligible preferred strategy to copy
 - stable JSON failure for an unsupported required strategy with
   `--no-copy-fallback`

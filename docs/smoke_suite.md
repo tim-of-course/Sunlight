@@ -29,4 +29,5 @@ The suite runs, in order:
 - `scripts/mvp-smoke`
 
 `scripts/mvp-smoke` covers the end-to-end fixture path through real local Git
-export with `--execute-local`. See [mvp_smoke.md](mvp_smoke.md) for details.
+export with `--execute-local`, including projection status and inspect local
+root verification. See [mvp_smoke.md](mvp_smoke.md) for details.

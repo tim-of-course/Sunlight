@@ -21,7 +21,8 @@ The smoke builds `sun`, then exercises the `basic-app` fixture end to end:
 - resolves the compatible auth/profile view
 - materializes a base execution projection into an empty temporary projection
   root and verifies the projected fixture files
-- checks projection status and inspect JSON against the materialized local root
+- checks projection status and inspect JSON against the materialized local root,
+  including local-only path metadata and `verification_state: present`
 - plans the compatible execution projection
 - records the fixture `cargo test` execution
 - creates the export-ready checkpoint
@@ -47,6 +48,12 @@ Expected projected fixture files:
 
 On platforms with executable mode support, the smoke also verifies
 `scripts/build.sh` is executable and `src/auth.ts` is not.
+
+Projection status and inspect smoke coverage verifies the local root exists and
+reports file, byte, executable, and sample-path summaries. It does not verify
+projection content hashes yet; the JSON explicitly reports
+`content_verification: not_available_without_persisted_manifest` until
+materialization persists a comparable manifest.
 
 The aggregate smoke suite also runs the validation and projection strategy
 smokes, which cover artifact validation, compatibility import, write-plan

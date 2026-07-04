@@ -928,6 +928,169 @@ fn status_json_fixture_projection_reports_dirty_content_from_manifest() {
     assert!(!session_stdout.contains("return email;"));
 }
 
+#[test]
+fn status_json_fixture_projection_reports_root_mismatch_from_persisted_binding() {
+    let repo = TestRepo::new("projection-status-root-mismatch");
+    let projection_root = repo.path().join("projection-root");
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    fs::write(
+        projection_root.join("src/auth.ts"),
+        "export function login(email: string) {\n  return email;\n}\n",
+    )
+    .unwrap();
+    let local_record_path = projection_root
+        .join(".sunlight/projections/execution/projection_exec_auth_profile_0001")
+        .join("projection-manifest-local.json");
+    let local_record = fs::read_to_string(&local_record_path).unwrap();
+    fs::write(
+        &local_record_path,
+        local_record.replace(
+            "local://.sunlight/projections/execution/projection_exec_auth_profile_0001",
+            "local://.sunlight/projections/compatibility/projection_compat_agent_a_0001",
+        ),
+    )
+    .unwrap();
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.projection\""));
+    assert!(stdout.contains("\"verification_state\":\"present\""));
+    assert!(stdout.contains("\"content_verification\":\"root_mismatch\""));
+    assert!(stdout.contains("\"dirty_local\":null"));
+    assert!(stdout.contains("\"mismatched_files\":0"));
+    assert!(stdout.contains("\"missing_files\":0"));
+    assert!(stdout.contains("\"extra_files\":0"));
+    assert!(stdout.contains("\"metadata_mismatches\":0"));
+    assert!(stdout.contains("\"verification_errors\":[]"));
+}
+
+#[test]
+fn status_json_fixture_projection_does_not_synthesize_root_mismatch_without_persisted_binding() {
+    let repo = TestRepo::new("projection-status-root-no-synthetic-mismatch");
+    let projection_root = repo.path().join("projection-root");
+    let other_root = repo.path().join("other-root");
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+    fs::create_dir_all(&other_root).unwrap();
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&other_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.projection\""));
+    assert!(stdout.contains("\"verification_state\":\"present\""));
+    assert!(stdout.contains("\"content_verification\":\"dirty\""));
+    assert!(stdout.contains("\"dirty_local\":true"));
+    assert!(stdout.contains("\"missing_files\":5"));
+    assert!(!stdout.contains("\"content_verification\":\"root_mismatch\""));
+}
+
+#[test]
+fn status_json_fixture_projection_reports_invalid_persisted_manifest_not_root_mismatch() {
+    let repo = TestRepo::new("projection-status-root-invalid-manifest");
+    let projection_root = repo.path().join("projection-root");
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    let local_record_path = projection_root
+        .join(".sunlight/projections/execution/projection_exec_auth_profile_0001")
+        .join("projection-manifest-local.json");
+    fs::write(&local_record_path, "{\"manifest\":null").unwrap();
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.projection\""));
+    assert!(stdout.contains("\"verification_state\":\"present\""));
+    assert!(stdout.contains("\"content_verification\":\"manifest_invalid\""));
+    assert!(stdout.contains("\"dirty_local\":null"));
+    assert!(stdout.contains("\"verification_errors\":[\"projection_manifest_local_invalid\"]"));
+    assert!(!stdout.contains("\"content_verification\":\"root_mismatch\""));
+}
+
 #[cfg(unix)]
 #[test]
 fn status_json_fixture_projection_reports_dirty_executable_bit_from_manifest() {

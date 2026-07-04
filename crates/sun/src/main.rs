@@ -42,6 +42,7 @@ use sunlight_core::projection::{
     fixture_inspection_projection_from_resolved_view,
     fixture_projection_manifest_from_content_tree, is_projection_local_metadata_path,
     materialize_fixture_projection_copy, plan_fixture_projection_materialization,
+    projection_manifest_local_record_path,
     ProjectionFilesystemMaterialization, ProjectionManifestRecord,
     ProjectionMaterializationCapabilities, ProjectionMaterializationError,
     ProjectionMaterializationErrorCode, ProjectionMaterializationLocalMetadata,
@@ -50,7 +51,7 @@ use sunlight_core::projection::{
     FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
     FIXTURE_EXPORT_PROJECTION_ID, FIXTURE_INSPECTION_PROJECTION_ID,
 };
-use sunlight_core::records::canonical_json_bytes;
+use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
 };
@@ -1873,6 +1874,11 @@ fn fixture_status_projection_json(
 ) -> Result<String, CliError> {
     let lifecycle_state = projection_lifecycle_state(projection, projection_root);
     let manifest = fixture_local_projection_manifest(projection)?;
+    let verification = local_projection_root_verification(projection, &manifest, projection_root);
+    let verification_json = local_projection_root_verification_json_from_verification(
+        projection_root,
+        &verification,
+    );
     Ok(format!(
         concat!(
             "{{\"ok\":true,\"data\":{{",
@@ -1914,8 +1920,8 @@ fn fixture_status_projection_json(
         projection.retention_state.as_str(),
         projection_root_ref_json(projection),
         local_projection_manifest_json(&manifest),
-        local_projection_root_verification(&manifest, projection_root).dirty_local_json(),
-        local_projection_root_verification_json(&manifest, projection_root),
+        verification.dirty_local_json(),
+        verification_json,
     ))
 }
 
@@ -4549,7 +4555,7 @@ fn fixture_inspect_projection_json(
         single_repo_tree_json(&projection.tree_identity),
         projection_record_json(projection),
         local_projection_manifest_json(&manifest),
-        local_projection_root_verification_json(&manifest, projection_root),
+        local_projection_root_verification_json(projection, &manifest, projection_root),
     ))
 }
 
@@ -4605,14 +4611,29 @@ impl LocalProjectionRootVerification {
     }
 }
 
+#[derive(Debug)]
+enum PersistedLocalManifestBinding {
+    Unavailable,
+    Invalid,
+    Available { normalized_root_ref: String },
+}
+
 fn local_projection_root_verification_json(
+    projection: &ProjectionRecord,
     manifest: &ProjectionManifestRecord,
     projection_root: Option<&std::path::Path>,
+) -> String {
+    let verification = local_projection_root_verification(projection, manifest, projection_root);
+    local_projection_root_verification_json_from_verification(projection_root, &verification)
+}
+
+fn local_projection_root_verification_json_from_verification(
+    projection_root: Option<&std::path::Path>,
+    verification: &LocalProjectionRootVerification,
 ) -> String {
     let Some(root) = projection_root else {
         return "null".to_string();
     };
-    let verification = local_projection_root_verification(manifest, projection_root);
     let scan = &verification.scan;
     format!(
         concat!(
@@ -4661,6 +4682,7 @@ fn local_projection_root_verification_json(
 }
 
 fn local_projection_root_verification(
+    projection: &ProjectionRecord,
     manifest: &ProjectionManifestRecord,
     projection_root: Option<&std::path::Path>,
 ) -> LocalProjectionRootVerification {
@@ -4709,6 +4731,43 @@ fn local_projection_root_verification(
             metadata_mismatches: 0,
             verification_errors: vec![error.to_string()],
         };
+    }
+
+    match persisted_local_manifest_binding(root, projection) {
+        PersistedLocalManifestBinding::Available {
+            normalized_root_ref,
+        } if normalized_root_ref != projection.root_ref.value => {
+            return LocalProjectionRootVerification {
+                scan,
+                verification_state: state,
+                content_verification: "root_mismatch",
+                manifest_ref: projection_manifest_ref(manifest),
+                manifest_digest: manifest.manifest_digest.clone(),
+                dirty_local: None,
+                mismatched_files: 0,
+                missing_files: 0,
+                extra_files: 0,
+                metadata_mismatches: 0,
+                verification_errors: Vec::new(),
+            };
+        }
+        PersistedLocalManifestBinding::Invalid => {
+            return LocalProjectionRootVerification {
+                scan,
+                verification_state: state,
+                content_verification: "manifest_invalid",
+                manifest_ref: projection_manifest_ref(manifest),
+                manifest_digest: manifest.manifest_digest.clone(),
+                dirty_local: None,
+                mismatched_files: 0,
+                missing_files: 0,
+                extra_files: 0,
+                metadata_mismatches: 0,
+                verification_errors: vec!["projection_manifest_local_invalid".to_string()],
+            };
+        }
+        PersistedLocalManifestBinding::Available { .. }
+        | PersistedLocalManifestBinding::Unavailable => {}
     }
 
     let fixture_store = InMemoryArtifactStore::fixture_basic_app();
@@ -4777,6 +4836,64 @@ fn local_projection_root_verification(
         extra_files,
         metadata_mismatches,
         verification_errors,
+    }
+}
+
+fn persisted_local_manifest_binding(
+    projection_root: &std::path::Path,
+    projection: &ProjectionRecord,
+) -> PersistedLocalManifestBinding {
+    let path = projection_manifest_local_record_path(projection_root, projection);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return PersistedLocalManifestBinding::Unavailable;
+        }
+        Err(_) => return PersistedLocalManifestBinding::Invalid,
+    };
+    let Ok(record) = parse_json_record(&bytes) else {
+        return PersistedLocalManifestBinding::Invalid;
+    };
+    parse_persisted_local_manifest_binding(&record)
+}
+
+fn parse_persisted_local_manifest_binding(record: &JsonValue) -> PersistedLocalManifestBinding {
+    let JsonValue::Object(envelope) = record else {
+        return PersistedLocalManifestBinding::Invalid;
+    };
+    let Some(JsonValue::Object(manifest)) = envelope.get("manifest") else {
+        return PersistedLocalManifestBinding::Invalid;
+    };
+    match manifest.get("manifest_digest") {
+        Some(JsonValue::String(value)) if value.starts_with("sha256:") => {}
+        _ => return PersistedLocalManifestBinding::Invalid,
+    }
+    let Some(JsonValue::Object(root_binding)) = envelope.get("root_binding") else {
+        return PersistedLocalManifestBinding::Invalid;
+    };
+    match root_binding.get("normalization") {
+        Some(JsonValue::String(value)) if value == "local_uri_relative_v1" => {}
+        _ => return PersistedLocalManifestBinding::Invalid,
+    }
+    match root_binding.get("privacy_class") {
+        Some(JsonValue::String(value)) if value == "local_only" => {}
+        _ => return PersistedLocalManifestBinding::Invalid,
+    }
+    let Some(JsonValue::Object(root_ref)) = root_binding.get("normalized_root_ref") else {
+        return PersistedLocalManifestBinding::Invalid;
+    };
+    match root_ref.get("privacy") {
+        Some(JsonValue::String(value)) if value == "local_only_path" => {}
+        _ => return PersistedLocalManifestBinding::Invalid,
+    }
+    let Some(JsonValue::String(value)) = root_ref.get("value") else {
+        return PersistedLocalManifestBinding::Invalid;
+    };
+    if !value.starts_with("local://.sunlight/projections/") {
+        return PersistedLocalManifestBinding::Invalid;
+    }
+    PersistedLocalManifestBinding::Available {
+        normalized_root_ref: value.clone(),
     }
 }
 

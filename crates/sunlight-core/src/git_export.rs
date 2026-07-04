@@ -8,7 +8,10 @@ use crate::resolver::SingleRepoTree;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static TEMPORARY_GIT_INDEX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitExportRequest {
@@ -675,13 +678,14 @@ fn write_git_tree(
 }
 
 fn temporary_git_index_path() -> std::path::PathBuf {
-    let unique = SystemTime::now()
+    let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
+    let sequence = TEMPORARY_GIT_INDEX_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "sunlight-git-export-index-{}-{unique}",
-        std::process::id()
+        "sunlight-git-export-index-{}-{timestamp}-{sequence}",
+        std::process::id(),
     ))
 }
 
@@ -1547,8 +1551,11 @@ mod tests {
         fixture_resolver_input, resolve_fixture_view, TopicRevisionSelection,
         FIXTURE_BASE_CHECKPOINT_ID,
     };
+    use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -2306,6 +2313,33 @@ mod tests {
         assert!(!tree.iter().any(|entry| entry.contains("untracked.txt")));
         assert!(!tree.iter().any(|entry| entry.contains("staged.txt")));
         assert!(!tree.iter().any(|entry| entry.contains("src/base.rs")));
+    }
+
+    #[test]
+    fn temporary_git_index_path_is_unique_for_parallel_writers() {
+        let threads = 16;
+        let paths_per_thread = 128;
+        let barrier = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::new();
+
+        for _ in 0..threads {
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                (0..paths_per_thread)
+                    .map(|_| temporary_git_index_path())
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        let paths = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        let unique_paths = paths.iter().collect::<HashSet<_>>();
+
+        assert_eq!(paths.len(), threads * paths_per_thread);
+        assert_eq!(unique_paths.len(), paths.len());
     }
 
     #[test]

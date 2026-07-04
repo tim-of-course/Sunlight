@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran native `scripts/smoke-suite.ps1` after `6e0a842` with `cargo fmt --check`, `cargo check`, `cargo test` with 77 Windows CLI tests and 129 core tests, validation smoke, projection strategy smoke, and MVP smoke. WSL verification covered root-binding persistence with 27 focused core projection tests, 80 WSL CLI JSON tests, and `git diff --check`. Scratchpad guard must run after this edit.
+- Verification: latest integrated pass ran native `scripts/smoke-suite.ps1` after `56e0118` with `cargo fmt --check`, `cargo check`, `cargo test` with 80 Windows CLI tests and 129 core tests, validation smoke, projection strategy smoke, and MVP smoke. WSL verification covered root-mismatch status/inspect with 83 WSL CLI JSON tests and `git diff --check`. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -119,12 +119,13 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-manifest-error-states`: integrated as `a97d7ec`.
 - Completed slice `projection-manifest-root-binding-contract`: integrated as `1bad247`.
 - Completed slice `projection-manifest-root-binding-persistence`: integrated as `bbbb3ac`; formatting checkpoint `1897fe0`; smoke harness checkpoint `6e0a842`.
-- Active slice `projection-manifest-root-mismatch-status-inspect`: WSL clone `/home/timothycard/code/Sunlight-2-projection-manifest-root-mismatch-status-inspect-20260704-151530`, branch `dm/projection-manifest-root-mismatch-status-inspect`, run artifacts under `C:\tmp\sunlight-manager\20260704-151530`.
+- Completed slice `projection-manifest-root-mismatch-status-inspect`: integrated as `10374b2`; formatting checkpoint `56e0118`.
+- Active slice `projection-manifest-local-envelope-validation`: WSL clone `/home/timothycard/code/Sunlight-2-projection-manifest-local-envelope-validation-20260704-155030`, branch `dm/projection-manifest-local-envelope-validation`, run artifacts under `C:\tmp\sunlight-manager\20260704-155030`.
 - Next heartbeat should inspect active WSL progress, import verified work if finished, run full smoke-suite validation, and keep project-wide projection manifest verification moving.
 
 ## Candidate Next Slices
 
-- Projection manifest invalid persisted-envelope status/inspect fixtures after root-mismatch behavior lands.
+- Projection manifest persisted-envelope docs/status contract cleanup after validation lands.
 - Validation smoke CI/usage follow-up remains optional after the smoke suite settles.
 
 ## Decisions

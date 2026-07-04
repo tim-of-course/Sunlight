@@ -110,7 +110,11 @@ try {
 
     $initJsonText = $initJson -join "`n"
     $init = $initJsonText | ConvertFrom-Json
-    if ($init.command -ne 'repository.init') {
+    $initCommand = $init.data.command
+    if (!$initCommand) {
+        $initCommand = $init.command
+    }
+    if ($initCommand -ne 'repository.init') {
         throw "sun init JSON did not include command repository.init:`n$initJsonText"
     }
 

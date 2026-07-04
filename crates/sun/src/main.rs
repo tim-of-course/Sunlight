@@ -18,7 +18,7 @@ use sunlight_core::resolver::{
     fixture_auth_revision, fixture_base_entries, fixture_overlapping_auth_revision,
     fixture_profile_revision, fixture_profile_revision_missing_auth_dependency,
     fixture_resolver_input, resolve_fixture_view, DependencyClosure, DeterministicResolverOrder,
-    ResolverConflictOrStalenessRecord, ResolverRecordKind, ResolvedViewResult, SingleRepoTree,
+    ResolvedViewResult, ResolverConflictOrStalenessRecord, ResolverRecordKind, SingleRepoTree,
     TopicRevisionRef, TopicRevisionSelection,
 };
 
@@ -287,11 +287,10 @@ fn artifact_write(ctx: &CommandContext) -> Result<(), CliError> {
 fn view_resolve(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_view_resolve_options(ctx)?;
     if options.fixture != "basic-app" {
-        return Err(invalid_request(format!(
-            "unknown fixture `{}`",
-            options.fixture
-        ))
-        .with_detail("fixture", options.fixture));
+        return Err(
+            invalid_request(format!("unknown fixture `{}`", options.fixture))
+                .with_detail("fixture", options.fixture),
+        );
     }
 
     if let Some(base_checkpoint_id) = &options.base_checkpoint_id {
@@ -484,9 +483,8 @@ fn parse_view_resolve_options(ctx: &CommandContext) -> Result<ViewResolveOptions
         }
     }
 
-    let fixture = fixture.ok_or_else(|| {
-        invalid_request("usage: sun view resolve requires --fixture basic-app")
-    })?;
+    let fixture = fixture
+        .ok_or_else(|| invalid_request("usage: sun view resolve requires --fixture basic-app"))?;
     let include = include.ok_or_else(|| {
         invalid_request(
             "usage: sun view resolve requires --include topic:revision[,topic:revision]",

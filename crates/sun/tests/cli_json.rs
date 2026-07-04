@@ -420,7 +420,9 @@ fn view_resolve_json_reversed_frontier_order_produces_same_tree_identity() {
         .arg("--fixture")
         .arg("basic-app")
         .arg("--include")
-        .arg("topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001")
+        .arg(
+            "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+        )
         .arg("--json")
         .current_dir(repo.path())
         .output()
@@ -433,7 +435,9 @@ fn view_resolve_json_reversed_frontier_order_produces_same_tree_identity() {
         .arg("--fixture")
         .arg("basic-app")
         .arg("--include")
-        .arg("topic_profile_ui:rev_profile_ui_0001,topic_auth_nullability:rev_auth_nullability_0001")
+        .arg(
+            "topic_profile_ui:rev_profile_ui_0001,topic_auth_nullability:rev_auth_nullability_0001",
+        )
         .arg("--json")
         .current_dir(repo.path())
         .output()
@@ -448,7 +452,10 @@ fn view_resolve_json_reversed_frontier_order_produces_same_tree_identity() {
     assert!(left_stdout.contains("\"staleness_ids\":[]"));
     assert!(left_stdout.contains("\"resolver_order\":{\"operation_ids\":[\"op_auth_trim_guard_0001\",\"op_profile_write_0001\"]}"));
     assert!(left_stdout.contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_0001\",\"topic_profile_ui\":\"rev_profile_ui_0001\"}"));
-    assert_eq!(resolved_view_id(&left_stdout), resolved_view_id(&right_stdout));
+    assert_eq!(
+        resolved_view_id(&left_stdout),
+        resolved_view_id(&right_stdout)
+    );
 }
 
 #[test]
@@ -461,7 +468,9 @@ fn view_resolve_json_independent_files_returns_conflict_free_tree() {
         .arg("--fixture")
         .arg("basic-app")
         .arg("--include")
-        .arg("topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001")
+        .arg(
+            "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+        )
         .arg("--json")
         .current_dir(repo.path())
         .output()
@@ -504,8 +513,9 @@ fn view_resolve_json_overlapping_same_artifact_returns_conflict_summary() {
     assert!(stdout.contains("\"record_type\":\"conflict\""));
     assert!(stdout.contains("\"kind\":\"same_artifact_conflict\""));
     assert!(stdout.contains("\"artifact_ids\":[\"artifact_src_auth_ts\"]"));
-    assert!(stdout
-        .contains("\"operation_ids\":[\"op_auth_trim_guard_0001\",\"op_profile_auth_null_guard_0001\"]"));
+    assert!(stdout.contains(
+        "\"operation_ids\":[\"op_auth_trim_guard_0001\",\"op_profile_auth_null_guard_0001\"]"
+    ));
     assert!(stdout.contains("\"path_refs\":[{\"path\":\"src/auth.ts\",\"path_state\":\"active\"}]"));
     assert!(stdout.contains(
         "\"policy_reason\":\"same artifact operations are not proven commutative under file_ops_v1\""
@@ -534,7 +544,8 @@ fn view_resolve_json_missing_dependency_returns_staleness_summary() {
     assert!(stdout.contains("\"view\":null"));
     assert!(stdout.contains("\"tree_identity\":null"));
     assert!(stdout.contains("\"conflict_ids\":[]"));
-    assert!(stdout.contains("\"staleness_ids\":[\"stale_missing_dependency_rev_auth_nullability_0001\"]"));
+    assert!(stdout
+        .contains("\"staleness_ids\":[\"stale_missing_dependency_rev_auth_nullability_0001\"]"));
     assert!(stdout.contains("\"record_type\":\"staleness\""));
     assert!(stdout.contains("\"kind\":\"missing_dependency\""));
     assert!(stdout.contains("\"candidate_refs\":{\"dependent_revision_ids\":[\"rev_profile_ui_0002\"],\"required_revision_ids\":[\"rev_auth_nullability_0001\"]}"));

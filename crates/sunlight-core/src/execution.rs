@@ -694,10 +694,7 @@ mod tests {
         assert_eq!(record.projection_id, FIXTURE_EXECUTION_PROJECTION_ID);
         assert_eq!(record.output_path, "src/generated/auth.generated.ts");
         assert_eq!(record.target_topic_id, "topic_auth_nullability");
-        assert_eq!(
-            record.classification,
-            OutputClassification::SourceLikeDelta
-        );
+        assert_eq!(record.classification, OutputClassification::SourceLikeDelta);
         assert_eq!(record.before_hash, None);
         assert_eq!(record.after_hash, "sha256:generated_auth_after");
         assert_eq!(
@@ -730,7 +727,10 @@ mod tests {
                     FIXTURE_PROMOTION_OPERATION_TRANSACTION_ID
                 ),
                 ("topic_revision", FIXTURE_PROMOTION_TOPIC_REVISION_ID),
-                ("session_generation", FIXTURE_PROMOTION_SESSION_GENERATION_ID),
+                (
+                    "session_generation",
+                    FIXTURE_PROMOTION_SESSION_GENERATION_ID
+                ),
             ]
         );
     }
@@ -742,7 +742,8 @@ mod tests {
         let candidate = fixture_promotion_candidate_provenance(&execution);
         let response = fixture_promotion_mutation_response(&candidate);
 
-        let record = execution_output_promotion_record_from_mutation_response(&candidate, &response);
+        let record =
+            execution_output_promotion_record_from_mutation_response(&candidate, &response);
 
         assert_eq!(record.operation_transaction_id, response.operation.id);
         assert_eq!(record.topic_revision_id, response.topic_revision.id);
@@ -751,10 +752,7 @@ mod tests {
             record.authored_context_id,
             response.operation.authored_context_id
         );
-        assert_eq!(
-            record.classification,
-            OutputClassification::SourceLikeDelta
-        );
+        assert_eq!(record.classification, OutputClassification::SourceLikeDelta);
     }
 
     #[test]

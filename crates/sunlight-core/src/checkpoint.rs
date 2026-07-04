@@ -153,7 +153,11 @@ pub fn fixture_checkpoint_from_resolved_view(
 ) -> Result<CheckpointRecord, CheckpointValidationError> {
     let tree_identity = checkpointable_tree_identity(view)?;
     let evidence_refs = match execution_evidence {
-        Some(execution) => vec![validated_execution_evidence(view, &tree_identity, execution)?],
+        Some(execution) => vec![validated_execution_evidence(
+            view,
+            &tree_identity,
+            execution,
+        )?],
         None => Vec::new(),
     };
 
@@ -183,9 +187,7 @@ pub fn fixture_checkpoint_from_resolved_view(
     })
 }
 
-pub fn fixture_git_export_map_from_checkpoint(
-    checkpoint: &CheckpointRecord,
-) -> GitExportMapRecord {
+pub fn fixture_git_export_map_from_checkpoint(checkpoint: &CheckpointRecord) -> GitExportMapRecord {
     GitExportMapRecord {
         id: FIXTURE_EXPORT_MAP_ID.to_string(),
         repository_id: checkpoint.repository_id.clone(),
@@ -332,8 +334,7 @@ mod tests {
         let view = conflict_free_view();
         let execution = fixture_passing_execution_from_resolved_view(&view).unwrap();
 
-        let checkpoint =
-            fixture_checkpoint_from_resolved_view(&view, Some(&execution)).unwrap();
+        let checkpoint = fixture_checkpoint_from_resolved_view(&view, Some(&execution)).unwrap();
 
         assert_eq!(checkpoint.id, FIXTURE_CHECKPOINT_ID);
         assert_eq!(checkpoint.resolved_view_id, view.resolved_view_id);
@@ -435,7 +436,10 @@ mod tests {
         );
         assert_eq!(error.execution_id, Some(execution.id));
         assert_eq!(error.expected_tree_identity, view.tree_identity);
-        assert_eq!(error.actual_tree_identity, Some(other_view.tree_identity.unwrap()));
+        assert_eq!(
+            error.actual_tree_identity,
+            Some(other_view.tree_identity.unwrap())
+        );
     }
 
     #[test]
@@ -450,7 +454,10 @@ mod tests {
             error.code,
             CheckpointErrorCode::CheckpointEvidenceTreeMismatch
         );
-        assert_eq!(error.execution_id, Some(FIXTURE_PASSING_EXECUTION_ID.to_string()));
+        assert_eq!(
+            error.execution_id,
+            Some(FIXTURE_PASSING_EXECUTION_ID.to_string())
+        );
         assert_eq!(error.actual_tree_identity, Some(execution.tree_identity));
     }
 
@@ -482,7 +489,10 @@ mod tests {
             export_map.export_shape.kind,
             ExportShapeKind::SingleCheckpointCommit
         );
-        assert_eq!(export_map.validation_report_id, FIXTURE_VALIDATION_REPORT_ID);
+        assert_eq!(
+            export_map.validation_report_id,
+            FIXTURE_VALIDATION_REPORT_ID
+        );
         assert_eq!(
             exported_checkpoint.export_refs,
             vec![ExportMapRef {

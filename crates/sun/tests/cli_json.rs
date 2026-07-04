@@ -615,7 +615,9 @@ fn run_json_fixture_failure_result_still_returns_execution_record() {
     assert_success(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("\"execution_id\":\"exec_auth_profile_tests_fail_0001\""));
-    assert!(stdout.contains("\"result\":{\"status\":\"fail\",\"exit_code\":101,\"timed_out\":false}"));
+    assert!(
+        stdout.contains("\"result\":{\"status\":\"fail\",\"exit_code\":101,\"timed_out\":false}")
+    );
     assert!(stdout.contains("\"output_summary_counts\":{\"total\":2,\"stdout_summary\":1,\"stderr_summary\":1,\"file_delta\":0,\"source_like_delta\":0}"));
     assert!(stdout.contains("\"promotion_candidates\":[]"));
 }

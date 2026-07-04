@@ -383,11 +383,7 @@ fn execution_run(ctx: &CommandContext) -> Result<(), CliError> {
     if ctx.json {
         println!("{}", execution_run_success_envelope(&execution));
     } else {
-        println!(
-            "{} {}",
-            execution.id,
-            execution.result.status.as_str()
-        );
+        println!("{} {}", execution.id, execution.result.status.as_str());
     }
 
     Ok(())
@@ -631,7 +627,9 @@ fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptio
                 break;
             }
             flag if flag.starts_with("--") => {
-                return Err(invalid_request(format!("unknown flag `{flag}` for sun run")));
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun run"
+                )));
             }
             value => {
                 return Err(invalid_request(format!(
@@ -643,7 +641,8 @@ fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptio
 
     let fixture =
         fixture.ok_or_else(|| invalid_request("usage: sun run requires --fixture basic-app"))?;
-    let view_id = view_id.ok_or_else(|| invalid_request("usage: sun run requires --view <view>"))?;
+    let view_id =
+        view_id.ok_or_else(|| invalid_request("usage: sun run requires --view <view>"))?;
     if command_argv.is_empty() {
         return Err(invalid_request(
             "usage: sun run --view <view> --fixture basic-app -- <command> [args...]",

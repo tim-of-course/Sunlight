@@ -19,6 +19,13 @@ use sunlight_core::execution::{
     fixture_promotion_candidate_provenance, ExecutionFoundationError, ExecutionRecord,
     OutputClassification, OutputKind, PromotionCandidateProvenance,
 };
+use sunlight_core::projection::{
+    fixture_compatibility_projection_from_resolved_view,
+    fixture_execution_projection_from_resolved_view, fixture_export_projection_from_resolved_view,
+    fixture_inspection_projection_from_resolved_view, ProjectionPurpose, ProjectionRecord,
+    ProjectionValidationError, FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
+    FIXTURE_EXPORT_PROJECTION_ID, FIXTURE_INSPECTION_PROJECTION_ID,
+};
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
 };
@@ -123,6 +130,12 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
             ))
         }
         [scope, command, ..] if scope == "view" && command == "resolve" => view_resolve(&ctx),
+        [scope, command, ..] if scope == "project" && command == "materialize" => {
+            project_materialize(&ctx)
+        }
+        [scope, command, ..] if scope == "projection" && command == "create" => {
+            project_materialize(&ctx)
+        }
         [scope, command, ..] if scope == "checkpoint" && command == "create" => {
             checkpoint_create(&ctx)
         }
@@ -395,6 +408,29 @@ fn execution_run(ctx: &CommandContext) -> Result<(), CliError> {
     Ok(())
 }
 
+fn project_materialize(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_project_materialize_options(ctx)?;
+    if options.fixture != "basic-app" {
+        return Err(
+            invalid_request(format!("unknown fixture `{}`", options.fixture))
+                .with_detail("fixture", options.fixture),
+        );
+    }
+
+    let view = fixture_resolved_view_by_id(&options.view_id)
+        .ok_or_else(|| object_not_found("resolved_view", &options.view_id))?;
+    let projection = fixture_projection_for_purpose(&view, options.purpose)
+        .map_err(projection_error)?;
+
+    if ctx.json {
+        println!("{}", projection_materialize_success_envelope(&projection));
+    } else {
+        println!("{} {}", projection.id, projection.root_ref.value);
+    }
+
+    Ok(())
+}
+
 fn checkpoint_create(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_checkpoint_create_options(ctx)?;
     if options.fixture != "basic-app" {
@@ -543,6 +579,86 @@ struct ExecutionRunOptions {
 struct CheckpointCreateOptions {
     fixture: String,
     view_id: String,
+}
+
+#[derive(Debug)]
+struct ProjectMaterializeOptions {
+    fixture: String,
+    view_id: String,
+    purpose: ProjectionPurpose,
+}
+
+fn parse_project_materialize_options(
+    ctx: &CommandContext,
+) -> Result<ProjectMaterializeOptions, CliError> {
+    let mut fixture = None;
+    let mut view_id = None;
+    let mut purpose = ProjectionPurpose::Execution;
+    let mut args = ctx.args.iter().skip(2);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun project materialize requires --fixture basic-app")
+                })?;
+                fixture = Some(value.clone());
+            }
+            "--view" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun project materialize requires --view <resolved-view-id>",
+                    )
+                })?;
+                view_id = Some(value.clone());
+            }
+            "--purpose" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun project materialize --purpose <purpose>")
+                })?;
+                purpose = parse_projection_purpose(value)?;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun project materialize"
+                )));
+            }
+            value if view_id.is_none() => view_id = Some(value.to_string()),
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected project materialize argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    let fixture = fixture.ok_or_else(|| {
+        invalid_request(
+            "usage: sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app",
+        )
+    })?;
+    let view_id = view_id.ok_or_else(|| {
+        invalid_request(
+            "usage: sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app",
+        )
+    })?;
+
+    Ok(ProjectMaterializeOptions {
+        fixture,
+        view_id,
+        purpose,
+    })
+}
+
+fn parse_projection_purpose(value: &str) -> Result<ProjectionPurpose, CliError> {
+    match value {
+        "execution" => Ok(ProjectionPurpose::Execution),
+        "compatibility" => Ok(ProjectionPurpose::Compatibility),
+        "inspection" => Ok(ProjectionPurpose::Inspection),
+        "export" => Ok(ProjectionPurpose::Export),
+        _ => Err(invalid_request(format!("unknown projection purpose `{value}`"))
+            .with_detail("purpose", value)),
+    }
 }
 
 fn parse_checkpoint_create_options(
@@ -927,6 +1043,16 @@ fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliEr
             fixture_inspect_checkpoint_json()?
         } else {
             format!("checkpoint {checkpoint_id}")
+        });
+    }
+    if let Some(projection_id) = selector.strip_prefix("projection:") {
+        let projection = fixture_projection_by_id(projection_id)
+            .ok_or_else(|| object_not_found("projection", projection_id))?
+            .map_err(projection_error)?;
+        return Ok(if json {
+            fixture_inspect_projection_json(&projection)
+        } else {
+            format!("projection {}", projection.id)
         });
     }
 
@@ -1820,6 +1946,40 @@ fn fixture_checkpoint() -> Result<CheckpointRecord, CliError> {
     fixture_checkpoint_from_resolved_view(&view, Some(&execution)).map_err(checkpoint_error)
 }
 
+fn fixture_projection_for_purpose(
+    view: &ResolvedViewResult,
+    purpose: ProjectionPurpose,
+) -> Result<ProjectionRecord, ProjectionValidationError> {
+    match purpose {
+        ProjectionPurpose::Execution => fixture_execution_projection_from_resolved_view(view),
+        ProjectionPurpose::Compatibility => fixture_compatibility_projection_from_resolved_view(
+            view,
+            "gen_agent_a_0001",
+        ),
+        ProjectionPurpose::Inspection => fixture_inspection_projection_from_resolved_view(view),
+        ProjectionPurpose::Export => fixture_export_projection_from_resolved_view(view),
+    }
+}
+
+fn fixture_projection_by_id(
+    projection_id: &str,
+) -> Option<Result<ProjectionRecord, ProjectionValidationError>> {
+    let view = fixture_resolved_view(vec![fixture_auth_revision(), fixture_profile_revision()]);
+    match projection_id {
+        FIXTURE_EXECUTION_PROJECTION_ID => {
+            Some(fixture_execution_projection_from_resolved_view(&view))
+        }
+        FIXTURE_COMPATIBILITY_PROJECTION_ID => Some(
+            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001"),
+        ),
+        FIXTURE_INSPECTION_PROJECTION_ID => {
+            Some(fixture_inspection_projection_from_resolved_view(&view))
+        }
+        FIXTURE_EXPORT_PROJECTION_ID => Some(fixture_export_projection_from_resolved_view(&view)),
+        _ => None,
+    }
+}
+
 fn artifact_error(error: ArtifactIoError) -> CliError {
     let message = match &error {
         ArtifactIoError::PathPolicyViolation { .. } => {
@@ -1933,6 +2093,31 @@ fn checkpoint_error(error: CheckpointValidationError) -> CliError {
         optional_string_json(error.execution_id.as_deref()),
         optional_single_repo_tree_json(error.expected_tree_identity.as_ref()),
         optional_single_repo_tree_json(error.actual_tree_identity.as_ref()),
+    ))
+}
+
+fn projection_error(error: ProjectionValidationError) -> CliError {
+    let message = match error.code.as_str() {
+        "projection_conflicted_view" => "resolved view has conflicts and cannot be projected",
+        "projection_stale_view" => "resolved view has staleness and cannot be projected",
+        "projection_conflicted_and_stale_view" => {
+            "resolved view has conflicts and staleness and cannot be projected"
+        }
+        "projection_missing_tree" => "resolved view has no projectable tree identity",
+        _ => "projection fixture could not be prepared",
+    };
+    CliError::new(error.code.as_str(), message).with_raw_details_json(format!(
+        concat!(
+            "{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"conflict_ids\":{},",
+            "\"staleness_ids\":{},",
+            "\"projection_id\":null",
+            "}}"
+        ),
+        json_escape(&error.resolved_view_id),
+        string_array_json(error.conflict_ids.iter().map(String::as_str)),
+        string_array_json(error.staleness_ids.iter().map(String::as_str)),
     ))
 }
 
@@ -2051,6 +2236,148 @@ fn checkpoint_create_success_envelope(checkpoint: &CheckpointRecord) -> String {
             .collect::<Vec<_>>()
             .join(","),
         export_refs_json(checkpoint),
+    )
+}
+
+fn projection_materialize_success_envelope(projection: &ProjectionRecord) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"projection.materialize\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"projection_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"projection_id\":\"{}\",",
+            "\"purpose\":\"{}\",",
+            "\"strategy\":\"{}\",",
+            "\"root_ref\":{},",
+            "\"tree_identity\":{},",
+            "\"cache_key\":\"{}\",",
+            "\"retention_state\":\"{}\",",
+            "\"policy\":{{",
+            "\"path_policy_id\":\"{}\",",
+            "\"operation_semantics_version\":\"{}\",",
+            "\"writable_policy\":\"{}\",",
+            "\"store_integrity_policy\":\"{}\",",
+            "\"privacy_class\":\"{}\"",
+            "}},",
+            "\"projection\":{}",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(&projection.repository_id),
+        json_escape(&projection.id),
+        json_escape(&projection.resolved_view_id),
+        json_escape(&projection.resolved_view_id),
+        single_repo_tree_json(&projection.tree_identity),
+        json_escape(&projection.id),
+        projection.purpose.as_str(),
+        projection.strategy.as_str(),
+        projection_root_ref_json(projection),
+        single_repo_tree_json(&projection.tree_identity),
+        json_escape(&projection.cache_key.stable_string()),
+        projection.retention_state.as_str(),
+        json_escape(&projection.path_policy_id),
+        json_escape(&projection.operation_semantics_version),
+        projection.writable_policy.as_str(),
+        projection.store_integrity_policy.as_str(),
+        projection.privacy_class.as_str(),
+        projection_record_json(projection),
+    )
+}
+
+fn fixture_inspect_projection_json(projection: &ProjectionRecord) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.projection\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"projection\":{}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&projection.repository_id),
+        json_escape(&projection.id),
+        json_escape(&projection.resolved_view_id),
+        json_escape(&projection.resolved_view_id),
+        single_repo_tree_json(&projection.tree_identity),
+        projection_record_json(projection),
+    )
+}
+
+fn projection_record_json(projection: &ProjectionRecord) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"schema_version\":{},",
+            "\"record_type\":\"{}\",",
+            "\"id\":\"{}\",",
+            "\"repository_scope\":{{\"kind\":\"single\",\"repository_id\":\"{}\"}},",
+            "\"purpose\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":{},",
+            "\"tree_identity\":{},",
+            "\"path_policy_id\":\"{}\",",
+            "\"operation_semantics_version\":\"{}\",",
+            "\"strategy\":\"{}\",",
+            "\"root_ref\":{},",
+            "\"created_from_content_tree\":\"{}\",",
+            "\"baseline_manifest_ref\":{},",
+            "\"writable_policy\":\"{}\",",
+            "\"store_integrity_policy\":\"{}\",",
+            "\"cache_key\":\"{}\",",
+            "\"retention_state\":\"{}\",",
+            "\"privacy_class\":\"{}\",",
+            "\"created_at\":\"{}\"",
+            "}}"
+        ),
+        projection.schema_version,
+        projection.record_type,
+        json_escape(&projection.id),
+        json_escape(&projection.repository_id),
+        projection.purpose.as_str(),
+        json_escape(&projection.resolved_view_id),
+        optional_string_json(projection.session_generation_id.as_deref()),
+        single_repo_tree_json(&projection.tree_identity),
+        json_escape(&projection.path_policy_id),
+        json_escape(&projection.operation_semantics_version),
+        projection.strategy.as_str(),
+        projection_root_ref_json(projection),
+        json_escape(&projection.created_from_content_tree),
+        optional_string_json(projection.baseline_manifest_ref.as_deref()),
+        projection.writable_policy.as_str(),
+        projection.store_integrity_policy.as_str(),
+        json_escape(&projection.cache_key.stable_string()),
+        projection.retention_state.as_str(),
+        projection.privacy_class.as_str(),
+        json_escape(&projection.created_at),
+    )
+}
+
+fn projection_root_ref_json(projection: &ProjectionRecord) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"value\":\"{}\",",
+            "\"privacy\":\"{}\",",
+            "\"privacy_class\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&projection.root_ref.value),
+        projection.root_ref.privacy.as_str(),
+        projection.root_ref.privacy.privacy_class().as_str(),
     )
 }
 
@@ -2986,6 +3313,7 @@ Usage:
   sun patch <path> --session <session> --fixture basic-app --expect-hash <hash> --patch-file <file> [--json]
   sun write <path> --session <session> --fixture basic-app --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]
   sun view resolve --fixture basic-app --include topic:revision[,topic:revision] [--json]
+  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app [--json]
   sun run --view <resolved-view-id> --fixture basic-app --json -- cargo test
   sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
 
@@ -2999,6 +3327,7 @@ Commands:
   patch      Apply a fixture-only unified diff to one artifact
   write      Write fixture-only content to one artifact path
   view       Resolve fixture topic revisions into a candidate view
+  project    Materialize fixture projections for exact resolved views
   run        Record a fixture execution for an exact resolved view
   checkpoint Freeze a fixture resolved view as an in-memory checkpoint
 "

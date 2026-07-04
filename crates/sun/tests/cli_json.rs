@@ -684,6 +684,134 @@ fn run_json_fixture_stale_view_rejects_before_projection() {
 }
 
 #[test]
+fn project_materialize_json_fixture_ready_view_returns_projection_envelope() {
+    let repo = TestRepo::new("projection-fixture-ready");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+
+    let output = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"projection.materialize\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"purpose\":\"execution\""));
+    assert!(stdout.contains("\"strategy\":\"copy\""));
+    assert!(stdout.contains("\"root_ref\":{\"value\":\"local://.sunlight/projections/execution/projection_exec_auth_profile_0001\",\"privacy\":\"local_only_path\",\"privacy_class\":\"local_only\"}"));
+    assert!(stdout.contains("\"tree_identity\":{\"kind\":\"SingleRepoTree\",\"repository_id\":\"repo_fixture_basic_app\",\"tree_hash\":\"tree_fixture_"));
+    assert!(stdout.contains("\"cache_key\":\"projection-cache:repo_fixture_basic_app:"));
+    assert!(stdout.contains(":execution:copy:read_only_source_private_outputs\""));
+    assert!(stdout.contains("\"retention_state\":\"active\""));
+    assert!(stdout.contains("\"policy\":{\"path_policy_id\":\"path_policy_posix_case_sensitive_v1\",\"operation_semantics_version\":\"file_ops_v1\",\"writable_policy\":\"read_only_source_private_outputs\",\"store_integrity_policy\":\"verify_before_reuse\",\"privacy_class\":\"local_only\"}"));
+    assert!(stdout.contains("\"record_type\":\"projection\""));
+}
+
+#[test]
+fn project_materialize_json_fixture_compatibility_records_import_policy() {
+    let repo = TestRepo::new("projection-fixture-compat");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+
+    let output = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("compatibility")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
+    assert!(stdout.contains("\"purpose\":\"compatibility\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0001\""));
+    assert!(stdout.contains("\"baseline_manifest_ref\":\"objects/projection-baselines/repo_fixture_basic_app/"));
+    assert!(stdout.contains("\"writable_policy\":\"writable_with_explicit_import\""));
+    assert!(stdout.contains("\"store_integrity_policy\":\"verify_on_import\""));
+}
+
+#[test]
+fn project_materialize_json_fixture_conflicted_view_returns_projection_error() {
+    let repo = TestRepo::new("projection-fixture-conflicted");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_auth_overlap_0001",
+    );
+
+    let output = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"projection_conflicted_view\""));
+    assert!(
+        stdout.contains("\"message\":\"resolved view has conflicts and cannot be projected\"")
+    );
+    assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(stdout.contains("\"conflict_ids\":[\"conflict_src_auth_ts_0001\"]"));
+    assert!(stdout.contains("\"staleness_ids\":[]"));
+    assert!(stdout.contains("\"projection_id\":null"));
+}
+
+#[test]
+fn project_materialize_json_fixture_stale_view_returns_projection_error() {
+    let repo = TestRepo::new("projection-fixture-stale");
+    let view_id = resolve_fixture_view_id(repo.path(), "topic_profile_ui:rev_profile_ui_0002");
+
+    let output = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"projection_stale_view\""));
+    assert!(stdout.contains("\"message\":\"resolved view has staleness and cannot be projected\""));
+    assert!(stdout.contains("\"conflict_ids\":[]"));
+    assert!(stdout
+        .contains("\"staleness_ids\":[\"stale_missing_dependency_rev_auth_nullability_0001\"]"));
+    assert!(stdout.contains("\"projection_id\":null"));
+}
+
+#[test]
 fn checkpoint_create_json_fixture_ready_view_returns_checkpoint_envelope() {
     let repo = TestRepo::new("checkpoint-fixture-ready");
     let view_id = resolve_fixture_view_id(
@@ -891,6 +1019,31 @@ fn inspect_json_fixture_checkpoint_returns_frozen_record() {
     assert!(stdout.contains(
         "\"evidence_refs\":[{\"kind\":\"execution\",\"execution_id\":\"exec_auth_profile_tests_0001\""
     ));
+}
+
+#[test]
+fn inspect_json_fixture_projection_returns_local_only_metadata() {
+    let repo = TestRepo::new("inspect-fixture-projection");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("projection:projection_exec_auth_profile_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.projection\""));
+    assert!(stdout.contains("\"record_type\":\"projection\""));
+    assert!(stdout.contains("\"id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"root_ref\":{\"value\":\"local://.sunlight/projections/execution/projection_exec_auth_profile_0001\",\"privacy\":\"local_only_path\",\"privacy_class\":\"local_only\"}"));
+    assert!(stdout.contains("\"cache_key\":\"projection-cache:repo_fixture_basic_app:"));
+    assert!(stdout.contains("\"retention_state\":\"active\""));
+    assert!(stdout.contains("\"privacy_class\":\"local_only\""));
 }
 
 #[test]

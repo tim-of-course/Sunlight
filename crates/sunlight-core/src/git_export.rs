@@ -1423,8 +1423,8 @@ mod tests {
 
     #[test]
     fn target_ref_validation_accepts_full_local_branch_ref() {
-        let target = validate_git_export_target_ref("refs/heads/sunlight/auth-profile-ready")
-            .unwrap();
+        let target =
+            validate_git_export_target_ref("refs/heads/sunlight/auth-profile-ready").unwrap();
 
         assert_eq!(target.full_name, "refs/heads/sunlight/auth-profile-ready");
         assert_eq!(target.branch_name, "sunlight/auth-profile-ready");
@@ -1503,10 +1503,9 @@ mod tests {
         assert_eq!(create.expected_old_commit_id, None);
         assert_eq!(create.allowed_reason, GitExportRefUpdateReason::CreateRef);
 
-        let replace_parent = plan_git_export_target_ref_update(ref_update_input(Some(
-            fixture_base_commit_id(),
-        )))
-        .unwrap();
+        let replace_parent =
+            plan_git_export_target_ref_update(ref_update_input(Some(fixture_base_commit_id())))
+                .unwrap();
         assert_eq!(
             replace_parent.expected_old_commit_id,
             Some(fixture_base_commit_id())

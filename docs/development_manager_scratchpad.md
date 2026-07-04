@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran native `scripts/smoke-suite.ps1` with `cargo fmt --check`, `cargo check`, `cargo test` with 189 tests, validation smoke, and projection smoke after CLI real Git export, smoke-suite runner, and Git index uniqueness fix integration. Scratchpad guard must run after this edit.
+- Verification: latest integrated pass ran native `scripts/smoke-suite.ps1` with `cargo fmt --check`, `cargo check`, `cargo test` with 68 CLI tests and 125 core tests, validation smoke, projection strategy smoke, and MVP end-to-end smoke after CLI projection-root copy and MVP smoke integration. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -101,15 +101,17 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `cli-real-git-export-writer`: integrated as `ccc47e5`; formatting checkpoint `3eecbd8`.
 - Completed slice `smoke-suite-runner`: integrated as `3112952`.
 - Completed slice `git-export-index-uniqueness`: integrated as `3513e7f`.
-- Active slice `cli-projection-filesystem-copy`: WSL clone `/home/timothycard/code/Sunlight-2-cli-projection-filesystem-copy-20260704-032415`, branch `dm/cli-projection-filesystem-copy`, run artifacts under `C:\tmp\sunlight-manager\20260704-032415`.
-- Active slice `mvp-end-to-end-smoke`: WSL clone `/home/timothycard/code/Sunlight-2-mvp-end-to-end-smoke-20260704-032415`, branch `dm/mvp-end-to-end-smoke`, run artifacts under `C:\tmp\sunlight-manager\20260704-032415`.
+- Completed slice `cli-projection-filesystem-copy`: integrated as `6eb1e21`; formatting checkpoint `d1ed0f9`.
+- Completed slice `mvp-end-to-end-smoke`: integrated as `7bb7e69`; native PowerShell smoke fix checkpoint `1ecd029`.
+- Active slice `mvp-projection-root-smoke`: WSL clone `/home/timothycard/code/Sunlight-2-mvp-projection-root-smoke-20260704-085024`, branch `dm/mvp-projection-root-smoke`, run artifacts under `C:\tmp\sunlight-manager\20260704-085024`.
+- Active slice `operator-local-projection-status`: WSL clone `/home/timothycard/code/Sunlight-2-operator-local-projection-status-20260704-085024`, branch `dm/operator-local-projection-status`, run artifacts under `C:\tmp\sunlight-manager\20260704-085024`.
 - Next heartbeat should inspect active WSL progress, import verified work if finished, run full smoke-suite validation, and keep one or two project-wide slices moving.
 
 ## Candidate Next Slices
 
-- Projection CLI filesystem copy follow-up after active slice lands.
-- End-to-end MVP smoke follow-up after active slice lands.
-- Validation smoke CI/usage follow-up remains optional after script lands.
+- Follow through on MVP projection-root smoke hardening after active slice lands.
+- Follow through on operator local projection status/inspect after active slice lands.
+- Validation smoke CI/usage follow-up remains optional after the smoke suite settles.
 
 ## Decisions
 
@@ -119,6 +121,5 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 
 ## Open Questions
 
-- First validation repo and exact test command are not yet selected.
-- Real Git export writer scope remains undecided.
-- Projection platform target likely starts on WSL/Linux unless product priority changes.
+- First external validation repo and exact test command are not yet selected.
+- Projection platform target still starts on WSL/Linux unless product priority changes.

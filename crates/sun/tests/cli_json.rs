@@ -1065,6 +1065,63 @@ fn status_json_fixture_checkpoint_returns_checkpoint_snapshot() {
 }
 
 #[test]
+fn status_json_fixture_export_map_returns_git_export_lifecycle_snapshot() {
+    let repo = TestRepo::new("status-fixture-export-map");
+
+    let output = sun()
+        .arg("status")
+        .arg("--export-map")
+        .arg("export_map_checkpoint_auth_profile_ready_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status export map should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.export_map\""));
+    assert!(stdout.contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout
+        .contains("\"validation_report_id\":\"validation_export_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_fixture_"));
+    assert!(stdout.contains("\"git_export\":{\"lifecycle_state\":\"exported\""));
+    assert!(stdout.contains("\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\""));
+    assert!(stdout.contains(
+        "\"git_commit_ids\":[\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"
+    ));
+    assert!(stdout.contains("\"partial_failure_marker\":null"));
+    assert!(stdout.contains("\"validation_report\":{"));
+    assert!(stdout.contains("\"ok\":true"));
+    assert!(stdout.contains("\"export_map\":{"));
+}
+
+#[test]
+fn status_json_fixture_missing_export_map_returns_object_not_found() {
+    let repo = TestRepo::new("status-fixture-export-map-missing");
+
+    let output = sun()
+        .arg("status")
+        .arg("--export-map")
+        .arg("missing")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status export map should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"object_not_found\""));
+    assert!(stdout.contains("\"selector\":\"missing\""));
+    assert!(stdout.contains("\"object_type\":\"export_map\""));
+}
+
+#[test]
 fn status_json_fixture_basic_app_returns_session_snapshot() {
     let repo = TestRepo::new("status-fixture-session");
 
@@ -1117,6 +1174,39 @@ fn inspect_json_fixture_checkpoint_returns_frozen_record() {
     assert!(stdout.contains(
         "\"evidence_refs\":[{\"kind\":\"execution\",\"execution_id\":\"exec_auth_profile_tests_0001\""
     ));
+}
+
+#[test]
+fn inspect_json_fixture_export_map_returns_mapping_record() {
+    let repo = TestRepo::new("inspect-fixture-export-map");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("export_map:export_map_checkpoint_auth_profile_ready_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect export map should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.export_map\""));
+    assert!(stdout.contains(
+        "\"ids\":{\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""
+    ));
+    assert!(stdout.contains("\"record_type\":\"git_export_map\""));
+    assert!(stdout.contains("\"id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"export_shape\":{\"kind\":\"single_checkpoint_commit\""));
+    assert!(stdout.contains("\"parent_policy\":\"base_checkpoint_git_parent\""));
+    assert!(stdout.contains("\"include_sunlight_metadata\":\"policy_approved_manifest_only\""));
+    assert!(stdout.contains("\"exported_at\":\"2026-07-03T00:00:00Z\""));
+    assert!(stdout
+        .contains("\"validation_report\":{\"id\":\"validation_export_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\""));
+    assert!(stdout.contains("\"privacy_class\":\"commit_default\""));
 }
 
 #[test]

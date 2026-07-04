@@ -533,6 +533,17 @@ fn status(ctx: &CommandContext) -> Result<(), CliError> {
                     format!("{checkpoint_id} export_ready=true")
                 }
             }
+            StatusScope::ExportMap(export_map_id) => {
+                let export = ensure_fixture_export_map(&export_map_id)?;
+                if ctx.json {
+                    fixture_status_export_map_json(&export)
+                } else {
+                    format!(
+                        "{} exported {}",
+                        export.response.export_map.id, export.response.export_map.git_ref
+                    )
+                }
+            }
         };
         println!("{output}");
         return Ok(());
@@ -586,6 +597,7 @@ enum StatusScope {
     Session(String),
     Topic(String),
     Checkpoint(String),
+    ExportMap(String),
 }
 
 #[derive(Debug)]
@@ -620,6 +632,12 @@ struct GitExportOptions {
     fixture: String,
     checkpoint_id: String,
     git_ref: String,
+}
+
+#[derive(Debug)]
+struct FixtureGitExport {
+    checkpoint: CheckpointRecord,
+    response: GitExportResponse,
 }
 
 #[derive(Debug)]
@@ -1008,6 +1026,12 @@ fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, C
                 })?;
                 scope = StatusScope::Checkpoint(value.clone());
             }
+            "--export-map" | "--export" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun status --export-map <export-map-id>")
+                })?;
+                scope = StatusScope::ExportMap(value.clone());
+            }
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
                     "unknown flag `{flag}` for sun status"
@@ -1100,6 +1124,15 @@ fn ensure_fixture_checkpoint(checkpoint_id: &str) -> Result<(), CliError> {
     }
 }
 
+fn ensure_fixture_export_map(export_map_id: &str) -> Result<FixtureGitExport, CliError> {
+    let export = fixture_git_export_response()?;
+    if export.response.export_map.id == export_map_id {
+        Ok(export)
+    } else {
+        Err(object_not_found("export_map", export_map_id))
+    }
+}
+
 fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliError> {
     let selector = options.selector.as_str();
     if let Some(session_id) = &options.session_id {
@@ -1148,6 +1181,17 @@ fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliEr
             fixture_inspect_checkpoint_json()?
         } else {
             format!("checkpoint {checkpoint_id}")
+        });
+    }
+    if let Some(export_map_id) = selector
+        .strip_prefix("export_map:")
+        .or_else(|| selector.strip_prefix("export:"))
+    {
+        let export = ensure_fixture_export_map(export_map_id)?;
+        return Ok(if json {
+            fixture_inspect_export_map_json(&export)
+        } else {
+            format!("export_map {}", export.response.export_map.id)
         });
     }
     if let Some(projection_id) = selector.strip_prefix("projection:") {
@@ -1435,6 +1479,51 @@ fn fixture_status_checkpoint_json() -> Result<String, CliError> {
     ))
 }
 
+fn fixture_status_export_map_json(export: &FixtureGitExport) -> String {
+    let response = &export.response;
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"status.export_map\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"export_map_id\":\"{}\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"validation_report_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"git_export\":{{",
+            "\"lifecycle_state\":\"exported\",",
+            "\"export_map_id\":\"{}\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"validation_report_id\":\"{}\",",
+            "\"git_ref\":\"{}\",",
+            "\"git_commit_ids\":{},",
+            "\"partial_failure_marker\":null",
+            "}},",
+            "\"validation_report\":{},",
+            "\"export_map\":{}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&response.export_map.repository_id),
+        json_escape(&response.export_map.id),
+        json_escape(&response.checkpoint_id),
+        json_escape(&response.validation_report.id),
+        json_escape(&export.checkpoint.resolved_view_id),
+        single_repo_tree_json(&response.export_map.tree_identity),
+        json_escape(&response.export_map.id),
+        json_escape(&response.checkpoint_id),
+        json_escape(&response.validation_report.id),
+        json_escape(&response.git_ref),
+        string_array_json(response.git_commit_ids.iter().map(String::as_str)),
+        git_export_validation_report_json(&response.validation_report),
+        git_export_map_json(&response.export_map),
+    )
+}
+
 fn fixture_inspect_artifact_json(artifact: FixtureArtifact) -> String {
     let provenance = if let Some(operation_id) = artifact.latest_operation_id {
         format!(
@@ -1541,6 +1630,37 @@ fn fixture_inspect_checkpoint_json() -> Result<String, CliError> {
         single_repo_tree_json(&checkpoint.tree_identity),
         checkpoint_json(&checkpoint),
     ))
+}
+
+fn fixture_inspect_export_map_json(export: &FixtureGitExport) -> String {
+    let response = &export.response;
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.export_map\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"export_map_id\":\"{}\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"validation_report_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"export_map\":{},",
+            "\"validation_report\":{}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&response.export_map.repository_id),
+        json_escape(&response.export_map.id),
+        json_escape(&response.checkpoint_id),
+        json_escape(&response.validation_report.id),
+        json_escape(&export.checkpoint.resolved_view_id),
+        single_repo_tree_json(&response.export_map.tree_identity),
+        git_export_map_json(&response.export_map),
+        git_export_validation_report_json(&response.validation_report),
+    )
 }
 
 fn fixture_inspect_operation_json() -> String {
@@ -2051,6 +2171,16 @@ fn fixture_checkpoint() -> Result<CheckpointRecord, CliError> {
     fixture_checkpoint_from_resolved_view(&view, Some(&execution)).map_err(checkpoint_error)
 }
 
+fn fixture_git_export_response() -> Result<FixtureGitExport, CliError> {
+    let checkpoint = fixture_checkpoint()?;
+    let response = git_export_checkpoint(GitExportRequest::from_checkpoint(&checkpoint))
+        .map_err(git_export_error)?;
+    Ok(FixtureGitExport {
+        checkpoint,
+        response,
+    })
+}
+
 fn fixture_projection_for_purpose(
     view: &ResolvedViewResult,
     purpose: ProjectionPurpose,
@@ -2446,6 +2576,7 @@ fn git_export_map_json(export_map: &GitExportMapRecord) -> String {
     format!(
         concat!(
             "{{",
+            "\"record_type\":\"git_export_map\",",
             "\"id\":\"{}\",",
             "\"repository_id\":\"{}\",",
             "\"checkpoint_id\":\"{}\",",

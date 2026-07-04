@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 109 tests, and `git diff --check` after CLI Git export and projection strategy spike integration. Scratchpad guard must run after this edit.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 109 tests, and `git diff --check` after CLI Git export, projection strategy, operator status, and Git export writer docs integration. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -80,15 +80,17 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `git-export-foundation`: integrated as `6bb6727`; formatting checkpoint `626ca41`.
 - Completed slice `cli-git-export-fixture`: integrated as `7947b05`; formatting checkpoint `bfa5053`.
 - Completed slice `projection-strategy-spike-plan`: integrated as `07302b9`.
-- Active slice `operator-status-matrix`: WSL clone `/home/timothycard/code/Sunlight-2-operator-status-matrix-20260703-222016`, branch `dm/operator-status-matrix`, run artifacts under `C:\tmp\sunlight-manager\20260703-222016`.
-- Active slice `git-export-writer-contract`: WSL clone `/home/timothycard/code/Sunlight-2-git-export-writer-contract-20260703-222016`, branch `dm/git-export-writer-contract`, run artifacts under `C:\tmp\sunlight-manager\20260703-222016`.
+- Completed slice `operator-status-matrix`: integrated as `4404fe2`.
+- Completed slice `git-export-writer-contract`: integrated as `c1ec72b`.
+- Active slice `compat-import-foundation`: WSL clone `/home/timothycard/code/Sunlight-2-compat-import-foundation-20260703-222335`, branch `dm/compat-import-foundation`, run artifacts under `C:\tmp\sunlight-manager\20260703-222335`.
+- Active slice `operator-status-cli-fixture`: WSL clone `/home/timothycard/code/Sunlight-2-operator-status-cli-fixture-20260703-222335`, branch `dm/operator-status-cli-fixture`, run artifacts under `C:\tmp\sunlight-manager\20260703-222335`.
 - Next heartbeat should inspect active slice last-message files, verify completed work, integrate acceptable commits, and keep one or two project-wide slices moving.
 
 ## Candidate Next Slices
 
 - Real Git export writer implementation after the writer contract settles.
 - Projection strategy implementation after the spike plan selects the first materialization path.
-- Compatibility import foundation after export/projection contracts settle.
+- Compatibility import CLI fixture after the foundation lands.
 
 ## Decisions
 

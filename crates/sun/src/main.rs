@@ -508,7 +508,11 @@ fn git_export(ctx: &CommandContext) -> Result<(), CliError> {
         if ctx.json {
             println!("{}", git_export_execute_fixture_success_envelope(&result));
         } else {
-            println!("{} {}", result.checkpoint_id, result.lifecycle_state.as_str());
+            println!(
+                "{} {}",
+                result.checkpoint_id,
+                result.lifecycle_state.as_str()
+            );
         }
 
         return Ok(());
@@ -1075,10 +1079,10 @@ fn parse_git_export_execution_fixture(
         "success" => Ok(GitExportExecutionFixtureMode::Success),
         "ref-update-failure" => Ok(GitExportExecutionFixtureMode::RefUpdateFailure),
         "export-map-failure" => Ok(GitExportExecutionFixtureMode::ExportMapFailure),
-        _ => Err(invalid_request(format!(
-            "unknown git export execution fixture `{value}`"
-        ))
-        .with_detail("execute_fixture", value)),
+        _ => Err(
+            invalid_request(format!("unknown git export execution fixture `{value}`"))
+                .with_detail("execute_fixture", value),
+        ),
     }
 }
 

@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 56 tests, `git diff --check`, and scratchpad length guard after status/inspect and checkpoint contract integration.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 60 tests, `git diff --check`, and scratchpad length guard after view-resolve and execution-projection integration.
 
 ## Active Work
 
@@ -68,8 +68,10 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `resolver-foundation`: integrated as `37c837a`; formatting checkpoint `dde1d62`.
 - Completed slice `cli-status-inspect-fixture`: integrated as `8edfcd8`; formatting checkpoint `aa45ff3`.
 - Completed slice `checkpoint-export-contract`: integrated as `cc7e0ad`.
-- Active slice `cli-view-resolve-fixture`: WSL clone `/home/timothycard/code/Sunlight-2-cli-view-resolve-fixture-20260703-190817`, branch `dm/cli-view-resolve-fixture`, logs under `C:\tmp\sunlight-manager\20260703-190817`.
-- Active slice `execution-projection-contract`: WSL clone `/home/timothycard/code/Sunlight-2-execution-projection-contract-20260703-190817`, branch `dm/execution-projection-contract`, logs under `C:\tmp\sunlight-manager\20260703-190817`.
+- Completed slice `cli-view-resolve-fixture`: integrated as `1055ace`; formatting checkpoint `7195ac5`.
+- Completed slice `execution-projection-contract`: integrated as `310345b`.
+- Active slice `execution-foundation`: WSL clone `/home/timothycard/code/Sunlight-2-execution-foundation-20260703-194619`, branch `dm/execution-foundation`, logs under `C:\tmp\sunlight-manager\20260703-194619` using `out3/err3`.
+- Active slice `compat-import-contract`: WSL clone `/home/timothycard/code/Sunlight-2-compat-import-contract-20260703-194619`, branch `dm/compat-import-contract`, logs under `C:\tmp\sunlight-manager\20260703-194619` using `out3/err3`.
 - Next heartbeat should inspect active slice logs, verify commits, integrate acceptable work, then launch the next one or two slices.
 
 ## Candidate First Slices

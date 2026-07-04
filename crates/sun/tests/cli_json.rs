@@ -1208,6 +1208,95 @@ fn status_json_fixture_projection_store_mismatch_reports_quarantine() {
 }
 
 #[test]
+fn status_json_fixture_projection_store_mismatch_writes_quarantine_record_with_root() {
+    let repo = TestRepo::new("projection-status-store-mismatch-quarantine-record");
+    let projection_root = repo.path().join("projection-root");
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--integrity-fixture")
+        .arg("store-mismatch")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"durable_record\":\"local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json\""));
+
+    let record = fs::read_to_string(quarantine_record_path(&projection_root))
+        .expect("quarantine record should be written");
+    assert_projection_quarantine_record_json(&record);
+}
+
+#[test]
+fn status_json_fixture_projection_ignores_persisted_quarantine_record_in_root_scan() {
+    let repo = TestRepo::new("projection-status-quarantine-record-root-scan");
+    let projection_root = repo.path().join("projection-root");
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    let quarantine = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--integrity-fixture")
+        .arg("store-mismatch")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+    assert_success(&quarantine);
+    assert!(quarantine_record_path(&projection_root).is_file());
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"content_verification\":\"verified\""));
+    assert!(stdout.contains("\"dirty_local\":false"));
+    assert!(stdout.contains("\"extra_files\":0"));
+    assert!(!stdout.contains(".sunlight/quarantine"));
+}
+
+#[test]
 fn status_json_fixture_projection_scan_missing_blob_reports_quarantine() {
     let repo = TestRepo::new("projection-status-scan-missing-blob");
 
@@ -3516,6 +3605,34 @@ fn inspect_json_fixture_projection_store_mismatch_reports_local_quarantine_metad
 }
 
 #[test]
+fn inspect_json_fixture_projection_store_mismatch_writes_quarantine_record_with_root() {
+    let repo = TestRepo::new("inspect-fixture-projection-store-mismatch-quarantine-record");
+    let projection_root = repo.path().join("projection-root");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("projection:projection_exec_auth_profile_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--integrity-fixture")
+        .arg("store-mismatch")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"durable_record\":\"local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json\""));
+
+    let record = fs::read_to_string(quarantine_record_path(&projection_root))
+        .expect("quarantine record should be written");
+    assert_projection_quarantine_record_json(&record);
+}
+
+#[test]
 fn inspect_json_fixture_projection_scan_missing_blob_reports_local_quarantine_metadata() {
     let repo = TestRepo::new("inspect-fixture-projection-scan-missing-blob");
 
@@ -3801,6 +3918,38 @@ fn json_string_field(stdout: &str, field: &str) -> String {
         .find('"')
         .unwrap_or_else(|| panic!("unterminated field `{field}` in stdout:\n{stdout}"));
     stdout[start..start + end].to_string()
+}
+
+fn quarantine_record_path(projection_root: &Path) -> PathBuf {
+    projection_root
+        .join(".sunlight")
+        .join("quarantine")
+        .join("projections")
+        .join("projection_exec_auth_profile_0001")
+        .join("execution_store_integrity_failed.json")
+}
+
+fn assert_projection_quarantine_record_json(record: &str) {
+    assert!(record.contains("\"privacy_class\":\"local_only\""));
+    assert!(record.contains("\"state\":\"quarantined\""));
+    assert!(record.contains("\"reason\":\"store_integrity_mismatch\""));
+    assert!(record.contains("\"reason_code\":\"execution_store_integrity_failed\""));
+    assert!(record.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(record.contains("\"resolved_view_id\":\"view_base_0001\""));
+    assert!(record.contains("\"root_ref\":{\"privacy\":\"local_only_path\",\"privacy_class\":\"local_only\",\"value\":\"local://.sunlight/projections/execution/projection_exec_auth_profile_0001\"}"));
+    assert!(record.contains("\"cache_key\":\"projection-cache:repo_fixture_basic_app:"));
+    assert!(record.contains("\"manifest_ref\":\"objects/projection-manifests/sha256/"));
+    assert!(record.contains("\"manifest_digest\":\"sha256:"));
+    assert!(record.contains("\"quarantine_refs\":{\"cache\":\"projection-cache:repo_fixture_basic_app:"));
+    assert!(record.contains("\"native_error\":\"native-error:execution_store_integrity_failed:projection_exec_auth_profile_0001\""));
+    assert!(record.contains("\"projection\":\"projection:projection_exec_auth_profile_0001\""));
+    assert!(record.contains("\"provenance\":{\"created_from_content_tree\":\"tree_fixture_base_0001\""));
+    assert!(record.contains("\"repository_id\":\"repo_fixture_basic_app\""));
+    assert!(record.contains("\"source_truth\":\"immutable_store_manifest\""));
+    assert!(record.contains("\"local_filesystem_source_truth\":false"));
+    assert!(record.contains("\"durable_record\":\"local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json\""));
+    assert!(record.contains("\"cache_reuse_allowed\":false"));
+    assert!(record.contains("\"cache_invalidation_reason\":\"execution_store_integrity_failed\""));
 }
 
 fn resolve_fixture_view_id(repo: &Path, include: &str) -> String {

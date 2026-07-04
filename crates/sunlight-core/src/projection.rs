@@ -18,6 +18,7 @@ pub const FIXTURE_CREATED_AT: &str = "2026-07-03T00:00:00Z";
 pub const FIXTURE_MANIFEST_MATERIALIZATION_GENERATION: u64 = 1;
 pub const PROJECTION_LOCAL_METADATA_DIR: &str = ".sunlight/projections";
 pub const PROJECTION_MANIFEST_LOCAL_RECORD_FILE: &str = "projection-manifest-local.json";
+pub const PROJECTION_QUARANTINE_LOCAL_METADATA_DIR: &str = ".sunlight/quarantine/projections";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionRecord {
@@ -667,6 +668,78 @@ impl ProjectionManifestLocalRecord {
         object.insert(
             "privacy_class".to_string(),
             JsonValue::String(PrivacyClass::LocalOnly.as_str().to_string()),
+        );
+        JsonValue::Object(object)
+    }
+}
+
+impl ProjectionQuarantineResult {
+    pub fn to_json_value(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "privacy_class".to_string(),
+            JsonValue::String(self.privacy_class.as_str().to_string()),
+        );
+        object.insert(
+            "state".to_string(),
+            JsonValue::String(self.state.as_str().to_string()),
+        );
+        object.insert(
+            "reason".to_string(),
+            JsonValue::String(self.reason_code.reason().to_string()),
+        );
+        object.insert(
+            "reason_code".to_string(),
+            JsonValue::String(self.reason_code.as_str().to_string()),
+        );
+        object.insert(
+            "projection_id".to_string(),
+            JsonValue::String(self.projection_id.clone()),
+        );
+        object.insert(
+            "resolved_view_id".to_string(),
+            JsonValue::String(self.resolved_view_id.clone()),
+        );
+        object.insert("root_ref".to_string(), root_ref_json(&self.root_ref));
+        object.insert(
+            "cache_key".to_string(),
+            JsonValue::String(self.cache_key.clone()),
+        );
+        object.insert(
+            "manifest_ref".to_string(),
+            optional_string_json(self.manifest_ref.as_deref()),
+        );
+        object.insert(
+            "manifest_digest".to_string(),
+            optional_string_json(self.manifest_digest.as_deref()),
+        );
+        object.insert(
+            "quarantine_refs".to_string(),
+            quarantine_refs_json(&self.quarantine_refs),
+        );
+        object.insert(
+            "provenance".to_string(),
+            quarantine_provenance_json(&self.provenance),
+        );
+        object.insert(
+            "source_truth".to_string(),
+            JsonValue::String(self.source_truth.as_str().to_string()),
+        );
+        object.insert(
+            "local_filesystem_source_truth".to_string(),
+            JsonValue::Bool(self.local_filesystem_source_truth),
+        );
+        object.insert(
+            "durable_record".to_string(),
+            optional_string_json(self.durable_record.as_deref()),
+        );
+        object.insert(
+            "cache_reuse_allowed".to_string(),
+            JsonValue::Bool(self.cache_reuse_allowed),
+        );
+        object.insert(
+            "cache_invalidation_reason".to_string(),
+            JsonValue::String(self.cache_invalidation_reason.as_str().to_string()),
         );
         JsonValue::Object(object)
     }
@@ -1745,6 +1818,45 @@ fn tree_identity_json(tree_identity: &SingleRepoTree) -> JsonValue {
     JsonValue::Object(object)
 }
 
+fn quarantine_refs_json(refs: &ProjectionQuarantineRefs) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "projection".to_string(),
+        JsonValue::String(refs.projection.clone()),
+    );
+    object.insert("cache".to_string(), JsonValue::String(refs.cache.clone()));
+    object.insert(
+        "native_error".to_string(),
+        JsonValue::String(refs.native_error.clone()),
+    );
+    JsonValue::Object(object)
+}
+
+fn quarantine_provenance_json(provenance: &ProjectionQuarantineProvenance) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "repository_id".to_string(),
+        JsonValue::String(provenance.repository_id.clone()),
+    );
+    object.insert(
+        "resolved_view_id".to_string(),
+        JsonValue::String(provenance.resolved_view_id.clone()),
+    );
+    object.insert(
+        "tree_identity".to_string(),
+        tree_identity_json(&provenance.tree_identity),
+    );
+    object.insert(
+        "created_from_content_tree".to_string(),
+        JsonValue::String(provenance.created_from_content_tree.clone()),
+    );
+    object.insert(
+        "store_integrity_policy".to_string(),
+        JsonValue::String(provenance.store_integrity_policy.as_str().to_string()),
+    );
+    JsonValue::Object(object)
+}
+
 fn root_ref_json(root_ref: &ProjectionRootRef) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert(
@@ -1904,6 +2016,35 @@ pub fn projection_manifest_local_record_path(
         .join(PROJECTION_MANIFEST_LOCAL_RECORD_FILE)
 }
 
+pub fn projection_quarantine_local_record_path(
+    projection_root: impl AsRef<Path>,
+    quarantine: &ProjectionQuarantineResult,
+) -> PathBuf {
+    projection_root
+        .as_ref()
+        .join(PROJECTION_QUARANTINE_LOCAL_METADATA_DIR)
+        .join(&quarantine.projection_id)
+        .join(format!("{}.json", quarantine.reason_code.as_str()))
+}
+
+pub fn persist_projection_quarantine_local_record(
+    projection_root: impl AsRef<Path>,
+    quarantine: &ProjectionQuarantineResult,
+) -> std::io::Result<PathBuf> {
+    let path = projection_quarantine_local_record_path(projection_root, quarantine);
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "projection quarantine record path has no parent",
+        ));
+    };
+    fs::create_dir_all(parent)?;
+    let bytes = canonical_json_bytes(&quarantine.to_json_value())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    fs::write(&path, bytes)?;
+    Ok(path)
+}
+
 fn persist_projection_manifest_local_record(
     projection_root: &Path,
     projection: &ProjectionRecord,
@@ -1960,8 +2101,16 @@ fn count_materialized_directories(root: &Path) -> std::io::Result<usize> {
 pub fn is_projection_local_metadata_path(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root)
         .ok()
-        .and_then(|relative| relative.components().next())
-        .map(|component| component.as_os_str() == ".sunlight")
+        .map(|relative| {
+            let mut components = relative.components();
+            matches!(
+                (components.next(), components.next()),
+                (Some(first), Some(second))
+                    if first.as_os_str() == ".sunlight"
+                        && (second.as_os_str() == "projections"
+                            || second.as_os_str() == "quarantine")
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -2678,6 +2827,82 @@ mod tests {
             quarantine.cache_invalidation_reason,
             ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed
         );
+    }
+
+    #[test]
+    fn projection_quarantine_local_record_persists_canonical_json_under_durable_record_path() {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let view = view_for_store(&store);
+        let projection = fixture_execution_projection_from_resolved_view(&view).unwrap();
+        let manifest = fixture_projection_manifest_from_content_tree(
+            &projection,
+            &view,
+            store.tree(),
+            store.content_blobs(),
+        )
+        .unwrap();
+        let result = projection_store_integrity_failed_quarantined(
+            &projection,
+            &manifest,
+            ProjectionStoreIntegrityReasonCode::ExecutionStoreIntegrityFailed,
+        );
+        let quarantine = result.quarantine.as_ref().unwrap();
+        let root = temp_projection_root("quarantine-local-record");
+
+        let path = persist_projection_quarantine_local_record(&root, quarantine).unwrap();
+
+        assert_eq!(
+            path,
+            root.join(".sunlight")
+                .join("quarantine")
+                .join("projections")
+                .join(FIXTURE_EXECUTION_PROJECTION_ID)
+                .join("execution_store_integrity_failed.json")
+        );
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes, canonical_json_bytes(&quarantine.to_json_value()).unwrap());
+        let parsed = parse_json_record(&bytes).unwrap();
+        let JsonValue::Object(record) = parsed else {
+            panic!("quarantine record should be a JSON object");
+        };
+        assert_eq!(
+            record.get("privacy_class"),
+            Some(&JsonValue::String("local_only".to_string()))
+        );
+        assert_eq!(
+            record.get("reason_code"),
+            Some(&JsonValue::String(
+                "execution_store_integrity_failed".to_string()
+            ))
+        );
+        assert_eq!(
+            record.get("durable_record"),
+            Some(&JsonValue::String(
+                "local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn projection_local_metadata_path_excludes_projection_and_quarantine_metadata_only() {
+        let root = Path::new("/tmp/projection-root");
+
+        assert!(is_projection_local_metadata_path(
+            root,
+            &root.join(".sunlight/projections/execution/projection_exec_auth_profile_0001/projection-manifest-local.json")
+        ));
+        assert!(is_projection_local_metadata_path(
+            root,
+            &root.join(".sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json")
+        ));
+        assert!(!is_projection_local_metadata_path(
+            root,
+            &root.join(".sunlight/other/local.txt")
+        ));
+        assert!(!is_projection_local_metadata_path(
+            root,
+            &root.join("src/auth.ts")
+        ));
     }
 
     #[test]

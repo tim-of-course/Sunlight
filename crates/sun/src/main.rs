@@ -50,9 +50,10 @@ use sunlight_core::projection::{
     fixture_inspection_projection_from_resolved_view,
     fixture_projection_manifest_from_content_tree, is_projection_local_metadata_path,
     materialize_fixture_projection_copy, plan_fixture_projection_materialization,
-    projection_manifest_local_record_path, projection_manifest_ref,
-    projection_store_integrity_failed_quarantined, projection_store_integrity_from_manifest_scan,
-    projection_store_integrity_not_checked, ProjectionFilesystemMaterialization,
+    persist_projection_quarantine_local_record, projection_manifest_local_record_path,
+    projection_manifest_ref, projection_store_integrity_failed_quarantined,
+    projection_store_integrity_from_manifest_scan, projection_store_integrity_not_checked,
+    ProjectionFilesystemMaterialization,
     ProjectionManifestRecord, ProjectionMaterializationCapabilities,
     ProjectionMaterializationError, ProjectionMaterializationErrorCode,
     ProjectionMaterializationLocalMetadata, ProjectionMaterializationPlan,
@@ -2273,6 +2274,7 @@ fn fixture_status_projection_json(
         local_projection_root_verification_json_from_verification(projection_root, &verification);
     let store_integrity =
         fixture_projection_store_integrity_result(projection, &manifest, integrity_fixture);
+    persist_projection_quarantine_record_if_available(projection_root, &store_integrity)?;
     let integrity_status = store_integrity.integrity_status.as_str();
     let retention_state = store_integrity
         .quarantine
@@ -5153,6 +5155,7 @@ fn fixture_inspect_projection_json(
     let manifest = fixture_local_projection_manifest(projection)?;
     let store_integrity =
         fixture_projection_store_integrity_result(projection, &manifest, integrity_fixture);
+    persist_projection_quarantine_record_if_available(projection_root, &store_integrity)?;
     Ok(format!(
         concat!(
             "{{\"ok\":true,\"data\":{{",
@@ -5231,6 +5234,29 @@ fn fixture_projection_store_integrity_result(
         }
         None => projection_store_integrity_not_checked(projection),
     }
+}
+
+fn persist_projection_quarantine_record_if_available(
+    projection_root: Option<&std::path::Path>,
+    integrity: &ProjectionStoreIntegrityResult,
+) -> Result<(), CliError> {
+    let Some(projection_root) = projection_root else {
+        return Ok(());
+    };
+    let Some(quarantine) = integrity.quarantine.as_ref() else {
+        return Ok(());
+    };
+    persist_projection_quarantine_local_record(projection_root, quarantine).map_err(|error| {
+        CliError::new(
+            "projection_quarantine_record_write_failed",
+            "failed to write projection quarantine local record",
+        )
+        .with_detail("projection_root", projection_root.display().to_string())
+        .with_detail("projection_id", quarantine.projection_id.clone())
+        .with_detail("reason_code", quarantine.reason_code.as_str())
+        .with_detail("error", error.to_string())
+    })?;
+    Ok(())
 }
 
 fn projection_local_store_integrity_json(integrity: &ProjectionStoreIntegrityResult) -> String {

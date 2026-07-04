@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran the default `scripts/smoke-suite.ps1` after `851d3e1`; it detected CRLF Bash scripts, fell back to the Windows-native lane, and passed `cargo fmt --check`, `cargo check`, `cargo test` with 93 Windows CLI tests and 134 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused WSL/Windows verification for the latest projection integrity slice passed projection-filtered CLI JSON tests, core projection tests, and `git diff --check`. Scratchpad guard must run after this edit.
+- Verification: latest full pass ran the default `scripts/smoke-suite.ps1` after `efc0206`; it detected CRLF Bash scripts, fell back to the Windows-native lane, and passed `cargo fmt --check`, `cargo check`, `cargo test` with 93 Windows CLI tests and 138 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused WSL/Windows verification for the latest projection integrity seam passed store-integrity-filtered core tests, core projection tests, and `git diff --check`. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -131,13 +131,14 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `execution-promotion-record-foundation`: integrated as `61b07ea`; formatting checkpoint `9575fe3`.
 - Completed slice `execution-promotion-status-inspect-fixture`: integrated as `290da59`; formatting checkpoint `5cda183`.
 - Completed slice `projection-store-integrity-verified-fixture`: integrated as `9f64aed`; formatting checkpoint `851d3e1`.
+- Completed slice `projection-store-integrity-scan-seam`: integrated as `a5a7992`; formatting checkpoint `efc0206`.
 - No active WSL slice at this checkpoint. Next heartbeat should start the next project-wide slice from the candidate list after confirming `main` is still clean.
 
 ## Candidate Next Slices
 
 - First external validation repo and exact test command remain the next product-level decision once the local fixture path is stable.
-- Projection store-integrity still needs real scanner/persistence wiring after the core result model.
-- Projection store-integrity scanner/persistence seam is the next implementation step after the verified/failure fixture exposure.
+- Projection store-integrity still needs CLI/materialization wiring to use the core manifest-scan seam, followed by persistence/quarantine follow-through.
+- First external validation repo can now move beyond the local `basic-app` fixture once the next projection integrity wiring slice is stable.
 
 ## Decisions
 

@@ -22,9 +22,20 @@ For a broader local validation pass, run `scripts/smoke-suite.sh` or
 `scripts/smoke-suite.ps1`. The suite adds Cargo format, check, and test gates
 before the focused smoke scripts.
 
+Use this focused script while iterating on the validation fixture contract. Use
+the aggregate smoke suite for branch handoff or CI wiring so the validation
+smoke runs with the workspace format, check, test, projection strategy, and MVP
+coverage. The CI handoff is provider-neutral; this repository does not
+currently define a `.github` workflow or another provider-specific CI file.
+
 By default the PowerShell wrapper uses WSL when `wsl.exe` is available so the
 same Bash script runs on Windows/WSL. Set `SUNLIGHT_SMOKE_USE_WSL=0` to run the
 native PowerShell implementation instead.
+
+The Linux/WSL lane expects a local Rust toolchain, `cargo`, and `git` on
+`PATH`. The Windows-native lane expects those tools on the Windows `PATH`; when
+WSL `rustfmt` is unavailable, run the aggregate smoke suite in native
+PowerShell as the formatting gate because it starts with `cargo fmt --check`.
 
 The smoke covers init idempotency, fixture read/list/search, fixture patch/write
 preconditions, compatible and conflicted view resolution, projection

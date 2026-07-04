@@ -710,7 +710,10 @@ fn project_materialize_json_fixture_ready_view_returns_projection_envelope() {
     assert!(stdout.contains("\"command\":\"projection.materialize\""));
     assert!(stdout.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
     assert!(stdout.contains("\"purpose\":\"execution\""));
+    assert!(stdout.contains("\"selected_strategy\":\"copy\""));
     assert!(stdout.contains("\"strategy\":\"copy\""));
+    assert!(stdout.contains("\"source\":\"resolved_content_tree\""));
+    assert!(stdout.contains("\"local_materialization\":{\"privacy_class\":\"local_only\",\"projection_id\":\"projection_exec_auth_profile_0001\""));
     assert!(stdout.contains("\"root_ref\":{\"value\":\"local://.sunlight/projections/execution/projection_exec_auth_profile_0001\",\"privacy\":\"local_only_path\",\"privacy_class\":\"local_only\"}"));
     assert!(stdout.contains("\"tree_identity\":{\"kind\":\"SingleRepoTree\",\"repository_id\":\"repo_fixture_basic_app\",\"tree_hash\":\"tree_fixture_"));
     assert!(stdout.contains("\"cache_key\":\"projection-cache:repo_fixture_basic_app:"));
@@ -718,6 +721,110 @@ fn project_materialize_json_fixture_ready_view_returns_projection_envelope() {
     assert!(stdout.contains("\"retention_state\":\"active\""));
     assert!(stdout.contains("\"policy\":{\"path_policy_id\":\"path_policy_posix_case_sensitive_v1\",\"operation_semantics_version\":\"file_ops_v1\",\"writable_policy\":\"read_only_source_private_outputs\",\"store_integrity_policy\":\"verify_before_reuse\",\"privacy_class\":\"local_only\"}"));
     assert!(stdout.contains("\"record_type\":\"projection\""));
+}
+
+#[test]
+fn project_materialize_json_fixture_reflink_strategy_succeeds() {
+    let repo = TestRepo::new("projection-fixture-reflink");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+
+    let output = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--strategy")
+        .arg("reflink")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"projection.materialize\""));
+    assert!(stdout.contains("\"selected_strategy\":\"reflink\""));
+    assert!(stdout.contains("\"strategy\":\"reflink\""));
+    assert!(stdout.contains(":execution:reflink:read_only_source_private_outputs\""));
+    assert!(stdout.contains("\"local_materialization\":{\"privacy_class\":\"local_only\",\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"source\":\"resolved_content_tree\""));
+}
+
+#[test]
+fn project_materialize_json_fixture_copy_fallback_for_ineligible_strategy() {
+    let repo = TestRepo::new("projection-fixture-copy-fallback");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+
+    let output = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--strategy")
+        .arg("hardlink_readonly")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"selected_strategy\":\"copy\""));
+    assert!(stdout.contains("\"strategy\":\"copy\""));
+    assert!(stdout.contains(":execution:copy:read_only_source_private_outputs\""));
+    assert!(stdout.contains("\"local_materialization\":{\"privacy_class\":\"local_only\",\"projection_id\":\"projection_exec_auth_profile_0001\""));
+}
+
+#[test]
+fn project_materialize_json_fixture_required_unsupported_strategy_fails() {
+    let repo = TestRepo::new("projection-fixture-required-unsupported");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+
+    let output = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--strategy")
+        .arg("hardlink_readonly")
+        .arg("--no-copy-fallback")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains(
+        "\"code\":\"projection_materialization_hardlink_readonly_requires_read_only_policy\""
+    ));
+    assert!(stdout.contains(
+        "\"message\":\"read-only hardlink materialization requires a read-only projection policy\""
+    ));
+    assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(stdout.contains("\"strategy\":\"hardlink_readonly\""));
+    assert!(stdout.contains("\"projection_id\":null"));
 }
 
 #[test]

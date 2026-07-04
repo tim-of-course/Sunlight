@@ -34,10 +34,13 @@ use sunlight_core::git_export::{
 use sunlight_core::projection::{
     fixture_compatibility_projection_from_resolved_view,
     fixture_execution_projection_from_resolved_view, fixture_export_projection_from_resolved_view,
-    fixture_inspection_projection_from_resolved_view, ProjectionPurpose, ProjectionRecord,
-    ProjectionValidationError, FIXTURE_COMPATIBILITY_PROJECTION_ID,
-    FIXTURE_EXECUTION_PROJECTION_ID, FIXTURE_EXPORT_PROJECTION_ID,
-    FIXTURE_INSPECTION_PROJECTION_ID,
+    fixture_inspection_projection_from_resolved_view, plan_fixture_projection_materialization,
+    ProjectionMaterializationCapabilities, ProjectionMaterializationError,
+    ProjectionMaterializationErrorCode, ProjectionMaterializationLocalMetadata,
+    ProjectionMaterializationPlan, ProjectionMaterializationRequest, ProjectionPurpose,
+    ProjectionRecord, ProjectionRootRef, ProjectionStrategy, ProjectionValidationError,
+    FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
+    FIXTURE_EXPORT_PROJECTION_ID, FIXTURE_INSPECTION_PROJECTION_ID,
 };
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
@@ -434,13 +437,19 @@ fn project_materialize(ctx: &CommandContext) -> Result<(), CliError> {
 
     let view = fixture_resolved_view_by_id(&options.view_id)
         .ok_or_else(|| object_not_found("resolved_view", &options.view_id))?;
-    let projection =
-        fixture_projection_for_purpose(&view, options.purpose).map_err(projection_error)?;
+    let plan = plan_fixture_projection_materialization(
+        &view,
+        fixture_projection_materialization_request(&options),
+    )
+    .map_err(projection_materialization_error)?;
 
     if ctx.json {
-        println!("{}", projection_materialize_success_envelope(&projection));
+        println!("{}", projection_materialize_success_envelope(&plan));
     } else {
-        println!("{} {}", projection.id, projection.root_ref.value);
+        println!(
+            "{} {}",
+            plan.projection.id, plan.projection.root_ref.value
+        );
     }
 
     Ok(())
@@ -705,6 +714,8 @@ struct ProjectMaterializeOptions {
     fixture: String,
     view_id: String,
     purpose: ProjectionPurpose,
+    strategy: Option<ProjectionStrategy>,
+    fallback_to_copy: bool,
 }
 
 #[derive(Debug)]
@@ -779,6 +790,8 @@ fn parse_project_materialize_options(
     let mut fixture = None;
     let mut view_id = None;
     let mut purpose = ProjectionPurpose::Execution;
+    let mut strategy = None;
+    let mut fallback_to_copy = true;
     let mut args = ctx.args.iter().skip(2);
 
     while let Some(arg) = args.next() {
@@ -802,6 +815,15 @@ fn parse_project_materialize_options(
                     invalid_request("usage: sun project materialize --purpose <purpose>")
                 })?;
                 purpose = parse_projection_purpose(value)?;
+            }
+            "--strategy" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun project materialize --strategy <strategy>")
+                })?;
+                strategy = Some(parse_projection_strategy(value)?);
+            }
+            "--no-copy-fallback" => {
+                fallback_to_copy = false;
             }
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
@@ -832,6 +854,8 @@ fn parse_project_materialize_options(
         fixture,
         view_id,
         purpose,
+        strategy,
+        fallback_to_copy,
     })
 }
 
@@ -844,6 +868,19 @@ fn parse_projection_purpose(value: &str) -> Result<ProjectionPurpose, CliError> 
         _ => Err(
             invalid_request(format!("unknown projection purpose `{value}`"))
                 .with_detail("purpose", value),
+        ),
+    }
+}
+
+fn parse_projection_strategy(value: &str) -> Result<ProjectionStrategy, CliError> {
+    match value {
+        "copy" => Ok(ProjectionStrategy::Copy),
+        "reflink" => Ok(ProjectionStrategy::Reflink),
+        "hardlink_readonly" => Ok(ProjectionStrategy::HardlinkReadonly),
+        "overlay_copyup" => Ok(ProjectionStrategy::OverlayCopyup),
+        _ => Err(
+            invalid_request(format!("unknown projection materialization strategy `{value}`"))
+                .with_detail("strategy", value),
         ),
     }
 }
@@ -2360,18 +2397,35 @@ fn fixture_base_git_commit_id() -> String {
     "git_sha1_base_parent_0001".to_string()
 }
 
-fn fixture_projection_for_purpose(
-    view: &ResolvedViewResult,
-    purpose: ProjectionPurpose,
-) -> Result<ProjectionRecord, ProjectionValidationError> {
-    match purpose {
-        ProjectionPurpose::Execution => fixture_execution_projection_from_resolved_view(view),
-        ProjectionPurpose::Compatibility => {
-            fixture_compatibility_projection_from_resolved_view(view, "gen_agent_a_0001")
-        }
-        ProjectionPurpose::Inspection => fixture_inspection_projection_from_resolved_view(view),
-        ProjectionPurpose::Export => fixture_export_projection_from_resolved_view(view),
+fn fixture_projection_materialization_request(
+    options: &ProjectMaterializeOptions,
+) -> ProjectionMaterializationRequest {
+    let strategy_preference = options
+        .strategy
+        .map(|strategy| vec![strategy])
+        .unwrap_or_else(|| vec![ProjectionStrategy::Copy]);
+
+    ProjectionMaterializationRequest {
+        purpose: options.purpose,
+        projection_id: fixture_projection_id_for_purpose(options.purpose).to_string(),
+        session_generation_id: fixture_projection_session_generation_id(options.purpose),
+        strategy_preference,
+        fallback_to_copy: options.fallback_to_copy,
+        capabilities: ProjectionMaterializationCapabilities::all_supported(),
     }
+}
+
+fn fixture_projection_id_for_purpose(purpose: ProjectionPurpose) -> &'static str {
+    match purpose {
+        ProjectionPurpose::Execution => FIXTURE_EXECUTION_PROJECTION_ID,
+        ProjectionPurpose::Compatibility => FIXTURE_COMPATIBILITY_PROJECTION_ID,
+        ProjectionPurpose::Inspection => FIXTURE_INSPECTION_PROJECTION_ID,
+        ProjectionPurpose::Export => FIXTURE_EXPORT_PROJECTION_ID,
+    }
+}
+
+fn fixture_projection_session_generation_id(purpose: ProjectionPurpose) -> Option<String> {
+    (purpose == ProjectionPurpose::Compatibility).then(|| "gen_agent_a_0001".to_string())
 }
 
 fn fixture_projection_by_id(
@@ -2554,6 +2608,59 @@ fn projection_error(error: ProjectionValidationError) -> CliError {
         json_escape(&error.resolved_view_id),
         string_array_json(error.conflict_ids.iter().map(String::as_str)),
         string_array_json(error.staleness_ids.iter().map(String::as_str)),
+    ))
+}
+
+fn projection_materialization_error(error: ProjectionMaterializationError) -> CliError {
+    if error.code == ProjectionMaterializationErrorCode::ProjectionValidationFailed {
+        if let Some(validation_error) = error.validation_error {
+            return projection_error(validation_error);
+        }
+    }
+
+    let message = match error.code.as_str() {
+        "projection_materialization_copy_unavailable" => {
+            "copy materialization is unavailable for this fixture"
+        }
+        "projection_materialization_reflink_unsupported" => {
+            "reflink materialization is unsupported for this fixture"
+        }
+        "projection_materialization_reflink_unsafe_for_writes" => {
+            "reflink materialization is unsafe for writable projections"
+        }
+        "projection_materialization_hardlink_readonly_unsupported" => {
+            "read-only hardlink materialization is unsupported for this fixture"
+        }
+        "projection_materialization_hardlink_readonly_requires_read_only_policy" => {
+            "read-only hardlink materialization requires a read-only projection policy"
+        }
+        "projection_materialization_hardlink_readonly_unsafe_for_store" => {
+            "read-only hardlink materialization cannot protect store integrity"
+        }
+        "projection_materialization_overlay_copyup_unsupported" => {
+            "overlay copy-up materialization is unsupported for this fixture"
+        }
+        "projection_materialization_overlay_copyup_unsafe_for_writes" => {
+            "overlay copy-up materialization is unsafe for writable projections"
+        }
+        "projection_materialization_metadata_policy_unsupported" => {
+            "materialization strategy does not preserve required metadata policy"
+        }
+        "projection_materialization_no_eligible_strategy" => {
+            "no eligible projection materialization strategy was found"
+        }
+        _ => "projection materialization could not be planned",
+    };
+    CliError::new(error.code.as_str(), message).with_raw_details_json(format!(
+        concat!(
+            "{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"strategy\":{},",
+            "\"projection_id\":null",
+            "}}"
+        ),
+        json_escape(&error.resolved_view_id),
+        optional_projection_strategy_json(error.strategy),
     ))
 }
 
@@ -3291,7 +3398,8 @@ fn export_shape_value_json(
     )
 }
 
-fn projection_materialize_success_envelope(projection: &ProjectionRecord) -> String {
+fn projection_materialize_success_envelope(plan: &ProjectionMaterializationPlan) -> String {
+    let projection = &plan.projection;
     format!(
         concat!(
             "{{\"ok\":true,",
@@ -3308,10 +3416,13 @@ fn projection_materialize_success_envelope(projection: &ProjectionRecord) -> Str
             "}},",
             "\"projection_id\":\"{}\",",
             "\"purpose\":\"{}\",",
+            "\"selected_strategy\":\"{}\",",
             "\"strategy\":\"{}\",",
             "\"root_ref\":{},",
             "\"tree_identity\":{},",
             "\"cache_key\":\"{}\",",
+            "\"source\":\"{}\",",
+            "\"local_materialization\":{},",
             "\"retention_state\":\"{}\",",
             "\"policy\":{{",
             "\"path_policy_id\":\"{}\",",
@@ -3333,9 +3444,12 @@ fn projection_materialize_success_envelope(projection: &ProjectionRecord) -> Str
         json_escape(&projection.id),
         projection.purpose.as_str(),
         projection.strategy.as_str(),
+        projection.strategy.as_str(),
         projection_root_ref_json(projection),
         single_repo_tree_json(&projection.tree_identity),
         json_escape(&projection.cache_key.stable_string()),
+        plan.source.as_str(),
+        projection_materialization_local_metadata_json(&plan.local_metadata),
         projection.retention_state.as_str(),
         json_escape(&projection.path_policy_id),
         json_escape(&projection.operation_semantics_version),
@@ -3343,6 +3457,37 @@ fn projection_materialize_success_envelope(projection: &ProjectionRecord) -> Str
         projection.store_integrity_policy.as_str(),
         projection.privacy_class.as_str(),
         projection_record_json(projection),
+    )
+}
+
+fn projection_materialization_local_metadata_json(
+    metadata: &ProjectionMaterializationLocalMetadata,
+) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"privacy_class\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"strategy\":\"{}\",",
+            "\"cache_key\":\"{}\",",
+            "\"root_ref\":{},",
+            "\"writable_policy\":\"{}\",",
+            "\"store_integrity_policy\":\"{}\",",
+            "\"source\":\"{}\"",
+            "}}"
+        ),
+        metadata.privacy_class.as_str(),
+        json_escape(&metadata.projection_id),
+        json_escape(&metadata.resolved_view_id),
+        single_repo_tree_json(&metadata.tree_identity),
+        metadata.strategy.as_str(),
+        json_escape(&metadata.cache_key),
+        projection_root_ref_value_json(&metadata.root_ref),
+        metadata.writable_policy.as_str(),
+        metadata.store_integrity_policy.as_str(),
+        metadata.source.as_str(),
     )
 }
 
@@ -3419,6 +3564,10 @@ fn projection_record_json(projection: &ProjectionRecord) -> String {
 }
 
 fn projection_root_ref_json(projection: &ProjectionRecord) -> String {
+    projection_root_ref_value_json(&projection.root_ref)
+}
+
+fn projection_root_ref_value_json(root_ref: &ProjectionRootRef) -> String {
     format!(
         concat!(
             "{{",
@@ -3427,9 +3576,9 @@ fn projection_root_ref_json(projection: &ProjectionRecord) -> String {
             "\"privacy_class\":\"{}\"",
             "}}"
         ),
-        json_escape(&projection.root_ref.value),
-        projection.root_ref.privacy.as_str(),
-        projection.root_ref.privacy.privacy_class().as_str(),
+        json_escape(&root_ref.value),
+        root_ref.privacy.as_str(),
+        root_ref.privacy.privacy_class().as_str(),
     )
 }
 
@@ -3902,6 +4051,12 @@ fn resolver_order_json(order: &DeterministicResolverOrder) -> String {
 fn optional_single_repo_tree_json(tree_identity: Option<&SingleRepoTree>) -> String {
     tree_identity
         .map(single_repo_tree_json)
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn optional_projection_strategy_json(strategy: Option<ProjectionStrategy>) -> String {
+    strategy
+        .map(|strategy| format!("\"{}\"", strategy.as_str()))
         .unwrap_or_else(|| "null".to_string())
 }
 

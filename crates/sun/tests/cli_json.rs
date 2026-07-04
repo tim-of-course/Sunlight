@@ -794,8 +794,9 @@ fn project_materialize_json_projection_root_requires_empty_directory() {
     assert_failure(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("\"code\":\"projection_materialization_projection_root_unavailable\""));
-    assert!(stdout
-        .contains("\"message\":\"projection root must be an empty directory or a creatable path\""));
+    assert!(stdout.contains(
+        "\"message\":\"projection root must be an empty directory or a creatable path\""
+    ));
     assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
     assert_eq!(
         fs::read_to_string(projection_root.join("sentinel.txt")).unwrap(),

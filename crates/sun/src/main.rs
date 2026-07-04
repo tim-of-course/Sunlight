@@ -940,9 +940,7 @@ fn parse_project_materialize_options(
             }
             "--projection-root" => {
                 let value = args.next().ok_or_else(|| {
-                    invalid_request(
-                        "usage: sun project materialize --projection-root <empty-path>",
-                    )
+                    invalid_request("usage: sun project materialize --projection-root <empty-path>")
                 })?;
                 projection_root = Some(PathBuf::from(value));
             }

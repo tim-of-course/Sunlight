@@ -810,9 +810,9 @@ fn status_json_fixture_projection_reports_local_root_verification() {
     assert!(stdout.contains("\"integrity_status\":\"not_checked\""));
     assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
     assert!(stdout.contains("\"verification_state\":\"present\""));
-    assert!(stdout.contains(
-        "\"content_verification\":\"not_available_without_persisted_manifest\""
-    ));
+    assert!(
+        stdout.contains("\"content_verification\":\"not_available_without_persisted_manifest\"")
+    );
     assert!(stdout.contains("\"files\":5"));
     assert!(stdout.contains("\"bytes\":222"));
     #[cfg(unix)]

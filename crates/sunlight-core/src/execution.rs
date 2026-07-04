@@ -497,7 +497,9 @@ mod tests {
         assert_eq!(projection.purpose, ProjectionPurpose::Execution);
         assert_eq!(projection.strategy, ProjectionStrategy::Copy);
         assert_eq!(projection.privacy_class, PrivacyClass::LocalOnly);
-        assert!(projection.cache_key.contains("path_policy_posix_case_sensitive_v1"));
+        assert!(projection
+            .cache_key
+            .contains("path_policy_posix_case_sensitive_v1"));
     }
 
     #[test]
@@ -512,7 +514,10 @@ mod tests {
         assert_eq!(execution.result.status, ExecutionStatus::Pass);
         assert_eq!(execution.result.exit_code, Some(0));
         assert_eq!(execution.projection_id, FIXTURE_EXECUTION_PROJECTION_ID);
-        assert_eq!(execution.environment_summary.id, FIXTURE_ENVIRONMENT_SUMMARY_ID);
+        assert_eq!(
+            execution.environment_summary.id,
+            FIXTURE_ENVIRONMENT_SUMMARY_ID
+        );
         assert_eq!(execution.outputs[0].kind, OutputKind::StdoutSummary);
     }
 

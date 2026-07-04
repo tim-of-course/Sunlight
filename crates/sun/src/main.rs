@@ -48,12 +48,13 @@ use sunlight_core::projection::{
     fixture_compatibility_projection_from_resolved_view,
     fixture_execution_projection_from_resolved_view, fixture_export_projection_from_resolved_view,
     fixture_inspection_projection_from_resolved_view,
-    fixture_projection_manifest_from_content_tree, is_projection_local_metadata_path,
-    materialize_fixture_projection_copy, persist_projection_quarantine_local_record,
-    plan_fixture_projection_materialization, projection_manifest_local_record_path,
-    projection_manifest_ref, projection_store_integrity_failed_quarantined,
-    projection_store_integrity_from_manifest_scan, projection_store_integrity_not_checked,
-    ProjectionFilesystemMaterialization, ProjectionManifestRecord,
+    fixture_projection_manifest_from_content_tree, is_projection_local_metadata_parent_path,
+    is_projection_local_metadata_path, materialize_fixture_projection_copy,
+    persist_projection_quarantine_local_record, plan_fixture_projection_materialization,
+    projection_manifest_local_record_path, projection_manifest_ref,
+    projection_store_integrity_failed_quarantined, projection_store_integrity_from_manifest_scan,
+    projection_store_integrity_not_checked, ProjectionFilesystemMaterialization,
+    ProjectionManifestRecord,
     ProjectionMaterializationCapabilities, ProjectionMaterializationError,
     ProjectionMaterializationErrorCode, ProjectionMaterializationLocalMetadata,
     ProjectionMaterializationPlan, ProjectionMaterializationRequest, ProjectionPurpose,
@@ -5909,8 +5910,15 @@ fn scan_local_projection_root_inner(
         }
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.is_dir() {
-            scan.directories += 1;
+            let directories_before = scan.directories;
+            let files_before = scan.files;
             scan_local_projection_root_inner(root, &path, scan)?;
+            if !is_projection_local_metadata_parent_path(root, &path)
+                || scan.directories > directories_before
+                || scan.files > files_before
+            {
+                scan.directories += 1;
+            }
         } else if metadata.is_file() {
             scan.files += 1;
             scan.bytes += metadata.len();

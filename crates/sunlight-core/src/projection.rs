@@ -2084,18 +2084,29 @@ fn persist_projection_manifest_local_record(
 }
 
 fn count_materialized_directories(root: &Path) -> std::io::Result<usize> {
-    let mut count = usize::from(root.is_dir());
-    for entry in fs::read_dir(root)? {
+    count_materialized_directories_inner(root, root)
+}
+
+fn count_materialized_directories_inner(root: &Path, current: &Path) -> std::io::Result<usize> {
+    let mut child_count = 0;
+    let mut has_visible_file = false;
+    for entry in fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
         if is_projection_local_metadata_path(root, &path) {
             continue;
         }
         if path.is_dir() {
-            count += count_materialized_directories(&path)?;
+            child_count += count_materialized_directories_inner(root, &path)?;
+        } else if path.is_file() {
+            has_visible_file = true;
         }
     }
-    Ok(count)
+    let count_current = current == root
+        || !is_projection_local_metadata_parent_path(root, current)
+        || child_count > 0
+        || has_visible_file;
+    Ok(child_count + usize::from(count_current))
 }
 
 pub fn is_projection_local_metadata_path(root: &Path, path: &Path) -> bool {
@@ -2110,6 +2121,17 @@ pub fn is_projection_local_metadata_path(root: &Path, path: &Path) -> bool {
                         && (second.as_os_str() == "projections"
                             || second.as_os_str() == "quarantine")
             )
+        })
+        .unwrap_or(false)
+}
+
+pub fn is_projection_local_metadata_parent_path(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .ok()
+        .map(|relative| {
+            let mut components = relative.components();
+            matches!(components.next(), Some(first) if first.as_os_str() == ".sunlight")
+                && components.next().is_none()
         })
         .unwrap_or(false)
 }
@@ -2906,6 +2928,33 @@ mod tests {
             root,
             &root.join("src/auth.ts")
         ));
+        assert!(is_projection_local_metadata_parent_path(
+            root,
+            &root.join(".sunlight")
+        ));
+        assert!(!is_projection_local_metadata_parent_path(
+            root,
+            &root.join(".sunlight/other")
+        ));
+    }
+
+    #[test]
+    fn materialized_directory_count_excludes_projection_metadata_but_keeps_other_sunlight_content()
+    {
+        let root = temp_projection_root("directory-count-metadata-filter");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(
+            root.join(".sunlight/projections/execution/projection_exec_auth_profile_0001"),
+        )
+        .unwrap();
+        fs::create_dir_all(
+            root.join(".sunlight/quarantine/projections/projection_exec_auth_profile_0001"),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".sunlight/other")).unwrap();
+
+        assert_eq!(count_materialized_directories(&root).unwrap(), 5);
     }
 
     #[test]

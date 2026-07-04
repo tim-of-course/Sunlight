@@ -1297,6 +1297,55 @@ fn status_json_fixture_projection_ignores_persisted_quarantine_record_in_root_sc
 }
 
 #[test]
+fn status_json_fixture_projection_reports_arbitrary_sunlight_other_as_extra_file() {
+    let repo = TestRepo::new("projection-status-sunlight-other-extra");
+    let projection_root = repo.path().join("projection-root");
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    write_nested_file(
+        &projection_root,
+        ".sunlight/other/local.txt",
+        "not projection metadata\n",
+    );
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"content_verification\":\"dirty\""));
+    assert!(stdout.contains("\"dirty_local\":true"));
+    assert!(stdout.contains("\"extra_files\":1"));
+    assert!(stdout.contains(".sunlight/other/local.txt"));
+}
+
+#[test]
 fn status_json_fixture_projection_scan_missing_blob_reports_quarantine() {
     let repo = TestRepo::new("projection-status-scan-missing-blob");
 

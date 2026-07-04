@@ -724,6 +724,147 @@ fn project_materialize_json_fixture_ready_view_returns_projection_envelope() {
 }
 
 #[test]
+fn project_materialize_json_projection_root_writes_basic_app_copy() {
+    let repo = TestRepo::new("projection-fixture-copy-write");
+    let projection_root = repo.path().join("projection-root");
+    let view_id = "view_base_0001";
+
+    let output = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"projection.materialize\""));
+    assert!(stdout.contains("\"projection_root\":{\"path\":\""));
+    assert!(stdout.contains("\"privacy\":\"local_only_path\",\"privacy_class\":\"local_only\""));
+    assert!(stdout.contains("\"files_written\":5"));
+    assert!(stdout.contains("\"bytes_written\":222"));
+    assert!(stdout.contains("\"executable_files\":1"));
+    assert!(stdout.contains("\"cleanup\":{\"projection_root\":{"));
+    assert!(stdout.contains("\"exists\":true,\"local_only\":true"));
+    assert_eq!(
+        fs::read_to_string(projection_root.join("README.md")).unwrap(),
+        "# Fixture Basic App\n\nUses User.email for login.\n"
+    );
+    assert_eq!(
+        fs::read_to_string(projection_root.join("src/auth.ts")).unwrap(),
+        "export function login(email: string) {\n  return email.trim().toLowerCase();\n}\n"
+    );
+    assert!(projection_root.join("docs/guide.md").is_file());
+    assert!(projection_root.join("scripts/build.sh").is_file());
+}
+
+#[test]
+fn project_materialize_json_projection_root_requires_empty_directory() {
+    let repo = TestRepo::new("projection-fixture-copy-nonempty");
+    let projection_root = repo.path().join("projection-root");
+    fs::create_dir_all(&projection_root).unwrap();
+    fs::write(projection_root.join("sentinel.txt"), "keep\n").unwrap();
+    let view_id = "view_base_0001";
+
+    let output = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"projection_materialization_projection_root_unavailable\""));
+    assert!(stdout
+        .contains("\"message\":\"projection root must be an empty directory or a creatable path\""));
+    assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert_eq!(
+        fs::read_to_string(projection_root.join("sentinel.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(!projection_root.join("README.md").exists());
+}
+
+#[test]
+fn project_materialize_json_projection_root_conflicted_view_rejects_before_writing() {
+    let repo = TestRepo::new("projection-fixture-copy-conflicted");
+    let projection_root = repo.path().join("projection-root");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_auth_overlap_0001",
+    );
+
+    let output = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"projection_conflicted_view\""));
+    assert!(stdout.contains("\"conflict_ids\":[\"conflict_src_auth_ts_0001\"]"));
+    assert!(stdout.contains("\"projection_id\":null"));
+    assert!(!projection_root.exists());
+}
+
+#[test]
+fn project_materialize_json_projection_root_stale_view_rejects_before_writing() {
+    let repo = TestRepo::new("projection-fixture-copy-stale");
+    let projection_root = repo.path().join("projection-root");
+    let view_id = resolve_fixture_view_id(repo.path(), "topic_profile_ui:rev_profile_ui_0002");
+
+    let output = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"projection_stale_view\""));
+    assert!(stdout
+        .contains("\"staleness_ids\":[\"stale_missing_dependency_rev_auth_nullability_0001\"]"));
+    assert!(stdout.contains("\"projection_id\":null"));
+    assert!(!projection_root.exists());
+}
+
+#[test]
 fn project_materialize_json_fixture_reflink_strategy_succeeds() {
     let repo = TestRepo::new("projection-fixture-reflink");
     let view_id = resolve_fixture_view_id(

@@ -39,7 +39,8 @@ use sunlight_core::git_export::{
 use sunlight_core::projection::{
     fixture_compatibility_projection_from_resolved_view,
     fixture_execution_projection_from_resolved_view, fixture_export_projection_from_resolved_view,
-    fixture_inspection_projection_from_resolved_view, plan_fixture_projection_materialization,
+    fixture_inspection_projection_from_resolved_view, materialize_fixture_projection_copy,
+    plan_fixture_projection_materialization, ProjectionFilesystemMaterialization,
     ProjectionMaterializationCapabilities, ProjectionMaterializationError,
     ProjectionMaterializationErrorCode, ProjectionMaterializationLocalMetadata,
     ProjectionMaterializationPlan, ProjectionMaterializationRequest, ProjectionPurpose,
@@ -55,7 +56,8 @@ use sunlight_core::resolver::{
     fixture_profile_revision, fixture_profile_revision_missing_auth_dependency,
     fixture_resolver_input, resolve_fixture_view, DependencyClosure, DeterministicResolverOrder,
     ResolvedViewResult, ResolverConflictOrStalenessRecord, ResolverRecordKind, SingleRepoTree,
-    TopicRevisionRef, TopicRevisionSelection, FIXTURE_BASE_CHECKPOINT_ID,
+    TopicRevisionRef, TopicRevisionSelection, TreeEntryState, FIXTURE_BASE_CHECKPOINT_ID,
+    FIXTURE_BASE_RESOLVED_VIEW_ID,
 };
 
 fn main() -> ExitCode {
@@ -442,6 +444,34 @@ fn project_materialize(ctx: &CommandContext) -> Result<(), CliError> {
 
     let view = fixture_resolved_view_by_id(&options.view_id)
         .ok_or_else(|| object_not_found("resolved_view", &options.view_id))?;
+
+    if let Some(projection_root) = &options.projection_root {
+        let store = InMemoryArtifactStore::fixture_basic_app();
+        let materialization = materialize_fixture_projection_copy(
+            &view,
+            fixture_projection_materialization_request(&options),
+            store.tree(),
+            store.content_blobs(),
+            projection_root,
+        )
+        .map_err(projection_materialization_error)?;
+
+        if ctx.json {
+            println!(
+                "{}",
+                projection_filesystem_materialize_success_envelope(&materialization)
+            );
+        } else {
+            println!(
+                "{} {}",
+                materialization.plan.projection.id,
+                materialization.projection_root.display()
+            );
+        }
+
+        return Ok(());
+    }
+
     let plan = plan_fixture_projection_materialization(
         &view,
         fixture_projection_materialization_request(&options),
@@ -800,6 +830,7 @@ struct ProjectMaterializeOptions {
     purpose: ProjectionPurpose,
     strategy: Option<ProjectionStrategy>,
     fallback_to_copy: bool,
+    projection_root: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -876,6 +907,7 @@ fn parse_project_materialize_options(
     let mut purpose = ProjectionPurpose::Execution;
     let mut strategy = None;
     let mut fallback_to_copy = true;
+    let mut projection_root = None;
     let mut args = ctx.args.iter().skip(2);
 
     while let Some(arg) = args.next() {
@@ -905,6 +937,14 @@ fn parse_project_materialize_options(
                     invalid_request("usage: sun project materialize --strategy <strategy>")
                 })?;
                 strategy = Some(parse_projection_strategy(value)?);
+            }
+            "--projection-root" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun project materialize --projection-root <empty-path>",
+                    )
+                })?;
+                projection_root = Some(PathBuf::from(value));
             }
             "--no-copy-fallback" => {
                 fallback_to_copy = false;
@@ -940,6 +980,7 @@ fn parse_project_materialize_options(
         purpose,
         strategy,
         fallback_to_copy,
+        projection_root,
     })
 }
 
@@ -2464,9 +2505,55 @@ fn fixture_resolver_revisions() -> Vec<TopicRevisionRef> {
 }
 
 fn fixture_resolved_view_by_id(view_id: &str) -> Option<ResolvedViewResult> {
+    if view_id == FIXTURE_BASE_RESOLVED_VIEW_ID {
+        return Some(fixture_base_resolved_content_view());
+    }
+
     fixture_known_resolved_views()
         .into_iter()
         .find(|view| view.resolved_view_id == view_id)
+}
+
+fn fixture_base_resolved_content_view() -> ResolvedViewResult {
+    let store = InMemoryArtifactStore::fixture_basic_app();
+    let tree_identity = SingleRepoTree {
+        repository_id: store.tree().repository_id.clone(),
+        tree_hash: store.tree().tree_hash.clone(),
+    };
+    let tree_entries = store
+        .tree()
+        .entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .map(|entry| {
+            (
+                entry.path.clone(),
+                TreeEntryState {
+                    artifact_id: entry.artifact_id.clone(),
+                    path: entry.path.clone(),
+                    content_hash: entry.content_ref.clone(),
+                },
+            )
+        })
+        .collect();
+
+    ResolvedViewResult {
+        resolved_view_id: FIXTURE_BASE_RESOLVED_VIEW_ID.to_string(),
+        repository_id: store.tree().repository_id.clone(),
+        base_checkpoint_ids: vec![FIXTURE_BASE_CHECKPOINT_ID.to_string()],
+        topic_frontier: Default::default(),
+        dependency_closure: DependencyClosure {
+            revision_ids: Vec::new(),
+        },
+        operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+        path_policy_id: store.tree().path_policy_id.clone(),
+        resolver_order: DeterministicResolverOrder {
+            operation_ids: Vec::new(),
+        },
+        tree_identity: Some(tree_identity),
+        records: Vec::new(),
+        tree_entries,
+    }
 }
 
 fn fixture_known_resolved_views() -> Vec<ResolvedViewResult> {
@@ -2958,6 +3045,19 @@ fn projection_materialization_error(error: ProjectionMaterializationError) -> Cl
         "projection_materialization_no_eligible_strategy" => {
             "no eligible projection materialization strategy was found"
         }
+        "projection_materialization_content_tree_mismatch" => {
+            "resolved view does not match fixture content tree"
+        }
+        "projection_materialization_missing_content_blob" => {
+            "fixture content tree references a missing content blob"
+        }
+        "projection_materialization_unsupported_content_entry_kind" => {
+            "fixture content tree contains an unsupported entry kind"
+        }
+        "projection_materialization_projection_root_unavailable" => {
+            "projection root must be an empty directory or a creatable path"
+        }
+        "projection_materialization_write_failed" => "projection files could not be written",
         _ => "projection materialization could not be planned",
     };
     CliError::new(error.code.as_str(), message).with_raw_details_json(format!(
@@ -4114,6 +4214,83 @@ fn projection_materialize_success_envelope(plan: &ProjectionMaterializationPlan)
     )
 }
 
+fn projection_filesystem_materialize_success_envelope(
+    materialization: &ProjectionFilesystemMaterialization,
+) -> String {
+    let plan = &materialization.plan;
+    let projection = &plan.projection;
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"projection.materialize\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"projection_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"projection_id\":\"{}\",",
+            "\"purpose\":\"{}\",",
+            "\"selected_strategy\":\"{}\",",
+            "\"strategy\":\"{}\",",
+            "\"root_ref\":{},",
+            "\"tree_identity\":{},",
+            "\"cache_key\":\"{}\",",
+            "\"source\":\"{}\",",
+            "\"local_materialization\":{},",
+            "\"projection_root\":{},",
+            "\"files_written\":{},",
+            "\"directories_created\":{},",
+            "\"bytes_written\":{},",
+            "\"executable_files\":{},",
+            "\"cleanup\":{},",
+            "\"retention_state\":\"{}\",",
+            "\"policy\":{{",
+            "\"path_policy_id\":\"{}\",",
+            "\"operation_semantics_version\":\"{}\",",
+            "\"writable_policy\":\"{}\",",
+            "\"store_integrity_policy\":\"{}\",",
+            "\"privacy_class\":\"{}\"",
+            "}},",
+            "\"projection\":{}",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(&projection.repository_id),
+        json_escape(&projection.id),
+        json_escape(&projection.resolved_view_id),
+        json_escape(&projection.resolved_view_id),
+        single_repo_tree_json(&projection.tree_identity),
+        json_escape(&projection.id),
+        projection.purpose.as_str(),
+        projection.strategy.as_str(),
+        projection.strategy.as_str(),
+        projection_root_ref_json(projection),
+        single_repo_tree_json(&projection.tree_identity),
+        json_escape(&projection.cache_key.stable_string()),
+        plan.source.as_str(),
+        projection_materialization_local_metadata_json(&plan.local_metadata),
+        local_projection_root_json(&materialization.projection_root),
+        materialization.files_written,
+        materialization.directories_created,
+        materialization.bytes_written,
+        materialization.executable_files,
+        projection_cleanup_check_json(materialization),
+        projection.retention_state.as_str(),
+        json_escape(&projection.path_policy_id),
+        json_escape(&projection.operation_semantics_version),
+        projection.writable_policy.as_str(),
+        projection.store_integrity_policy.as_str(),
+        projection.privacy_class.as_str(),
+        projection_record_json(projection),
+    )
+}
+
 fn projection_materialization_local_metadata_json(
     metadata: &ProjectionMaterializationLocalMetadata,
 ) -> String {
@@ -4142,6 +4319,34 @@ fn projection_materialization_local_metadata_json(
         metadata.writable_policy.as_str(),
         metadata.store_integrity_policy.as_str(),
         metadata.source.as_str(),
+    )
+}
+
+fn local_projection_root_json(path: &std::path::Path) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"path\":\"{}\",",
+            "\"privacy\":\"local_only_path\",",
+            "\"privacy_class\":\"local_only\"",
+            "}}"
+        ),
+        json_escape(&path.display().to_string()),
+    )
+}
+
+fn projection_cleanup_check_json(materialization: &ProjectionFilesystemMaterialization) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"projection_root\":{},",
+            "\"exists\":{},",
+            "\"local_only\":{}",
+            "}}"
+        ),
+        local_projection_root_json(&materialization.cleanup.projection_root),
+        materialization.cleanup.exists,
+        materialization.cleanup.local_only,
     )
 }
 
@@ -5174,7 +5379,7 @@ Usage:
   sun patch <path> --session <session> --fixture basic-app --expect-hash <hash> --patch-file <file> [--json]
   sun write <path> --session <session> --fixture basic-app --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]
   sun view resolve --fixture basic-app --include topic:revision[,topic:revision] [--json]
-  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app [--json]
+  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app [--projection-root <empty-path>] [--json]
   sun run --view <resolved-view-id> --fixture basic-app --json -- cargo test
   sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
   sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan|--execute-fixture success|ref-update-failure|export-map-failure|--execute-local --repo <path>] --json

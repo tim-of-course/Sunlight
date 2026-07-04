@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran the default `scripts/smoke-suite.ps1` after `dfd23bb`; it detected CRLF Bash scripts, fell back to the Windows-native lane, and passed `cargo fmt --check`, `cargo check`, `cargo test` with 98 Windows CLI tests and 138 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused WSL/Windows verification for the latest execution integrity gate passed run fixture tests, CLI integrity tests, store-integrity-filtered core tests, `git diff --check`, and Windows `cargo fmt --check`. Scratchpad guard must run after this edit.
+- Verification: latest full pass ran the default `scripts/smoke-suite.ps1` after `2f8b533`; it detected CRLF Bash scripts, fell back to the Windows-native lane, and passed `cargo fmt --check`, `cargo check`, `cargo test` with 98 Windows CLI tests and 138 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused WSL/Windows verification for the latest durable quarantine metadata passed CLI integrity tests, run fixture tests, store-integrity-filtered core tests, `git diff --check`, and Windows `cargo fmt --check`. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -134,12 +134,13 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-store-integrity-scan-seam`: integrated as `a5a7992`; formatting checkpoint `efc0206`.
 - Completed slice `projection-store-integrity-cli-scan-wiring`: integrated as `e5500af`; formatting checkpoint `a58f8d6`.
 - Completed slice `execution-store-integrity-gate-fixture`: integrated as `9f700c1`; formatting checkpoint `dfd23bb`.
-- Active WSL slice `projection-quarantine-durable-record`: clone `/home/timothycard/code/Sunlight-2-projection-quarantine-durable-record-20260704-175151`, branch `dm/projection-quarantine-durable-record`, started from `5cb5d89`.
+- Completed slice `projection-quarantine-durable-record`: integrated as `24feb6e`; formatting checkpoint `2f8b533`.
+- No active WSL slice at this checkpoint. Next heartbeat should choose the first external validation repo/command or start actual quarantine record filesystem persistence.
 
 ## Candidate Next Slices
 
-- Projection store-integrity durable quarantine/cache invalidation follow-through is active.
-- First external validation repo and exact test command are now the next product-level decision once the projection integrity persistence path is stable enough to test against real project files.
+- First external validation repo and exact test command are now the next product-level decision.
+- Projection integrity still needs actual local quarantine record filesystem persistence/GC beyond the durable local record reference.
 
 ## Decisions
 

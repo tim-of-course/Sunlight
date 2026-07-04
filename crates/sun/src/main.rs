@@ -1710,10 +1710,10 @@ fn parse_inspect_options(ctx: &CommandContext) -> Result<Option<InspectOptions>,
 fn parse_store_integrity_fixture(value: &str) -> Result<StoreIntegrityFixture, CliError> {
     match value {
         "store-mismatch" => Ok(StoreIntegrityFixture::StoreMismatch),
-        _ => Err(invalid_request(format!(
-            "unknown integrity fixture `{value}`"
-        ))
-        .with_detail("integrity_fixture", value)),
+        _ => Err(
+            invalid_request(format!("unknown integrity fixture `{value}`"))
+                .with_detail("integrity_fixture", value),
+        ),
     }
 }
 
@@ -2108,7 +2108,8 @@ fn fixture_status_projection_json(
     let integrity_status = projection_integrity_status(integrity_fixture);
     let retention_state = projection_retention_state_for_status(projection, integrity_fixture);
     let quarantine_json = projection_quarantine_json(projection, &manifest, integrity_fixture);
-    let native_errors_json = projection_native_errors_json(projection, &manifest, integrity_fixture);
+    let native_errors_json =
+        projection_native_errors_json(projection, &manifest, integrity_fixture);
     Ok(format!(
         concat!(
             "{{\"ok\":true,\"data\":{{",
@@ -4850,9 +4851,7 @@ fn ensure_store_integrity_fixture_scope(
     Ok(())
 }
 
-fn projection_integrity_status(
-    integrity_fixture: Option<StoreIntegrityFixture>,
-) -> &'static str {
+fn projection_integrity_status(integrity_fixture: Option<StoreIntegrityFixture>) -> &'static str {
     match integrity_fixture {
         Some(StoreIntegrityFixture::StoreMismatch) => "failed",
         None => "not_checked",

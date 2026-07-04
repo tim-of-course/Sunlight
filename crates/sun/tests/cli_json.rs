@@ -958,7 +958,9 @@ fn status_json_fixture_projection_store_mismatch_reports_quarantine() {
     assert!(stdout.contains("\"reason_code\":\"execution_store_integrity_failed\""));
     assert!(stdout.contains("\"cache_key\":\"projection-cache:repo_fixture_basic_app:"));
     assert!(stdout.contains("\"manifest_ref\":\"objects/projection-manifests/sha256/"));
-    assert!(stdout.contains("\"quarantine_refs\":{\"projection\":\"projection:projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains(
+        "\"quarantine_refs\":{\"projection\":\"projection:projection_exec_auth_profile_0001\""
+    ));
     assert!(stdout.contains("\"source_truth\":\"immutable_store_manifest\""));
     assert!(stdout.contains("\"local_filesystem_source_truth\":false"));
     assert!(stdout.contains("\"native_errors\":[{\"code\":\"execution_store_integrity_failed\""));
@@ -3117,7 +3119,9 @@ fn inspect_json_fixture_projection_store_mismatch_reports_local_quarantine_metad
     assert!(stdout.contains("\"id\":\"projection_exec_auth_profile_0001\""));
     assert!(stdout.contains("\"retention_state\":\"active\""));
     assert!(stdout.contains("\"local_store_integrity\":{\"privacy_class\":\"local_only\",\"integrity_status\":\"failed\""));
-    assert!(stdout.contains("\"local_quarantine\":{\"privacy_class\":\"local_only\",\"state\":\"quarantined\""));
+    assert!(stdout.contains(
+        "\"local_quarantine\":{\"privacy_class\":\"local_only\",\"state\":\"quarantined\""
+    ));
     assert!(stdout.contains("\"reason_code\":\"execution_store_integrity_failed\""));
     assert!(stdout.contains("\"durable_record\":null"));
     assert!(stdout.contains("\"local_root_verification\":null"));

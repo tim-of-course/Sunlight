@@ -917,6 +917,63 @@ fn status_json_fixture_projection_reports_dirty_content_from_manifest() {
     assert!(!session_stdout.contains("return email;"));
 }
 
+#[cfg(unix)]
+#[test]
+fn status_json_fixture_projection_reports_dirty_executable_bit_from_manifest() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TestRepo::new("projection-status-root-dirty-executable");
+    let projection_root = repo.path().join("projection-root");
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    let build_script = projection_root.join("scripts/build.sh");
+    let mut permissions = fs::metadata(&build_script).unwrap().permissions();
+    permissions.set_mode(permissions.mode() & !0o111);
+    fs::set_permissions(&build_script, permissions).unwrap();
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.projection\""));
+    assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
+    assert!(stdout.contains("\"verification_state\":\"present\""));
+    assert!(stdout.contains("\"content_verification\":\"dirty\""));
+    assert!(stdout.contains("\"dirty_local\":true"));
+    assert!(stdout.contains("\"mismatched_files\":0"));
+    assert!(stdout.contains("\"missing_files\":0"));
+    assert!(stdout.contains("\"extra_files\":0"));
+    assert!(stdout.contains("\"metadata_mismatches\":1"));
+    assert!(stdout.contains("\"verification_errors\":[]"));
+}
+
 #[test]
 fn status_json_fixture_projection_reports_missing_and_extra_local_files_from_manifest() {
     let repo = TestRepo::new("projection-status-root-extra-missing");

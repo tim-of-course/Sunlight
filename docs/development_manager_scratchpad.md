@@ -90,13 +90,15 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-materialization-foundation`: integrated as `b58f308`; formatting checkpoint `1ddf6b9`.
 - Completed slice `cli-projection-materialization-fixture`: integrated as `e0b39e9`; formatting checkpoint `02911da`.
 - Completed slice `compat-import-status-inspect`: integrated as `af9d5e2`; formatting checkpoint `02911da`.
-- Active capacity is open after this integration; next launch should pick non-conflicting implementation or validation slices.
+- Active slice `git-export-execution-foundation`: WSL clone `/home/timothycard/code/Sunlight-2-git-export-execution-foundation-20260704-002329`, branch `dm/git-export-execution-foundation`, run artifacts under `C:\tmp\sunlight-manager\20260704-002329`.
+- Active slice `validation-repo-plan`: WSL clone `/home/timothycard/code/Sunlight-2-validation-repo-plan-20260704-002329`, branch `dm/validation-repo-plan`, run artifacts under `C:\tmp\sunlight-manager\20260704-002329`.
+- Next heartbeat should inspect active slice last-message files, verify completed work, integrate acceptable commits, and keep one or two project-wide slices moving.
 
 ## Candidate Next Slices
 
-- Real Git export execution after writer fixture lands.
+- Real Git export CLI execution after execution foundation lands.
 - Projection strategy implementation after the spike plan selects the first materialization path.
-- Compatibility import status/inspect surfaces after CLI import lands.
+- Validation repo smoke script after validation plan lands.
 
 ## Decisions
 

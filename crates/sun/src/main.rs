@@ -13,11 +13,16 @@ use sunlight_core::artifacts::{
 };
 use sunlight_core::checkpoint::{
     fixture_checkpoint_from_resolved_view, CheckpointRecord, CheckpointValidationError, EvidenceRef,
+    GitExportMapRecord,
 };
 use sunlight_core::execution::{
     fixture_failing_execution_from_resolved_view, fixture_passing_execution_from_resolved_view,
     fixture_promotion_candidate_provenance, ExecutionFoundationError, ExecutionRecord,
     OutputClassification, OutputKind, PromotionCandidateProvenance,
+};
+use sunlight_core::git_export::{
+    git_export_checkpoint, GitExportError, GitExportRequest, GitExportResponse,
+    GitExportValidationFailure, GitExportValidationReport,
 };
 use sunlight_core::projection::{
     fixture_compatibility_projection_from_resolved_view,
@@ -140,6 +145,7 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         [scope, command, ..] if scope == "checkpoint" && command == "create" => {
             checkpoint_create(&ctx)
         }
+        [scope, command, ..] if scope == "git" && command == "export" => git_export(&ctx),
         [command, ..] if command == "run" => execution_run(&ctx),
         [command, ..] if command == "read" => artifact_read(&ctx),
         [command, ..] if command == "list" => artifact_list(&ctx),
@@ -460,6 +466,33 @@ fn checkpoint_create(ctx: &CommandContext) -> Result<(), CliError> {
     Ok(())
 }
 
+fn git_export(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_git_export_options(ctx)?;
+    if options.fixture != "basic-app" {
+        return Err(
+            invalid_request(format!("unknown fixture `{}`", options.fixture))
+                .with_detail("fixture", options.fixture),
+        );
+    }
+
+    let checkpoint = fixture_checkpoint()?;
+    if checkpoint.id != options.checkpoint_id {
+        return Err(object_not_found("checkpoint", &options.checkpoint_id));
+    }
+
+    let mut request = GitExportRequest::from_checkpoint(&checkpoint);
+    request.git_ref = options.git_ref;
+    let response = git_export_checkpoint(request).map_err(git_export_error)?;
+
+    if ctx.json {
+        println!("{}", git_export_success_envelope(&response));
+    } else {
+        println!("{} {}", response.checkpoint_id, response.git_ref);
+    }
+
+    Ok(())
+}
+
 fn status(ctx: &CommandContext) -> Result<(), CliError> {
     if let Some(options) = parse_status_options(ctx)? {
         if options.fixture != "basic-app" {
@@ -580,6 +613,13 @@ struct ExecutionRunOptions {
 struct CheckpointCreateOptions {
     fixture: String,
     view_id: String,
+}
+
+#[derive(Debug)]
+struct GitExportOptions {
+    fixture: String,
+    checkpoint_id: String,
+    git_ref: String,
 }
 
 #[derive(Debug)]
@@ -713,6 +753,68 @@ fn parse_checkpoint_create_options(
     })?;
 
     Ok(CheckpointCreateOptions { fixture, view_id })
+}
+
+fn parse_git_export_options(ctx: &CommandContext) -> Result<GitExportOptions, CliError> {
+    let mut fixture = None;
+    let mut checkpoint_id = None;
+    let mut git_ref = None;
+    let mut args = ctx.args.iter().skip(2);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun git export requires --fixture basic-app")
+                })?;
+                fixture = Some(value.clone());
+            }
+            "--checkpoint" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun git export requires --checkpoint <checkpoint-id>")
+                })?;
+                checkpoint_id = Some(value.clone());
+            }
+            "--branch" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun git export requires --branch <git-ref>")
+                })?;
+                git_ref = Some(value.clone());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun git export"
+                )));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected git export argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    let fixture = fixture.ok_or_else(|| {
+        invalid_request(
+            "usage: sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app",
+        )
+    })?;
+    let checkpoint_id = checkpoint_id.ok_or_else(|| {
+        invalid_request(
+            "usage: sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app",
+        )
+    })?;
+    let git_ref = git_ref.ok_or_else(|| {
+        invalid_request(
+            "usage: sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app",
+        )
+    })?;
+
+    Ok(GitExportOptions {
+        fixture,
+        checkpoint_id,
+        git_ref,
+    })
 }
 
 fn parse_view_resolve_options(ctx: &CommandContext) -> Result<ViewResolveOptions, CliError> {
@@ -2147,6 +2249,20 @@ fn execution_error(error: ExecutionFoundationError) -> CliError {
     ))
 }
 
+fn git_export_error(error: GitExportError) -> CliError {
+    let message = match error.code.as_str() {
+        "export_policy_failed" => "checkpoint failed Git export validation",
+        "export_parent_not_found" => "Git export parent checkpoint was not found",
+        "export_git_failed" => "Git export failed",
+        "export_map_write_failed" => "Git export map could not be written",
+        _ => "Git export failed",
+    };
+    CliError::new(error.code.as_str(), message).with_raw_details_json(format!(
+        "{{\"validation_report\":{}}}",
+        git_export_validation_report_json(&error.validation_report),
+    ))
+}
+
 fn init_success_envelope(
     repository_id: &str,
     repo_root: &str,
@@ -2238,6 +2354,137 @@ fn checkpoint_create_success_envelope(checkpoint: &CheckpointRecord) -> String {
             .collect::<Vec<_>>()
             .join(","),
         export_refs_json(checkpoint),
+    )
+}
+
+fn git_export_success_envelope(response: &GitExportResponse) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"{}\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"checkpoint_id\":\"{}\",",
+            "\"export_map_id\":\"{}\",",
+            "\"validation_report_id\":\"{}\"",
+            "}},",
+            "\"validation_report\":{},",
+            "\"git_ref\":\"{}\",",
+            "\"git_commit_ids\":{},",
+            "\"export_map\":{}",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(&response.command),
+        json_escape(&response.checkpoint_id),
+        json_escape(&response.checkpoint_id),
+        json_escape(&response.export_map.id),
+        json_escape(&response.validation_report.id),
+        git_export_validation_report_json(&response.validation_report),
+        json_escape(&response.git_ref),
+        string_array_json(response.git_commit_ids.iter().map(String::as_str)),
+        git_export_map_json(&response.export_map),
+    )
+}
+
+fn git_export_validation_report_json(report: &GitExportValidationReport) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"id\":\"{}\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"git_ref\":\"{}\",",
+            "\"ok\":{},",
+            "\"summary\":{{",
+            "\"records_checked\":{},",
+            "\"payloads_checked\":{},",
+            "\"warnings\":{},",
+            "\"blocked\":{}",
+            "}},",
+            "\"failures\":[{}]",
+            "}}"
+        ),
+        json_escape(&report.id),
+        json_escape(&report.checkpoint_id),
+        json_escape(&report.git_ref),
+        report.ok,
+        report.summary.records_checked,
+        report.summary.payloads_checked,
+        report.summary.warnings,
+        report.summary.blocked,
+        report
+            .failures
+            .iter()
+            .map(git_export_validation_failure_json)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn git_export_validation_failure_json(failure: &GitExportValidationFailure) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"check\":\"{}\",",
+            "\"code\":\"{}\",",
+            "\"field\":{},",
+            "\"value\":{},",
+            "\"reason\":\"{}\"",
+            "}}"
+        ),
+        failure.check.as_str(),
+        failure.code.as_str(),
+        optional_string_json(failure.field.as_deref()),
+        optional_string_json(failure.value.as_deref()),
+        json_escape(&failure.reason),
+    )
+}
+
+fn git_export_map_json(export_map: &GitExportMapRecord) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"id\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"git_remote\":{},",
+            "\"git_ref\":\"{}\",",
+            "\"git_commit_ids\":{},",
+            "\"export_shape\":{},",
+            "\"validation_report_id\":\"{}\",",
+            "\"exported_at\":\"{}\",",
+            "\"privacy_class\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&export_map.id),
+        json_escape(&export_map.repository_id),
+        json_escape(&export_map.checkpoint_id),
+        single_repo_tree_json(&export_map.tree_identity),
+        optional_string_json(export_map.git_remote.as_deref()),
+        json_escape(&export_map.git_ref),
+        string_array_json(export_map.git_commit_ids.iter().map(String::as_str)),
+        export_shape_json(export_map),
+        json_escape(&export_map.validation_report_id),
+        json_escape(&export_map.exported_at),
+        export_map.privacy_class.as_str(),
+    )
+}
+
+fn export_shape_json(export_map: &GitExportMapRecord) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"kind\":\"{}\",",
+            "\"parent_policy\":\"{}\",",
+            "\"include_sunlight_metadata\":\"{}\"",
+            "}}"
+        ),
+        export_map.export_shape.kind.as_str(),
+        json_escape(&export_map.export_shape.parent_policy),
+        json_escape(&export_map.export_shape.include_sunlight_metadata),
     )
 }
 
@@ -3318,6 +3565,7 @@ Usage:
   sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app [--json]
   sun run --view <resolved-view-id> --fixture basic-app --json -- cargo test
   sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
+  sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app --json
 
 Commands:
   init       Create the conservative local .sunlight repository layout
@@ -3332,6 +3580,7 @@ Commands:
   project    Materialize fixture projections for exact resolved views
   run        Record a fixture execution for an exact resolved view
   checkpoint Freeze a fixture resolved view as an in-memory checkpoint
+  git        Export a fixture checkpoint to a Git ref
 "
     );
 }

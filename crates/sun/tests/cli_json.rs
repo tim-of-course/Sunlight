@@ -913,6 +913,106 @@ fn checkpoint_create_json_fixture_stale_view_returns_stable_error() {
 }
 
 #[test]
+fn git_export_json_fixture_checkpoint_returns_export_envelope() {
+    let repo = TestRepo::new("git-export-fixture-ready");
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/auth-profile-ready")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"git.export\""));
+    assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
+    assert!(
+        stdout.contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\"")
+    );
+    assert!(
+        stdout.contains("\"validation_report_id\":\"validation_export_auth_profile_ready_0001\"")
+    );
+    assert!(stdout.contains("\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\""));
+    assert!(stdout
+        .contains("\"git_commit_ids\":[\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"));
+    assert!(stdout.contains("\"validation_report\":{"));
+    assert!(stdout.contains("\"ok\":true"));
+    assert!(stdout.contains("\"failures\":[]"));
+    assert!(stdout.contains(
+        "\"export_shape\":{\"kind\":\"single_checkpoint_commit\",\"parent_policy\":\"base_checkpoint_git_parent\",\"include_sunlight_metadata\":\"policy_approved_manifest_only\"}"
+    ));
+    assert!(stdout.contains("\"privacy_class\":\"commit_default\""));
+}
+
+#[test]
+fn git_export_json_fixture_missing_checkpoint_returns_object_not_found() {
+    let repo = TestRepo::new("git-export-missing-checkpoint");
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_missing_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/auth-profile-ready")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"object_not_found\""));
+    assert!(stdout.contains("\"message\":\"Sunlight object was not found\""));
+    assert!(stdout.contains("\"selector\":\"checkpoint_missing_0001\""));
+    assert!(stdout.contains("\"object_type\":\"checkpoint\""));
+}
+
+#[test]
+fn git_export_json_fixture_invalid_git_ref_returns_validation_failure() {
+    let repo = TestRepo::new("git-export-invalid-ref");
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/bad ref")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"export_policy_failed\""));
+    assert!(stdout.contains("\"message\":\"checkpoint failed Git export validation\""));
+    assert!(stdout.contains("\"validation_report\":{"));
+    assert!(stdout.contains("\"git_ref\":\"refs/heads/bad ref\""));
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"blocked\":1"));
+    assert!(stdout.contains("\"check\":\"git_ref\""));
+    assert!(stdout.contains("\"code\":\"export_ref_invalid\""));
+    assert!(stdout.contains("\"field\":\"git_ref\""));
+    assert!(stdout.contains("\"value\":\"refs/heads/bad ref\""));
+}
+
+#[test]
 fn status_json_fixture_basic_app_returns_repository_snapshot() {
     let repo = TestRepo::new("status-fixture-repository");
 

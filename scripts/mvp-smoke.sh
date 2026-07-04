@@ -35,6 +35,19 @@ assert_contains() {
     fi
 }
 
+assert_file_content() {
+    local path="$1"
+    local expected="$2"
+    local label="$3"
+
+    [[ -f "$path" ]] || fail "missing projected fixture file for $label: $path"
+    local actual
+    actual="$(cat "$path")"
+    if [[ "$actual" != "$expected" ]]; then
+        fail "unexpected projected fixture content for $label"
+    fi
+}
+
 run_ok() {
     local label="$1"
     shift
@@ -91,7 +104,31 @@ assert_contains "$out" '"staleness_ids":[]' "resolve staleness"
 view_id="$(json_string_field "$out" resolved_view_id)"
 [[ -n "$view_id" ]] || fail "could not extract resolved_view_id"
 
-step "Materializing projection and running fixture command"
+step "Materializing base projection to filesystem"
+projection_root="$tmp_dir/projection-root"
+mkdir "$projection_root"
+out="$(run_ok project-filesystem sun project materialize --view view_base_0001 --purpose execution --fixture basic-app --projection-root "$projection_root" --json)"
+assert_contains "$out" '"command":"projection.materialize"' "projection command"
+assert_contains "$out" '"projection_id":"projection_exec_auth_profile_0001"' "projection id"
+assert_contains "$out" '"resolved_view_id":"view_base_0001"' "projection base view"
+assert_contains "$out" '"selected_strategy":"copy"' "projection strategy"
+assert_contains "$out" '"files_written":5' "projected file count"
+assert_contains "$out" '"executable_files":1' "projected executable count"
+
+projected_file_count="$(find "$projection_root" -type f | wc -l | tr -d '[:space:]')"
+[[ "$projected_file_count" == "5" ]] || fail "projected file count is $projected_file_count, expected 5"
+for path in README.md docs/guide.md scripts/build.sh src/auth.ts src/profile.ts; do
+    [[ -f "$projection_root/$path" ]] || fail "projection root missing $path"
+done
+assert_file_content "$projection_root/README.md" $'# Fixture Basic App\n\nUses User.email for login.' "README.md"
+assert_file_content "$projection_root/src/auth.ts" $'export function login(email: string) {\n  return email.trim().toLowerCase();\n}' "src/auth.ts"
+
+if [[ "${OS:-}" != "Windows_NT" ]]; then
+    [[ -x "$projection_root/scripts/build.sh" ]] || fail "scripts/build.sh is not executable"
+    [[ ! -x "$projection_root/src/auth.ts" ]] || fail "src/auth.ts should not be executable"
+fi
+
+step "Planning ready projection and running fixture command"
 out="$(run_ok project-execution sun project materialize --view "$view_id" --purpose execution --fixture basic-app --json)"
 assert_contains "$out" '"command":"projection.materialize"' "projection command"
 assert_contains "$out" '"projection_id":"projection_exec_auth_profile_0001"' "projection id"

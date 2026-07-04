@@ -16,6 +16,21 @@ try {
         }
     }
 
+    function Assert-FileContent($Path, $Expected, $Label) {
+        if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
+            throw "Missing projected fixture file for ${Label}: $Path"
+        }
+        $actual = Get-Content -Raw -LiteralPath $Path
+        if ($actual.EndsWith("`r`n")) {
+            $actual = $actual.Substring(0, $actual.Length - 2)
+        } elseif ($actual.EndsWith("`n")) {
+            $actual = $actual.Substring(0, $actual.Length - 1)
+        }
+        if ($actual -ne $Expected) {
+            throw "Unexpected projected fixture content for $Label"
+        }
+    }
+
     function Invoke-SunOk($Label, [string[]]$Arguments) {
         $stdout = Join-Path $tmpRoot ($Label + '.stdout')
         $stderr = Join-Path $tmpRoot ($Label + '.stderr')
@@ -103,7 +118,42 @@ try {
     Assert-Contains $out '"staleness_ids":[]' 'resolve staleness'
     $viewId = Json-StringField $out 'resolved_view_id'
 
-    Step 'Materializing projection and running fixture command'
+    Step 'Materializing base projection to filesystem'
+    $projectionRoot = Join-Path $tmpRoot 'projection-root'
+    New-Item -ItemType Directory -Path $projectionRoot | Out-Null
+    $out = Invoke-SunOk 'project-filesystem' @('project', 'materialize', '--view', 'view_base_0001', '--purpose', 'execution', '--fixture', 'basic-app', '--projection-root', $projectionRoot, '--json')
+    Assert-Contains $out '"command":"projection.materialize"' 'projection command'
+    Assert-Contains $out '"projection_id":"projection_exec_auth_profile_0001"' 'projection id'
+    Assert-Contains $out '"resolved_view_id":"view_base_0001"' 'projection base view'
+    Assert-Contains $out '"selected_strategy":"copy"' 'projection strategy'
+    Assert-Contains $out '"files_written":5' 'projected file count'
+    Assert-Contains $out '"executable_files":1' 'projected executable count'
+
+    $projectedFiles = Get-ChildItem -LiteralPath $projectionRoot -File -Recurse
+    if ($projectedFiles.Count -ne 5) {
+        throw "Projected file count is $($projectedFiles.Count), expected 5"
+    }
+    foreach ($path in @('README.md', 'docs/guide.md', 'scripts/build.sh', 'src/auth.ts', 'src/profile.ts')) {
+        $fullPath = Join-Path $projectionRoot $path
+        if (!(Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+            throw "Projection root missing $path"
+        }
+    }
+    Assert-FileContent (Join-Path $projectionRoot 'README.md') "# Fixture Basic App`n`nUses User.email for login." 'README.md'
+    Assert-FileContent (Join-Path $projectionRoot 'src/auth.ts') "export function login(email: string) {`n  return email.trim().toLowerCase();`n}" 'src/auth.ts'
+
+    if ($PSVersionTable.PSEdition -eq 'Core' -and !$IsWindows) {
+        $scriptMode = [int][System.IO.File]::GetUnixFileMode((Join-Path $projectionRoot 'scripts/build.sh'))
+        $sourceMode = [int][System.IO.File]::GetUnixFileMode((Join-Path $projectionRoot 'src/auth.ts'))
+        if (($scriptMode -band 73) -eq 0) {
+            throw 'scripts/build.sh is not executable'
+        }
+        if (($sourceMode -band 73) -ne 0) {
+            throw 'src/auth.ts should not be executable'
+        }
+    }
+
+    Step 'Planning ready projection and running fixture command'
     $out = Invoke-SunOk 'project-execution' @('project', 'materialize', '--view', $viewId, '--purpose', 'execution', '--fixture', 'basic-app', '--json')
     Assert-Contains $out '"command":"projection.materialize"' 'projection command'
     Assert-Contains $out '"projection_id":"projection_exec_auth_profile_0001"' 'projection id'

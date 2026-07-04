@@ -19,7 +19,9 @@ scripts/mvp-smoke.ps1
 The smoke builds `sun`, then exercises the `basic-app` fixture end to end:
 
 - resolves the compatible auth/profile view
-- materializes the execution projection
+- materializes a base execution projection into an empty temporary projection
+  root and verifies the projected fixture files
+- plans the compatible execution projection
 - records the fixture `cargo test` execution
 - creates the export-ready checkpoint
 - initializes a temporary local Git repository
@@ -33,6 +35,17 @@ Expected exported fixture files:
 - `src/profile.rs`
 - `bin/run-auth-check`
 - `.sunlight/export-manifest.json`
+
+Expected projected fixture files:
+
+- `README.md`
+- `docs/guide.md`
+- `scripts/build.sh`
+- `src/auth.ts`
+- `src/profile.ts`
+
+On platforms with executable mode support, the smoke also verifies
+`scripts/build.sh` is executable and `src/auth.ts` is not.
 
 The aggregate smoke suite also runs the validation and projection strategy
 smokes, which cover artifact validation, compatibility import, write-plan

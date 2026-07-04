@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 172 tests, `git diff --check HEAD~4 HEAD`, native `scripts/validation-smoke.ps1`, and native `scripts/projection-strategy-smoke.ps1` after projection smoke and Git export validation integration. Scratchpad guard must run after this edit.
+- Verification: latest integrated pass ran `cargo fmt --check`, `cargo test` with 184 tests, `git diff --check HEAD~3 HEAD`, native `scripts/projection-strategy-smoke.ps1`, and native `scripts/validation-smoke.ps1` after real Git export writer execution and filesystem projection materialization foundations. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -96,9 +96,9 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `validation-smoke-script`: integrated as `20a1c13`.
 - Completed slice `projection-strategy-smoke-harness`: integrated as `b2c0cd6`; wrapper fix checkpoint `a9a4471`.
 - Completed slice `git-export-real-writer-validation`: integrated as `7ac6236`; formatting checkpoint `3680f68`.
-- Active slice `git-export-real-writer-execution`: WSL clone `/home/timothycard/code/Sunlight-2-git-export-real-writer-execution-20260704-021132`, branch `dm/git-export-real-writer-execution`, run artifacts under `C:\tmp\sunlight-manager\20260704-021132`.
-- Active slice `projection-filesystem-materialization`: WSL clone `/home/timothycard/code/Sunlight-2-projection-filesystem-materialization-20260704-021132`, branch `dm/projection-filesystem-materialization`, run artifacts under `C:\tmp\sunlight-manager\20260704-021132`.
-- Next heartbeat should inspect active WSL progress, import verified work if finished, run full verification, and keep one or two project-wide slices moving.
+- Completed slice `git-export-real-writer-execution`: integrated as `7eb7c2b`; formatting checkpoint `897d45f`.
+- Completed slice `projection-filesystem-materialization`: integrated as `058b4a0`; formatting checkpoint `897d45f`.
+- Active capacity is open after this integration; next launch should pick non-conflicting implementation or validation slices.
 
 ## Candidate Next Slices
 

@@ -42,14 +42,14 @@ use sunlight_core::projection::{
     fixture_inspection_projection_from_resolved_view,
     fixture_projection_manifest_from_content_tree, is_projection_local_metadata_path,
     materialize_fixture_projection_copy, plan_fixture_projection_materialization,
-    projection_manifest_local_record_path,
-    ProjectionFilesystemMaterialization, ProjectionManifestRecord,
-    ProjectionMaterializationCapabilities, ProjectionMaterializationError,
-    ProjectionMaterializationErrorCode, ProjectionMaterializationLocalMetadata,
-    ProjectionMaterializationPlan, ProjectionMaterializationRequest, ProjectionPurpose,
-    ProjectionRecord, ProjectionRootRef, ProjectionStrategy, ProjectionValidationError,
-    FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
-    FIXTURE_EXPORT_PROJECTION_ID, FIXTURE_INSPECTION_PROJECTION_ID,
+    projection_manifest_local_record_path, ProjectionFilesystemMaterialization,
+    ProjectionManifestRecord, ProjectionMaterializationCapabilities,
+    ProjectionMaterializationError, ProjectionMaterializationErrorCode,
+    ProjectionMaterializationLocalMetadata, ProjectionMaterializationPlan,
+    ProjectionMaterializationRequest, ProjectionPurpose, ProjectionRecord, ProjectionRootRef,
+    ProjectionStrategy, ProjectionValidationError, FIXTURE_COMPATIBILITY_PROJECTION_ID,
+    FIXTURE_EXECUTION_PROJECTION_ID, FIXTURE_EXPORT_PROJECTION_ID,
+    FIXTURE_INSPECTION_PROJECTION_ID,
 };
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repository::{
@@ -1875,10 +1875,8 @@ fn fixture_status_projection_json(
     let lifecycle_state = projection_lifecycle_state(projection, projection_root);
     let manifest = fixture_local_projection_manifest(projection)?;
     let verification = local_projection_root_verification(projection, &manifest, projection_root);
-    let verification_json = local_projection_root_verification_json_from_verification(
-        projection_root,
-        &verification,
-    );
+    let verification_json =
+        local_projection_root_verification_json_from_verification(projection_root, &verification);
     Ok(format!(
         concat!(
             "{{\"ok\":true,\"data\":{{",

@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full native pass ran `scripts/smoke-suite.ps1` after `57e999f` with `cargo fmt --check`, `cargo check`, `cargo test` with 82 Windows CLI tests and 129 core tests, validation smoke, projection strategy smoke, and MVP smoke. WSL verification covered persisted envelope validation with 85 WSL CLI JSON tests, 27 focused core projection tests, and `git diff --check`; docs cleanup `7d63da4` and smoke usage guidance `407e33c` passed committed diff whitespace checks. Scratchpad guard must run after this edit.
+- Verification: latest full native pass ran `SUNLIGHT_SMOKE_USE_WSL=0 scripts/smoke-suite.ps1` after `32e0625` with `cargo fmt --check`, `cargo check`, `cargo test` with 84 Windows CLI tests and 129 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused WSL verification for execution promotion passed 87 CLI JSON tests plus `git diff --check`; the default Windows smoke wrapper currently falls into a WSL CRLF failure and has an active hardening slice. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -123,13 +123,15 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-manifest-local-envelope-validation`: integrated as `75f514e`; formatting checkpoint `57e999f`.
 - Completed slice `projection-manifest-status-docs-cleanup`: integrated as `7d63da4`.
 - Completed slice `validation-smoke-usage-followup`: integrated as `407e33c`.
-- Active slice `cli-execution-promotion-fixture`: WSL clone `/home/timothycard/code/Sunlight-2-cli-execution-promotion-fixture-20260704-173532`, branch `dm/cli-execution-promotion-fixture`, run artifacts under `C:\tmp\sunlight-manager\20260704-173532`. Initial launcher failed because prompt backticks expanded through the shell; the relaunch uses stdin prompt delivery and is running.
-- Next heartbeat should inspect active WSL progress, import verified work if finished, and keep project-wide execution-output promotion moving.
+- Completed slice `cli-execution-promotion-fixture`: integrated as `cbae54c`; formatting checkpoint `32e0625`.
+- Active slice `store-integrity-quarantine-fixture`: WSL clone `/home/timothycard/code/Sunlight-2-store-integrity-quarantine-fixture-20260704-181033`, branch `dm/store-integrity-quarantine-fixture`, run artifacts under `C:\tmp\sunlight-manager\20260704-181033`.
+- Active slice `smoke-suite-wsl-crlf-hardening`: WSL clone `/home/timothycard/code/Sunlight-2-smoke-suite-wsl-crlf-hardening-20260704-181033`, branch `dm/smoke-suite-wsl-crlf-hardening`, run artifacts under `C:\tmp\sunlight-manager\20260704-181033`.
+- Next heartbeat should inspect active WSL progress, import verified work if finished, and keep project-wide projection integrity and verification ergonomics moving.
 
 ## Candidate Next Slices
 
-- Execution-output promotion should land as a fixture-level CLI path before deeper persistent execution store work.
-- Store integrity/quarantine fixtures remain useful after promotion flow has a visible operator path.
+- Execution-output promotion still needs a later persistent store path after the fixture-level command proves the envelope.
+- Export validation should eventually reject generated source outputs that lack promotion provenance.
 
 ## Decisions
 

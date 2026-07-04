@@ -838,6 +838,145 @@ fn status_json_fixture_projection_reports_local_root_verification() {
 }
 
 #[test]
+fn status_json_fixture_projection_reports_dirty_content_from_manifest() {
+    let repo = TestRepo::new("projection-status-root-dirty-content");
+    let projection_root = repo.path().join("projection-root");
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    fs::write(
+        projection_root.join("src/auth.ts"),
+        "export function login(email: string) {\n  return email;\n}\n",
+    )
+    .unwrap();
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let status_stdout = stdout(&output);
+    assert!(status_stdout.contains("\"command\":\"status.projection\""));
+    assert!(status_stdout.contains("\"dirty_local\":true"));
+    assert!(status_stdout
+        .contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
+    assert!(status_stdout.contains("\"verification_state\":\"present\""));
+    assert!(status_stdout.contains("\"content_verification\":\"dirty\""));
+    assert!(status_stdout.contains("\"mismatched_files\":1"));
+    assert!(status_stdout.contains("\"missing_files\":0"));
+    assert!(status_stdout.contains("\"extra_files\":0"));
+    assert!(status_stdout.contains("\"metadata_mismatches\":0"));
+    assert!(status_stdout.contains("\"verification_errors\":[]"));
+    assert!(status_stdout.contains("\"files\":5"));
+    assert!(status_stdout.contains("\"sample_paths\":[\"README.md\",\"docs/guide.md\""));
+    assert!(!status_stdout.contains("\"operation_transaction_id\""));
+    assert!(!status_stdout.contains("\"checkpoint_id\""));
+
+    let session_status = sun()
+        .arg("status")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status session should run");
+    assert_success(&session_status);
+    let session_stdout = stdout(&session_status);
+    assert!(session_stdout.contains("\"command\":\"status.session\""));
+    assert!(session_stdout
+        .contains("\"ids\":{\"session_id\":\"session_agent_a\",\"write_topic_id\":\"topic_auth_nullability\"}"));
+    assert!(
+        session_stdout.contains("\"resolved_view_id\":\"view_agent_a_after_patch_0001\"")
+    );
+    assert!(session_stdout.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
+    assert!(session_stdout.contains("\"last_operation_id\":\"op_auth_trim_guard_0001\""));
+    assert!(!session_stdout.contains("\"checkpoint_id\""));
+    assert!(!session_stdout.contains("return email;"));
+}
+
+#[test]
+fn status_json_fixture_projection_reports_missing_and_extra_local_files_from_manifest() {
+    let repo = TestRepo::new("projection-status-root-extra-missing");
+    let projection_root = repo.path().join("projection-root");
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    fs::remove_file(projection_root.join("docs/guide.md")).unwrap();
+    write_nested_file(&projection_root, "local-only.txt", "not in manifest\n");
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.projection\""));
+    assert!(stdout.contains("\"dirty_local\":true"));
+    assert!(stdout.contains("\"local_root_verification\":{\"projection_root\":{\"path\":\""));
+    assert!(stdout.contains("\"verification_state\":\"present\""));
+    assert!(stdout.contains("\"content_verification\":\"dirty\""));
+    assert!(stdout.contains("\"mismatched_files\":0"));
+    assert!(stdout.contains("\"missing_files\":1"));
+    assert!(stdout.contains("\"extra_files\":1"));
+    assert!(stdout.contains("\"metadata_mismatches\":0"));
+    assert!(stdout.contains("\"verification_errors\":[]"));
+    assert!(stdout.contains("\"files\":5"));
+    assert!(stdout.contains("\"sample_paths\":[\"README.md\",\"local-only.txt\""));
+    assert!(stdout.contains("\"scan_error\":null"));
+    assert!(!stdout.contains("\"content_verification\":\"verified\""));
+}
+
+#[test]
 fn inspect_json_fixture_projection_verifies_unchanged_materialized_root() {
     let repo = TestRepo::new("projection-inspect-root");
     let projection_root = repo.path().join("projection-root");

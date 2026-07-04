@@ -3940,10 +3940,13 @@ fn assert_projection_quarantine_record_json(record: &str) {
     assert!(record.contains("\"cache_key\":\"projection-cache:repo_fixture_basic_app:"));
     assert!(record.contains("\"manifest_ref\":\"objects/projection-manifests/sha256/"));
     assert!(record.contains("\"manifest_digest\":\"sha256:"));
-    assert!(record.contains("\"quarantine_refs\":{\"cache\":\"projection-cache:repo_fixture_basic_app:"));
+    assert!(record
+        .contains("\"quarantine_refs\":{\"cache\":\"projection-cache:repo_fixture_basic_app:"));
     assert!(record.contains("\"native_error\":\"native-error:execution_store_integrity_failed:projection_exec_auth_profile_0001\""));
     assert!(record.contains("\"projection\":\"projection:projection_exec_auth_profile_0001\""));
-    assert!(record.contains("\"provenance\":{\"created_from_content_tree\":\"tree_fixture_base_0001\""));
+    assert!(
+        record.contains("\"provenance\":{\"created_from_content_tree\":\"tree_fixture_base_0001\"")
+    );
     assert!(record.contains("\"repository_id\":\"repo_fixture_basic_app\""));
     assert!(record.contains("\"source_truth\":\"immutable_store_manifest\""));
     assert!(record.contains("\"local_filesystem_source_truth\":false"));

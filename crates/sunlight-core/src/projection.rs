@@ -2860,7 +2860,10 @@ mod tests {
                 .join("execution_store_integrity_failed.json")
         );
         let bytes = fs::read(&path).unwrap();
-        assert_eq!(bytes, canonical_json_bytes(&quarantine.to_json_value()).unwrap());
+        assert_eq!(
+            bytes,
+            canonical_json_bytes(&quarantine.to_json_value()).unwrap()
+        );
         let parsed = parse_json_record(&bytes).unwrap();
         let JsonValue::Object(record) = parsed else {
             panic!("quarantine record should be a JSON object");

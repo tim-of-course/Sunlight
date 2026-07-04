@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran native `scripts/smoke-suite.ps1` after `57e999f` with `cargo fmt --check`, `cargo check`, `cargo test` with 82 Windows CLI tests and 129 core tests, validation smoke, projection strategy smoke, and MVP smoke. WSL verification covered persisted envelope validation with 85 WSL CLI JSON tests, 27 focused core projection tests, and `git diff --check`. Scratchpad guard must run after this edit.
+- Verification: latest full native pass ran `scripts/smoke-suite.ps1` after `57e999f` with `cargo fmt --check`, `cargo check`, `cargo test` with 82 Windows CLI tests and 129 core tests, validation smoke, projection strategy smoke, and MVP smoke. WSL verification covered persisted envelope validation with 85 WSL CLI JSON tests, 27 focused core projection tests, and `git diff --check`; docs cleanup import `7d63da4` passed committed diff whitespace checks. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -121,7 +121,8 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-manifest-root-binding-persistence`: integrated as `bbbb3ac`; formatting checkpoint `1897fe0`; smoke harness checkpoint `6e0a842`.
 - Completed slice `projection-manifest-root-mismatch-status-inspect`: integrated as `10374b2`; formatting checkpoint `56e0118`.
 - Completed slice `projection-manifest-local-envelope-validation`: integrated as `75f514e`; formatting checkpoint `57e999f`.
-- Active slice `projection-manifest-status-docs-cleanup`: WSL clone `/home/timothycard/code/Sunlight-2-projection-manifest-status-docs-cleanup-20260704-162531`, branch `dm/projection-manifest-status-docs-cleanup`, run artifacts under `C:\tmp\sunlight-manager\20260704-162531`.
+- Completed slice `projection-manifest-status-docs-cleanup`: integrated as `7d63da4`.
+- Active slice `validation-smoke-usage-followup`: WSL clone `/home/timothycard/code/Sunlight-2-validation-smoke-usage-followup-20260704-170032`, branch `dm/validation-smoke-usage-followup`, run artifacts under `C:\tmp\sunlight-manager\20260704-170032`.
 - Next heartbeat should inspect active WSL progress, import verified work if finished, run full smoke-suite validation, and keep project-wide projection manifest verification moving.
 
 ## Candidate Next Slices

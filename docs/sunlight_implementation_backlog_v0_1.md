@@ -108,11 +108,11 @@ This backlog intentionally avoids Phase 5 operator polish and Phase 6 compatibil
 
 **Outcome:** tests run against exact resolved views, and tool-produced source changes can be promoted into topic-owned operations.
 
-**Projection manifest status/inspect gap**
+**Projection manifest status/inspect baseline**
 
-- `root_mismatch` cannot be implemented against the current fixture persisted-manifest stand-in without fabricating semantics. The stand-in derives manifest identity and entries from the projection record and fixture content tree, but it does not persist the materialized root location or a stable normalized root binding alongside the manifest.
-- To implement `root_mismatch`, projection materialization must persist a manifest record that includes the projection ID, resolved view/tree identity, manifest digest/ref, and the normalized local root binding used at materialization time. Status/inspect can then compare the caller-supplied `--projection-root` after the same normalization and return `content_verification: root_mismatch` before any byte comparison.
-- Until that persistence contract exists, fixture status/inspect should continue to cover feasible local verification failures such as missing roots, non-directory roots, scan failures, dirty content, missing/extra files, and executable metadata drift.
+- Projection materialization persists a local manifest envelope with manifest identity and a normalized root binding. Status and inspect validate that envelope before content verification.
+- Stale or malformed persisted envelopes report `content_verification: manifest_invalid`; a valid envelope whose root binding differs from the current projection `root_ref` reports `content_verification: root_mismatch` before byte comparison.
+- Fixture status/inspect should continue to cover missing roots, non-directory roots, scan failures, unavailable manifest metadata, dirty content, missing/extra files, executable metadata drift, invalid envelopes, and valid root-binding mismatches.
 
 **Work packages**
 

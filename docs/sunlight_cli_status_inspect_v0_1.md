@@ -190,7 +190,7 @@ Required rules:
 
 - `projection_root.path` is a local-only path and must not be exported or stored in commit-default records.
 - `verification_state` is `present` when the root exists and is a directory, `missing` when it does not exist, and `not_directory` when the supplied path is a non-directory.
-- `content_verification` remains `not_available_without_persisted_manifest` until projection materialization persists a manifest that can be compared against the local root.
+- `content_verification` remains `not_available_without_persisted_manifest` until projection materialization records comparable manifest metadata for the local root.
 - Counts and `sample_paths` are scan summaries for operator visibility, not native provenance and not proof of content correctness.
 - Without `--projection-root`, projection status embeds no local root verification details and projection inspect returns `local_root_verification: null`.
 
@@ -255,16 +255,24 @@ Required identity inputs:
 
 Required local root binding:
 
-- Materialization must persist a local-only envelope beside the manifest with `manifest`, `root_binding.normalized_root_ref`, `root_binding.normalization`, and `root_binding.privacy_class`.
+- Materialization must persist a local-only envelope beside the manifest with manifest identity fields, `manifest.root_ref`, `root_binding.normalized_root_ref`, `root_binding.normalization`, and `root_binding.privacy_class`.
 - `root_binding.normalized_root_ref` is the normalized form of the materialized local root used for later status/inspect comparison. For the v0.1 local URI fixture contract, normalization is `local_uri_relative_v1`: path separators are `/`, dot segments are removed, the value is rooted under the projection-local `local://.sunlight/projections/...` namespace, and host absolute paths are not retained.
 - The root binding is comparison metadata only. It is excluded from `manifest_digest`, projection manifest identity, exportable records, checkpoints, and commit-default records.
-- `root_mismatch` requires a valid persisted manifest plus persisted root binding. The current stateless fixture path must not synthesize `root_mismatch` from scan summaries alone.
+- `root_mismatch` requires a valid persisted manifest envelope whose `root_binding.normalized_root_ref` differs from the current projection `root_ref`. Status/inspect must not synthesize `root_mismatch` from scan summaries or the caller-supplied filesystem path alone.
 
 ```json
 {
   "manifest": {
     "id": "projection_manifest_exec_auth_profile_0001",
-    "manifest_digest": "sha256:projection_manifest_exec_auth_profile_0001"
+    "manifest_digest": "sha256:projection_manifest_exec_auth_profile_0001",
+    "projection_id": "projection_exec_auth_profile_0001",
+    "resolved_view_id": "view_base_0001",
+    "materialization_generation": 1,
+    "root_ref": {
+      "value": "local://.sunlight/projections/execution/projection_exec_auth_profile_0001",
+      "privacy": "local_only_path",
+      "privacy_class": "local_only"
+    }
   },
   "root_binding": {
     "normalized_root_ref": {
@@ -302,8 +310,9 @@ Required local-only privacy rules:
 Invalidation rules:
 
 - A manifest is stale when the projection record changes, the projection is refreshed, the input resolved view or session generation moves, the tree identity changes, the path policy changes, the strategy changes in a way that changes materialized semantics, or the materialization generation increments.
-- A stale, missing, unreadable, schema-invalid, or digest-mismatched manifest sets `content_verification` to `manifest_unavailable` or `manifest_invalid`; it must not silently fall back to verified.
-- A caller-supplied local root whose normalized root ref does not match the projection `root_ref` is `root_mismatch` and must not be content-verified against that manifest.
+- Missing or unreadable manifest metadata sets `content_verification` to `not_available_without_persisted_manifest` or `manifest_unavailable`; it must not be treated as `root_mismatch`.
+- A stale, malformed, schema-invalid, digest-mismatched, or identity-mismatched persisted envelope sets `content_verification` to `manifest_invalid`; it must not silently fall back to verified.
+- A valid persisted envelope whose normalized root binding does not match the current projection `root_ref` is `root_mismatch` and must not be content-verified against that manifest.
 - Verification must fail closed: any unreadable expected file, unsupported metadata check, or path traversal ambiguity prevents `verified`.
 
 When a valid manifest exists, `local_root_verification` extends the scan block with content-verification fields:
@@ -331,8 +340,8 @@ Allowed `content_verification` values:
 | `verified` | The local root exists, the manifest is valid, every manifest entry matches local content and required metadata, and no disallowed extra paths are present. |
 | `dirty` | The manifest is valid, but local content, required metadata, path set, or policy state differs. |
 | `manifest_unavailable` | A manifest ref is expected but missing or unreadable. |
-| `manifest_invalid` | The manifest schema, digest, identity inputs, or entry ordering is invalid. |
-| `root_mismatch` | The caller-supplied local root does not match the projection root recorded by the manifest. |
+| `manifest_invalid` | The persisted manifest envelope, schema, digest, identity inputs, or entry ordering is invalid or stale. |
+| `root_mismatch` | A valid persisted envelope records a root binding that does not match the current projection root. |
 | `verification_error` | Verification could not complete because of an unreadable file, unsupported required metadata check, traversal ambiguity, or other local IO error. |
 
 ### Artifact Summary
@@ -1002,13 +1011,14 @@ Use the `fixture-basic-app` repository and stable labels from the artifact IO an
 | `status_repository_snapshot` | Init, create topic, start session, patch once, run `sun status --json`. | Shows base checkpoint, open topic head, active session, current generation, native errors array, and no Git working tree dependency. |
 | `status_session_read_after_write` | Patch `src/auth.ts`, then run `sun status --session session_agent_a --json`. | Shows `gen_agent_a_0002`, `view_agent_a_after_patch_0001`, topic head `rev_auth_nullability_0001`, and changed artifact after hash. |
 | `status_topic_without_session` | Create topic and patch, then inspect topic status without passing a session. | Shows topic metadata, head revision, revision count, and changed artifacts. |
-| `status_projection_local_root_present` | Materialize the fixture projection, then run projection status with its local root. | Shows `status.projection`, lifecycle `materialized`, `verification_state: present`, local-only root path metadata, count summaries, and no content verification before a persisted manifest exists. |
+| `status_projection_local_root_present` | Materialize the fixture projection, then run projection status with its local root. | Shows `status.projection`, lifecycle `materialized`, `verification_state: present`, local-only root path metadata, count summaries, and content verification only from persisted manifest metadata. |
 | `status_projection_manifest_verified` | Materialize the fixture projection with a persisted manifest, then run projection status with its unchanged local root. | Shows manifest ref/digest, `content_verification: verified`, `dirty_local: false`, zero mismatches, and file hashes verified from manifest entries rather than scan summaries. |
 | `status_projection_manifest_dirty_content` | Modify one projected file after manifest creation, then run projection status with the same local root. | Shows `content_verification: dirty`, `dirty_local: true`, one mismatched file, and no native topic/session/checkpoint mutation. |
 | `status_projection_manifest_dirty_executable` | Toggle executable metadata on `scripts/build.sh` where the platform supports executable bits. | Shows `content_verification: dirty`, one metadata mismatch, and unchanged content hash for the file. |
 | `status_projection_manifest_extra_missing` | Add an untracked local file and remove one manifest entry from the projection root. | Shows `content_verification: dirty`, nonzero `extra_files` and `missing_files`, bounded local-only path samples, and unchanged projection refs. |
-| `status_projection_manifest_invalidated` | Refresh or rematerialize the projection so the manifest identity no longer matches the projection record. | Shows `content_verification: manifest_invalid` or `manifest_unavailable`; status does not reuse stale content verification. |
-| `status_projection_root_mismatch` | Supply a different directory for a projection that has a valid manifest. | Shows `content_verification: root_mismatch` and does not compare that directory's bytes to the manifest. |
+| `status_projection_manifest_invalidated` | Corrupt the persisted local manifest envelope or make its projection identity stale. | Shows `content_verification: manifest_invalid`; status does not reuse stale content verification or report `root_mismatch`. |
+| `status_projection_root_mismatch` | Change only the persisted envelope root binding for a projection that otherwise has a valid manifest. | Shows `content_verification: root_mismatch` and does not compare that root's bytes to the manifest. |
+| `status_projection_no_synthetic_root_mismatch` | Supply a different directory without a persisted binding for that directory. | Shows dirty or missing content results from manifest entry comparison, not `root_mismatch`. |
 | `status_projection_local_root_missing` | Run projection status with a missing local root. | Shows `verification_state: missing`, zero counts, and unchanged native projection refs. |
 | `status_projection_local_root_not_directory` | Run projection status with a file path as the local root. | Shows `verification_state: not_directory`, no file content verification, and no native mutation. |
 | `inspect_artifact_after_patch` | Patch `src/auth.ts`, then inspect it through the same session. | Shows current after hash, path history, latest operation, topic, revision, session, and before/after refs. |

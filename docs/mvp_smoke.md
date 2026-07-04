@@ -50,11 +50,11 @@ On platforms with executable mode support, the smoke also verifies
 `scripts/build.sh` is executable and `src/auth.ts` is not.
 
 Projection status and inspect smoke coverage verifies the local root exists and
-reports file, byte, executable, and sample-path summaries. It does not verify
-projection content hashes yet; the JSON explicitly reports
-`content_verification: not_available_without_persisted_manifest` until
-materialization persists a comparable manifest. The persisted manifest contract
-and future acceptance coverage are defined in
+reports file, byte, executable, sample-path, and persisted-manifest verification
+summaries. When comparable persisted manifest metadata is unavailable, the JSON
+reports `content_verification: not_available_without_persisted_manifest`; valid
+persisted envelopes enable verified, dirty, invalid, and root-mismatch outcomes.
+The persisted manifest contract and acceptance coverage are defined in
 [sunlight_cli_status_inspect_v0_1.md](sunlight_cli_status_inspect_v0_1.md).
 
 The aggregate smoke suite also runs the validation and projection strategy

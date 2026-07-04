@@ -253,6 +253,32 @@ Required identity inputs:
 - Manifest identity includes `projection_id`, `purpose`, `strategy`, `repository_id`, `resolved_view_id`, optional `session_generation_id`, `tree_identity`, `path_policy_id`, `operation_semantics_version`, and `materialization_generation`.
 - The manifest is invalid for any other projection record, resolved view, session generation, tree identity, path policy, strategy, or materialization generation.
 
+Required local root binding:
+
+- Materialization must persist a local-only envelope beside the manifest with `manifest`, `root_binding.normalized_root_ref`, `root_binding.normalization`, and `root_binding.privacy_class`.
+- `root_binding.normalized_root_ref` is the normalized form of the materialized local root used for later status/inspect comparison. For the v0.1 local URI fixture contract, normalization is `local_uri_relative_v1`: path separators are `/`, dot segments are removed, the value is rooted under the projection-local `local://.sunlight/projections/...` namespace, and host absolute paths are not retained.
+- The root binding is comparison metadata only. It is excluded from `manifest_digest`, projection manifest identity, exportable records, checkpoints, and commit-default records.
+- `root_mismatch` requires a valid persisted manifest plus persisted root binding. The current stateless fixture path must not synthesize `root_mismatch` from scan summaries alone.
+
+```json
+{
+  "manifest": {
+    "id": "projection_manifest_exec_auth_profile_0001",
+    "manifest_digest": "sha256:projection_manifest_exec_auth_profile_0001"
+  },
+  "root_binding": {
+    "normalized_root_ref": {
+      "value": "local://.sunlight/projections/execution/projection_exec_auth_profile_0001",
+      "privacy": "local_only_path",
+      "privacy_class": "local_only"
+    },
+    "normalization": "local_uri_relative_v1",
+    "privacy_class": "local_only"
+  },
+  "privacy_class": "local_only"
+}
+```
+
 Required path and executable metadata:
 
 - `entries` are sorted by normalized repository-relative `path` under the projection path policy.

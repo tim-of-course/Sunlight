@@ -380,6 +380,32 @@ pub struct ProjectionManifestRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionManifestLocalRecord {
+    pub manifest: ProjectionManifestRecord,
+    pub root_binding: ProjectionManifestRootBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionManifestRootBinding {
+    pub normalized_root_ref: ProjectionRootRef,
+    pub normalization: ProjectionRootNormalization,
+    pub privacy_class: PrivacyClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionRootNormalization {
+    LocalUriRelativeV1,
+}
+
+impl ProjectionRootNormalization {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalUriRelativeV1 => "local_uri_relative_v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionManifestEntry {
     pub path: String,
     pub kind: ArtifactKind,
@@ -515,6 +541,36 @@ impl ProjectionManifestRecord {
             JsonValue::String(self.created_at.clone()),
         );
         JsonValue::Object(object)
+    }
+}
+
+impl ProjectionManifestLocalRecord {
+    pub fn digest(&self) -> Result<String, ProjectionManifestDigestError> {
+        self.manifest.digest()
+    }
+
+    pub fn to_json_value(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert("manifest".to_string(), self.manifest.to_json_value());
+        object.insert(
+            "root_binding".to_string(),
+            manifest_root_binding_json(&self.root_binding),
+        );
+        object.insert(
+            "privacy_class".to_string(),
+            JsonValue::String(PrivacyClass::LocalOnly.as_str().to_string()),
+        );
+        JsonValue::Object(object)
+    }
+}
+
+impl ProjectionManifestRootBinding {
+    pub fn from_normalized_root_ref(normalized_root_ref: ProjectionRootRef) -> Self {
+        Self {
+            normalized_root_ref,
+            normalization: ProjectionRootNormalization::LocalUriRelativeV1,
+            privacy_class: PrivacyClass::LocalOnly,
+        }
     }
 }
 
@@ -1423,6 +1479,23 @@ fn root_ref_json(root_ref: &ProjectionRootRef) -> JsonValue {
     JsonValue::Object(object)
 }
 
+fn manifest_root_binding_json(root_binding: &ProjectionManifestRootBinding) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "normalized_root_ref".to_string(),
+        root_ref_json(&root_binding.normalized_root_ref),
+    );
+    object.insert(
+        "normalization".to_string(),
+        JsonValue::String(root_binding.normalization.as_str().to_string()),
+    );
+    object.insert(
+        "privacy_class".to_string(),
+        JsonValue::String(root_binding.privacy_class.as_str().to_string()),
+    );
+    JsonValue::Object(object)
+}
+
 fn optional_string_json(value: Option<&str>) -> JsonValue {
     value
         .map(|value| JsonValue::String(value.to_string()))
@@ -2045,6 +2118,27 @@ mod tests {
             "local://.sunlight/projections/execution/moved-root".to_string();
         moved_manifest.created_at = "2026-07-04T00:00:00Z".to_string();
         assert_eq!(moved_manifest.digest().unwrap(), manifest.manifest_digest);
+
+        let local_record = ProjectionManifestLocalRecord {
+            manifest: manifest.clone(),
+            root_binding: ProjectionManifestRootBinding::from_normalized_root_ref(
+                manifest.root_ref.clone(),
+            ),
+        };
+        let mut rebound_local_record = local_record.clone();
+        rebound_local_record.root_binding.normalized_root_ref.value =
+            "local://.sunlight/projections/execution/rebound-root".to_string();
+        assert_eq!(local_record.digest().unwrap(), manifest.manifest_digest);
+        assert_eq!(
+            rebound_local_record.digest().unwrap(),
+            manifest.manifest_digest
+        );
+        assert_ne!(rebound_local_record.root_binding, local_record.root_binding);
+        let local_record_json =
+            String::from_utf8(canonical_json_bytes(&local_record.to_json_value()).unwrap())
+                .unwrap();
+        assert!(local_record_json.contains("\"root_binding\""));
+        assert!(local_record_json.contains("\"normalization\":\"local_uri_relative_v1\""));
 
         let next_generation_manifest = projection_manifest_from_content_tree(
             &projection,

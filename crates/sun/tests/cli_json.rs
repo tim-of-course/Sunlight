@@ -1421,6 +1421,114 @@ fn git_export_write_plan_json_fixture_returns_writer_plan() {
 }
 
 #[test]
+fn git_export_execute_fixture_json_returns_execution_success() {
+    let repo = TestRepo::new("git-export-execute-fixture-success");
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/auth-profile-ready")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--execute-fixture")
+        .arg("success")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export execute fixture should run");
+
+    assert_success(&output);
+    assert!(!repo.path().join(".git").exists());
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"git.export.execute_fixture\""));
+    assert!(stdout.contains("\"lifecycle_state\":\"exported\""));
+    assert!(stdout
+        .contains("\"created_commit_id\":\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
+    assert!(stdout.contains(
+        "\"summary\":{\"commit_created\":true,\"ref_updated\":true,\"export_map_written\":true,\"completed_steps\":[\"commit_created\",\"ref_updated\",\"export_map_written\"]}"
+    ));
+    assert!(stdout.contains("\"error\":null"));
+    assert!(stdout.contains("\"export_map\":{"));
+    assert!(stdout
+        .contains("\"git_commit_ids\":[\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"));
+}
+
+#[test]
+fn git_export_execute_fixture_json_ref_update_partial_failure() {
+    let repo = TestRepo::new("git-export-execute-fixture-ref-update-partial");
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/auth-profile-ready")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--execute-fixture")
+        .arg("ref-update-failure")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export execute fixture should run");
+
+    assert_success(&output);
+    assert!(!repo.path().join(".git").exists());
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"git.export.execute_fixture\""));
+    assert!(stdout.contains("\"lifecycle_state\":\"partial\""));
+    assert!(stdout
+        .contains("\"created_commit_id\":\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
+    assert!(stdout.contains(
+        "\"summary\":{\"commit_created\":true,\"ref_updated\":false,\"export_map_written\":false,\"completed_steps\":[\"commit_created\"]}"
+    ));
+    assert!(stdout.contains("\"code\":\"export_ref_update_failed\""));
+    assert!(stdout.contains("\"failed_step\":\"ref_updated\""));
+    assert!(stdout.contains("\"message\":\"fixture ref update failed\""));
+    assert!(stdout.contains("\"export_map\":null"));
+}
+
+#[test]
+fn git_export_execute_fixture_json_export_map_partial_failure() {
+    let repo = TestRepo::new("git-export-execute-fixture-export-map-partial");
+
+    let output = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/auth-profile-ready")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--execute-fixture")
+        .arg("export-map-failure")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export execute fixture should run");
+
+    assert_success(&output);
+    assert!(!repo.path().join(".git").exists());
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"git.export.execute_fixture\""));
+    assert!(stdout.contains("\"lifecycle_state\":\"partial\""));
+    assert!(stdout
+        .contains("\"created_commit_id\":\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
+    assert!(stdout.contains(
+        "\"summary\":{\"commit_created\":true,\"ref_updated\":true,\"export_map_written\":false,\"completed_steps\":[\"commit_created\",\"ref_updated\"]}"
+    ));
+    assert!(stdout.contains("\"code\":\"export_map_write_failed\""));
+    assert!(stdout.contains("\"failed_step\":\"export_map_written\""));
+    assert!(stdout.contains("\"message\":\"fixture export map write failed\""));
+    assert!(stdout.contains("\"export_map\":null"));
+}
+
+#[test]
 fn git_export_write_plan_json_fixture_target_ref_conflict_returns_planner_error() {
     let repo = TestRepo::new("git-export-write-plan-ref-conflict");
 

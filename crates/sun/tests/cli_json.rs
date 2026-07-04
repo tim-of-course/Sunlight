@@ -1554,13 +1554,21 @@ fn git_export_execute_local_json_writes_real_commit_and_ref() {
     let stdout = stdout(&output);
     assert!(stdout.contains("\"command\":\"git.export.execute\""));
     assert!(stdout.contains("\"lifecycle_state\":\"exported\""));
-    assert!(stdout.contains("\"summary\":{\"commit_created\":true,\"ref_updated\":true,\"export_map_written\":true"));
+    assert!(stdout.contains(
+        "\"summary\":{\"commit_created\":true,\"ref_updated\":true,\"export_map_written\":true"
+    ));
     assert!(stdout.contains("\"export_map\":{"));
 
     let commit_id = json_string_field(&stdout, "created_commit_id");
-    let ref_id = git(repo.path(), &["rev-parse", "refs/heads/sunlight/local-export"]);
+    let ref_id = git(
+        repo.path(),
+        &["rev-parse", "refs/heads/sunlight/local-export"],
+    );
     assert_eq!(ref_id.trim(), commit_id);
-    assert_eq!(git(repo.path(), &["cat-file", "-t", &commit_id]).trim(), "commit");
+    assert_eq!(
+        git(repo.path(), &["cat-file", "-t", &commit_id]).trim(),
+        "commit"
+    );
     assert_eq!(
         git(repo.path(), &["rev-parse", &format!("{commit_id}^")]).trim(),
         base_commit_id
@@ -1609,7 +1617,10 @@ fn git_export_execute_local_ignores_dirty_worktree_and_index() {
 fn git_export_execute_local_target_ref_conflict_fails() {
     let repo = TestRepo::new("git-export-execute-local-ref-conflict");
     init_local_git_repo(&repo);
-    let unrelated_commit_id = git(repo.path(), &["commit-tree", "HEAD^{tree}", "-m", "unrelated"]);
+    let unrelated_commit_id = git(
+        repo.path(),
+        &["commit-tree", "HEAD^{tree}", "-m", "unrelated"],
+    );
     let unrelated_commit_id = unrelated_commit_id.trim().to_string();
     git(
         repo.path(),
@@ -1641,7 +1652,10 @@ fn git_export_execute_local_target_ref_conflict_fails() {
     let stdout = stdout(&output);
     assert!(stdout.contains("\"code\":\"export_target_ref_conflict\""));
     assert!(stdout.contains("\"target_ref\":\"refs/heads/sunlight/local-conflict\""));
-    let ref_id = git(repo.path(), &["rev-parse", "refs/heads/sunlight/local-conflict"]);
+    let ref_id = git(
+        repo.path(),
+        &["rev-parse", "refs/heads/sunlight/local-conflict"],
+    );
     assert_eq!(ref_id.trim(), unrelated_commit_id);
 }
 
@@ -1676,7 +1690,10 @@ fn git_export_execute_local_export_map_partial_failure() {
     assert!(stdout.contains("\"failed_step\":\"export_map_written\""));
     assert!(stdout.contains("\"export_map\":null"));
     let commit_id = json_string_field(&stdout, "created_commit_id");
-    let ref_id = git(repo.path(), &["rev-parse", "refs/heads/sunlight/local-map-partial"]);
+    let ref_id = git(
+        repo.path(),
+        &["rev-parse", "refs/heads/sunlight/local-map-partial"],
+    );
     assert_eq!(ref_id.trim(), commit_id);
 }
 

@@ -2636,11 +2636,7 @@ fn fixture_git_export_content_files() -> Vec<GitExportContentFile> {
     ]
 }
 
-fn git_export_content_file(
-    path: &str,
-    bytes: &[u8],
-    executable: bool,
-) -> GitExportContentFile {
+fn git_export_content_file(path: &str, bytes: &[u8], executable: bool) -> GitExportContentFile {
     GitExportContentFile {
         path: path.to_string(),
         bytes: bytes.to_vec(),

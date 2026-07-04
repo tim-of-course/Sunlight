@@ -385,14 +385,13 @@ pub fn plan_fixture_projection_materialization(
     view: &ResolvedViewResult,
     request: ProjectionMaterializationRequest,
 ) -> Result<ProjectionMaterializationPlan, ProjectionMaterializationError> {
-    let tree_identity = validate_projectable_view(view).map_err(|error| {
-        ProjectionMaterializationError {
+    let tree_identity =
+        validate_projectable_view(view).map_err(|error| ProjectionMaterializationError {
             code: ProjectionMaterializationErrorCode::ProjectionValidationFailed,
             resolved_view_id: view.resolved_view_id.clone(),
             strategy: None,
             validation_error: Some(error),
-        }
-    })?;
+        })?;
     let writable_policy = default_writable_policy(request.purpose);
     let strategy = select_projection_materialization_strategy(
         &request.strategy_preference,
@@ -856,7 +855,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(plan.source, ProjectionMaterializationSource::ResolvedContentTree);
+        assert_eq!(
+            plan.source,
+            ProjectionMaterializationSource::ResolvedContentTree
+        );
         assert_eq!(plan.projection.strategy, ProjectionStrategy::Reflink);
         assert_eq!(
             plan.projection.created_from_content_tree,
@@ -868,7 +870,10 @@ mod tests {
             plan.local_metadata.root_ref.privacy,
             RootRefPrivacy::LocalOnlyPath
         );
-        assert!(plan.local_metadata.cache_key.contains(":execution:reflink:"));
+        assert!(plan
+            .local_metadata
+            .cache_key
+            .contains(":execution:reflink:"));
     }
 
     #[test]
@@ -941,7 +946,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(plan.projection.strategy, ProjectionStrategy::HardlinkReadonly);
+        assert_eq!(
+            plan.projection.strategy,
+            ProjectionStrategy::HardlinkReadonly
+        );
         assert_eq!(plan.projection.writable_policy, WritablePolicy::ReadOnly);
 
         let error = select_projection_materialization_strategy(

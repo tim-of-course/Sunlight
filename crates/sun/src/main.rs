@@ -26,10 +26,10 @@ use sunlight_core::execution::{
     OutputClassification, OutputKind, PromotionCandidateProvenance,
 };
 use sunlight_core::git_export::{
-    git_export_checkpoint, plan_git_export_writer, GitExportError, GitExportPlanningError,
-    GitExportRefUpdatePlan, GitExportRequest, GitExportResponse, GitExportValidationFailure,
-    GitExportValidationReport, GitExportWriterInput, GitExportWriterPlan,
-    GitExportCommitPlan, GitExportRepositoryState, GitRefState, ImportedBaseGitCommit,
+    git_export_checkpoint, plan_git_export_writer, GitExportCommitPlan, GitExportError,
+    GitExportPlanningError, GitExportRefUpdatePlan, GitExportRepositoryState, GitExportRequest,
+    GitExportResponse, GitExportValidationFailure, GitExportValidationReport, GitExportWriterInput,
+    GitExportWriterPlan, GitRefState, ImportedBaseGitCommit,
 };
 use sunlight_core::projection::{
     fixture_compatibility_projection_from_resolved_view,
@@ -497,10 +497,7 @@ fn git_export(ctx: &CommandContext) -> Result<(), CliError> {
         if ctx.json {
             println!("{}", git_export_write_plan_success_envelope(&plan));
         } else {
-            println!(
-                "{} {}",
-                plan.commit.checkpoint_id, plan.ref_update.git_ref
-            );
+            println!("{} {}", plan.commit.checkpoint_id, plan.ref_update.git_ref);
         }
 
         return Ok(());

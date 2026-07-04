@@ -1195,15 +1195,15 @@ fn git_export_write_plan_json_fixture_returns_writer_plan() {
     );
     assert!(stdout.contains("\"planned_commit\":{"));
     assert!(stdout.contains("\"parent_commit_id\":\"git_sha1_base_parent_0001\""));
-    assert!(
-        stdout.contains("\"planned_commit_id\":\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"")
-    );
+    assert!(stdout
+        .contains("\"planned_commit_id\":\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
     assert!(stdout.contains(
         "\"ref_update\":{\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\",\"expected_old_commit_id\":\"git_sha1_base_parent_0001\",\"new_commit_id\":\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"allowed_reason\":\"replace_selected_parent\"}"
     ));
     assert!(stdout.contains("\"export_map\":{"));
     assert!(stdout.contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
-    assert!(stdout.contains("\"git_commit_ids\":[\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"));
+    assert!(stdout
+        .contains("\"git_commit_ids\":[\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"));
 }
 
 #[test]

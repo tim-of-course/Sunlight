@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest integrated pass ran native `scripts/smoke-suite.ps1` with `cargo fmt --check`, `cargo check`, `cargo test` with 74 CLI tests and 125 core tests, validation smoke, projection strategy smoke, and MVP smoke covering projection-root status/inspect verification. Scratchpad guard must run after this edit.
+- Verification: latest integrated pass ran native `scripts/smoke-suite.ps1` with `cargo fmt --check`, `cargo check`, `cargo test` with 74 Windows CLI tests and 128 core tests, validation smoke, projection strategy smoke, and MVP smoke. WSL verification also covered Unix-only projection symlink scan tests with 76 CLI tests. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -111,14 +111,15 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-status-inspect-docs`: integrated as `b42df81`.
 - Completed slice `projection-manifest-contract`: integrated as `2e9adc6`.
 - Completed slice `projection-local-root-scan-hardening`: integrated as `3228635`.
-- Active slice `projection-manifest-foundation`: WSL clone `/home/timothycard/code/Sunlight-2-projection-manifest-foundation-20260704-111026`, branch `dm/projection-manifest-foundation`, run artifacts under `C:\tmp\sunlight-manager\20260704-111026`.
-- Active slice `projection-scan-symlink-edge-cases`: WSL clone `/home/timothycard/code/Sunlight-2-projection-scan-symlink-edge-cases-20260704-111026`, branch `dm/projection-scan-symlink-edge-cases`, run artifacts under `C:\tmp\sunlight-manager\20260704-111026`.
-- Next heartbeat should inspect active WSL progress, import verified work if finished, run full smoke-suite validation, and keep one or two project-wide slices moving.
+- Completed slice `projection-manifest-foundation`: integrated as `a318f22`; formatting checkpoint `a6a99a4`.
+- Completed slice `projection-scan-symlink-edge-cases`: integrated as `eddd6e8`.
+- Active slice `projection-manifest-status-fixture`: WSL clone `/home/timothycard/code/Sunlight-2-projection-manifest-status-fixture-20260704-114527`, branch `dm/projection-manifest-status-fixture`, run artifacts under `C:\tmp\sunlight-manager\20260704-114527`.
+- Next heartbeat should inspect active WSL progress, import verified work if finished, run full smoke-suite validation, and keep project-wide projection manifest verification moving.
 
 ## Candidate Next Slices
 
-- Follow through on projection manifest foundation after active slice lands.
-- Follow through on projection scan symlink edge cases after active slice lands.
+- Projection manifest dirty-content verification after the verified-root fixture path lands.
+- Projection manifest extra/missing file verification after dirty-content behavior is stable.
 - Validation smoke CI/usage follow-up remains optional after the smoke suite settles.
 
 ## Decisions

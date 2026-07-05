@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `d72b79d` and covered `815b49a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 148 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Docs-only compat import alignment passed targeted `rg` and `git diff --check` after `d6162bd`. Optional Super Search validation passed after `e02debe`; refresh is active after the recent compatibility import work.
+- Verification: latest full pass ran after `d72b79d` and covered `815b49a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 148 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Docs-only compat import alignment passed targeted `rg` and `git diff --check` after `d6162bd`. Optional Super Search validation passed after `0bb5ae6`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat import, and fixture Git export.
 
 ## Active Work
 
@@ -102,7 +102,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `compat-import-rename-plus-edit-cli-coverage`: integrated as `815b49a`; WSL implementation was imported manager-side after WSL `cargo-fmt` was unavailable, with Windows `cargo fmt` and focused CLI verification.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-rename-plus-edit`: default `scripts/smoke-suite.ps1` passed after `d72b79d`.
 - Completed slice `compat-import-docs-acceptance-sync`: integrated as `d6162bd`; WSL docs-only implementation was imported manager-side after prompt quoting caused a nonzero helper exit, with targeted docs verification passing on Windows.
-- Active verification slice `external-validation-super-search-refresh-after-compat-import-hardening`: rerun the optional Super Search validation harness after the expanded compatibility import fixture coverage and docs sync.
+- Completed verification slice `external-validation-super-search-refresh-after-compat-import-hardening`: optional `scripts/external-validation-super-search.ps1` passed after `0bb5ae6` with Super Search `mix test`, `bun run test`, temp-clone `sun init`, fixture compat import, and fixture-backed Git export.
 
 ## Candidate Next Slices
 

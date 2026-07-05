@@ -205,6 +205,13 @@ try {
     Assert-Contains $out '"validation_report_id":"validation_export_auth_profile_ready_0001"' 'policy check export validation report'
     Assert-Contains $out '"failures":[]' 'policy check export failures'
 
+    $out = Invoke-SunOk 'policy-explain' @('policy', 'explain', 'validation_export_auth_profile_ready_0001', '--json')
+    Assert-Contains $out '"command":"policy.explain"' 'policy explain command'
+    Assert-Contains $out '"validation_report_id":"validation_export_auth_profile_ready_0001"' 'policy explain validation report id'
+    Assert-Contains $out '"ids":{"validation_report_id":"validation_export_auth_profile_ready_0001"}' 'policy explain ids validation report id'
+    Assert-Contains $out '"validation_report":{"id":"validation_export_auth_profile_ready_0001"' 'policy explain validation report'
+    Assert-Contains $out '"failures":[]' 'policy explain failures'
+
     Step 'Compatibility project, diff, import, and Git export write plan'
     $out = Invoke-SunOk 'compat-project' @('compat', 'project', '--session', 'session_agent_a', '--fixture', 'basic-app', '--json')
     Assert-Contains $out '"command":"compat.project"' 'compat project command'

@@ -204,6 +204,13 @@ assert_contains "$out" '"command":"policy.check-export"' "policy check export co
 assert_contains "$out" '"validation_report_id":"validation_export_auth_profile_ready_0001"' "policy check export validation report"
 assert_contains "$out" '"failures":[]' "policy check export failures"
 
+out="$(run_ok policy-explain sun policy explain validation_export_auth_profile_ready_0001 --json)"
+assert_contains "$out" '"command":"policy.explain"' "policy explain command"
+assert_contains "$out" '"validation_report_id":"validation_export_auth_profile_ready_0001"' "policy explain validation report id"
+assert_contains "$out" '"ids":{"validation_report_id":"validation_export_auth_profile_ready_0001"}' "policy explain ids validation report id"
+assert_contains "$out" '"validation_report":{"id":"validation_export_auth_profile_ready_0001"' "policy explain validation report"
+assert_contains "$out" '"failures":[]' "policy explain failures"
+
 step "Compatibility project, diff, import, and Git export write plan"
 out="$(run_ok compat-project sun compat project --session session_agent_a --fixture basic-app --json)"
 assert_contains "$out" '"command":"compat.project"' "compat project command"

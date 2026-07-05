@@ -158,10 +158,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `git-ref-smoke-docs-coverage`: integrated as `297843e`; WSL implementation was `ae83d0f`.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-git-ref-smoke`: default `scripts/smoke-suite.ps1` passed after `c6a58c3`.
 - Completed slice `export-selector-alias-fixture-coverage`: integrated as `2e5e552`; WSL implementation was `d1fa2c5`.
+- Active verification slice `aggregate-smoke-suite-refresh-after-export-alias`: run the default smoke suite after export selector alias coverage.
 
 ## Candidate Next Slices
 
-- Next useful slice: aggregate smoke-suite refresh after export alias coverage.
+- Next useful slice after active verification: choose the next small Phase 5 operator ergonomics gap from the architecture and current CLI surface.
 
 ## Decisions
 

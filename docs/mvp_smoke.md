@@ -32,7 +32,7 @@ The smoke builds `sun`, then exercises the `basic-app` fixture end to end:
 - records the fixture `cargo test` execution
 - creates the export-ready checkpoint
 - initializes a temporary local Git repository
-- runs `sun git export --execute-local --repo <temp-repo>`
+- runs `sun git export --checkpoint <checkpoint-id> --branch <ref> --execute-local --repo <temp-repo>`
 - verifies the exported ref points to the created commit
 - verifies the commit parent and exported tree contain the expected fixture files
 

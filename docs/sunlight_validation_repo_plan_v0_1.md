@@ -68,12 +68,12 @@ Real-repo flows are limited to repository bootstrap and local export execution a
 | Resolve | `sun view resolve --fixture basic-app --json` | Fixture | Returns exact resolved view, `SingleRepoTree`, topic frontier, deterministic order, and no conflicts for compatible revisions. |
 | Resolve conflict | `sun view resolve --fixture basic-app --scenario overlapping-auth --json` | Fixture | Returns structured same-artifact conflict or staleness record without checkpoint eligibility. |
 | Run | `sun run --view view_auth_profile_ready_0001 --fixture basic-app --json -- cargo test` | Fixture | Returns `execution.run`, projection ID, command argv, output summaries, result, view, and tree identity. |
-| Projection | `sun projection create --view view_auth_profile_ready_0001 --purpose execution --fixture basic-app --json` | Fixture | Returns projection ID, purpose, strategy, root ref or handle, tree identity, and local-only policy. |
+| Projection materialization | `sun project materialize --view view_auth_profile_ready_0001 --purpose execution --fixture basic-app --json` | Fixture | Returns `projection.materialize`, projection ID, purpose, selected strategy, root ref or handle, tree identity, and local-only policy. |
 | Checkpoint | `sun checkpoint create --view view_auth_profile_ready_0001 --fixture basic-app --json` | Fixture | Returns `checkpoint.create`, checkpoint ID, conflict-free status, tree identity, selected evidence, and export readiness. |
-| Compat import | `sun compat import --projection projection_compat_agent_a_0001 --session session_agent_a --select compat_delta_src_auth_ts_0001 --fixture basic-app --json` | Fixture | Returns one `compat_import` operation, one topic revision, selected delta refs, and generation advance. |
-| Git export planning | `sun git export checkpoint_auth_profile_ready_0001 --branch refs/heads/sunlight/auth-profile-ready --fixture basic-app --plan-only --json` | Fixture plus local Git state | Returns export shape `single_checkpoint_commit`, validation report, selected parent, ref update plan, and no working-tree content dependency. |
-
-If an implementation uses `project materialize` as the CLI spelling for projection creation, the same assertions apply to `sun project materialize --view <resolved-view-id> --purpose <purpose> --fixture basic-app --json`. The validation repo should keep one canonical spelling per release and cover aliases only while both are intentionally supported.
+| Compat project | `sun compat project --session session_agent_a --fixture basic-app --json` | Fixture | Returns `compat.project`, compatibility projection ID, baseline resolved view, baseline manifest digest, tree identity, strategy, root ref, and retention state. |
+| Compat diff | `sun compat diff --projection projection_compat_agent_a_0001 --fixture basic-app --json` | Fixture | Returns `compat.diff`, projection ID, baseline view and tree, candidate counts, quarantine refs, and selected safe default candidate `compat_delta_src_auth_ts_0001`. |
+| Compat import | `sun compat import --projection projection_compat_agent_a_0001 --candidate compat_delta_src_auth_ts_0001 --fixture basic-app --json` | Fixture | Returns `compat.import`, one operation transaction, one topic revision, selected candidate delta refs, and generation advance. Repeat `--candidate <candidate-delta-id>` for multi-candidate imports; the smoke path stays single-candidate for concise output. |
+| Git export write planning | `sun git export --checkpoint checkpoint_auth_profile_ready_0001 --branch refs/heads/sunlight/auth-profile-ready --fixture basic-app --write-plan --json` | Fixture plus local Git state | Returns `git.export.write_plan`, export shape `single_checkpoint_commit`, validation report, selected parent, ref update plan, planned commit ID, and no working-tree content dependency. |
 
 ## Smoke Flow Order
 
@@ -84,10 +84,10 @@ Run smoke flows in this order so failures point to the earliest broken contract:
 3. Patch one existing artifact and write one new artifact; verify read-after-write IDs.
 4. Resolve compatible topic revisions into `view_auth_profile_ready_0001`.
 5. Resolve the overlapping-auth scenario and verify a structured conflict prevents checkpoint creation.
-6. Create an execution projection and run the fixture command.
+6. Materialize an execution projection and run the fixture command.
 7. Create a checkpoint from the conflict-free resolved view and passing execution evidence.
-8. Create a compatibility projection, import one selected delta, and verify normal operation provenance.
-9. Plan Git export for `single_checkpoint_commit`; later writer tests may create the real commit after policy gates are implemented.
+8. Create a compatibility projection, diff it, import one selected candidate delta, and verify normal operation provenance.
+9. Write-plan Git export for `single_checkpoint_commit`; writer tests may create the real commit after policy gates are implemented.
 
 ## Expected CI Commands
 

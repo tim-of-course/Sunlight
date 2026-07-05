@@ -193,7 +193,7 @@ sun patch src/auth.ts --session S1 < patch.diff
 sun view resolve --base main@K100 --include auth-rework@r3,profile-ui@r2
 sun run V42 -- bun test
 sun checkpoint create V42 --name auth-profile-ready
-sun git export K18 --branch feature/auth-profile-ready
+sun git export --checkpoint K18 --branch feature/auth-profile-ready
 ```
 
 ## 6.1 Authoring invariants
@@ -712,7 +712,7 @@ sun run <view> -- <command>
 sun execution promote-output <execution> --to-topic <topic> --select <paths>
 sun checkpoint create <view>
 sun publish <topic|checkpoint> --policy <policy>
-sun git export <checkpoint>
+sun git export --checkpoint <checkpoint>
 ```
 
 # Appendix C. Source context used

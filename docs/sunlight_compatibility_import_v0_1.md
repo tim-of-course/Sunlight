@@ -115,7 +115,7 @@ Minimum CLI:
 ```text
 sun compat project --session <session> --json
 sun compat diff --projection <projection-id> --json
-sun compat import --projection <projection-id> --candidate <candidate-delta-id>... --json
+sun compat import --projection <projection-id> --candidate <candidate-delta-id> --candidate <candidate-delta-id> --json
 ```
 
 Required common preconditions:
@@ -319,7 +319,7 @@ Compatibility import extends the existing JSON envelope and dotted command namin
 | --- | --- |
 | `sun compat project --session <session> --json` | Returns `command: "compat.project"`, projection ID, session ID, baseline resolved view ID, tree identity, path policy, strategy, root ref, and retention state |
 | `sun compat diff --projection <projection-id> --json` | Returns `command: "compat.diff"`, projection ID, baseline view/tree, candidate counts by classification, selected-safe defaults, warnings, and quarantine refs |
-| `sun compat import --projection <projection-id> --candidate ... --json` | Returns `command: "compat.import"`, operation ID, topic revision ID, new session generation, resolved view, tree identity, selected candidate IDs, imported artifact summaries, ignored candidates, and quarantine refs |
+| `sun compat import --projection <projection-id> --candidate <candidate-delta-id> --candidate <candidate-delta-id> --json` | Returns `command: "compat.import"`, operation ID, topic revision ID, new session generation, resolved view, tree identity, selected candidate IDs, imported artifact summaries, ignored candidates, and quarantine refs |
 | `sun status --projection <projection-id> --json` | Shows projection metadata, dirty candidate summary, quarantine count, last import attempt, retention state, and native errors |
 | `sun status --session <session> --json` | Includes recent compatibility projections bound to the session and last import operation, if any |
 | `sun inspect projection:<projection-id> --json` | Shows local-only projection metadata, baseline manifest digest, view/tree refs, path policy, strategy, dirty state, quarantine refs, and retention |

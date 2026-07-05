@@ -984,6 +984,19 @@ fn status(ctx: &CommandContext) -> Result<(), CliError> {
                     fixture_status_topic_text()
                 }
             }
+            StatusScope::View(view_id) => {
+                let view = fixture_resolved_view_by_id(&view_id)
+                    .ok_or_else(|| object_not_found("resolved_view", &view_id))?;
+                if ctx.json {
+                    fixture_status_view_json(&view)
+                } else {
+                    format!(
+                        "{} {}",
+                        view.resolved_view_id,
+                        resolved_view_lifecycle_state(&view)
+                    )
+                }
+            }
             StatusScope::Projection(projection_id) => {
                 let projection = fixture_projection_by_id(&projection_id)
                     .ok_or_else(|| object_not_found("projection", &projection_id))?
@@ -1110,6 +1123,7 @@ enum StatusScope {
     Repository,
     Session(String),
     Topic(String),
+    View(String),
     Projection(String),
     Checkpoint(String),
     ExportMap(String),
@@ -2177,6 +2191,12 @@ fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, C
                     .ok_or_else(|| invalid_request("usage: sun status --topic <topic>"))?;
                 scope = StatusScope::Topic(value.clone());
             }
+            "--view" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun status --view <resolved-view-id>")
+                })?;
+                scope = StatusScope::View(value.clone());
+            }
             "--projection" => {
                 let value = args.next().ok_or_else(|| {
                     invalid_request("usage: sun status --projection <projection-id>")
@@ -2467,11 +2487,14 @@ fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliEr
                 format!("operation {} compat_import", response.operation_id)
             });
         }
-        if operation_id == "op_auth_trim_guard_0001" {
+        if matches!(
+            operation_id,
+            "op_auth_trim_guard_0001" | "op_profile_auth_null_guard_0001"
+        ) {
             return Ok(if json {
-                fixture_inspect_operation_json()
+                fixture_inspect_operation_json(operation_id)?
             } else {
-                "operation op_auth_trim_guard_0001 patch src/auth.ts".to_string()
+                format!("operation {operation_id} patch src/auth.ts")
             });
         }
         return Err(object_not_found("operation", operation_id));
@@ -2521,6 +2544,28 @@ fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliEr
             fixture_inspect_topic_json()
         } else {
             fixture_status_topic_text()
+        });
+    }
+    if let Some(view_id) = selector.strip_prefix("view:") {
+        let view = fixture_resolved_view_by_id(view_id)
+            .ok_or_else(|| object_not_found("resolved_view", view_id))?;
+        return Ok(if json {
+            fixture_inspect_view_json(&view)
+        } else {
+            format!(
+                "view {} {}",
+                view.resolved_view_id,
+                resolved_view_lifecycle_state(&view)
+            )
+        });
+    }
+    if let Some(conflict_id) = selector.strip_prefix("conflict:") {
+        let record = fixture_resolver_record_by_id(conflict_id)
+            .ok_or_else(|| object_not_found("conflict_staleness", conflict_id))?;
+        return Ok(if json {
+            fixture_inspect_conflict_json(&record)
+        } else {
+            format!("conflict {} {}", record.id, record.kind.as_str())
         });
     }
     if let Some(checkpoint_id) = selector.strip_prefix("checkpoint:") {
@@ -2601,6 +2646,13 @@ fn fixture_inspect_artifact(selector: &str, json: bool) -> Result<String, CliErr
     } else {
         Ok(format!("{} {}", artifact.artifact_id, artifact.path))
     }
+}
+
+fn fixture_resolver_record_by_id(conflict_id: &str) -> Option<ResolverConflictOrStalenessRecord> {
+    fixture_known_resolved_views()
+        .into_iter()
+        .flat_map(|view| view.records.into_iter())
+        .find(|record| record.id == conflict_id)
 }
 
 fn object_not_found(kind: &'static str, selector: &str) -> CliError {
@@ -3355,23 +3407,42 @@ fn fixture_inspect_git_json(export: &FixtureGitExport) -> String {
     )
 }
 
-fn fixture_inspect_operation_json() -> String {
-    format!(
+fn fixture_inspect_operation_json(operation_id: &str) -> Result<String, CliError> {
+    let (topic_id, topic_revision_id, actor_id, authored_context_id, after_hash) =
+        match operation_id {
+            "op_auth_trim_guard_0001" => (
+                FIXTURE_WRITE_TOPIC_ID,
+                "rev_auth_nullability_0001",
+                FIXTURE_ACTOR_ID,
+                "ctx_agent_a_gen_0001",
+                "sha256:auth_trim_guard",
+            ),
+            "op_profile_auth_null_guard_0001" => (
+                "topic_profile_ui",
+                "rev_profile_auth_overlap_0001",
+                "agent_b",
+                "ctx_agent_b_gen_0001",
+                "sha256:auth_null_guard",
+            ),
+            _ => return Err(object_not_found("operation", operation_id)),
+        };
+
+    Ok(format!(
         concat!(
             "{{\"ok\":true,\"data\":{{",
             "\"command\":\"inspect.operation\",",
             "\"repository_id\":\"{}\",",
             "\"ids\":{{",
-            "\"operation_transaction_id\":\"op_auth_trim_guard_0001\",",
+            "\"operation_transaction_id\":\"{}\",",
             "\"topic_id\":\"{}\",",
             "\"session_id\":\"{}\",",
-            "\"topic_revision_id\":\"rev_auth_nullability_0001\"",
+            "\"topic_revision_id\":\"{}\"",
             "}},",
             "\"view\":{},",
             "\"operation\":{{",
             "\"mutation\":\"patch\",",
             "\"actor_id\":\"{}\",",
-            "\"authored_context_id\":\"ctx_agent_a_gen_0001\",",
+            "\"authored_context_id\":\"{}\",",
             "\"session_generation_id\":\"{}\",",
             "\"classification\":\"source\",",
             "\"privacy_class\":\"policy_gated\",",
@@ -3383,25 +3454,279 @@ fn fixture_inspect_operation_json() -> String {
             "}},",
             "\"write_set\":[{{\"artifact_id\":\"artifact_src_auth_ts\",\"path\":\"src/auth.ts\",\"mutation\":\"patch\"}}],",
             "\"before_refs\":{{\"content_hash\":\"sha256:auth_base\",\"tree_hash\":\"{}\"}},",
-            "\"after_refs\":{{\"content_hash\":\"sha256:auth_trim_guard\",\"tree_hash\":\"tree_after_auth_patch_0001\"}}",
+            "\"after_refs\":{{\"content_hash\":\"{}\",\"tree_hash\":\"tree_after_auth_patch_0001\"}}",
             "}},",
             "\"created_revision\":{{",
-            "\"topic_revision_id\":\"rev_auth_nullability_0001\",",
+            "\"topic_revision_id\":\"{}\",",
             "\"revision_number\":1,",
             "\"parent_revision_id\":null",
-            "}}",
+            "}},",
+            "\"resolver_impacts\":{}",
             "}},\"warnings\":[]}}"
         ),
         FIXTURE_REPOSITORY_ID,
-        FIXTURE_WRITE_TOPIC_ID,
+        operation_id,
+        topic_id,
         FIXTURE_SESSION_ID,
+        topic_revision_id,
         fixture_base_view_json(),
-        FIXTURE_ACTOR_ID,
+        actor_id,
+        authored_context_id,
         FIXTURE_SESSION_GENERATION_ID,
         FIXTURE_RESOLVED_VIEW_ID,
         FIXTURE_SESSION_GENERATION_ID,
         FIXTURE_TREE_HASH,
+        after_hash,
+        topic_revision_id,
+        operation_resolver_impacts_json(operation_id),
+    ))
+}
+
+fn operation_resolver_impacts_json(operation_id: &str) -> String {
+    let records = fixture_known_resolved_views()
+        .into_iter()
+        .flat_map(|view| view.records.into_iter())
+        .filter(|record| record.operation_ids.iter().any(|id| id == operation_id))
+        .collect::<Vec<_>>();
+
+    format!(
+        concat!(
+            "{{",
+            "\"conflict_ids\":{},",
+            "\"staleness_ids\":{},",
+            "\"records\":[{}]",
+            "}}"
+        ),
+        string_array_json(
+            records
+                .iter()
+                .filter(|record| record.kind.is_conflict())
+                .map(|record| record.id.as_str())
+        ),
+        string_array_json(
+            records
+                .iter()
+                .filter(|record| record.kind.is_staleness())
+                .map(|record| record.id.as_str())
+        ),
+        records
+            .iter()
+            .map(resolver_record_json)
+            .collect::<Vec<_>>()
+            .join(","),
     )
+}
+
+fn fixture_status_view_json(view: &ResolvedViewResult) -> String {
+    let conflict_ids = view
+        .conflicts()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+    let staleness_ids = view
+        .staleness()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"status.view\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"resolved_view_id\":\"{}\"}},",
+            "\"view\":{},",
+            "\"resolved_view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"lifecycle_state\":\"{}\",",
+            "\"base_checkpoint_ids\":{},",
+            "\"topic_frontier\":{},",
+            "\"dependency_closure\":{},",
+            "\"resolver_order\":{},",
+            "\"conflict_count\":{},",
+            "\"staleness_count\":{},",
+            "\"conflict_ids\":{},",
+            "\"staleness_ids\":{},",
+            "\"tree_identity\":{},",
+            "\"missing_tree_reason\":{}",
+            "}}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&view.repository_id),
+        json_escape(&view.resolved_view_id),
+        view_resolve_view_json(view),
+        json_escape(&view.resolved_view_id),
+        json_escape(&view.repository_id),
+        resolved_view_lifecycle_state(view),
+        string_array_json(view.base_checkpoint_ids.iter().map(String::as_str)),
+        topic_frontier_json(view),
+        dependency_closure_json(&view.dependency_closure),
+        resolver_order_json(&view.resolver_order),
+        conflict_ids.len(),
+        staleness_ids.len(),
+        string_array_json(conflict_ids.iter().copied()),
+        string_array_json(staleness_ids.iter().copied()),
+        optional_single_repo_tree_json(view.tree_identity.as_ref()),
+        optional_string_json(resolved_view_missing_tree_reason(view)),
+    )
+}
+
+fn fixture_inspect_view_json(view: &ResolvedViewResult) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.view\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"resolved_view_id\":\"{}\"}},",
+            "\"view\":{},",
+            "\"resolved_view\":{},",
+            "\"resolver_inputs\":{{",
+            "\"base_checkpoint_ids\":{},",
+            "\"topic_frontier\":{},",
+            "\"dependency_closure\":{},",
+            "\"resolver_order\":{}",
+            "}},",
+            "\"conflict_refs\":[{}],",
+            "\"staleness_refs\":[{}],",
+            "\"tree_identity\":{},",
+            "\"missing_tree_reason\":{},",
+            "\"lifecycle_state\":\"{}\"",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&view.repository_id),
+        json_escape(&view.resolved_view_id),
+        view_resolve_view_json(view),
+        resolved_view_record_json(view),
+        string_array_json(view.base_checkpoint_ids.iter().map(String::as_str)),
+        topic_frontier_json(view),
+        dependency_closure_json(&view.dependency_closure),
+        resolver_order_json(&view.resolver_order),
+        view.conflicts()
+            .map(resolver_ref_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        view.staleness()
+            .map(resolver_ref_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        optional_single_repo_tree_json(view.tree_identity.as_ref()),
+        optional_string_json(resolved_view_missing_tree_reason(view)),
+        resolved_view_lifecycle_state(view),
+    )
+}
+
+fn fixture_inspect_conflict_json(record: &ResolverConflictOrStalenessRecord) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.conflict\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"conflict_id\":\"{}\",\"resolved_view_id\":\"{}\"}},",
+            "\"view\":null,",
+            "\"conflict_staleness\":{},",
+            "\"competing_operation_ids\":{},",
+            "\"path_refs\":[{}],",
+            "\"artifact_ids\":{},",
+            "\"authored_context_ids\":{},",
+            "\"policy_reason\":\"{}\"",
+            "}},\"warnings\":[]}}"
+        ),
+        FIXTURE_REPOSITORY_ID,
+        json_escape(&record.id),
+        json_escape(&record.resolved_view_id),
+        resolver_record_json(record),
+        string_array_json(record.operation_ids.iter().map(String::as_str)),
+        record
+            .path_refs
+            .iter()
+            .map(|path_ref| {
+                format!(
+                    "{{\"path\":\"{}\",\"path_state\":\"{}\"}}",
+                    json_escape(&path_ref.path),
+                    json_escape(&path_ref.path_state)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        string_array_json(record.artifact_ids.iter().map(String::as_str)),
+        string_array_json(record.authored_context_ids.iter().map(String::as_str)),
+        json_escape(&record.policy_reason),
+    )
+}
+
+fn resolved_view_record_json(view: &ResolvedViewResult) -> String {
+    let conflict_ids = view
+        .conflicts()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+    let staleness_ids = view
+        .staleness()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+
+    format!(
+        concat!(
+            "{{",
+            "\"schema_version\":1,",
+            "\"record_type\":\"resolved_view\",",
+            "\"id\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"base_checkpoint_ids\":{},",
+            "\"topic_frontier\":{},",
+            "\"dependency_closure\":{},",
+            "\"operation_semantics_version\":\"{}\",",
+            "\"path_policy_id\":\"{}\",",
+            "\"resolver_order\":{},",
+            "\"conflict_ids\":{},",
+            "\"staleness_ids\":{},",
+            "\"tree_identity\":{},",
+            "\"lifecycle_state\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&view.resolved_view_id),
+        json_escape(&view.repository_id),
+        string_array_json(view.base_checkpoint_ids.iter().map(String::as_str)),
+        topic_frontier_json(view),
+        dependency_closure_json(&view.dependency_closure),
+        json_escape(&view.operation_semantics_version),
+        json_escape(&view.path_policy_id),
+        resolver_order_json(&view.resolver_order),
+        string_array_json(conflict_ids.iter().copied()),
+        string_array_json(staleness_ids.iter().copied()),
+        optional_single_repo_tree_json(view.tree_identity.as_ref()),
+        resolved_view_lifecycle_state(view),
+    )
+}
+
+fn resolver_ref_json(record: &ResolverConflictOrStalenessRecord) -> String {
+    format!(
+        "{{\"id\":\"{}\",\"kind\":\"{}\"}}",
+        json_escape(&record.id),
+        record.kind.as_str(),
+    )
+}
+
+fn resolved_view_lifecycle_state(view: &ResolvedViewResult) -> &'static str {
+    if view.conflicts().next().is_some() {
+        "conflicted"
+    } else if view.staleness().next().is_some() {
+        "stale"
+    } else if view.tree_identity.is_none() {
+        "missing_tree"
+    } else {
+        "resolved"
+    }
+}
+
+fn resolved_view_missing_tree_reason(view: &ResolvedViewResult) -> Option<&'static str> {
+    if view.tree_identity.is_some() {
+        None
+    } else if view.conflicts().next().is_some() {
+        Some("blocked_by_conflict")
+    } else if view.staleness().next().is_some() {
+        Some("blocked_by_staleness")
+    } else {
+        Some("tree_identity_unavailable")
+    }
 }
 
 fn fixture_inspect_session_json() -> String {
@@ -8719,12 +9044,15 @@ Usage:
   sun policy check-commit [--paths <path>...] --json
   sun policy explain <validation-report-id> --json
   sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan|--execute-fixture success|ref-update-failure|export-map-failure|--execute-local --repo <path>] --json
+  sun status --view <resolved-view-id> --fixture basic-app [--json]
   sun status --export <export-map-id> --fixture basic-app [--json]
   sun status --git <commit-or-ref> --fixture basic-app [--json]
   sun status --projection <projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|scan-missing-blob|verified] [--json]
   sun status --execution <execution-id> --fixture basic-app [--promoted] [--json]
   sun inspect export:<export-map-id> --fixture basic-app [--json]
   sun inspect git:<commit-or-ref> --fixture basic-app [--json]
+  sun inspect view:<resolved-view-id> --fixture basic-app [--json]
+  sun inspect conflict:<conflict-id> --fixture basic-app [--json]
   sun inspect projection:<projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|scan-missing-blob|verified] [--json]
   sun inspect execution:<execution-id> --fixture basic-app [--promoted] [--json]
 

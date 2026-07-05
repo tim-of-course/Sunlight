@@ -638,6 +638,125 @@ fn view_resolve_json_overlapping_same_artifact_returns_conflict_summary() {
 }
 
 #[test]
+fn view_conflict_visibility_json_round_trips_conflict_id_through_status_and_inspect() {
+    let repo = TestRepo::new("view-conflict-visibility");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_auth_overlap_0001",
+    );
+    let conflict_id = "conflict_src_auth_ts_0001";
+
+    let status = sun()
+        .arg("status")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status --view should run");
+    assert_success(&status);
+    let status_stdout = stdout(&status);
+    assert!(status_stdout.contains("\"command\":\"status.view\""));
+    assert!(status_stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(status_stdout.contains("\"lifecycle_state\":\"conflicted\""));
+    assert!(status_stdout.contains("\"base_checkpoint_ids\":[\"checkpoint_base_0001\"]"));
+    assert!(status_stdout.contains("\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_0001\",\"topic_profile_ui\":\"rev_profile_auth_overlap_0001\"}"));
+    assert!(status_stdout.contains("\"dependency_closure\":{\"revision_ids\":[\"rev_auth_nullability_0001\",\"rev_profile_auth_overlap_0001\"]}"));
+    assert!(status_stdout.contains("\"resolver_order\":{\"operation_ids\":[]}"));
+    assert!(status_stdout.contains("\"conflict_count\":1"));
+    assert!(status_stdout.contains(&format!("\"conflict_ids\":[\"{conflict_id}\"]")));
+    assert!(status_stdout.contains("\"staleness_count\":0"));
+    assert!(status_stdout.contains("\"tree_identity\":null"));
+    assert!(status_stdout.contains("\"missing_tree_reason\":\"blocked_by_conflict\""));
+
+    let inspect_view = sun()
+        .arg("inspect")
+        .arg(format!("view:{view_id}"))
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect view should run");
+    assert_success(&inspect_view);
+    let inspect_view_stdout = stdout(&inspect_view);
+    assert!(inspect_view_stdout.contains("\"command\":\"inspect.view\""));
+    assert!(inspect_view_stdout.contains("\"record_type\":\"resolved_view\""));
+    assert!(inspect_view_stdout.contains(&format!("\"conflict_ids\":[\"{conflict_id}\"]")));
+    assert!(inspect_view_stdout.contains(&format!(
+        "\"conflict_refs\":[{{\"id\":\"{conflict_id}\",\"kind\":\"same_artifact_conflict\"}}]"
+    )));
+    assert!(inspect_view_stdout.contains("\"tree_identity\":null"));
+
+    let inspect_conflict = sun()
+        .arg("inspect")
+        .arg(format!("conflict:{conflict_id}"))
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect conflict should run");
+    assert_success(&inspect_conflict);
+    let inspect_conflict_stdout = stdout(&inspect_conflict);
+    assert!(inspect_conflict_stdout.contains("\"command\":\"inspect.conflict\""));
+    assert!(inspect_conflict_stdout.contains(&format!("\"conflict_id\":\"{conflict_id}\"")));
+    assert!(inspect_conflict_stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(inspect_conflict_stdout.contains("\"kind\":\"same_artifact_conflict\""));
+    assert!(inspect_conflict_stdout.contains(
+        "\"competing_operation_ids\":[\"op_auth_trim_guard_0001\",\"op_profile_auth_null_guard_0001\"]"
+    ));
+    assert!(inspect_conflict_stdout
+        .contains("\"path_refs\":[{\"path\":\"src/auth.ts\",\"path_state\":\"active\"}]"));
+    assert!(inspect_conflict_stdout.contains("\"artifact_ids\":[\"artifact_src_auth_ts\"]"));
+    assert!(inspect_conflict_stdout.contains(
+        "\"policy_reason\":\"same artifact operations are not proven commutative under file_ops_v1\""
+    ));
+
+    let inspect_operation = sun()
+        .arg("inspect")
+        .arg("operation:op_auth_trim_guard_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect operation should run");
+    assert_success(&inspect_operation);
+    let inspect_operation_stdout = stdout(&inspect_operation);
+    assert!(inspect_operation_stdout.contains("\"command\":\"inspect.operation\""));
+    assert!(inspect_operation_stdout
+        .contains("\"operation_transaction_id\":\"op_auth_trim_guard_0001\""));
+    assert!(inspect_operation_stdout.contains(&format!("\"conflict_ids\":[\"{conflict_id}\"]")));
+    assert!(inspect_operation_stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+}
+
+#[test]
+fn view_conflict_visibility_json_missing_view_selector_returns_object_not_found() {
+    let repo = TestRepo::new("view-conflict-missing");
+
+    let output = sun()
+        .arg("status")
+        .arg("--view")
+        .arg("view_missing_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status --view should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"object_not_found\""));
+    assert!(stdout.contains("\"selector\":\"view_missing_0001\""));
+    assert!(stdout.contains("\"object_type\":\"resolved_view\""));
+}
+
+#[test]
 fn view_resolve_json_missing_dependency_returns_staleness_summary() {
     let repo = TestRepo::new("view-resolve-staleness");
 

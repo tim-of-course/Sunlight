@@ -3061,6 +3061,47 @@ fn compat_diff_json_fixture_basic_app_returns_candidate_surface() {
 }
 
 #[test]
+fn compat_working_tree_unrelated_files_do_not_appear_in_diff_fixture() {
+    let repo = TestRepo::new("compat-working-tree-diff-fixture");
+    init_local_git_repo(&repo);
+    write_nested_file(
+        repo.path(),
+        "src/untracked-main-worktree.ts",
+        "export const mainWorktreeOnly = true;\n",
+    );
+    write_nested_file(
+        repo.path(),
+        ".sunlight/local/noise.json",
+        "{\"main_worktree_only\":true}\n",
+    );
+
+    let output = sun()
+        .arg("compat")
+        .arg("diff")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat diff should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"compat.diff\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
+    assert!(stdout.contains("\"candidate_counts\":{\"total\":12"));
+    assert!(stdout.contains(
+        "\"by_classification\":{\"cache\":1,\"generated\":1,\"policy\":1,\"secret\":1,\"source\":8}"
+    ));
+    assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
+    assert!(stdout.contains("\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""));
+    assert!(!stdout.contains("src/untracked-main-worktree.ts"));
+    assert!(!stdout.contains(".sunlight/local/noise.json"));
+}
+
+#[test]
 fn compat_diff_json_fixture_invalid_projection_returns_not_found() {
     let repo = TestRepo::new("compat-diff-invalid-projection");
 
@@ -3125,6 +3166,51 @@ fn compat_import_json_fixture_candidate_returns_operation_plan() {
     assert!(stdout.contains(
         "\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_compat_0001\"}"
     ));
+}
+
+#[test]
+fn compat_working_tree_unrelated_files_do_not_appear_in_import_fixture() {
+    let repo = TestRepo::new("compat-working-tree-import-fixture");
+    init_local_git_repo(&repo);
+    write_nested_file(
+        repo.path(),
+        "src/untracked-main-worktree.ts",
+        "export const mainWorktreeOnly = true;\n",
+    );
+    write_nested_file(
+        repo.path(),
+        ".sunlight/local/noise.json",
+        "{\"main_worktree_only\":true}\n",
+    );
+
+    let output = sun()
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--candidate")
+        .arg("compat_delta_src_auth_ts_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat import should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"compat.import\""));
+    assert!(stdout.contains("\"repository_id\":\"repo_fixture_basic_app\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_compat_import_0001\""));
+    assert!(stdout.contains("\"tree_hash\":\"tree_after_compat_import_0001\""));
+    assert!(stdout.contains("\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""));
+    assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
+    assert!(!stdout.contains("src/untracked-main-worktree.ts"));
+    assert!(!stdout.contains(".sunlight/local/noise.json"));
 }
 
 #[test]

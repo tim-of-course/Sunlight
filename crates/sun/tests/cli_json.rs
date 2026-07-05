@@ -2854,6 +2854,80 @@ fn project_materialize_json_fixture_required_unsupported_strategy_fails() {
 }
 
 #[test]
+fn project_materialize_json_fixture_required_overlay_copyup_fails_when_unavailable() {
+    let repo = TestRepo::new("projection-fixture-required-overlay-unavailable");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+
+    let output = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--strategy")
+        .arg("overlay_copyup")
+        .arg("--no-copy-fallback")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"projection_materialization_overlay_copyup_unsupported\""));
+    assert!(stdout.contains(
+        "\"message\":\"overlay copy-up materialization is unsupported for this fixture\""
+    ));
+    assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(stdout.contains("\"strategy\":\"overlay_copyup\""));
+    assert!(stdout.contains("\"projection_id\":null"));
+}
+
+#[test]
+fn project_materialize_json_fixture_required_hardlink_inspection_fails_without_store_proof() {
+    let repo = TestRepo::new("projection-fixture-required-hardlink-unprotected");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+
+    let output = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("inspection")
+        .arg("--strategy")
+        .arg("hardlink_readonly")
+        .arg("--no-copy-fallback")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.contains("\"code\":\"projection_materialization_hardlink_readonly_unsupported\"")
+    );
+    assert!(stdout.contains(
+        "\"message\":\"read-only hardlink materialization is unsupported for this fixture\""
+    ));
+    assert!(stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(stdout.contains("\"strategy\":\"hardlink_readonly\""));
+    assert!(stdout.contains("\"projection_id\":null"));
+}
+
+#[test]
 fn project_materialize_json_fixture_compatibility_records_import_policy() {
     let repo = TestRepo::new("projection-fixture-compat");
     let view_id = resolve_fixture_view_id(

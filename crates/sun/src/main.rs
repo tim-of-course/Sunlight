@@ -4570,8 +4570,15 @@ fn fixture_projection_materialization_request(
         session_generation_id: fixture_projection_session_generation_id(options.purpose),
         strategy_preference,
         fallback_to_copy: options.fallback_to_copy,
-        capabilities: ProjectionMaterializationCapabilities::all_supported(),
+        capabilities: fixture_projection_capabilities(),
     }
+}
+
+fn fixture_projection_capabilities() -> ProjectionMaterializationCapabilities {
+    let mut capabilities = ProjectionMaterializationCapabilities::copy_only();
+    capabilities.reflink_supported = true;
+    capabilities.reflink_writes_are_private = true;
+    capabilities
 }
 
 fn fixture_projection_id_for_purpose(purpose: ProjectionPurpose) -> &'static str {

@@ -19,7 +19,7 @@ if ([System.IO.Path]::IsPathRooted($TargetRepo)) {
 $tmpRoot = $null
 
 function Step($Message) {
-    Write-Output "==> $Message"
+    Write-Host "==> $Message"
 }
 
 function Require-Command($Name) {

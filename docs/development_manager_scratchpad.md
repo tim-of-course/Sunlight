@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `8f4212d`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 120 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`. After `d862c5c`, Git ref status/inspect passed `cargo fmt --check`, `cargo test -p sun --test cli_json git_ref`, and `git diff --check HEAD~1..HEAD`.
+- Verification: latest full pass ran after `8f4212d`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 120 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`. After `d862c5c`, Git ref status/inspect passed `cargo fmt --check`, `cargo test -p sun --test cli_json git_ref`, and `git diff --check HEAD~1..HEAD`. Current smoke precheck confirmed validation smoke/docs do not yet cover `status --git` or `inspect git:`.
 
 ## Active Work
 
@@ -155,6 +155,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `policy-explain-smoke-coverage`: integrated as `f4f0f1f`; WSL implementation was `cc33f29`.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-policy-explain`: default `scripts/smoke-suite.ps1` passed after `8f4212d`.
 - Completed slice `git-ref-status-inspect-fixture`: integrated as `d862c5c`; WSL implementation was `950065c` plus manager-side Windows rustfmt amendment.
+- Active slice `git-ref-smoke-docs-coverage`: WSL Codex should add Git ref status/inspect lookup to focused validation smoke scripts and docs only as needed.
 
 ## Candidate Next Slices
 

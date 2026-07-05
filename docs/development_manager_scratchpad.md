@@ -146,10 +146,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `cli-compat-import-multiple-candidates`: integrated as `ff0caf6`.
 - Completed slice `validation-plan-cli-reconcile`: integrated as `16d167e`; manager tracking checkpoint `3cce17c`.
 - Completed slice `policy-check-export-cli-fixture`: integrated as `41fc082`; WSL implementation was `aff2f61` plus manager-side rustfmt review fix.
+- Active WSL slice `policy-check-commit-cli-fixture`: expose documented `sun policy check-commit` over the existing `.sunlight` commit policy validator with focused CLI tests.
 
 ## Candidate Next Slices
 
-- Next useful slice: `policy-check-commit-cli-fixture` so `.sunlight` commit policy has the same operator-visible command coverage as export validation.
+- After commit/export policy commands are both surfaced, consider adding policy command coverage to validation smoke if it stays concise.
 
 ## Decisions
 

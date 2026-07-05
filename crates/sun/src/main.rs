@@ -814,13 +814,12 @@ fn compat_diff(ctx: &CommandContext) -> Result<(), CliError> {
     let candidates = fixture_basic_app_candidate_deltas();
 
     if ctx.json {
-        println!("{}", compat_diff_success_envelope(&projection, &current_view, &candidates));
-    } else {
         println!(
-            "{} {} candidates",
-            projection.id,
-            candidates.len()
+            "{}",
+            compat_diff_success_envelope(&projection, &current_view, &candidates)
         );
+    } else {
+        println!("{} {} candidates", projection.id, candidates.len());
     }
 
     Ok(())
@@ -4511,9 +4510,11 @@ fn compat_diff_success_envelope(
                 .find(|candidate| candidate.candidate_delta_id == "compat_delta_src_auth_ts_0001")
                 .expect("fixture safe default candidate should exist"),
         ),
-        string_array_json(candidates.iter().filter_map(|candidate| {
-            candidate.quarantine_ref.as_deref()
-        })),
+        string_array_json(
+            candidates
+                .iter()
+                .filter_map(|candidate| { candidate.quarantine_ref.as_deref() })
+        ),
         candidates
             .iter()
             .map(compat_candidate_json)

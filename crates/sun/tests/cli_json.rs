@@ -2620,9 +2620,8 @@ fn compat_project_json_fixture_basic_app_returns_projection_surface() {
     assert!(stdout.contains("\"baseline_manifest_digest\":\"sha256:compat_baseline\""));
     assert!(stdout.contains("\"retention_state\":\"active\""));
     assert!(stdout.contains("\"privacy_class\":\"local_only\""));
-    assert!(stdout.contains(
-        "\"path_policy\":{\"path_policy_id\":\"path_policy_posix_case_sensitive_v1\""
-    ));
+    assert!(stdout
+        .contains("\"path_policy\":{\"path_policy_id\":\"path_policy_posix_case_sensitive_v1\""));
 }
 
 #[test]
@@ -2678,7 +2677,9 @@ fn compat_diff_json_fixture_basic_app_returns_candidate_surface() {
     assert!(stdout.contains(
         "\"selected_safe_default_candidate\":{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""
     ));
-    assert!(stdout.contains("\"quarantine_refs\":[\"quarantine://compat/projection_compat_agent_a_0001/env\"]"));
+    assert!(stdout.contains(
+        "\"quarantine_refs\":[\"quarantine://compat/projection_compat_agent_a_0001/env\"]"
+    ));
     assert!(stdout.contains("\"candidate_delta_id\":\"compat_delta_dist_bundle_0001\""));
     assert!(stdout.contains("\"candidate_delta_id\":\"compat_delta_env_secret_0001\""));
     assert!(stdout.contains("\"native_operation_ids\":[]"));

@@ -6135,7 +6135,6 @@ fn is_safe_default_compat_candidate(candidate: &CompatCandidateDelta) -> bool {
         CompatCandidateKind::ModifiedSource
             | CompatCandidateKind::CreatedSource
             | CompatCandidateKind::DeletedSource
-            | CompatCandidateKind::MovedOrRenamed
             | CompatCandidateKind::MetadataChanged
     ) && candidate.classification == "source"
         && candidate.path_policy_result.allowed

@@ -2905,12 +2905,12 @@ fn compat_diff_json_fixture_basic_app_returns_candidate_surface() {
     assert!(stdout.contains(
         "\"tree_identity\":{\"kind\":\"SingleRepoTree\",\"repository_id\":\"repo_fixture_basic_app\",\"tree_hash\":\"tree_fixture_base_0001\"}"
     ));
-    assert!(stdout.contains("\"candidate_counts\":{\"total\":7"));
+    assert!(stdout.contains("\"candidate_counts\":{\"total\":8"));
     assert!(stdout.contains(
-        "\"by_classification\":{\"cache\":1,\"generated\":1,\"policy\":1,\"secret\":1,\"source\":3}"
+        "\"by_classification\":{\"cache\":1,\"generated\":1,\"policy\":1,\"secret\":1,\"source\":4}"
     ));
     assert!(stdout.contains(
-        "\"by_kind\":{\"cache_or_build_output\":1,\"conflicted_delta\":1,\"created_source\":1,\"generated_source\":1,\"modified_source\":1,\"path_policy_blocked\":1,\"secret_like\":1}"
+        "\"by_kind\":{\"cache_or_build_output\":1,\"conflicted_delta\":1,\"created_source\":1,\"generated_source\":1,\"modified_source\":1,\"moved_or_renamed\":1,\"path_policy_blocked\":1,\"secret_like\":1}"
     ));
     assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
     assert!(stdout.contains(
@@ -2926,6 +2926,14 @@ fn compat_diff_json_fixture_basic_app_returns_candidate_surface() {
     assert!(stdout.contains("\"path\":\"src/auth.conflicted.ts\""));
     assert!(stdout.contains(
         "\"path_policy_result\":{\"allowed\":true,\"normalized_path\":\"src/auth.conflicted.ts\",\"reason\":null}"
+    ));
+    assert!(stdout.contains("\"candidate_delta_id\":\"compat_delta_auth_rename_ambiguous_0001\""));
+    assert!(stdout.contains("\"kind\":\"moved_or_renamed\""));
+    assert!(stdout.contains("\"operation_kind\":\"move\""));
+    assert!(stdout.contains("\"path\":\"src/auth-renamed.ts\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
+    assert!(stdout.contains(
+        "\"path_policy_result\":{\"allowed\":true,\"normalized_path\":\"src/auth-renamed.ts\",\"reason\":null}"
     ));
     assert!(stdout.contains("\"candidate_delta_id\":\"compat_delta_generated_schema_0001\""));
     assert!(stdout.contains("\"kind\":\"generated_source\""));
@@ -3382,6 +3390,44 @@ fn compat_import_conflicted_delta_json_fixture_is_atomic_failure() {
     assert!(stdout.contains("\"message\":\"selected compatibility candidate is conflicted\""));
     assert!(stdout.contains("\"candidate_delta_ids\":[\"compat_delta_src_auth_conflict_0001\"]"));
     assert!(stdout.contains("\"reason\":\"conflicted candidate cannot be imported\""));
+    assert!(stdout.contains("\"imported_artifacts\":[]"));
+    assert!(stdout.contains("\"operation_transaction_id\":null"));
+    assert!(stdout.contains("\"topic_revision_id\":null"));
+    assert!(stdout.contains("\"session_generation_id\":null"));
+    assert!(!stdout.contains("\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
+    assert!(!stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
+    assert!(!stdout.contains("\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+}
+
+#[test]
+fn compat_import_ambiguous_rename_json_fixture_is_atomic_failure() {
+    let repo = TestRepo::new("compat-import-ambiguous-rename");
+
+    let output = sun()
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--candidate")
+        .arg("compat_delta_auth_rename_ambiguous_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat import should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"compat_ambiguous_rename\""));
+    assert!(stdout.contains(
+        "\"message\":\"selected compatibility candidate has ambiguous rename identity\""
+    ));
+    assert!(
+        stdout.contains("\"candidate_delta_ids\":[\"compat_delta_auth_rename_ambiguous_0001\"]")
+    );
+    assert!(stdout.contains("\"reason\":\"fixture foundation does not resolve rename identity\""));
     assert!(stdout.contains("\"imported_artifacts\":[]"));
     assert!(stdout.contains("\"operation_transaction_id\":null"));
     assert!(stdout.contains("\"topic_revision_id\":null"));
@@ -4963,12 +5009,12 @@ fn status_json_fixture_compat_projection_reports_dirty_candidates() {
     assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
     assert!(stdout.contains("\"purpose\":\"compatibility\""));
     assert!(stdout.contains("\"retention_state\":\"active\""));
-    assert!(stdout.contains("\"candidate_counts\":{\"total\":7"));
+    assert!(stdout.contains("\"candidate_counts\":{\"total\":8"));
     assert!(stdout.contains(
-        "\"by_classification\":{\"cache\":1,\"generated\":1,\"policy\":1,\"secret\":1,\"source\":3}"
+        "\"by_classification\":{\"cache\":1,\"generated\":1,\"policy\":1,\"secret\":1,\"source\":4}"
     ));
     assert!(stdout.contains(
-        "\"by_kind\":{\"cache_or_build_output\":1,\"conflicted_delta\":1,\"created_source\":1,\"generated_source\":1,\"modified_source\":1,\"path_policy_blocked\":1,\"secret_like\":1}"
+        "\"by_kind\":{\"cache_or_build_output\":1,\"conflicted_delta\":1,\"created_source\":1,\"generated_source\":1,\"modified_source\":1,\"moved_or_renamed\":1,\"path_policy_blocked\":1,\"secret_like\":1}"
     ));
     assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
     assert!(stdout.contains(
@@ -5041,18 +5087,19 @@ fn inspect_json_fixture_compat_projection_reports_baseline_policy_and_candidates
     assert!(stdout
         .contains("\"path_policy\":{\"path_policy_id\":\"path_policy_posix_case_sensitive_v1\""));
     assert!(stdout.contains("\"writable_import_policy\":{\"writable_policy\":\"writable_with_explicit_import\",\"import_required\":true"));
-    assert!(stdout.contains("\"candidate_summary\":{\"candidate_counts\":{\"total\":7"));
+    assert!(stdout.contains("\"candidate_summary\":{\"candidate_counts\":{\"total\":8"));
     assert!(stdout.contains(
-        "\"by_classification\":{\"cache\":1,\"generated\":1,\"policy\":1,\"secret\":1,\"source\":3}"
+        "\"by_classification\":{\"cache\":1,\"generated\":1,\"policy\":1,\"secret\":1,\"source\":4}"
     ));
     assert!(stdout.contains(
-        "\"by_kind\":{\"cache_or_build_output\":1,\"conflicted_delta\":1,\"created_source\":1,\"generated_source\":1,\"modified_source\":1,\"path_policy_blocked\":1,\"secret_like\":1}"
+        "\"by_kind\":{\"cache_or_build_output\":1,\"conflicted_delta\":1,\"created_source\":1,\"generated_source\":1,\"modified_source\":1,\"moved_or_renamed\":1,\"path_policy_blocked\":1,\"secret_like\":1}"
     ));
     assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
     assert!(stdout.contains(
         "\"candidate_detail_refs\":[{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""
     ));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_src_auth_conflict_0001\""));
+    assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_auth_rename_ambiguous_0001\""));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_generated_schema_0001\""));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_env_secret_0001\""));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_reserved_sunlight_0001\""));

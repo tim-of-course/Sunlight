@@ -38,16 +38,19 @@ External validation boundaries:
 - Do not run package install commands or any network work.
 - Require a clean target Git status before validation so baseline results stay stable.
 - Sunlight validation must create a temporary clone or copy of Super Search before running `sun init`.
-- The temporary validation clone may receive `.sunlight` metadata and must be removed after the run.
+- Compatibility import coverage remains fixture-backed and may be run after temp clone init only to assert the stable command envelope, operation ID, and revision ID.
+- Local Git export execution may target the temporary validation clone with a dedicated `refs/heads/sunlight/*` branch and fixture checkpoint content.
+- The temporary validation clone may receive `.sunlight` metadata, local export commits, export maps, and validation refs, and must be removed after the run.
 
 ## Boundaries
 
 Fixture-backed flows are allowed to use `--fixture basic-app` and stable fixture IDs such as `session_agent_a`, `view_base_0001`, and `checkpoint_auth_profile_ready_0001`. These tests validate command envelopes, identities, policy gates, and provenance links.
 
-Real-repo flows are limited to repository bootstrap and export safety planning:
+Real-repo flows are limited to repository bootstrap and local export execution against a disposable clone:
 
 - `sun init --json` must create `.sunlight` metadata in a real temporary Git repo.
 - Git export planning must inspect local Git parent/ref state but must not build export content from the working tree.
+- Local Git export execution may create commits, export maps, and refs only inside the temporary clone, using fixture checkpoint content and `--execute-local --repo <temp-clone>`.
 - No test may require network access, package installation, remote Git operations, or direct edits to project source as an authoring path.
 
 ## Command Matrix

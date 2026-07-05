@@ -99,32 +99,38 @@ The spike is complete when:
 - local-only data boundaries are documented
 - Phase 3 can proceed with a clear default and no dependency on mutable working-tree files
 
-## Observed WSL/Linux Temp Filesystem Probe
+## Observed WSL/Linux Filesystem Probe
 
-On July 5, 2026, `scripts/projection-strategy-smoke.sh` added a scoped
-temp-directory capability probe. The rows are local observations for the
-current WSL/Linux temp filesystem only; they omit absolute paths and do not
-claim support on other mounts or hosts.
+On July 5, 2026, `scripts/projection-strategy-smoke.sh` added scoped
+capability probes for the default temp directory and an optional non-temp
+parent such as the WSL home clone. The rows are local observations for this
+host and these mounts only; they omit absolute paths and do not claim support
+on other mounts or hosts.
 
 ```text
 projection_fs_capability host_scope=current_wsl_linux_tempdir fs_type=tmpfs probe_root=tempdir absolute_paths=omitted
-projection_fs_capability strategy=reflink fs_type=tmpfs reflink_attempt=failed writes_private=unknown accepted=deferred reason=operation_not_supported
-projection_fs_capability strategy=hardlink_readonly fs_type=tmpfs hardlink_attempt=ok read_only_write_blocked=yes chmod_write_mutated_store=yes mutation_isolation_risk=present accepted=deferred reason=shared_inode_owner_can_chmod_projection_and_mutate_store
-projection_fs_capability strategy=overlay_copyup fs_type=tmpfs overlay_attempt=failed copyup_writes_private=unknown accepted=deferred reason=permission_denied
+projection_fs_capability host_scope=current_wsl_linux_tempdir probe_root=tempdir strategy=copy fs_type=tmpfs accepted=accepted reason=correctness_fallback
+projection_fs_capability host_scope=current_wsl_linux_tempdir probe_root=tempdir strategy=reflink fs_type=tmpfs reflink_attempt=failed writes_private=unknown accepted=deferred reason=operation_not_supported
+projection_fs_capability host_scope=current_wsl_linux_tempdir probe_root=tempdir strategy=hardlink_readonly fs_type=tmpfs hardlink_attempt=ok read_only_write_blocked=yes chmod_write_mutated_store=yes mutation_isolation_risk=present accepted=deferred reason=shared_inode_owner_can_chmod_projection_and_mutate_store
+projection_fs_capability host_scope=current_wsl_linux_tempdir probe_root=tempdir strategy=overlay_copyup fs_type=tmpfs overlay_attempt=failed copyup_writes_private=unknown accepted=deferred reason=permission_denied
+projection_fs_capability host_scope=current_wsl_linux_non_temp_root fs_type=ext2/ext3 probe_root=non_temp absolute_paths=omitted
+projection_fs_capability host_scope=current_wsl_linux_non_temp_root probe_root=non_temp strategy=copy fs_type=ext2/ext3 accepted=accepted reason=correctness_fallback
+projection_fs_capability host_scope=current_wsl_linux_non_temp_root probe_root=non_temp strategy=reflink fs_type=ext2/ext3 reflink_attempt=failed writes_private=unknown accepted=deferred reason=operation_not_supported
+projection_fs_capability host_scope=current_wsl_linux_non_temp_root probe_root=non_temp strategy=hardlink_readonly fs_type=ext2/ext3 hardlink_attempt=ok read_only_write_blocked=yes chmod_write_mutated_store=yes mutation_isolation_risk=present accepted=deferred reason=shared_inode_owner_can_chmod_projection_and_mutate_store
+projection_fs_capability host_scope=current_wsl_linux_non_temp_root probe_root=non_temp strategy=overlay_copyup fs_type=ext2/ext3 overlay_attempt=failed copyup_writes_private=unknown accepted=deferred reason=permission_denied
 ```
 
 Decision from this host probe:
 
 - `copy` remains the accepted correctness fallback.
-- `reflink` is deferred for this temp filesystem because the real reflink
-  attempt failed as unsupported.
+- `reflink` is deferred for both observed filesystems because the real reflink
+  attempts failed as unsupported.
 - `hardlink_readonly` is deferred because read-only file mode blocked a direct
   write but did not protect immutable store content from owner `chmod` followed
   by mutation through the linked projection path.
 - `overlay_copyup` is deferred because unprivileged overlay/copy-up was not
   observable without sudo or package installation.
 
-The next useful probe is a non-temp WSL/Linux filesystem slice if product work
-needs a faster-than-copy default. That slice should still keep `copy` as the
-fallback and must include command compatibility plus store-integrity checks.
+Any future move toward a faster-than-copy default should still keep `copy` as
+the fallback and must include command compatibility plus store-integrity checks.
 

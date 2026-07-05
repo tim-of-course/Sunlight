@@ -5,8 +5,12 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo_bin="${CARGO:-cargo}"
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/sun-projection-strategy-smoke.XXXXXX")"
+non_temp_probe_dir=""
 cleanup() {
     rm -rf "$tmp_dir"
+    if [[ -n "$non_temp_probe_dir" ]]; then
+        rm -rf "$non_temp_probe_dir"
+    fi
 }
 trap cleanup EXIT
 
@@ -142,6 +146,8 @@ classify_probe_error() {
 probe_reflink_capability() {
     local probe_root="$1"
     local fs_type="$2"
+    local host_scope="$3"
+    local probe_label="$4"
     local src="$probe_root/reflink-source"
     local dst="$probe_root/reflink-dest"
     local stderr_file="$probe_root/reflink.stderr"
@@ -163,18 +169,20 @@ probe_reflink_capability() {
             private_writes="no"
             reason="dest_write_changed_source_hash"
         fi
-        printf 'projection_fs_capability strategy=reflink fs_type=%s reflink_attempt=ok writes_private=%s accepted=%s reason=%s\n' \
-            "$fs_type" "$private_writes" "$([[ "$private_writes" == "yes" ]] && printf accepted || printf deferred)" "$reason"
+        printf 'projection_fs_capability host_scope=%s probe_root=%s strategy=reflink fs_type=%s reflink_attempt=ok writes_private=%s accepted=%s reason=%s\n' \
+            "$host_scope" "$probe_label" "$fs_type" "$private_writes" "$([[ "$private_writes" == "yes" ]] && printf accepted || printf deferred)" "$reason"
     else
         reason="$(classify_probe_error "$(cat "$stderr_file")")"
-        printf 'projection_fs_capability strategy=reflink fs_type=%s reflink_attempt=failed writes_private=unknown accepted=deferred reason=%s\n' \
-            "$fs_type" "$reason"
+        printf 'projection_fs_capability host_scope=%s probe_root=%s strategy=reflink fs_type=%s reflink_attempt=failed writes_private=unknown accepted=deferred reason=%s\n' \
+            "$host_scope" "$probe_label" "$fs_type" "$reason"
     fi
 }
 
 probe_hardlink_readonly_capability() {
     local probe_root="$1"
     local fs_type="$2"
+    local host_scope="$3"
+    local probe_label="$4"
     local store="$probe_root/hardlink-store"
     local link="$probe_root/hardlink-projection"
     local stderr_file="$probe_root/hardlink.stderr"
@@ -216,19 +224,21 @@ probe_hardlink_readonly_capability() {
             reason="shared_inode_owner_can_chmod_projection_and_mutate_store"
         fi
 
-        printf 'projection_fs_capability strategy=hardlink_readonly fs_type=%s hardlink_attempt=ok read_only_write_blocked=%s chmod_write_mutated_store=%s mutation_isolation_risk=%s accepted=deferred reason=%s\n' \
-            "$fs_type" "$read_only_write_blocked" "$chmod_write_mutated_store" "$mutation_risk" "$reason"
+        printf 'projection_fs_capability host_scope=%s probe_root=%s strategy=hardlink_readonly fs_type=%s hardlink_attempt=ok read_only_write_blocked=%s chmod_write_mutated_store=%s mutation_isolation_risk=%s accepted=deferred reason=%s\n' \
+            "$host_scope" "$probe_label" "$fs_type" "$read_only_write_blocked" "$chmod_write_mutated_store" "$mutation_risk" "$reason"
     else
         chmod u+w "$store"
         reason="$(classify_probe_error "$(cat "$stderr_file")")"
-        printf 'projection_fs_capability strategy=hardlink_readonly fs_type=%s hardlink_attempt=failed read_only_write_blocked=unknown chmod_write_mutated_store=unknown mutation_isolation_risk=unknown accepted=deferred reason=%s\n' \
-            "$fs_type" "$reason"
+        printf 'projection_fs_capability host_scope=%s probe_root=%s strategy=hardlink_readonly fs_type=%s hardlink_attempt=failed read_only_write_blocked=unknown chmod_write_mutated_store=unknown mutation_isolation_risk=unknown accepted=deferred reason=%s\n' \
+            "$host_scope" "$probe_label" "$fs_type" "$reason"
     fi
 }
 
 probe_overlay_copyup_capability() {
     local probe_root="$1"
     local fs_type="$2"
+    local host_scope="$3"
+    local probe_label="$4"
     local lower="$probe_root/overlay-lower"
     local upper="$probe_root/overlay-upper"
     local work="$probe_root/overlay-work"
@@ -254,8 +264,8 @@ probe_overlay_copyup_capability() {
             reason="overlay_write_did_not_preserve_lower_file"
         fi
         umount "$merged" 2>/dev/null || true
-        printf 'projection_fs_capability strategy=overlay_copyup fs_type=%s overlay_attempt=ok copyup_writes_private=%s accepted=%s reason=%s\n' \
-            "$fs_type" "$private_writes" "$([[ "$private_writes" == "yes" ]] && printf accepted || printf deferred)" "$reason"
+        printf 'projection_fs_capability host_scope=%s probe_root=%s strategy=overlay_copyup fs_type=%s overlay_attempt=ok copyup_writes_private=%s accepted=%s reason=%s\n' \
+            "$host_scope" "$probe_label" "$fs_type" "$private_writes" "$([[ "$private_writes" == "yes" ]] && printf accepted || printf deferred)" "$reason"
     elif command -v fuse-overlayfs >/dev/null 2>&1 \
         && fuse-overlayfs -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$merged" 2>"$stderr_file"; then
         printf 'sunlight-projection-overlay-merged-mutation\n' >"$merged/file.txt"
@@ -268,25 +278,38 @@ probe_overlay_copyup_capability() {
             reason="fuse_overlayfs_write_did_not_preserve_lower_file"
         fi
         fusermount -u "$merged" 2>/dev/null || umount "$merged" 2>/dev/null || true
-        printf 'projection_fs_capability strategy=overlay_copyup fs_type=%s overlay_attempt=ok copyup_writes_private=%s accepted=%s reason=%s\n' \
-            "$fs_type" "$private_writes" "$([[ "$private_writes" == "yes" ]] && printf accepted || printf deferred)" "$reason"
+        printf 'projection_fs_capability host_scope=%s probe_root=%s strategy=overlay_copyup fs_type=%s overlay_attempt=ok copyup_writes_private=%s accepted=%s reason=%s\n' \
+            "$host_scope" "$probe_label" "$fs_type" "$private_writes" "$([[ "$private_writes" == "yes" ]] && printf accepted || printf deferred)" "$reason"
     else
         reason="$(classify_probe_error "$(cat "$stderr_file")")"
-        printf 'projection_fs_capability strategy=overlay_copyup fs_type=%s overlay_attempt=failed copyup_writes_private=unknown accepted=deferred reason=%s\n' \
-            "$fs_type" "$reason"
+        printf 'projection_fs_capability host_scope=%s probe_root=%s strategy=overlay_copyup fs_type=%s overlay_attempt=failed copyup_writes_private=unknown accepted=deferred reason=%s\n' \
+            "$host_scope" "$probe_label" "$fs_type" "$reason"
     fi
 }
 
-probe_real_filesystem_capabilities() {
-    local probe_root="$tmp_dir/real-fs-probe"
+probe_filesystem_capabilities() {
+    local probe_root="$1"
+    local host_scope="$2"
+    local probe_label="$3"
     local fs_type
 
     mkdir -p "$probe_root"
     fs_type="$(stat -f -c %T "$probe_root" 2>/dev/null || printf 'unknown')"
-    printf 'projection_fs_capability host_scope=current_wsl_linux_tempdir fs_type=%s probe_root=tempdir absolute_paths=omitted\n' "$fs_type"
-    probe_reflink_capability "$probe_root" "$fs_type"
-    probe_hardlink_readonly_capability "$probe_root" "$fs_type"
-    probe_overlay_copyup_capability "$probe_root" "$fs_type"
+    printf 'projection_fs_capability host_scope=%s fs_type=%s probe_root=%s absolute_paths=omitted\n' "$host_scope" "$fs_type" "$probe_label"
+    printf 'projection_fs_capability host_scope=%s probe_root=%s strategy=copy fs_type=%s accepted=accepted reason=correctness_fallback\n' "$host_scope" "$probe_label" "$fs_type"
+    probe_reflink_capability "$probe_root" "$fs_type" "$host_scope" "$probe_label"
+    probe_hardlink_readonly_capability "$probe_root" "$fs_type" "$host_scope" "$probe_label"
+    probe_overlay_copyup_capability "$probe_root" "$fs_type" "$host_scope" "$probe_label"
+}
+
+probe_real_filesystem_capabilities() {
+    probe_filesystem_capabilities "$tmp_dir/real-fs-probe" current_wsl_linux_tempdir tempdir
+
+    if [[ -n "${SUNLIGHT_PROJECTION_SMOKE_NON_TEMP_ROOT:-}" ]]; then
+        mkdir -p "$SUNLIGHT_PROJECTION_SMOKE_NON_TEMP_ROOT"
+        non_temp_probe_dir="$(mktemp -d "$SUNLIGHT_PROJECTION_SMOKE_NON_TEMP_ROOT/sun-projection-non-temp-fs-probe.XXXXXX")"
+        probe_filesystem_capabilities "$non_temp_probe_dir" current_wsl_linux_non_temp_root non_temp
+    fi
 }
 
 sun() {

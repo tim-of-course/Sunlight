@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `46c20d6`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 128 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`.
+- Verification: latest full pass ran after `46c20d6`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 128 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. After `6322652`, focused status round-trip coverage passed `cargo fmt --check`, `cargo test -p sun --test cli_json status_round_trip`, and `git diff --check HEAD~1..HEAD`. Optional Super Search validation last passed after `03a1e43`.
 
 ## Active Work
 
@@ -159,11 +159,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-git-ref-smoke`: default `scripts/smoke-suite.ps1` passed after `c6a58c3`.
 - Completed slice `export-selector-alias-fixture-coverage`: integrated as `2e5e552`; WSL implementation was `d1fa2c5`.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-export-alias`: default `scripts/smoke-suite.ps1` passed after `46c20d6`.
-- Active slice `operator-status-round-trip-coverage`: add focused fixture coverage that implemented status selectors expose IDs that round-trip through inspect.
+- Completed slice `operator-status-round-trip-coverage`: integrated as `6322652`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
+- Active verification slice `aggregate-smoke-suite-refresh-after-round-trip`: run the default smoke suite after status round-trip coverage.
 
 ## Candidate Next Slices
 
-- Next useful slice after active work: optional external Super Search validation refresh, unless the round-trip coverage exposes a smaller follow-up.
+- Next useful slice after active verification: optional external Super Search validation refresh, unless aggregate verification exposes a smaller follow-up.
 
 ## Decisions
 

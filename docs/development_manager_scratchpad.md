@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `5aa6275`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 118 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`. Focused policy CLI tests and validation-smoke policy coverage passed before the aggregate refresh. Next guard must run after this edit.
+- Verification: latest full pass ran after `5aa6275`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 118 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`. After `297e22d`, policy failure docs passed `git diff --check` and targeted wording searches for `commit_policy_failed`, `export_policy_failed`, and stale policy command failure claims. Next guard must run after this edit.
 
 ## Active Work
 
@@ -149,11 +149,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `policy-check-commit-cli-fixture`: integrated as `7b5b839`; WSL implementation was `14edbd2`.
 - Completed slice `policy-command-smoke-coverage`: integrated as `12af17d`; WSL implementation was `d2c7071`.
 - Completed verification slice `aggregate-smoke-suite-refresh`: default `scripts/smoke-suite.ps1` passed after `5aa6275`.
-- Active WSL slice `policy-failure-operator-docs`: document commit/export policy validation failure-path operator guidance without changing code.
+- Completed slice `policy-failure-operator-docs`: integrated as `297e22d`; WSL implementation was `b646648`.
 
 ## Candidate Next Slices
 
-- After policy failure-path docs, consider a focused CLI/doc test sweep for stale policy command examples.
+- Next useful slice: focused docs sweep for stale policy command examples and error-code wording.
 
 ## Decisions
 

@@ -42,12 +42,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `a6af00b` and covered `7e2d64e`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 151 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `0bb5ae6`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat import, and fixture Git export.
+- Verification: latest full pass ran after `a6af00b` and covered `7e2d64e`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 151 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `2faf5dd`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat project/diff/status/inspect, happy-path and generated-failure compat import, and fixture Git export.
 
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `external-validation-compat-breadth`: delegated next. Broaden the optional Super Search harness with fixture-backed compatibility project/diff/status/inspect and one atomic failure assertion after temp-clone init, without touching the target repo or making it default CI.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
@@ -108,10 +107,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-stale-preconditions`: default `scripts/smoke-suite.ps1` passed after `61c9240`.
 - Completed slice `compat-projection-quarantine-retention-cli-coverage`: integrated as `7e2d64e`; WSL implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check` and focused CLI verification.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-projection-retention`: default `scripts/smoke-suite.ps1` passed after `a6af00b`.
+- Completed slice `external-validation-compat-breadth`: integrated as `2faf5dd`; WSL script implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows parse/whitespace checks and full optional Super Search validation passing.
 
 ## Candidate Next Slices
 
-- Next useful slices after the active one: remaining Phase 6 compatibility import hardening gaps found by docs/test reconciliation.
+- Next useful slices: remaining Phase 6 compatibility import hardening gaps found by docs/test reconciliation.
 
 ## Decisions
 

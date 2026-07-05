@@ -2620,7 +2620,11 @@ fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliEr
         }
         if matches!(
             operation_id,
-            "op_auth_trim_guard_0001" | "op_profile_auth_null_guard_0001"
+            "op_auth_trim_guard_0001"
+                | "op_profile_auth_null_guard_0001"
+                | "op_auth_move_0001"
+                | "op_auth_delete_0001"
+                | "op_auth_metadata_0001"
         ) {
             return Ok(if json {
                 fixture_inspect_operation_json(operation_id)?
@@ -3633,6 +3637,10 @@ fn fixture_inspect_git_json(export: &FixtureGitExport) -> String {
 }
 
 fn fixture_inspect_operation_json(operation_id: &str) -> Result<String, CliError> {
+    if let Some(response) = fixture_structural_mutation_response_by_operation_id(operation_id)? {
+        return Ok(fixture_inspect_mutation_operation_json(&response));
+    }
+
     let (topic_id, topic_revision_id, actor_id, authored_context_id, after_hash) =
         match operation_id {
             "op_auth_trim_guard_0001" => (
@@ -3705,6 +3713,67 @@ fn fixture_inspect_operation_json(operation_id: &str) -> Result<String, CliError
         topic_revision_id,
         operation_resolver_impacts_json(operation_id),
     ))
+}
+
+fn fixture_structural_mutation_response_by_operation_id(
+    operation_id: &str,
+) -> Result<Option<MutationResponse>, CliError> {
+    let mut store = InMemoryArtifactStore::fixture_basic_app();
+    let response = match operation_id {
+        "op_auth_move_0001" => store.move_path(MoveRequest {
+            session_id: FIXTURE_SESSION_ID.to_string(),
+            source_path: "src/auth.ts".to_string(),
+            target_path: "src/auth.renamed.ts".to_string(),
+            expected_hash: "sha256:auth_base".to_string(),
+        }),
+        "op_auth_delete_0001" => store.delete_path(DeleteRequest {
+            session_id: FIXTURE_SESSION_ID.to_string(),
+            path: "src/auth.ts".to_string(),
+            expected_hash: "sha256:auth_base".to_string(),
+        }),
+        "op_auth_metadata_0001" => store.metadata_set(MetadataSetRequest {
+            session_id: FIXTURE_SESSION_ID.to_string(),
+            path: "src/auth.ts".to_string(),
+            expected_hash: "sha256:auth_base".to_string(),
+            classification: "generated".to_string(),
+        }),
+        _ => return Ok(None),
+    }
+    .map_err(artifact_error)?;
+
+    Ok(Some(response))
+}
+
+fn fixture_inspect_mutation_operation_json(response: &MutationResponse) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.operation\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"topic_id\":\"{}\",",
+            "\"session_id\":\"{}\",",
+            "\"topic_revision_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\"",
+            "}},",
+            "\"view\":{},",
+            "\"operation\":{},",
+            "\"created_revision\":{},",
+            "\"session_generation\":{}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&response.repository_id),
+        json_escape(&response.operation.id),
+        json_escape(&response.operation.topic_id),
+        json_escape(&response.operation.session_id),
+        json_escape(&response.topic_revision.id),
+        json_escape(&response.session_generation.id),
+        view_json(&response.view),
+        operation_json(response),
+        topic_revision_json(response),
+        session_generation_json(response),
+    )
 }
 
 fn operation_resolver_impacts_json(operation_id: &str) -> String {

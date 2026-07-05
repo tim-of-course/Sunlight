@@ -716,6 +716,105 @@ fn metadata_set_json_fixture_basic_app_returns_metadata_mutation_envelope() {
 }
 
 #[test]
+fn structural_mutation_provenance_round_trips_through_operation_inspect() {
+    let repo = TestRepo::new("structural-mutation-inspect-roundtrip");
+
+    let move_output = sun()
+        .arg("move")
+        .arg("src/auth.ts")
+        .arg("src/auth.renamed.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--expect-hash")
+        .arg("sha256:auth_base")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun move should run");
+    assert_success(&move_output);
+
+    let move_inspect = inspect_fixture_operation(repo.path(), "op_auth_move_0001");
+    assert!(move_inspect.contains("\"command\":\"inspect.operation\""));
+    assert!(move_inspect.contains("\"operation_transaction_id\":\"op_auth_move_0001\""));
+    assert!(move_inspect.contains("\"topic_revision_id\":\"rev_auth_nullability_0001\""));
+    assert!(move_inspect.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
+    assert!(move_inspect.contains("\"mutation\":\"move\""));
+    assert!(move_inspect.contains("\"expected_path\":\"src/auth.ts\""));
+    assert!(move_inspect.contains("\"expected_hash\":\"sha256:auth_base\""));
+    assert!(move_inspect.contains("\"payload\":{\"kind\":\"move\""));
+    assert!(move_inspect
+        .contains("\"path_binding_removal\":{\"path\":\"src/auth.ts\",\"state\":\"tombstone\"}"));
+    assert!(move_inspect.contains(
+        "\"path_binding_addition\":{\"path\":\"src/auth.renamed.ts\",\"state\":\"active\"}"
+    ));
+    assert!(move_inspect.contains(
+        "\"created_revision\":{\"topic_revision_id\":\"rev_auth_nullability_0001\",\"topic_id\":\"topic_auth_nullability\",\"revision_number\":1,\"parent_revision_id\":null,\"operation_transaction_id\":\"op_auth_move_0001\""
+    ));
+    assert!(move_inspect.contains(
+        "\"session_generation\":{\"session_generation_id\":\"gen_agent_a_0002\",\"session_id\":\"session_agent_a\",\"write_topic_id\":\"topic_auth_nullability\""
+    ));
+    assert!(move_inspect.contains("\"created_by_operation_id\":\"op_auth_move_0001\""));
+
+    let delete_output = sun()
+        .arg("delete")
+        .arg("src/auth.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--expect-hash")
+        .arg("sha256:auth_base")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun delete should run");
+    assert_success(&delete_output);
+
+    let delete_inspect = inspect_fixture_operation(repo.path(), "op_auth_delete_0001");
+    assert!(delete_inspect.contains("\"operation_transaction_id\":\"op_auth_delete_0001\""));
+    assert!(delete_inspect.contains("\"topic_revision_id\":\"rev_auth_nullability_0001\""));
+    assert!(delete_inspect.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
+    assert!(delete_inspect.contains("\"mutation\":\"delete\""));
+    assert!(delete_inspect.contains("\"payload\":{\"kind\":\"delete\""));
+    assert!(delete_inspect
+        .contains("\"path_binding_removal\":{\"path\":\"src/auth.ts\",\"state\":\"tombstone\"}"));
+    assert!(delete_inspect.contains("\"tombstone\":true"));
+    assert!(delete_inspect.contains("\"path_state\":\"tombstone\""));
+    assert!(delete_inspect.contains("\"created_by_operation_id\":\"op_auth_delete_0001\""));
+
+    let metadata_output = sun()
+        .arg("metadata")
+        .arg("set")
+        .arg("src/auth.ts")
+        .arg("--classification")
+        .arg("generated")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--expect-hash")
+        .arg("sha256:auth_base")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun metadata set should run");
+    assert_success(&metadata_output);
+
+    let metadata_inspect = inspect_fixture_operation(repo.path(), "op_auth_metadata_0001");
+    assert!(metadata_inspect.contains("\"operation_transaction_id\":\"op_auth_metadata_0001\""));
+    assert!(metadata_inspect.contains("\"topic_revision_id\":\"rev_auth_nullability_0001\""));
+    assert!(metadata_inspect.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
+    assert!(metadata_inspect.contains("\"mutation\":\"metadata_set\""));
+    assert!(metadata_inspect.contains("\"classification\":\"generated\""));
+    assert!(metadata_inspect.contains("\"payload\":{\"kind\":\"metadata_set\""));
+    assert!(metadata_inspect.contains("\"classification_before\":\"source\""));
+    assert!(metadata_inspect.contains("\"classification_after\":\"generated\""));
+    assert!(metadata_inspect.contains("\"created_by_operation_id\":\"op_auth_metadata_0001\""));
+}
+
+#[test]
 fn patch_json_fixture_basic_app_stale_hash_returns_precondition_failure() {
     let repo = TestRepo::new("patch-stale-fixture");
     let patch_file = repo.write_file("auth.patch", auth_trim_guard_patch());
@@ -6701,6 +6800,20 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn inspect_fixture_operation(repo: &Path, operation_id: &str) -> String {
+    let output = sun()
+        .arg("inspect")
+        .arg(format!("operation:{operation_id}"))
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo)
+        .output()
+        .expect("sun inspect operation should run");
+    assert_success(&output);
+    stdout(&output)
 }
 
 fn tree_hash(stdout: &str) -> String {

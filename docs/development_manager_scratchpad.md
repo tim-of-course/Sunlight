@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `36e49b8` and covered `e17fa71`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 143 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused compat ambiguous-rename checks passed after `7d1c796`. Optional Super Search validation passed after `e02debe`.
+- Verification: latest full pass ran after `973da56` and covered `7d1c796`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 144 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -183,7 +183,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `compat-import-generated-policy-cli-coverage`: integrated as `e17fa71`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-generated-policy`: default `scripts/smoke-suite.ps1` passed after `36e49b8`.
 - Completed slice `compat-import-ambiguous-rename-cli-coverage`: integrated as `7d1c796`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
-- Active verification slice `aggregate-smoke-suite-refresh-after-compat-import-ambiguous-rename`: run the default smoke suite after the compatibility ambiguous-rename import coverage lands.
+- Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-ambiguous-rename`: default `scripts/smoke-suite.ps1` passed after `973da56`.
 
 ## Candidate Next Slices
 

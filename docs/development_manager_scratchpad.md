@@ -42,12 +42,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `ef848cd` and covered `7b80d72`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 154 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `2faf5dd`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat project/diff/status/inspect, happy-path and generated-failure compat import, and fixture Git export.
+- Verification: latest full pass ran after `b2ae867` and covered the ignored-path Phase 6 gap closure. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 155 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `2faf5dd`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat project/diff/status/inspect, happy-path and generated-failure compat import, and fixture Git export.
 
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `compat-ignored-path-fixture-coverage`: delegated next. Close the Phase 6 audit gap by adding or explicitly reconciling distinct ignored-path compatibility fixture coverage without broadening real-filesystem import claims.
+- Active slice `projection-platform-spike-metrics`: delegated next. Move back to projection platform work by running or tightening the WSL/Linux projection strategy spike metrics and documenting shareable results without leaking machine-specific paths.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
@@ -115,10 +115,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-projection-only-boundary`: default `scripts/smoke-suite.ps1` passed after `ef848cd`.
 - Completed slice `compat-status-docs-reconcile`: integrated as `6fb413d`; WSL docs implementation was imported manager-side after the WSL Git sandbox blocked committing, with drift search and `git diff --check` passing.
 - Completed slice `phase6-acceptance-audit`: integrated as `224d567`; WSL audit found the distinct ignored-path fixture coverage gap, with focused compat import/status/inspect/checkpoint/export tests and `git diff --check` passing under `/tmp` Zig caches.
+- Completed slice `compat-ignored-path-fixture-coverage`: integrated as `b2ae867`; WSL implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check`, focused compat/status/inspect/working-tree tests, and default smoke passing.
+- Completed verification slice `aggregate-smoke-suite-refresh-after-ignored-path-coverage`: default `scripts/smoke-suite.ps1` passed after `b2ae867`.
 
 ## Candidate Next Slices
 
-- Next useful slices after the active one: focused/full smoke over any ignored-path fixture coverage, then move back to platform projection work if Phase 6 stays closed.
+- Next useful slices after the active one: close concrete projection spike findings, then continue execution projection/cache hardening.
 
 ## Decisions
 

@@ -4807,10 +4807,44 @@ fn status_json_fixture_compat_projection_reports_dirty_candidates() {
     assert!(stdout.contains(
         "\"quarantine_refs\":[\"quarantine://compat/projection_compat_agent_a_0001/env\"]"
     ));
-    assert!(stdout.contains("\"last_import_attempt\":null"));
+    assert!(stdout.contains(
+        "\"last_import_attempt\":{\"compat_import_operation_id\":\"op_compat_import_auth_0001\""
+    ));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_compat_import_0001\""));
+    assert!(stdout.contains("\"candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
     assert!(stdout.contains("\"local_projection_refs\":{\"root_ref\":{\"value\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001\""));
     assert!(stdout.contains("\"candidate_summary_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/compat-diff-summary.json\""));
     assert!(stdout.contains("\"candidate_detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas\""));
+}
+
+#[test]
+fn status_json_fixture_compat_projection_last_import_visibility() {
+    let repo = TestRepo::new("status-fixture-compat-projection-last-import-visibility");
+
+    let output = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status compat projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains(
+        "\"last_import_attempt\":{\"compat_import_operation_id\":\"op_compat_import_auth_0001\""
+    ));
+    assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
+    assert!(stdout.contains("\"candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_compat_import_0001\""));
 }
 
 #[test]
@@ -4846,11 +4880,45 @@ fn inspect_json_fixture_compat_projection_reports_baseline_policy_and_candidates
         "\"candidate_detail_refs\":[{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""
     ));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_env_secret_0001\""));
-    assert!(stdout.contains("\"last_import_attempt\":null"));
-    assert!(stdout.contains("\"native_operation_ids\":[]"));
-    assert!(stdout.contains("\"native_revision_ids\":[]"));
-    assert!(!stdout.contains("op_compat_import_auth_0001"));
-    assert!(!stdout.contains("rev_auth_nullability_compat_0001"));
+    assert!(stdout.contains(
+        "\"last_import_attempt\":{\"compat_import_operation_id\":\"op_compat_import_auth_0001\""
+    ));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_compat_import_0001\""));
+    assert!(stdout.contains("\"native_operation_ids\":[\"op_compat_import_auth_0001\"]"));
+    assert!(stdout.contains("\"native_revision_ids\":[\"rev_auth_nullability_compat_0001\"]"));
+}
+
+#[test]
+fn inspect_json_fixture_compat_projection_last_import_visibility() {
+    let repo = TestRepo::new("inspect-fixture-compat-projection-last-import-visibility");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("projection:projection_compat_agent_a_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect compat projection should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains(
+        "\"compatibility_projection\":{\"baseline\":{\"resolved_view_id\":\"view_base_0001\""
+    ));
+    assert!(stdout.contains(
+        "\"last_import_attempt\":{\"compat_import_operation_id\":\"op_compat_import_auth_0001\""
+    ));
+    assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
+    assert!(stdout.contains("\"candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_compat_import_0001\""));
+    assert!(stdout.contains("\"native_operation_ids\":[\"op_compat_import_auth_0001\"]"));
+    assert!(stdout.contains("\"native_revision_ids\":[\"rev_auth_nullability_compat_0001\"]"));
 }
 
 #[test]

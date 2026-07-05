@@ -5868,17 +5868,19 @@ fn compat_projection_status_extension_json(projection: &ProjectionRecord) -> Str
     }
 
     let candidates = fixture_basic_app_candidate_deltas();
+    let last_import_attempt = compat_projection_last_import_attempt_json(projection);
     format!(
         concat!(
             ",\"candidate_counts\":{}",
             ",\"selected_candidate_delta_ids\":{}",
             ",\"quarantine_refs\":{}",
-            ",\"last_import_attempt\":null",
+            ",\"last_import_attempt\":{}",
             ",\"local_projection_refs\":{}"
         ),
         compat_candidate_counts_json(&candidates),
         compat_projection_selected_candidate_ids_json(),
         compat_quarantine_refs_json(&candidates),
+        last_import_attempt,
         compat_projection_local_refs_json(projection, &candidates),
     )
 }
@@ -5889,6 +5891,19 @@ fn compat_projection_inspect_extension_json(projection: &ProjectionRecord) -> St
     }
 
     let candidates = fixture_basic_app_candidate_deltas();
+    let import = compat_projection_last_import_response(projection);
+    let last_import_attempt = import
+        .as_ref()
+        .map(compat_import_attempt_json)
+        .unwrap_or_else(|| "null".to_string());
+    let native_operation_ids = import
+        .as_ref()
+        .map(|response| string_array_json([response.operation_id.as_str()].into_iter()))
+        .unwrap_or_else(|| "[]".to_string());
+    let native_revision_ids = import
+        .as_ref()
+        .map(|response| string_array_json([response.topic_revision_id.as_str()].into_iter()))
+        .unwrap_or_else(|| "[]".to_string());
     format!(
         concat!(
             ",\"compatibility_projection\":{{",
@@ -5913,9 +5928,9 @@ fn compat_projection_inspect_extension_json(projection: &ProjectionRecord) -> St
             "}},",
             "\"candidate_detail_refs\":{},",
             "\"local_projection_refs\":{},",
-            "\"last_import_attempt\":null,",
-            "\"native_operation_ids\":[],",
-            "\"native_revision_ids\":[]",
+            "\"last_import_attempt\":{},",
+            "\"native_operation_ids\":{},",
+            "\"native_revision_ids\":{}",
             "}}"
         ),
         json_escape(&projection.resolved_view_id),
@@ -5932,6 +5947,55 @@ fn compat_projection_inspect_extension_json(projection: &ProjectionRecord) -> St
         json_escape(&compat_candidate_summary_ref(projection)),
         compat_candidate_detail_refs_json(projection, &candidates),
         compat_projection_local_refs_json(projection, &candidates),
+        last_import_attempt,
+        native_operation_ids,
+        native_revision_ids,
+    )
+}
+
+fn compat_projection_last_import_attempt_json(projection: &ProjectionRecord) -> String {
+    compat_projection_last_import_response(projection)
+        .as_ref()
+        .map(compat_import_attempt_json)
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn compat_projection_last_import_response(
+    projection: &ProjectionRecord,
+) -> Option<CompatImportResponse> {
+    if projection.id != FIXTURE_COMPATIBILITY_PROJECTION_ID {
+        return None;
+    }
+
+    fixture_compat_import_response_by_operation_id(FIXTURE_COMPAT_IMPORT_OPERATION_ID).ok()
+}
+
+fn compat_import_attempt_json(response: &CompatImportResponse) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"compat_import_operation_id\":\"{}\",",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"topic_revision_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"candidate_delta_ids\":{},",
+            "\"selected_deltas\":[{}],",
+            "\"topic_revision\":{},",
+            "\"session_generation\":{}",
+            "}}"
+        ),
+        json_escape(&response.operation_id),
+        json_escape(&response.operation_id),
+        json_escape(&response.projection_id),
+        json_escape(&response.topic_revision_id),
+        json_escape(&response.session_generation_id),
+        json_escape(&response.resolved_view_id),
+        compat_import_candidate_delta_ids_json(response),
+        compat_selected_deltas_json(response),
+        compat_topic_revision_json(response),
+        compat_session_generation_json(response),
     )
 }
 

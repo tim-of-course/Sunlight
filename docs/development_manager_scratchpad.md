@@ -47,7 +47,6 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `compat-projection-quarantine-retention-cli-coverage`: delegated next. Focus is compatibility projection retention/quarantine visibility and local-only cleanup boundaries, reusing the existing fixture surface without adding a broad retention scheduler.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
@@ -106,10 +105,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `external-validation-super-search-refresh-after-compat-import-hardening`: optional `scripts/external-validation-super-search.ps1` passed after `0bb5ae6` with Super Search `mix test`, `bun run test`, temp-clone `sun init`, fixture compat import, and fixture-backed Git export.
 - Completed slice `compat-import-stale-precondition-cli-coverage`: integrated as `a4a7718`; WSL implementation was imported manager-side after WSL `cargo-fmt` was unavailable, with Windows `cargo fmt` and focused CLI verification.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-stale-preconditions`: default `scripts/smoke-suite.ps1` passed after `61c9240`.
+- Completed slice `compat-projection-quarantine-retention-cli-coverage`: integrated as `7e2d64e`; WSL implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check` and focused CLI verification.
 
 ## Candidate Next Slices
 
-- Next useful slices after the active one: fixture external validation breadth, then remaining Phase 6 compatibility import hardening gaps found by docs/test reconciliation.
+- Next useful slices: fixture external validation breadth, then remaining Phase 6 compatibility import hardening gaps found by docs/test reconciliation.
 
 ## Decisions
 

@@ -4367,6 +4367,96 @@ fn git_export_write_plan_json_fixture_returns_writer_plan() {
 }
 
 #[test]
+fn projection_only_local_edits_are_not_checkpoint_or_export_source_truth() {
+    let repo = TestRepo::new("projection-only-boundary-fixture-ready");
+    let projection_root = repo.path().join("projection-root");
+    let view_id = resolve_fixture_view_id(
+        repo.path(),
+        "topic_auth_nullability:rev_auth_nullability_0001,topic_profile_ui:rev_profile_ui_0001",
+    );
+    let projection_only_filename = "projection-only-unimported.ts";
+    let projection_only_content = "projection only local source truth";
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    write_nested_file(
+        &projection_root,
+        &format!(
+            ".sunlight/projections/compatibility/projection_compat_agent_a_0001/\
+             candidate-deltas/{projection_only_filename}"
+        ),
+        projection_only_content,
+    );
+    write_nested_file(
+        &projection_root,
+        &format!("src/{projection_only_filename}"),
+        projection_only_content,
+    );
+
+    let checkpoint = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg("--view")
+        .arg(&view_id)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun checkpoint create should run");
+
+    assert_success(&checkpoint);
+    let checkpoint_stdout = stdout(&checkpoint);
+    assert!(checkpoint_stdout.contains("\"command\":\"checkpoint.create\""));
+    assert!(checkpoint_stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
+    assert!(checkpoint_stdout.contains(&format!("\"resolved_view_id\":\"{view_id}\"")));
+    assert!(checkpoint_stdout.contains("\"export_ready\":true"));
+    assert!(!checkpoint_stdout.contains(projection_only_filename));
+    assert!(!checkpoint_stdout.contains(projection_only_content));
+
+    let write_plan = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--branch")
+        .arg("refs/heads/sunlight/auth-profile-ready")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--write-plan")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export write plan should run");
+
+    assert_success(&write_plan);
+    let write_plan_stdout = stdout(&write_plan);
+    assert!(write_plan_stdout.contains("\"command\":\"git.export.write_plan\""));
+    assert!(write_plan_stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
+    assert!(write_plan_stdout
+        .contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
+    assert!(write_plan_stdout
+        .contains("\"planned_commit_id\":\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
+    assert!(!write_plan_stdout.contains(projection_only_filename));
+    assert!(!write_plan_stdout.contains(projection_only_content));
+}
+
+#[test]
 fn git_export_execute_fixture_json_returns_execution_success() {
     let repo = TestRepo::new("git-export-execute-fixture-success");
 

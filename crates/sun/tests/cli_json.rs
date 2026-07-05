@@ -4036,6 +4036,158 @@ fn status_json_fixture_missing_export_map_returns_object_not_found() {
 }
 
 #[test]
+fn status_json_fixture_git_ref_lookup_returns_export_map_snapshot() {
+    let repo = TestRepo::new("status-fixture-git-ref");
+
+    let output = sun()
+        .arg("status")
+        .arg("--git")
+        .arg("refs/heads/sunlight/auth-profile-ready")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status git ref should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.git\""));
+    assert!(stdout.contains("\"ids\":{\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\""));
+    assert!(stdout.contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
+    assert!(
+        stdout.contains("\"validation_report_id\":\"validation_export_auth_profile_ready_0001\"")
+    );
+    assert!(stdout.contains("\"git_export\":{\"lifecycle_state\":\"exported\""));
+    assert!(stdout.contains("\"mapping_state\":\"resolved\""));
+    assert!(stdout
+        .contains("\"git_commit_ids\":[\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"));
+    assert!(stdout.contains("\"export_map\":{"));
+    assert!(stdout.contains("\"ok\":true"));
+}
+
+#[test]
+fn status_json_fixture_git_ref_commit_lookup_returns_export_map_snapshot() {
+    let repo = TestRepo::new("status-fixture-git-ref-commit");
+
+    let output = sun()
+        .arg("status")
+        .arg("--git")
+        .arg("git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status git commit should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.git\""));
+    assert!(stdout.contains("\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\""));
+    assert!(stdout.contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout
+        .contains("\"git_commit_ids\":[\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"));
+}
+
+#[test]
+fn inspect_json_fixture_git_ref_lookup_returns_export_map_mapping() {
+    let repo = TestRepo::new("inspect-fixture-git-ref");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("git:refs/heads/sunlight/auth-profile-ready")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect git ref should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.git\""));
+    assert!(stdout.contains("\"ids\":{\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\""));
+    assert!(stdout.contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
+    assert!(
+        stdout.contains("\"git_mapping\":{\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\"")
+    );
+    assert!(stdout.contains("\"record_type\":\"git_export_map\""));
+    assert!(stdout
+        .contains("\"validation_report\":{\"id\":\"validation_export_auth_profile_ready_0001\""));
+}
+
+#[test]
+fn inspect_json_fixture_git_ref_commit_lookup_returns_export_map_mapping() {
+    let repo = TestRepo::new("inspect-fixture-git-ref-commit");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("git:git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect git commit should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.git\""));
+    assert!(stdout.contains("\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\""));
+    assert!(stdout.contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout
+        .contains("\"git_commit_ids\":[\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"));
+}
+
+#[test]
+fn status_json_fixture_git_ref_missing_lookup_returns_object_not_found() {
+    let repo = TestRepo::new("status-fixture-git-ref-missing");
+
+    let output = sun()
+        .arg("status")
+        .arg("--git")
+        .arg("refs/heads/sunlight/missing")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status missing git ref should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"object_not_found\""));
+    assert!(stdout.contains("\"selector\":\"refs/heads/sunlight/missing\""));
+    assert!(stdout.contains("\"object_type\":\"git\""));
+}
+
+#[test]
+fn inspect_json_fixture_git_ref_missing_lookup_returns_object_not_found() {
+    let repo = TestRepo::new("inspect-fixture-git-ref-missing");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("git:git_sha1_missing")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect missing git commit should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"object_not_found\""));
+    assert!(stdout.contains("\"selector\":\"git_sha1_missing\""));
+    assert!(stdout.contains("\"object_type\":\"git\""));
+}
+
+#[test]
 fn status_json_fixture_basic_app_returns_session_snapshot() {
     let repo = TestRepo::new("status-fixture-session");
 

@@ -1021,6 +1021,17 @@ fn status(ctx: &CommandContext) -> Result<(), CliError> {
                     )
                 }
             }
+            StatusScope::Git(selector) => {
+                let export = ensure_fixture_git_export_by_selector(&selector)?;
+                if ctx.json {
+                    fixture_status_git_json(&export)
+                } else {
+                    format!(
+                        "{} exported {}",
+                        export.response.export_map.git_ref, export.response.export_map.id
+                    )
+                }
+            }
             StatusScope::CompatImport(operation_id) => {
                 let response = fixture_compat_import_response_by_operation_id(&operation_id)?;
                 if ctx.json {
@@ -1101,6 +1112,7 @@ enum StatusScope {
     Projection(String),
     Checkpoint(String),
     ExportMap(String),
+    Git(String),
     CompatImport(String),
     Execution(String),
 }
@@ -2196,6 +2208,12 @@ fn parse_status_options(ctx: &CommandContext) -> Result<Option<StatusOptions>, C
                 })?;
                 scope = StatusScope::ExportMap(value.clone());
             }
+            "--git" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| invalid_request("usage: sun status --git <commit-or-ref>"))?;
+                scope = StatusScope::Git(value.clone());
+            }
             "--compat-import" => {
                 let value = args.next().ok_or_else(|| {
                     invalid_request("usage: sun status --compat-import <operation-id>")
@@ -2374,6 +2392,21 @@ fn ensure_fixture_export_map(export_map_id: &str) -> Result<FixtureGitExport, Cl
     }
 }
 
+fn ensure_fixture_git_export_by_selector(selector: &str) -> Result<FixtureGitExport, CliError> {
+    let export = fixture_git_export_response()?;
+    let response = &export.response;
+    if response.git_ref == selector
+        || response
+            .git_commit_ids
+            .iter()
+            .any(|commit_id| commit_id == selector)
+    {
+        Ok(export)
+    } else {
+        Err(object_not_found("git", selector))
+    }
+}
+
 fn fixture_execution_by_id(execution_id: &str) -> Result<ExecutionRecord, CliError> {
     if execution_id != FIXTURE_PASSING_EXECUTION_ID {
         return Err(object_not_found("execution", execution_id));
@@ -2496,6 +2529,14 @@ fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliEr
             fixture_inspect_export_map_json(&export)
         } else {
             format!("export_map {}", export.response.export_map.id)
+        });
+    }
+    if let Some(git_selector) = selector.strip_prefix("git:") {
+        let export = ensure_fixture_git_export_by_selector(git_selector)?;
+        return Ok(if json {
+            fixture_inspect_git_json(&export)
+        } else {
+            format!("git {}", export.response.export_map.id)
         });
     }
     if let Some(projection_id) = selector.strip_prefix("projection:") {
@@ -2985,6 +3026,54 @@ fn fixture_status_export_map_json(export: &FixtureGitExport) -> String {
     )
 }
 
+fn fixture_status_git_json(export: &FixtureGitExport) -> String {
+    let response = &export.response;
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"status.git\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"git_ref\":\"{}\",",
+            "\"export_map_id\":\"{}\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"validation_report_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"git_export\":{{",
+            "\"lifecycle_state\":\"exported\",",
+            "\"mapping_state\":\"resolved\",",
+            "\"export_map_id\":\"{}\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"validation_report_id\":\"{}\",",
+            "\"git_ref\":\"{}\",",
+            "\"git_commit_ids\":{},",
+            "\"partial_failure_marker\":null",
+            "}},",
+            "\"validation_report\":{},",
+            "\"export_map\":{}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&response.export_map.repository_id),
+        json_escape(&response.git_ref),
+        json_escape(&response.export_map.id),
+        json_escape(&response.checkpoint_id),
+        json_escape(&response.validation_report.id),
+        json_escape(&export.checkpoint.resolved_view_id),
+        single_repo_tree_json(&response.export_map.tree_identity),
+        json_escape(&response.export_map.id),
+        json_escape(&response.checkpoint_id),
+        json_escape(&response.validation_report.id),
+        json_escape(&response.git_ref),
+        string_array_json(response.git_commit_ids.iter().map(String::as_str)),
+        git_export_validation_report_json(&response.validation_report),
+        git_export_map_json(&response.export_map),
+    )
+}
+
 fn fixture_inspect_artifact_json(artifact: FixtureArtifact) -> String {
     let provenance = if let Some(operation_id) = artifact.latest_operation_id {
         format!(
@@ -3119,6 +3208,49 @@ fn fixture_inspect_export_map_json(export: &FixtureGitExport) -> String {
         json_escape(&response.validation_report.id),
         json_escape(&export.checkpoint.resolved_view_id),
         single_repo_tree_json(&response.export_map.tree_identity),
+        git_export_map_json(&response.export_map),
+        git_export_validation_report_json(&response.validation_report),
+    )
+}
+
+fn fixture_inspect_git_json(export: &FixtureGitExport) -> String {
+    let response = &export.response;
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.git\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"git_ref\":\"{}\",",
+            "\"export_map_id\":\"{}\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"validation_report_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"git_mapping\":{{",
+            "\"git_ref\":\"{}\",",
+            "\"git_commit_ids\":{},",
+            "\"export_map_id\":\"{}\",",
+            "\"checkpoint_id\":\"{}\"",
+            "}},",
+            "\"export_map\":{},",
+            "\"validation_report\":{}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&response.export_map.repository_id),
+        json_escape(&response.git_ref),
+        json_escape(&response.export_map.id),
+        json_escape(&response.checkpoint_id),
+        json_escape(&response.validation_report.id),
+        json_escape(&export.checkpoint.resolved_view_id),
+        single_repo_tree_json(&response.export_map.tree_identity),
+        json_escape(&response.git_ref),
+        string_array_json(response.git_commit_ids.iter().map(String::as_str)),
+        json_escape(&response.export_map.id),
+        json_escape(&response.checkpoint_id),
         git_export_map_json(&response.export_map),
         git_export_validation_report_json(&response.validation_report),
     )
@@ -8488,8 +8620,10 @@ Usage:
   sun policy check-commit [--paths <path>...] --json
   sun policy explain <validation-report-id> --json
   sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan|--execute-fixture success|ref-update-failure|export-map-failure|--execute-local --repo <path>] --json
+  sun status --git <commit-or-ref> --fixture basic-app [--json]
   sun status --projection <projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|scan-missing-blob|verified] [--json]
   sun status --execution <execution-id> --fixture basic-app [--promoted] [--json]
+  sun inspect git:<commit-or-ref> --fixture basic-app [--json]
   sun inspect projection:<projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|scan-missing-blob|verified] [--json]
   sun inspect execution:<execution-id> --fixture basic-app [--promoted] [--json]
 

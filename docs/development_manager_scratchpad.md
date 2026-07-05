@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `17780c1`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 129 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`.
+- Verification: latest full pass ran after `17780c1`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 129 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -161,7 +161,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-export-alias`: default `scripts/smoke-suite.ps1` passed after `46c20d6`.
 - Completed slice `operator-status-round-trip-coverage`: integrated as `6322652`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-round-trip`: default `scripts/smoke-suite.ps1` passed after `17780c1`.
-- Active verification slice `external-validation-super-search-refresh`: rerun optional Super Search validation after recent operator surface and smoke coverage changes.
+- Completed verification slice `external-validation-super-search-refresh`: optional `scripts/external-validation-super-search.ps1` passed after `e02debe` with Super Search `mix test`, `bun run test`, temp-clone `sun init`, fixture compat import, and fixture-backed Git export.
 
 ## Candidate Next Slices
 

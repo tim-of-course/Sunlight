@@ -47,7 +47,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `projection-platform-spike-metrics`: delegated next. Move back to projection platform work by running or tightening the WSL/Linux projection strategy spike metrics and documenting shareable results without leaking machine-specific paths.
+- Active slice `projection-real-fs-capability-probe`: ready next. Probe WSL/Linux reflink, read-only hardlink, and overlay/copy-up capabilities in a scoped local harness without claiming portability beyond observed host behavior.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
@@ -117,10 +117,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `phase6-acceptance-audit`: integrated as `224d567`; WSL audit found the distinct ignored-path fixture coverage gap, with focused compat import/status/inspect/checkpoint/export tests and `git diff --check` passing under `/tmp` Zig caches.
 - Completed slice `compat-ignored-path-fixture-coverage`: integrated as `b2ae867`; WSL implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check`, focused compat/status/inspect/working-tree tests, and default smoke passing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-ignored-path-coverage`: default `scripts/smoke-suite.ps1` passed after `b2ae867`.
+- Completed slice `projection-platform-spike-metrics`: integrated as `6342747`; WSL scripts/docs implementation was imported manager-side after the WSL Git sandbox blocked committing, with WSL shell smoke/focused projection tests and Windows projection-strategy smoke passing.
 
 ## Candidate Next Slices
 
-- Next useful slices after the active one: close concrete projection spike findings, then continue execution projection/cache hardening.
+- Next useful slices after the active one: turn any real-filesystem probe result into accepted/deferred strategy decisions, then continue execution projection/cache hardening.
 
 ## Decisions
 

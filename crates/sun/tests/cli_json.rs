@@ -1590,6 +1590,74 @@ fn projection_quarantine_cleanup_preserves_other_sunlight_content_and_projection
 }
 
 #[test]
+fn projection_quarantine_cleanup_preserves_compat_projection_local_metadata() {
+    let repo = TestRepo::new("projection-quarantine-cleanup-preserve-compat");
+    let projection_root = repo.path().join("projection-root");
+
+    let quarantine = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--integrity-fixture")
+        .arg("store-mismatch")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+    assert_success(&quarantine);
+
+    write_nested_file(
+        &projection_root,
+        ".sunlight/projections/compatibility/projection_compat_agent_a_0001/compat-diff-summary.json",
+        "{}\n",
+    );
+    write_nested_file(
+        &projection_root,
+        ".sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_env_secret_0001",
+        "{}\n",
+    );
+    write_nested_file(
+        &projection_root,
+        ".sunlight/quarantine/compat/projection_compat_agent_a_0001/env.json",
+        "{}\n",
+    );
+
+    let cleanup = sun()
+        .arg("projection")
+        .arg("quarantine-cleanup")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun projection quarantine-cleanup should run");
+
+    assert_success(&cleanup);
+    assert!(!quarantine_record_path(&projection_root).exists());
+    assert!(projection_root
+        .join(
+            ".sunlight/projections/compatibility/projection_compat_agent_a_0001/compat-diff-summary.json"
+        )
+        .is_file());
+    assert!(projection_root
+        .join(
+            ".sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_env_secret_0001"
+        )
+        .is_file());
+    assert!(projection_root
+        .join(".sunlight/quarantine/compat/projection_compat_agent_a_0001/env.json")
+        .is_file());
+}
+
+#[test]
 fn projection_quarantine_cleanup_json_is_idempotent_when_absent() {
     let repo = TestRepo::new("projection-quarantine-cleanup-absent");
     let projection_root = repo.path().join("projection-root");
@@ -5324,8 +5392,10 @@ fn status_json_fixture_compat_projection_reports_dirty_candidates() {
     assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_compat_import_0001\""));
     assert!(stdout.contains("\"candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
     assert!(stdout.contains("\"local_projection_refs\":{\"root_ref\":{\"value\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001\""));
+    assert!(stdout.contains("\"privacy_class\":\"local_only\""));
     assert!(stdout.contains("\"candidate_summary_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/compat-diff-summary.json\""));
     assert!(stdout.contains("\"candidate_detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas\""));
+    assert!(stdout.contains("\"local_projection_refs\":{\"root_ref\":{\"value\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001\",\"privacy\":\"local_only_path\",\"privacy_class\":\"local_only\"},\"baseline_manifest_ref\":\"objects/projection-baselines/repo_fixture_basic_app/view_base_0001\",\"candidate_summary_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/compat-diff-summary.json\",\"candidate_detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas\",\"quarantine_refs\":[\"quarantine://compat/projection_compat_agent_a_0001/env\"]}"));
 }
 
 #[test]
@@ -5393,6 +5463,10 @@ fn inspect_json_fixture_compat_projection_reports_baseline_policy_and_candidates
     assert!(stdout.contains(
         "\"candidate_detail_refs\":[{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""
     ));
+    assert!(stdout.contains("\"summary_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/compat-diff-summary.json\""));
+    assert!(stdout.contains(
+        "\"quarantine_refs\":[\"quarantine://compat/projection_compat_agent_a_0001/env\"]"
+    ));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_src_auth_delete_0001\""));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_src_auth_metadata_0001\""));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_src_auth_conflict_0001\""));
@@ -5402,6 +5476,7 @@ fn inspect_json_fixture_compat_projection_reports_baseline_policy_and_candidates
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_generated_schema_0001\""));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_env_secret_0001\""));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_reserved_sunlight_0001\""));
+    assert!(stdout.contains("\"local_projection_refs\":{\"root_ref\":{\"value\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001\",\"privacy\":\"local_only_path\",\"privacy_class\":\"local_only\"},\"baseline_manifest_ref\":\"objects/projection-baselines/repo_fixture_basic_app/view_base_0001\",\"candidate_summary_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/compat-diff-summary.json\",\"candidate_detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas\",\"quarantine_refs\":[\"quarantine://compat/projection_compat_agent_a_0001/env\"]}"));
     assert!(stdout.contains(
         "\"last_import_attempt\":{\"compat_import_operation_id\":\"op_compat_import_auth_0001\""
     ));

@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `d8e0925` and covered `4cd2dcf`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 146 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
+- Verification: latest full pass ran after `d8e0925` and covered `4cd2dcf`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 146 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused metadata-only compat-import checks passed after `5333445`. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -97,7 +97,8 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-delete-success`: default `scripts/smoke-suite.ps1` passed after `a371669`.
 - Completed slice `compat-import-rename-success-cli-coverage`: integrated as `4cd2dcf`; WSL implementation was imported manager-side after the WSL sandbox blocked committing, with Windows `cargo fmt` and focused CLI verification.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-rename-success`: default `scripts/smoke-suite.ps1` passed after `d8e0925`.
-- Active slice `compat-import-metadata-success-cli-coverage`: add a metadata-only compatibility candidate and verify CLI import preserves artifact identity, stable content hash, same-path before/after refs, and `metadata` operation kind.
+- Completed slice `compat-import-metadata-success-cli-coverage`: integrated as `5333445`; WSL implementation was imported manager-side after WSL `cargo-fmt` was unavailable, with Windows `cargo fmt` and focused CLI verification.
+- Active verification slice `aggregate-smoke-suite-refresh-after-compat-import-metadata-success`: refresh the default smoke suite after the metadata-only import success path.
 
 ## Candidate Next Slices
 

@@ -1590,6 +1590,64 @@ fn projection_quarantine_cleanup_preserves_other_sunlight_content_and_projection
 }
 
 #[test]
+fn projection_quarantine_cleanup_reports_only_target_projection_quarantine() {
+    let repo = TestRepo::new("projection-quarantine-cleanup-scoped-report");
+    let projection_root = repo.path().join("projection-root");
+
+    let quarantine = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--integrity-fixture")
+        .arg("store-mismatch")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+    assert_success(&quarantine);
+
+    let sibling_record = projection_root
+        .join(".sunlight/quarantine/projections/projection_inspect_auth_profile_0001")
+        .join("execution_store_integrity_failed.json");
+    fs::create_dir_all(sibling_record.parent().unwrap()).unwrap();
+    fs::write(
+        &sibling_record,
+        "{\"projection_id\":\"projection_inspect_auth_profile_0001\"}\n",
+    )
+    .unwrap();
+
+    let cleanup = sun()
+        .arg("projection")
+        .arg("quarantine-cleanup")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun projection quarantine-cleanup should run");
+
+    assert_success(&cleanup);
+    let stdout = stdout(&cleanup);
+    assert!(stdout.contains("\"command\":\"projection.quarantine_cleanup\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"retention_state_after\":\"removed\""));
+    assert!(stdout.contains(
+        "local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json"
+    ));
+    assert!(!stdout.contains("projection_inspect_auth_profile_0001"));
+    assert!(!quarantine_record_path(&projection_root).exists());
+    assert!(sibling_record.is_file());
+}
+
+#[test]
 fn projection_quarantine_cleanup_preserves_compat_projection_local_metadata() {
     let repo = TestRepo::new("projection-quarantine-cleanup-preserve-compat");
     let projection_root = repo.path().join("projection-root");

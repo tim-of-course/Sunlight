@@ -47,7 +47,6 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `compat-projection-only-checkpoint-boundary`: delegated next. Add fixture-backed CLI coverage that projection-only/local edits are excluded from checkpoint/export source truth unless imported.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
@@ -111,6 +110,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `external-validation-compat-breadth`: integrated as `2faf5dd`; WSL script implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows parse/whitespace checks and full optional Super Search validation passing.
 - Completed slice `compat-working-tree-isolation-cli-coverage`: integrated as `ba43a02`; WSL test implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check` and focused CLI verification.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-working-tree-isolation`: default `scripts/smoke-suite.ps1` passed after `f96aedb`.
+- Completed slice `compat-projection-only-checkpoint-boundary`: integrated as `7b80d72`; WSL test implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check` and focused CLI verification.
 
 ## Candidate Next Slices
 

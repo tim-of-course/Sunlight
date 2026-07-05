@@ -166,10 +166,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-repository-inspect`: default `scripts/smoke-suite.ps1` passed after `eb6255a`.
 - Completed slice `artifact-export-trace-visibility`: integrated as `6665ba7`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-artifact-export-trace`: default `scripts/smoke-suite.ps1` passed after `abdac17`.
+- Active slice `view-conflict-status-inspect`: add focused fixture support for `sun status --view`, `sun inspect view:`, and `sun inspect conflict:` so resolver conflict state is operator-visible.
 
 ## Candidate Next Slices
 
-- Next useful slice: choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
+- Next useful slice after active work: aggregate smoke refresh, then choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
 
 ## Decisions
 

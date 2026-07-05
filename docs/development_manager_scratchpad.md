@@ -156,10 +156,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-policy-explain`: default `scripts/smoke-suite.ps1` passed after `8f4212d`.
 - Completed slice `git-ref-status-inspect-fixture`: integrated as `d862c5c`; WSL implementation was `950065c` plus manager-side Windows rustfmt amendment.
 - Completed slice `git-ref-smoke-docs-coverage`: integrated as `297843e`; WSL implementation was `ae83d0f`.
+- Active verification slice `aggregate-smoke-suite-refresh-after-git-ref-smoke`: run the default smoke suite after Git ref lookup smoke coverage.
 
 ## Candidate Next Slices
 
-- Next useful slice: aggregate smoke-suite refresh after Git ref lookup smoke coverage.
+- Next useful slice after active verification: choose the next small Phase 5 operator ergonomics gap from the architecture and current CLI surface.
 
 ## Decisions
 

@@ -15,8 +15,9 @@ use sunlight_core::artifacts::{
 };
 use sunlight_core::checkpoint::{
     fixture_checkpoint_from_resolved_view, CheckpointRecord, CheckpointValidationError,
-    EvidenceRef, GitExportMapRecord, FIXTURE_CREATED_AT, FIXTURE_EXPORT_MAP_ID,
-    FIXTURE_GIT_COMMIT_ID, FIXTURE_VALIDATION_REPORT_ID,
+    EvidenceRef, GitExportMapRecord, FIXTURE_CHECKPOINT_ID, FIXTURE_CREATED_AT,
+    FIXTURE_EXPORTED_GIT_REF, FIXTURE_EXPORT_MAP_ID, FIXTURE_GIT_COMMIT_ID,
+    FIXTURE_VALIDATION_REPORT_ID,
 };
 use sunlight_core::compat_import::{
     fixture_basic_app_candidate_deltas, plan_fixture_basic_app_import, CompatCandidateDelta,
@@ -3175,6 +3176,7 @@ fn fixture_inspect_artifact_json(artifact: FixtureArtifact) -> String {
             )
         })
         .unwrap_or_else(|| "[]".to_string());
+    let checkpoint_export_trace = fixture_artifact_checkpoint_export_trace_json(artifact);
 
     format!(
         concat!(
@@ -3201,7 +3203,8 @@ fn fixture_inspect_artifact_json(artifact: FixtureArtifact) -> String {
             "}}],",
             "\"provenance\":{},",
             "\"before_refs\":{},",
-            "\"after_refs\":{}",
+            "\"after_refs\":{},",
+            "\"checkpoint_export_trace\":{}",
             "}},\"warnings\":[]}}"
         ),
         FIXTURE_REPOSITORY_ID,
@@ -3219,6 +3222,36 @@ fn fixture_inspect_artifact_json(artifact: FixtureArtifact) -> String {
         provenance,
         before_refs,
         after_refs,
+        checkpoint_export_trace,
+    )
+}
+
+fn fixture_artifact_checkpoint_export_trace_json(artifact: FixtureArtifact) -> String {
+    if artifact.latest_operation_id != Some("op_auth_trim_guard_0001") {
+        return "null".to_string();
+    }
+
+    format!(
+        concat!(
+            "{{",
+            "\"operation_id\":\"{}\",",
+            "\"topic_revision_id\":\"rev_auth_nullability_0001\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"execution_evidence_id\":\"{}\",",
+            "\"execution_result\":\"pass\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"export_map_id\":\"{}\",",
+            "\"git_ref\":\"{}\",",
+            "\"git_commit_ids\":[\"{}\"]",
+            "}}"
+        ),
+        artifact.latest_operation_id.unwrap(),
+        FIXTURE_RESOLVED_VIEW_ID,
+        FIXTURE_PASSING_EXECUTION_ID,
+        FIXTURE_CHECKPOINT_ID,
+        FIXTURE_EXPORT_MAP_ID,
+        FIXTURE_EXPORTED_GIT_REF,
+        FIXTURE_GIT_COMMIT_ID,
     )
 }
 

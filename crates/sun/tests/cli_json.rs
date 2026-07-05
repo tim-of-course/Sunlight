@@ -4929,6 +4929,65 @@ fn inspect_json_fixture_basic_app_path_returns_artifact_snapshot() {
 }
 
 #[test]
+fn checkpoint_export_trace_is_exact_for_changed_fixture_artifact() {
+    let repo = TestRepo::new("artifact-checkpoint-export-trace-changed");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("src/auth.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.artifact\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
+    assert!(stdout.contains("\"checkpoint_export_trace\":{"));
+    assert!(stdout.contains("\"operation_id\":\"op_auth_trim_guard_0001\""));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_0001\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_patch_0001\""));
+    assert!(stdout.contains("\"execution_evidence_id\":\"exec_auth_profile_tests_0001\""));
+    assert!(stdout.contains("\"execution_result\":\"pass\""));
+    assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\""));
+    assert!(stdout
+        .contains("\"git_commit_ids\":[\"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"));
+}
+
+#[test]
+fn checkpoint_export_trace_is_null_for_base_fixture_artifact() {
+    let repo = TestRepo::new("artifact-checkpoint-export-trace-base");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.artifact\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_readme_md\""));
+    assert!(stdout.contains("\"provenance\":null"));
+    assert!(stdout.contains("\"checkpoint_export_trace\":null"));
+    assert!(!stdout.contains("\"export_map_id\":\"export_map_checkpoint_auth_profile_ready_0001\""));
+    assert!(!stdout.contains("\"git_commit_ids\""));
+}
+
+#[test]
 fn inspect_json_fixture_basic_app_operation_returns_authored_context() {
     let repo = TestRepo::new("inspect-fixture-operation");
 

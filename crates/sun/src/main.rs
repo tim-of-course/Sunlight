@@ -6197,6 +6197,7 @@ fn compat_selected_deltas_json(response: &CompatImportResponse) -> String {
                     "\"patch_digest\":{},",
                     "\"base_content_hash\":{},",
                     "\"result_content_hash\":{},",
+                    "\"operations\":[{}],",
                     "\"classification\":\"{}\",",
                     "\"privacy_class\":\"{}\"",
                     "}}"
@@ -6207,8 +6208,39 @@ fn compat_selected_deltas_json(response: &CompatImportResponse) -> String {
                 optional_string_json(delta.patch_digest.as_deref()),
                 optional_string_json(delta.base_content_hash.as_deref()),
                 optional_string_json(delta.result_content_hash.as_deref()),
+                compat_selected_delta_operations_json(delta),
                 json_escape(&delta.classification),
                 delta.privacy_class.as_str(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn compat_selected_delta_operations_json(
+    delta: &sunlight_core::compat_import::CompatSelectedDeltaPlan,
+) -> String {
+    delta
+        .operations
+        .iter()
+        .map(|operation| {
+            format!(
+                concat!(
+                    "{{",
+                    "\"operation_kind\":\"{}\",",
+                    "\"source_path\":{},",
+                    "\"target_path\":\"{}\",",
+                    "\"base_content_hash\":{},",
+                    "\"result_content_hash\":{},",
+                    "\"patch_digest\":{}",
+                    "}}"
+                ),
+                operation.operation_kind.as_str(),
+                optional_string_json(operation.source_path.as_deref()),
+                json_escape(&operation.target_path),
+                optional_string_json(operation.base_content_hash.as_deref()),
+                optional_string_json(operation.result_content_hash.as_deref()),
+                optional_string_json(operation.patch_digest.as_deref()),
             )
         })
         .collect::<Vec<_>>()
@@ -6329,6 +6361,7 @@ fn compat_import_payload_json(response: &CompatImportResponse) -> String {
                         "\"patch_digest\":{},",
                         "\"base_content_hash\":{},",
                         "\"result_content_hash\":{},",
+                        "\"operations\":[{}],",
                         "\"classification\":\"{}\",",
                         "\"privacy_class\":\"{}\"",
                         "}}"
@@ -6339,6 +6372,7 @@ fn compat_import_payload_json(response: &CompatImportResponse) -> String {
                     optional_string_json(delta.patch_digest.as_deref()),
                     optional_string_json(delta.base_content_hash.as_deref()),
                     optional_string_json(delta.result_content_hash.as_deref()),
+                    compat_selected_delta_operations_json(delta),
                     json_escape(&delta.classification),
                     delta.privacy_class.as_str(),
                 )

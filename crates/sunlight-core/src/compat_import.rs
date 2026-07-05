@@ -124,8 +124,19 @@ pub struct CompatSelectedDeltaPlan {
     pub patch_digest: Option<String>,
     pub base_content_hash: Option<String>,
     pub result_content_hash: Option<String>,
+    pub operations: Vec<CompatSelectedDeltaOperationPlan>,
     pub classification: String,
     pub privacy_class: PrivacyClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompatSelectedDeltaOperationPlan {
+    pub operation_kind: CompatFileOperationKind,
+    pub source_path: Option<String>,
+    pub target_path: String,
+    pub base_content_hash: Option<String>,
+    pub result_content_hash: Option<String>,
+    pub patch_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +405,27 @@ pub fn fixture_basic_app_candidate_deltas() -> Vec<CompatCandidateDelta> {
             path_policy_result: CompatPathPolicyResult {
                 allowed: true,
                 normalized_path: Some("src/auth.renamed.ts".to_string()),
+                reason: None,
+            },
+            quarantine_ref: None,
+        },
+        CompatCandidateDelta {
+            candidate_delta_id: "compat_delta_src_auth_rename_edit_0001".to_string(),
+            kind: CompatCandidateKind::MovedOrRenamed,
+            operation_kind: CompatFileOperationKind::Move,
+            artifact_id: Some("artifact_src_auth_ts".to_string()),
+            path: "src/auth.renamed-edited.ts".to_string(),
+            source_path: Some("src/auth.ts".to_string()),
+            before_hash: Some("sha256:auth_base".to_string()),
+            after_hash: Some("sha256:auth_rename_edit_projection_after".to_string()),
+            byte_length: 128,
+            executable: false,
+            media_type: "text/typescript; charset=utf-8".to_string(),
+            classification: "source".to_string(),
+            privacy_class: PrivacyClass::PolicyGated,
+            path_policy_result: CompatPathPolicyResult {
+                allowed: true,
+                normalized_path: Some("src/auth.renamed-edited.ts".to_string()),
                 reason: None,
             },
             quarantine_ref: None,
@@ -914,6 +946,7 @@ fn build_response(
                 .then(|| format!("sha256:{}_patch", candidate.candidate_delta_id)),
             base_content_hash: candidate.before_hash.clone(),
             result_content_hash: candidate.after_hash.clone(),
+            operations: selected_delta_operations(candidate),
             classification: candidate.classification.clone(),
             privacy_class: candidate.privacy_class,
         })
@@ -1059,6 +1092,45 @@ fn artifact_id_for_candidate(candidate: &CompatCandidateDelta) -> String {
         .artifact_id
         .clone()
         .unwrap_or_else(|| format!("artifact_{}", candidate.path.replace(['/', '.'], "_")))
+}
+
+fn selected_delta_operations(
+    candidate: &CompatCandidateDelta,
+) -> Vec<CompatSelectedDeltaOperationPlan> {
+    if candidate.kind == CompatCandidateKind::MovedOrRenamed
+        && candidate.before_hash.is_some()
+        && candidate.after_hash.is_some()
+        && candidate.before_hash != candidate.after_hash
+    {
+        return vec![
+            CompatSelectedDeltaOperationPlan {
+                operation_kind: CompatFileOperationKind::Move,
+                source_path: candidate.source_path.clone(),
+                target_path: candidate.path.clone(),
+                base_content_hash: candidate.before_hash.clone(),
+                result_content_hash: candidate.before_hash.clone(),
+                patch_digest: None,
+            },
+            CompatSelectedDeltaOperationPlan {
+                operation_kind: CompatFileOperationKind::Patch,
+                source_path: Some(candidate.path.clone()),
+                target_path: candidate.path.clone(),
+                base_content_hash: candidate.before_hash.clone(),
+                result_content_hash: candidate.after_hash.clone(),
+                patch_digest: Some(format!("sha256:{}_patch", candidate.candidate_delta_id)),
+            },
+        ];
+    }
+
+    vec![CompatSelectedDeltaOperationPlan {
+        operation_kind: candidate.operation_kind,
+        source_path: candidate.source_path.clone(),
+        target_path: candidate.path.clone(),
+        base_content_hash: candidate.before_hash.clone(),
+        result_content_hash: candidate.after_hash.clone(),
+        patch_digest: (candidate.operation_kind == CompatFileOperationKind::Patch)
+            .then(|| format!("sha256:{}_patch", candidate.candidate_delta_id)),
+    }]
 }
 
 fn tree_identity_view(tree_identity: &SingleRepoTree) -> crate::artifacts::TreeIdentityView {

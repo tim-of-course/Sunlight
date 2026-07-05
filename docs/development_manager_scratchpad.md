@@ -47,7 +47,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `post-phase1-closure-readiness-audit`: ready next. Refresh the MVP readiness audit against the architecture after help/docs, structural inspect provenance, full smoke, and external validation are all current; identify the next narrow gap or record that MVP coverage is verifiably complete.
+- Active slice: none for the current fixture/local MVP acceptance target. Closure audit `e7328b1` records that no concrete blocking gap remains; do not create more implementation slices without a new product target beyond this acceptance scope.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Earlier integrated work through `6fb413d` includes policy command fixtures/docs, operator status round trips, repository/artifact/view/status visibility, external Super Search validation, compatibility import breadth and variants, projection-only checkpoint boundaries, and compatibility status docs reconcile. Full slice detail is in Git history.
@@ -70,10 +70,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `post-phase1-readiness-refresh`: integrated as `e46e9ad`; WSL docs refresh updated MVP readiness after Phase 1 acceptance and identified stale CLI help/operator docs as the next narrow gap, with `git diff --check` and stale-phrase search passing.
 - Completed slice `phase1-cli-help-docs-sync`: integrated as `5341480`; WSL help/docs implementation was imported manager-side after timeout/Git lock constraints, with Windows format, focused global help test, actual `sun --help`, `git diff --check`, and stale-wording search passing. MVP readiness now points to structural status/inspect provenance as the next narrow gap.
 - Completed slice `phase1-structural-status-inspect-roundtrip`: integrated as `684f6ba`; WSL implementation was imported manager-side after Git lock constraints, with Windows format, focused structural/mutation/inspect tests, `git diff --check`, default smoke-suite, and optional external Super Search validation passing.
+- Completed slice `post-phase1-closure-readiness-audit`: integrated as `e7328b1`; WSL docs audit was imported manager-side after Git lock constraints, with `git diff --check` and stale-wording search passing. It concludes the current fixture/local MVP acceptance target is verifiably covered and has no remaining concrete blocking gap.
 
 ## Candidate Next Slices
 
-- Next useful slices after the active one: if the closure audit finds a specific gap, delegate the smallest acceptance slice; if it finds no blocking gap, prepare a concise MVP readiness/release summary and stop creating implementation work.
+- No automatic next implementation slice for the current target. Next work should start only after choosing a new target, such as first target agent integration, broader validation repos, projection platform priority, hosted collaboration, dashboard polish, or cross-repo timing.
 
 ## Decisions
 

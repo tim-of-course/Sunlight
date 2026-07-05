@@ -47,7 +47,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `phase6-acceptance-audit`: delegated next. Audit Phase 6 compatibility import against architecture, status/inspect, validation plan, and current fixture-backed tests to identify any remaining acceptance gaps before moving back to broader projection/platform work.
+- Active slice `compat-ignored-path-fixture-coverage`: delegated next. Close the Phase 6 audit gap by adding or explicitly reconciling distinct ignored-path compatibility fixture coverage without broadening real-filesystem import claims.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
@@ -114,10 +114,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `compat-projection-only-checkpoint-boundary`: integrated as `7b80d72`; WSL test implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check` and focused CLI verification.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-projection-only-boundary`: default `scripts/smoke-suite.ps1` passed after `ef848cd`.
 - Completed slice `compat-status-docs-reconcile`: integrated as `6fb413d`; WSL docs implementation was imported manager-side after the WSL Git sandbox blocked committing, with drift search and `git diff --check` passing.
+- Completed slice `phase6-acceptance-audit`: integrated as `224d567`; WSL audit found the distinct ignored-path fixture coverage gap, with focused compat import/status/inspect/checkpoint/export tests and `git diff --check` passing under `/tmp` Zig caches.
 
 ## Candidate Next Slices
 
-- Next useful slices after the active audit: close any concrete Phase 6 acceptance gaps it finds, otherwise move back to platform projection work.
+- Next useful slices after the active one: focused/full smoke over any ignored-path fixture coverage, then move back to platform projection work if Phase 6 stays closed.
 
 ## Decisions
 

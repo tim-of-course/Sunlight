@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `f96aedb` and covered `ba43a02`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 153 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `2faf5dd`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat project/diff/status/inspect, happy-path and generated-failure compat import, and fixture Git export.
+- Verification: latest full pass ran after `ef848cd` and covered `7b80d72`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 154 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `2faf5dd`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat project/diff/status/inspect, happy-path and generated-failure compat import, and fixture Git export.
 
 ## Active Work
 
@@ -111,6 +111,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `compat-working-tree-isolation-cli-coverage`: integrated as `ba43a02`; WSL test implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check` and focused CLI verification.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-working-tree-isolation`: default `scripts/smoke-suite.ps1` passed after `f96aedb`.
 - Completed slice `compat-projection-only-checkpoint-boundary`: integrated as `7b80d72`; WSL test implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check` and focused CLI verification.
+- Completed verification slice `aggregate-smoke-suite-refresh-after-projection-only-boundary`: default `scripts/smoke-suite.ps1` passed after `ef848cd`.
 
 ## Candidate Next Slices
 

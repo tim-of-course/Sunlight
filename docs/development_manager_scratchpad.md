@@ -47,7 +47,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `compat-status-docs-reconcile`: delegated next. Align the status/inspect and validation docs with the current fixture-backed compatibility projection/import surface after recent Phase 6 boundary coverage.
+- Active slice `phase6-acceptance-audit`: delegated next. Audit Phase 6 compatibility import against architecture, status/inspect, validation plan, and current fixture-backed tests to identify any remaining acceptance gaps before moving back to broader projection/platform work.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
@@ -113,10 +113,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-working-tree-isolation`: default `scripts/smoke-suite.ps1` passed after `f96aedb`.
 - Completed slice `compat-projection-only-checkpoint-boundary`: integrated as `7b80d72`; WSL test implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check` and focused CLI verification.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-projection-only-boundary`: default `scripts/smoke-suite.ps1` passed after `ef848cd`.
+- Completed slice `compat-status-docs-reconcile`: integrated as `6fb413d`; WSL docs implementation was imported manager-side after the WSL Git sandbox blocked committing, with drift search and `git diff --check` passing.
 
 ## Candidate Next Slices
 
-- Next useful slices after the active one: final Phase 6 acceptance audit, then decide whether to keep hardening compatibility import or move back to platform projection work.
+- Next useful slices after the active audit: close any concrete Phase 6 acceptance gaps it finds, otherwise move back to platform projection work.
 
 ## Decisions
 

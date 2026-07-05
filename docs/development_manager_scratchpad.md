@@ -161,10 +161,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-export-alias`: default `scripts/smoke-suite.ps1` passed after `46c20d6`.
 - Completed slice `operator-status-round-trip-coverage`: integrated as `6322652`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-round-trip`: default `scripts/smoke-suite.ps1` passed after `17780c1`.
+- Active verification slice `external-validation-super-search-refresh`: rerun optional Super Search validation after recent operator surface and smoke coverage changes.
 
 ## Candidate Next Slices
 
-- Next useful slice: optional external Super Search validation refresh, unless a smaller Phase 5 operator gap is clearer at the next heartbeat.
+- Next useful slice after active verification: choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
 
 ## Decisions
 

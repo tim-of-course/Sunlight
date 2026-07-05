@@ -81,6 +81,14 @@ try {
         return $match.Groups[1].Value
     }
 
+    function Json-NumberField($Json, $Field) {
+        $match = [regex]::Match($Json, '"' + [regex]::Escape($Field) + '":([0-9]+)')
+        if (!$match.Success) {
+            throw "Could not find JSON number field: $Field"
+        }
+        return $match.Groups[1].Value
+    }
+
     Step 'Building sun CLI'
     Push-Location $repoRoot
     try {
@@ -121,6 +129,36 @@ try {
     Assert-Contains $out ':execution:copy:read_only_source_private_outputs' 'copy cache key'
     Assert-Contains $out '"store_integrity_policy":"verify_before_reuse"' 'copy integrity policy'
     Assert-NotContains $out $tmpRoot 'local-only metadata excludes smoke temp path'
+
+    Step 'Collecting portable fixture copy metrics'
+    $metricsViewId = 'view_base_0001'
+    $projectionRoot = Join-Path $tmpRoot 'projection-root'
+    $elapsed = [System.Diagnostics.Stopwatch]::StartNew()
+    $out = Invoke-SunOk 'copy-metrics' @('project', 'materialize', '--view', $metricsViewId, '--purpose', 'execution', '--fixture', 'basic-app', '--projection-root', $projectionRoot, '--json')
+    $elapsed.Stop()
+    $filesWritten = Json-NumberField $out 'files_written'
+    $directoriesCreated = Json-NumberField $out 'directories_created'
+    $bytesWritten = Json-NumberField $out 'bytes_written'
+    $executableFiles = Json-NumberField $out 'executable_files'
+    $manifestEntries = ([regex]::Matches($out, '"content_hash":')).Count
+    $summary = [regex]::Match($out, '"summary":\{"directories":([0-9]+),"files":([0-9]+),"bytes":([0-9]+)')
+    if (!$summary.Success) {
+        throw "Could not find local projection manifest summary"
+    }
+    Assert-Contains $out '"selected_strategy":"copy"' 'copy metrics selected strategy'
+    Assert-Contains $out '"local_projection_manifest":{' 'copy metrics manifest'
+    Assert-Contains $out '"cleanup":{"projection_root":{' 'copy metrics cleanup'
+    Write-Output ("projection_metric fixture=basic-app view={0} purpose=execution selected_strategy=copy elapsed_ms={1} files_written={2} directories_created={3} bytes_written={4} executable_files={5} manifest_entries={6} manifest_files={7} manifest_directories={8} manifest_bytes={9} deferred_strategies=reflink_real_fs,hardlink_readonly_real_fs,overlay_copyup_real_fs scope=fixture_copy_materialization_only" -f `
+        $metricsViewId, `
+        [int64]$elapsed.Elapsed.TotalMilliseconds, `
+        $filesWritten, `
+        $directoriesCreated, `
+        $bytesWritten, `
+        $executableFiles, `
+        $manifestEntries, `
+        $summary.Groups[2].Value, `
+        $summary.Groups[1].Value, `
+        $summary.Groups[3].Value)
 
     Step 'Verifying explicit reflink strategy selection JSON'
     $out = Invoke-SunOk 'reflink' @('project', 'materialize', '--view', $viewId, '--purpose', 'execution', '--strategy', 'reflink', '--fixture', 'basic-app', '--json')

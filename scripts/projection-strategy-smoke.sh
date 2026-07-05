@@ -98,6 +98,12 @@ json_string_field() {
     printf '%s' "$json" | sed -n "s/.*\"$field\":\"\\([^\"]*\\)\".*/\\1/p" | head -n 1
 }
 
+json_number_field() {
+    local json="$1"
+    local field="$2"
+    printf '%s' "$json" | sed -n "s/.*\"$field\":\\([0-9][0-9]*\\).*/\\1/p" | head -n 1
+}
+
 sun() {
     "$sun_bin" "$@"
 }
@@ -132,6 +138,29 @@ assert_contains "$out" '"root_ref":{"value":"local://.sunlight/projections/execu
 assert_contains "$out" ':execution:copy:read_only_source_private_outputs"' "copy cache key"
 assert_contains "$out" '"store_integrity_policy":"verify_before_reuse"' "copy integrity policy"
 assert_not_contains "$out" "$tmp_dir" "local-only metadata excludes smoke temp path"
+
+step "Collecting portable fixture copy metrics"
+metrics_view_id="view_base_0001"
+projection_root="$tmp_dir/projection-root"
+start_ns="$(date +%s%N)"
+out="$(run_ok copy-metrics sun project materialize --view "$metrics_view_id" --purpose execution --fixture basic-app --projection-root "$projection_root" --json)"
+end_ns="$(date +%s%N)"
+elapsed_ms="$(((end_ns - start_ns) / 1000000))"
+files_written="$(json_number_field "$out" files_written)"
+directories_created="$(json_number_field "$out" directories_created)"
+bytes_written="$(json_number_field "$out" bytes_written)"
+executable_files="$(json_number_field "$out" executable_files)"
+manifest_entries="$(printf '%s' "$out" | grep -o '"content_hash":' | wc -l | tr -d '[:space:]')"
+manifest_directories="$(printf '%s' "$out" | sed -n 's/.*"summary":{"directories":\([0-9][0-9]*\),"files":[0-9][0-9]*,"bytes":[0-9][0-9]*.*/\1/p' | head -n 1)"
+manifest_files="$(printf '%s' "$out" | sed -n 's/.*"summary":{"directories":[0-9][0-9]*,"files":\([0-9][0-9]*\),"bytes":[0-9][0-9]*.*/\1/p' | head -n 1)"
+manifest_bytes="$(printf '%s' "$out" | sed -n 's/.*"summary":{"directories":[0-9][0-9]*,"files":[0-9][0-9]*,"bytes":\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+assert_contains "$out" '"selected_strategy":"copy"' "copy metrics selected strategy"
+assert_contains "$out" '"local_projection_manifest":{' "copy metrics manifest"
+assert_contains "$out" '"cleanup":{"projection_root":{' "copy metrics cleanup"
+[[ -n "$files_written" && -n "$directories_created" && -n "$bytes_written" && -n "$executable_files" ]] || fail "could not extract filesystem materialization counts"
+[[ -n "$manifest_entries" && -n "$manifest_directories" && -n "$manifest_files" && -n "$manifest_bytes" ]] || fail "could not extract manifest counts"
+printf 'projection_metric fixture=basic-app view=%s purpose=execution selected_strategy=copy elapsed_ms=%s files_written=%s directories_created=%s bytes_written=%s executable_files=%s manifest_entries=%s manifest_files=%s manifest_directories=%s manifest_bytes=%s deferred_strategies=reflink_real_fs,hardlink_readonly_real_fs,overlay_copyup_real_fs scope=fixture_copy_materialization_only\n' \
+    "$metrics_view_id" "$elapsed_ms" "$files_written" "$directories_created" "$bytes_written" "$executable_files" "$manifest_entries" "$manifest_files" "$manifest_directories" "$manifest_bytes"
 
 step "Verifying explicit reflink strategy selection JSON"
 out="$(run_ok reflink sun project materialize --view "$view_id" --purpose execution --strategy reflink --fixture basic-app --json)"

@@ -149,10 +149,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `policy-check-commit-cli-fixture`: integrated as `7b5b839`; WSL implementation was `14edbd2`.
 - Completed slice `policy-command-smoke-coverage`: integrated as `12af17d`; WSL implementation was `d2c7071`.
 - Completed verification slice `aggregate-smoke-suite-refresh`: default `scripts/smoke-suite.ps1` passed after `5aa6275`.
+- Active WSL slice `policy-failure-operator-docs`: document commit/export policy validation failure-path operator guidance without changing code.
 
 ## Candidate Next Slices
 
-- Next useful slice: failure-path operator docs for commit/export policy validation.
+- After policy failure-path docs, consider a focused CLI/doc test sweep for stale policy command examples.
 
 ## Decisions
 

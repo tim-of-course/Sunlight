@@ -42,12 +42,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `de5c5cb` and covered Phase 1 structural mutation CLI acceptance. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 168 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. After `5341480`, focused help/docs verification passed with `cargo fmt --check`, `cargo test -p sun --test cli_json global_help_describes_phase1_fixture_lifecycle_commands -- --nocapture`, `cargo run -p sun -- --help`, `git diff --check`, and a stale-wording search. Optional Super Search validation passed after `44775b8`.
+- Verification: latest full pass ran after `684f6ba`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 170 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation also passed after `684f6ba`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat project/diff/status/inspect, happy-path and generated-failure compat import, and fixture Git export.
 
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `phase1-structural-status-inspect-roundtrip`: ready next. Add focused status/inspect round-trip coverage for accepted Phase 1 structural mutation provenance.
+- Active slice `post-phase1-closure-readiness-audit`: ready next. Refresh the MVP readiness audit against the architecture after help/docs, structural inspect provenance, full smoke, and external validation are all current; identify the next narrow gap or record that MVP coverage is verifiably complete.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Earlier integrated work through `6fb413d` includes policy command fixtures/docs, operator status round trips, repository/artifact/view/status visibility, external Super Search validation, compatibility import breadth and variants, projection-only checkpoint boundaries, and compatibility status docs reconcile. Full slice detail is in Git history.
@@ -69,10 +69,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `phase1-structural-mutation-acceptance`: integrated as `de5c5cb`; WSL implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check`, focused artifact/move/delete/metadata tests, and default smoke passing.
 - Completed slice `post-phase1-readiness-refresh`: integrated as `e46e9ad`; WSL docs refresh updated MVP readiness after Phase 1 acceptance and identified stale CLI help/operator docs as the next narrow gap, with `git diff --check` and stale-phrase search passing.
 - Completed slice `phase1-cli-help-docs-sync`: integrated as `5341480`; WSL help/docs implementation was imported manager-side after timeout/Git lock constraints, with Windows format, focused global help test, actual `sun --help`, `git diff --check`, and stale-wording search passing. MVP readiness now points to structural status/inspect provenance as the next narrow gap.
+- Completed slice `phase1-structural-status-inspect-roundtrip`: integrated as `684f6ba`; WSL implementation was imported manager-side after Git lock constraints, with Windows format, focused structural/mutation/inspect tests, `git diff --check`, default smoke-suite, and optional external Super Search validation passing.
 
 ## Candidate Next Slices
 
-- Next useful slices after the active one: refresh optional external validation, then run a full smoke-suite baseline if the status/inspect round trip lands cleanly.
+- Next useful slices after the active one: if the closure audit finds a specific gap, delegate the smallest acceptance slice; if it finds no blocking gap, prepare a concise MVP readiness/release summary and stop creating implementation work.
 
 ## Decisions
 
@@ -83,5 +84,5 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 
 ## Open Questions
 
-- Whether the next external validation step should remain an optional local harness or become a broader non-default suite is still open.
+- Whether optional external validation should remain a local harness or become a broader non-default suite is still open.
 - Projection platform target still starts on WSL/Linux unless product priority changes.

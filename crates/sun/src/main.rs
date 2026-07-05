@@ -2632,7 +2632,7 @@ fn fixture_status_projection_json(
             "\"local_store_integrity\":{},",
             "\"quarantine\":{},",
             "\"dirty_local\":{},",
-            "\"local_root_verification\":{}",
+            "\"local_root_verification\":{}{}",
             "}},",
             "\"native_errors\":{}",
             "}},\"warnings\":[]}}"
@@ -2657,6 +2657,7 @@ fn fixture_status_projection_json(
         quarantine_json,
         verification.dirty_local_json(),
         verification_json,
+        compat_projection_status_extension_json(projection),
         native_errors_json,
     ))
 }
@@ -4621,6 +4622,7 @@ fn fixture_status_compat_import_json(response: &CompatImportResponse) -> String 
             "\"imported_artifact_count\":{},",
             "\"selected_delta_count\":{},",
             "\"quarantine_count\":{},",
+            "\"candidate_delta_ids\":{},",
             "\"imported_artifacts\":[{}],",
             "\"selected_deltas\":[{}],",
             "\"operation_plan\":{},",
@@ -4649,6 +4651,7 @@ fn fixture_status_compat_import_json(response: &CompatImportResponse) -> String 
             .selected_deltas
             .len(),
         response.quarantine_refs.len(),
+        compat_import_candidate_delta_ids_json(response),
         response
             .imported_artifacts
             .iter()
@@ -4685,7 +4688,8 @@ fn fixture_inspect_compat_import_json(response: &CompatImportResponse) -> String
             "\"operation_transaction_id\":\"{}\",",
             "\"topic_revision_id\":\"{}\",",
             "\"session_generation_id\":\"{}\",",
-            "\"resolved_view_id\":\"{}\"",
+            "\"resolved_view_id\":\"{}\",",
+            "\"candidate_delta_ids\":{}",
             "}},",
             "\"imported_artifacts\":[{}],",
             "\"selected_deltas\":[{}],",
@@ -4710,6 +4714,7 @@ fn fixture_inspect_compat_import_json(response: &CompatImportResponse) -> String
         json_escape(&response.topic_revision_id),
         json_escape(&response.session_generation_id),
         json_escape(&response.resolved_view_id),
+        compat_import_candidate_delta_ids_json(response),
         response
             .imported_artifacts
             .iter()
@@ -4842,6 +4847,154 @@ fn compat_candidate_counts_json(candidates: &[CompatCandidateDelta]) -> String {
     )
 }
 
+fn compat_projection_status_extension_json(projection: &ProjectionRecord) -> String {
+    if projection.purpose != ProjectionPurpose::Compatibility {
+        return String::new();
+    }
+
+    let candidates = fixture_basic_app_candidate_deltas();
+    format!(
+        concat!(
+            ",\"candidate_counts\":{}",
+            ",\"selected_candidate_delta_ids\":{}",
+            ",\"quarantine_refs\":{}",
+            ",\"last_import_attempt\":null",
+            ",\"local_projection_refs\":{}"
+        ),
+        compat_candidate_counts_json(&candidates),
+        compat_projection_selected_candidate_ids_json(),
+        compat_quarantine_refs_json(&candidates),
+        compat_projection_local_refs_json(projection, &candidates),
+    )
+}
+
+fn compat_projection_inspect_extension_json(projection: &ProjectionRecord) -> String {
+    if projection.purpose != ProjectionPurpose::Compatibility {
+        return String::new();
+    }
+
+    let candidates = fixture_basic_app_candidate_deltas();
+    format!(
+        concat!(
+            ",\"compatibility_projection\":{{",
+            "\"baseline\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"manifest_ref\":{},",
+            "\"manifest_digest\":\"{}\"",
+            "}},",
+            "\"path_policy\":{},",
+            "\"writable_import_policy\":{{",
+            "\"writable_policy\":\"{}\",",
+            "\"import_required\":true,",
+            "\"store_integrity_policy\":\"{}\",",
+            "\"operation_semantics_version\":\"{}\"",
+            "}},",
+            "\"candidate_summary\":{{",
+            "\"candidate_counts\":{},",
+            "\"selected_candidate_delta_ids\":{},",
+            "\"quarantine_refs\":{},",
+            "\"summary_ref\":\"{}\"",
+            "}},",
+            "\"candidate_detail_refs\":{},",
+            "\"local_projection_refs\":{},",
+            "\"last_import_attempt\":null,",
+            "\"native_operation_ids\":[],",
+            "\"native_revision_ids\":[]",
+            "}}"
+        ),
+        json_escape(&projection.resolved_view_id),
+        single_repo_tree_json(&projection.tree_identity),
+        optional_string_json(projection.baseline_manifest_ref.as_deref()),
+        json_escape(FIXTURE_COMPAT_BASELINE_MANIFEST_DIGEST),
+        compat_path_policy_json(projection),
+        projection.writable_policy.as_str(),
+        projection.store_integrity_policy.as_str(),
+        json_escape(&projection.operation_semantics_version),
+        compat_candidate_counts_json(&candidates),
+        compat_projection_selected_candidate_ids_json(),
+        compat_quarantine_refs_json(&candidates),
+        json_escape(&compat_candidate_summary_ref(projection)),
+        compat_candidate_detail_refs_json(projection, &candidates),
+        compat_projection_local_refs_json(projection, &candidates),
+    )
+}
+
+fn compat_projection_selected_candidate_ids_json() -> String {
+    string_array_json(["compat_delta_src_auth_ts_0001"].into_iter())
+}
+
+fn compat_quarantine_refs_json(candidates: &[CompatCandidateDelta]) -> String {
+    string_array_json(
+        candidates
+            .iter()
+            .filter_map(|candidate| candidate.quarantine_ref.as_deref()),
+    )
+}
+
+fn compat_projection_local_refs_json(
+    projection: &ProjectionRecord,
+    candidates: &[CompatCandidateDelta],
+) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"root_ref\":{},",
+            "\"baseline_manifest_ref\":{},",
+            "\"candidate_summary_ref\":\"{}\",",
+            "\"candidate_detail_ref\":\"{}\",",
+            "\"quarantine_refs\":{}",
+            "}}"
+        ),
+        projection_root_ref_json(projection),
+        optional_string_json(projection.baseline_manifest_ref.as_deref()),
+        json_escape(&compat_candidate_summary_ref(projection)),
+        json_escape(&compat_candidate_detail_ref(projection)),
+        compat_quarantine_refs_json(candidates),
+    )
+}
+
+fn compat_candidate_detail_refs_json(
+    projection: &ProjectionRecord,
+    candidates: &[CompatCandidateDelta],
+) -> String {
+    let items = candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                concat!(
+                    "{{",
+                    "\"candidate_delta_id\":\"{}\",",
+                    "\"detail_ref\":\"{}\"",
+                    "}}"
+                ),
+                json_escape(&candidate.candidate_delta_id),
+                json_escape(&format!(
+                    "{}/{}",
+                    compat_candidate_detail_ref(projection),
+                    candidate.candidate_delta_id
+                )),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+fn compat_candidate_summary_ref(projection: &ProjectionRecord) -> String {
+    format!(
+        "local://.sunlight/projections/compatibility/{}/compat-diff-summary.json",
+        projection.id
+    )
+}
+
+fn compat_candidate_detail_ref(projection: &ProjectionRecord) -> String {
+    format!(
+        "local://.sunlight/projections/compatibility/{}/candidate-deltas",
+        projection.id
+    )
+}
+
 fn compat_candidate_json(candidate: &CompatCandidateDelta) -> String {
     format!(
         concat!(
@@ -4931,6 +5084,18 @@ fn compat_imported_artifact_json(artifact: &CompatImportedArtifact) -> String {
         optional_string_json(artifact.after_hash.as_deref()),
         json_escape(&artifact.classification),
         artifact.privacy_class.as_str(),
+    )
+}
+
+fn compat_import_candidate_delta_ids_json(response: &CompatImportResponse) -> String {
+    string_array_json(
+        response
+            .plan
+            .operation
+            .mutation_payload
+            .selected_deltas
+            .iter()
+            .map(|delta| delta.candidate_delta_id.as_str()),
     )
 }
 
@@ -5755,7 +5920,7 @@ fn fixture_inspect_projection_json(
             "\"local_projection_manifest\":{},",
             "\"local_store_integrity\":{},",
             "\"local_quarantine\":{},",
-            "\"local_root_verification\":{}",
+            "\"local_root_verification\":{}{}",
             "}},\"warnings\":[]}}"
         ),
         json_escape(&projection.repository_id),
@@ -5768,6 +5933,7 @@ fn fixture_inspect_projection_json(
         projection_local_store_integrity_json(&store_integrity),
         projection_quarantine_json(&store_integrity),
         local_projection_root_verification_json(projection, &manifest, projection_root),
+        compat_projection_inspect_extension_json(projection),
     ))
 }
 

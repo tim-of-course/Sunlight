@@ -17,6 +17,8 @@ Projection status and inspect are operator diagnostics over a projection record 
 
 The v0.1 CLI fixture also accepts `--integrity-fixture store-mismatch` on projection status and inspect for `projection_exec_auth_profile_0001`. This is a narrow operator-visibility fixture for a failed immutable-store integrity check. It reports local-only quarantine and integrity metadata. With `--projection-root`, it also persists a local-only quarantine JSON record under that projection root; without `--projection-root`, it reports only the local URI reference where that record would live. The record is diagnostic metadata, not source truth, not a durable native source record, and not a general persistent quarantine database.
 
+For the v0.1 `basic-app` compatibility projection fixture, projection status also reports dirty candidate counts, safe default candidate IDs, quarantine refs, local-only candidate summary/detail refs, and `last_import_attempt: null` before import. Projection inspect adds a `compatibility_projection` block with baseline manifest refs, path policy, writable/import policy, candidate summary/detail refs, local-only projection refs, and empty `native_operation_ids`/`native_revision_ids` until an explicit import succeeds.
+
 ## Common JSON Envelope
 
 Every CLI command that accepts `--json` returns one of the two envelope shapes below.

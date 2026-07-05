@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `d8b8f8a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 111 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. After `ff0caf6`, focused multi-candidate import verification passed `cargo fmt --check`, `git diff --check`, targeted CLI test, full `cargo test -p sun --test cli_json` with 112 tests, and default `validation-smoke.ps1` through the CRLF fallback. Optional Super Search validation passed after `03a1e43`. Docs should now reconcile validation-plan CLI spellings with implemented surfaces. Next guard must run after this edit.
+- Verification: latest full pass ran after `d8b8f8a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 111 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. After `ff0caf6`, focused multi-candidate import verification passed `cargo fmt --check`, `git diff --check`, targeted CLI test, full `cargo test -p sun --test cli_json` with 112 tests, and default `validation-smoke.ps1` through the CRLF fallback. Optional Super Search validation passed after `03a1e43`. After `16d167e`, docs CLI spelling checks passed for stale compat import, Git export planning, and projection materialization commands. Next guard must run after this edit.
 
 ## Active Work
 
@@ -144,11 +144,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `compat-status-inspect-visibility`: integrated as `6c1063a`; formatting checkpoint `d8b8f8a`.
 - Completed slice `focused-smoke-wrapper-crlf-hardening`: integrated as `3ff62d1`.
 - Completed slice `cli-compat-import-multiple-candidates`: integrated as `ff0caf6`.
-- Active WSL slice `validation-plan-cli-reconcile`: align validation plan command matrix and smoke order with current CLI spellings for compatibility project/diff/import and Git export write planning.
+- Completed slice `validation-plan-cli-reconcile`: integrated as `16d167e`; manager tracking checkpoint `3cce17c`.
+- Active WSL slice `policy-check-export-cli-fixture`: expose documented `sun policy check-export --checkpoint <id> --fixture basic-app --json` over the existing export validation report path, with focused CLI tests and docs/smoke updates only if needed.
 
 ## Candidate Next Slices
 
-- Compatibility import smoke currently stays single-candidate for concise output; broaden only if operator workflow coverage needs it.
+- After `policy-check-export-cli-fixture`, consider `policy-check-commit-cli-fixture` so `.sunlight` commit policy has the same operator-visible command coverage as export validation.
 
 ## Decisions
 

@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `d72b79d` and covered `815b49a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 148 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused stale-precondition compat-import checks passed after `a4a7718`. Optional Super Search validation passed after `0bb5ae6`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat import, and fixture Git export.
+- Verification: latest full pass ran after `61c9240` and covered `a4a7718`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 150 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `0bb5ae6`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat import, and fixture Git export.
 
 ## Active Work
 
@@ -104,7 +104,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `compat-import-docs-acceptance-sync`: integrated as `d6162bd`; WSL docs-only implementation was imported manager-side after prompt quoting caused a nonzero helper exit, with targeted docs verification passing on Windows.
 - Completed verification slice `external-validation-super-search-refresh-after-compat-import-hardening`: optional `scripts/external-validation-super-search.ps1` passed after `0bb5ae6` with Super Search `mix test`, `bun run test`, temp-clone `sun init`, fixture compat import, and fixture-backed Git export.
 - Completed slice `compat-import-stale-precondition-cli-coverage`: integrated as `a4a7718`; WSL implementation was imported manager-side after WSL `cargo-fmt` was unavailable, with Windows `cargo fmt` and focused CLI verification.
-- Active verification slice `aggregate-smoke-suite-refresh-after-compat-import-stale-preconditions`: refresh the default smoke suite after adding stale projection/session compatibility import CLI coverage.
+- Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-stale-preconditions`: default `scripts/smoke-suite.ps1` passed after `61c9240`.
 
 ## Candidate Next Slices
 

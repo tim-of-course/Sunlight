@@ -195,11 +195,13 @@ Hard failures cannot be downgraded to warnings for `secret`, `local_only`, unsaf
 ## Export Policy Failure Guidance
 
 `policy.check-export` failures are export blockers. When invoked directly,
-`sun policy check-export --checkpoint <checkpoint-id> --json` reports
-`export_policy_failed` and includes the validation report context. When the
-same hard failures are encountered through `sun git export`, the export command
-also reports `export_policy_failed`. In both cases, no Git commit, target ref
-update, or successful `git_export_map` may be claimed for the failed export.
+the current fixture CLI
+`sun policy check-export --checkpoint <checkpoint-id> --fixture basic-app --json`
+reports `export_policy_failed` and includes the validation report context. When
+the same hard failures are encountered through `sun git export`, the export
+command also reports `export_policy_failed`. In both cases, no Git commit,
+target ref update, or successful `git_export_map` may be claimed for the failed
+export.
 
 Operators should inspect these JSON fields before retrying:
 
@@ -252,7 +254,7 @@ Phase 4 extends the existing CLI JSON envelope without changing its success/fail
 | Command | Required exposure |
 | --- | --- |
 | `sun checkpoint create --view <resolved-view-id> --fixture basic-app --json` | Returns `command: "checkpoint.create"`, checkpoint ID, resolved view ID, tree identity, selected evidence refs, and `export_ready: true/false`. |
-| `sun policy check-export --checkpoint <checkpoint-id> --json` | Returns validation report ID, candidate summary, checked record/payload counts, warnings, and hard failures. |
+| `sun policy check-export --checkpoint <checkpoint-id> --fixture basic-app --json` | Returns validation report ID, candidate summary, checked record/payload counts, warnings, and hard failures. |
 | `sun git export --checkpoint <checkpoint-id> --branch <ref> --json` | Returns `command: "git.export"`, checkpoint ID, validation report ID, Git ref, Git commit IDs, and export-map ID. |
 | `sun status --checkpoint <checkpoint-id> --json` | Shows checkpoint record, conflict/evidence/export readiness, validation report summary, and export refs. |
 | `sun inspect checkpoint:<checkpoint-id> --json` | Shows frozen resolved view link, exact frontier, tree identity, evidence refs, conflict-free flag, retention class, and export refs. |

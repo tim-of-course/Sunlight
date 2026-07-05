@@ -178,10 +178,10 @@ Policy validation failures are hard gates, not warnings. A failed
 `sun policy check-commit --json` surfaces the CLI error code
 `commit_policy_failed` and must stop Git transport until the native records or
 candidate path set are fixed. A failed
-`sun policy check-export --checkpoint <checkpoint-id> --json` surfaces
-`export_policy_failed`; `sun git export` uses the same CLI-facing error code
-when export validation blocks the operation. The lower-level validator report
-may still identify the abstract validator-layer failure as
+`sun policy check-export --checkpoint <checkpoint-id> --fixture basic-app --json`
+surfaces `export_policy_failed`; `sun git export` uses the same CLI-facing
+error code when export validation blocks the operation. The lower-level
+validator report may still identify the abstract validator-layer failure as
 `policy_validation_failed`. Operators must not repair the failure by editing
 generated Git commits, export-map output, or projected Git files directly.
 
@@ -234,9 +234,10 @@ Safe operator actions for export validation failures are to rerun checkpoint
 planning from an exact conflict-free resolved view, rerun promotion for
 generated outputs, import missing content into native records, select a
 different evidence policy, choose a valid non-moving export target, or rerun
-`sun policy check-export` after the native inputs are corrected. Do not edit
-the Git export output directly; exported Git history is a projection of the
-validated checkpoint and native records remain authoritative.
+`sun policy check-export --checkpoint <checkpoint-id> --fixture basic-app --json`
+after the native inputs are corrected. Do not edit the Git export output
+directly; exported Git history is a projection of the validated checkpoint and
+native records remain authoritative.
 
 ## Unsafe Reference Detection
 
@@ -300,7 +301,7 @@ Minimum validator commands:
 ```text
 sun policy check-commit --json
 sun policy check-commit --paths <path>... --json
-sun policy check-export --checkpoint <checkpoint-id> --json
+sun policy check-export --checkpoint <checkpoint-id> --fixture basic-app --json
 sun policy explain <validation-report-id> --json
 ```
 

@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `f5066f1`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 105 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. After `b3a0f8b`, focused compat verification passed `cargo fmt --check`, `git diff --check`, `cargo test -p sun --test cli_json` with 109 tests, WSL `scripts/validation-smoke.sh`, and Windows-native `scripts/validation-smoke.ps1`; the default PowerShell wrapper still needs the existing WSL CRLF fallback behavior. Optional Super Search validation passed after `03a1e43`. Scratchpad guard must run after this edit.
+- Verification: latest full pass ran after `f5066f1`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 105 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. After `b3a0f8b`, focused compat verification passed `cargo fmt --check`, `git diff --check`, `cargo test -p sun --test cli_json` with 109 tests, WSL `scripts/validation-smoke.sh`, and Windows-native `scripts/validation-smoke.ps1`; the default PowerShell wrapper still needs the existing WSL CRLF fallback behavior. Optional Super Search validation passed after `03a1e43`. Next guard must run after this edit.
 
 ## Active Work
 
@@ -141,6 +141,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-quarantine-docs-reconcile`: integrated as `0fbc28e`.
 - Completed slice `external-validation-super-search-export`: integrated as `2431fa7`; logging fix checkpoint `03a1e43`.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
+- Active WSL slice `compat-status-inspect-visibility`: broaden status/inspect around compatibility projection dirty candidates and import attempts after the new compat project/diff surfaces.
 
 ## Candidate Next Slices
 

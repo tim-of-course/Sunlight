@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `eb6255a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 131 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
+- Verification: latest full pass ran after `eb6255a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 131 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. After `6665ba7`, artifact export trace coverage passed `cargo fmt --check`, `cargo test -p sun --test cli_json checkpoint_export_trace`, and `git diff --check`. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -164,11 +164,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `external-validation-super-search-refresh`: optional `scripts/external-validation-super-search.ps1` passed after `e02debe` with Super Search `mix test`, `bun run test`, temp-clone `sun init`, fixture compat import, and fixture-backed Git export.
 - Completed slice `repository-inspect-selector`: integrated as `175c448`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-repository-inspect`: default `scripts/smoke-suite.ps1` passed after `eb6255a`.
-- Active slice `artifact-export-trace-visibility`: add focused fixture coverage so artifact inspect exposes the checkpoint/export/Git trace required by the operator status matrix.
+- Completed slice `artifact-export-trace-visibility`: integrated as `6665ba7`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
+- Active verification slice `aggregate-smoke-suite-refresh-after-artifact-export-trace`: run the default smoke suite after artifact export trace coverage.
 
 ## Candidate Next Slices
 
-- Next useful slice after active work: aggregate smoke refresh, then choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
+- Next useful slice after active verification: choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
 
 ## Decisions
 

@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `055e73f` and covered `24e3dbf`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 137 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
+- Verification: latest full pass ran after `055e73f` and covered `24e3dbf`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 137 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused compat projection last-import checks passed after `301477b`. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -172,11 +172,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-session-visibility`: default `scripts/smoke-suite.ps1` passed after `5b1d344`.
 - Completed slice `compat-artifact-import-provenance`: integrated as `24e3dbf`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-artifact-provenance`: default `scripts/smoke-suite.ps1` passed after `055e73f`.
-- Active slice `compat-projection-last-import-visibility`: replace compatibility projection `last_import_attempt:null` placeholders in status/inspect fixture surfaces with the existing compat import operation, revision, generation, and selected-delta IDs.
+- Completed slice `compat-projection-last-import-visibility`: integrated as `301477b`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
+- Active verification slice `aggregate-smoke-suite-refresh-after-compat-projection-import`: rerun the default smoke suite after compat projection last-import visibility.
 
 ## Candidate Next Slices
 
-- Next useful slice after active work: aggregate smoke refresh, then choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
+- Next useful slice after active verification: choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
 
 ## Decisions
 

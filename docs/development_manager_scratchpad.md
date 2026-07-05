@@ -47,6 +47,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
+- Active slice `compat-working-tree-isolation-cli-coverage`: delegated next. Add fixture-backed coverage that unrelated main Git working tree edits do not appear in compatibility projection diff/import results and do not advance native state.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
@@ -111,13 +112,14 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 
 ## Candidate Next Slices
 
-- Next useful slices: remaining Phase 6 compatibility import hardening gaps found by docs/test reconciliation.
+- Next useful slices after the active one: checkpoint/export exclusion for projection-only edits, then remaining Phase 6 docs/test reconciliation gaps.
 
 ## Decisions
 
 - Scratchpad length budget is enforced at 20,000 characters.
 - Direct implementation edits should be delegated to WSL Codex agents.
 - WSL `rustfmt` is currently unavailable, so manager-side Windows `cargo fmt` remains the formatting gate after WSL imports.
+- Recent WSL slice clones may stay dirty after manager-side import because the WSL Codex sandbox cannot create `.git/index.lock`; treat the Windows commits as source of truth.
 
 ## Open Questions
 

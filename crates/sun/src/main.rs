@@ -2874,7 +2874,8 @@ fn fixture_status_session_json() -> String {
             "\"revision_number\":1",
             "}},",
             "\"changed_artifacts\":[{}],",
-            "\"last_operation_id\":\"op_auth_trim_guard_0001\"",
+            "\"last_operation_id\":\"op_auth_trim_guard_0001\",",
+            "\"compatibility_imports\":{}",
             "}},\"warnings\":[]}}"
         ),
         FIXTURE_REPOSITORY_ID,
@@ -2886,6 +2887,57 @@ fn fixture_status_session_json() -> String {
         FIXTURE_WRITE_TOPIC_ID,
         FIXTURE_WRITE_TOPIC_ID,
         fixture_changed_artifact_json(),
+        fixture_session_compatibility_imports_json(),
+    )
+}
+
+fn fixture_session_compatibility_imports_json() -> String {
+    let projection = fixture_compat_import_projection_by_id(FIXTURE_COMPATIBILITY_PROJECTION_ID)
+        .expect("fixture compatibility projection should exist")
+        .expect("fixture compatibility projection should validate");
+    let import = fixture_compat_import_response_by_operation_id(FIXTURE_COMPAT_IMPORT_OPERATION_ID)
+        .expect("fixture compatibility import should exist");
+    let candidates = fixture_basic_app_candidate_deltas();
+
+    format!(
+        concat!(
+            "{{",
+            "\"recent_projections\":[{{",
+            "\"projection_id\":\"{}\",",
+            "\"purpose\":\"{}\",",
+            "\"baseline\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"selected_candidate_delta_ids\":{},",
+            "\"candidate_summary\":{{",
+            "\"candidate_counts\":{},",
+            "\"quarantine_refs\":{}",
+            "}}",
+            "}}],",
+            "\"last_import\":{{",
+            "\"compat_import_operation_id\":\"{}\",",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"candidate_delta_ids\":{}",
+            "}}",
+            "}}"
+        ),
+        json_escape(&projection.id),
+        projection.purpose.as_str(),
+        json_escape(&projection.resolved_view_id),
+        single_repo_tree_json(&projection.tree_identity),
+        compat_projection_selected_candidate_ids_json(),
+        compat_candidate_counts_json(&candidates),
+        compat_quarantine_refs_json(&candidates),
+        json_escape(&import.operation_id),
+        json_escape(&import.operation_id),
+        json_escape(&import.projection_id),
+        json_escape(&import.session_generation_id),
+        json_escape(&import.resolved_view_id),
+        compat_import_candidate_delta_ids_json(&import),
     )
 }
 

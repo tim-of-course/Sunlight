@@ -4607,6 +4607,41 @@ fn status_json_fixture_basic_app_returns_session_snapshot() {
 }
 
 #[test]
+fn compat_session_status_import_visibility() {
+    let repo = TestRepo::new("compat-session-status-import-visibility");
+
+    let output = sun()
+        .arg("status")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"status.session\""));
+    assert!(stdout.contains(
+        "\"ids\":{\"session_id\":\"session_agent_a\",\"write_topic_id\":\"topic_auth_nullability\"}"
+    ));
+    assert!(stdout.contains("\"compatibility_imports\":{"));
+    assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
+    assert!(stdout.contains("\"purpose\":\"compatibility\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_base_0001\""));
+    assert!(stdout.contains("\"tree_hash\":\"tree_fixture_base_0001\""));
+    assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
+    assert!(stdout.contains(
+        "\"last_import\":{\"compat_import_operation_id\":\"op_compat_import_auth_0001\""
+    ));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_compat_import_0001\""));
+}
+
+#[test]
 fn inspect_json_fixture_checkpoint_returns_frozen_record() {
     let repo = TestRepo::new("inspect-fixture-checkpoint");
 

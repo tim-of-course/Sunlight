@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `f5066f1`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 105 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Docs-only quarantine reconciliation passed `git diff --check` plus stale-phrase `rg` review after `0fbc28e`. Optional `scripts/external-validation-super-search.ps1` last passed against local Super Search with `mix test`, `bun run test`, temp clone, and `sun init --json`. Scratchpad guard must run after this edit.
+- Verification: latest full pass ran after `f5066f1`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 105 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional `scripts/external-validation-super-search.ps1` passed after `03a1e43` against local Super Search with `mix test`, `bun run test`, temp clone init, fixture compat import, local Git export execute, export ref resolve, and target-clean check. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -139,11 +139,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-quarantine-record-persistence`: integrated as `0849e94`; formatting checkpoint `7aa4c6a`; scan-count fix `b384f03`; formatting checkpoint `9bd5e0f`.
 - Completed slice `projection-quarantine-retention-cleanup`: integrated as `e8ec961`; formatting checkpoint `f5066f1`.
 - Completed slice `projection-quarantine-docs-reconcile`: integrated as `0fbc28e`.
-- Active WSL slice `external-validation-super-search-export`: deepen optional Super Search validation beyond init by exercising fixture compatibility import and local Git export behavior against the temp clone boundary.
+- Completed slice `external-validation-super-search-export`: integrated as `2431fa7`; logging fix checkpoint `03a1e43`.
+- Active WSL slice `compat-project-diff-fixture`: add fixture `sun compat project` and `sun compat diff` JSON surfaces so compatibility import has explicit projection/diff steps before import.
 
 ## Candidate Next Slices
 
-- After the external validation slice lands, reassess whether the optional Super Search harness should remain separate from default smoke coverage.
+- After compat project/diff fixture coverage lands, broaden status/inspect around compatibility projection dirty state and import attempts.
 
 ## Decisions
 

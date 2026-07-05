@@ -8620,9 +8620,11 @@ Usage:
   sun policy check-commit [--paths <path>...] --json
   sun policy explain <validation-report-id> --json
   sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan|--execute-fixture success|ref-update-failure|export-map-failure|--execute-local --repo <path>] --json
+  sun status --export <export-map-id> --fixture basic-app [--json]
   sun status --git <commit-or-ref> --fixture basic-app [--json]
   sun status --projection <projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|scan-missing-blob|verified] [--json]
   sun status --execution <execution-id> --fixture basic-app [--promoted] [--json]
+  sun inspect export:<export-map-id> --fixture basic-app [--json]
   sun inspect git:<commit-or-ref> --fixture basic-app [--json]
   sun inspect projection:<projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|scan-missing-blob|verified] [--json]
   sun inspect execution:<execution-id> --fixture basic-app [--promoted] [--json]

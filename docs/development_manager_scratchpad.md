@@ -42,12 +42,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `67e40d6` and covered scoped projection quarantine cleanup reporting. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 158 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused quarantine cleanup verification passed after `8ddbb6f`. Optional Super Search validation passed after `44775b8`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat project/diff/status/inspect, happy-path and generated-failure compat import, and fixture Git export.
+- Verification: latest full pass ran after `e60e1ac` and covered Phase 1 topic/session lifecycle CLI acceptance. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 164 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `44775b8`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat project/diff/status/inspect, happy-path and generated-failure compat import, and fixture Git export.
 
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `phase1-native-lifecycle-acceptance`: ready next. Start with fixture-backed `topic create` and `session start` CLI acceptance, then continue into structural mutation commands.
+- Active slice `phase1-structural-mutation-acceptance`: ready next. Add fixture-backed `move`, `delete`, and `metadata set` CLI acceptance without broad storage rewrites.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Earlier integrated work through `6fb413d` includes policy command fixtures/docs, operator status round trips, repository/artifact/view/status visibility, external Super Search validation, compatibility import breadth and variants, projection-only checkpoint boundaries, and compatibility status docs reconcile. Full slice detail is in Git history.
@@ -65,10 +65,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-cache-reuse-lifecycle-audit`: integrated as `8ddbb6f`; WSL test implementation was imported manager-side after the WSL Git sandbox blocked committing, with WSL core projection/execution and CLI projection filters passing, plus Windows `cargo fmt --check`, `git diff --check`, and focused quarantine cleanup CLI verification.
 - Completed verification slice `external-validation-post-cache-hardening`: integrated harness sync as `44775b8`; initial target-side preflight flake passed on narrow rerun, then full optional Super Search validation passed after syncing the canonical compatibility fixture count to 13.
 - Completed slice `mvp-readiness-audit`: integrated as `168783b`; WSL docs audit identified Phase 1 native lifecycle and structural mutation CLI acceptance as the next narrow gap, with `git diff --check` passing.
+- Completed slice `phase1-native-lifecycle-acceptance`: integrated as `e60e1ac`; WSL implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check`, focused topics/session CLI tests, and default smoke passing.
 
 ## Candidate Next Slices
 
-- Next useful slices after the active one: close Phase 1 topic/session CLI acceptance, then delegate structural mutation acceptance for move/delete/metadata.
+- Next useful slices after the active one: close structural mutation acceptance for move/delete/metadata, then run aggregate smoke and refresh the readiness audit if needed.
 
 ## Decisions
 

@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `b16a1f2` and covered `dff513f`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 140 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
+- Verification: latest full pass ran after `b16a1f2` and covered `dff513f`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 140 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused compat path-policy checks passed after `0c4894d`. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -176,7 +176,8 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-projection-import`: default `scripts/smoke-suite.ps1` passed after `6be9da4`.
 - Completed slice `compat-import-atomic-failure-cli-coverage`: integrated as `dff513f`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-atomic-failure`: default `scripts/smoke-suite.ps1` passed after `b16a1f2`.
-- Active slice `compat-import-path-policy-cli-coverage`: expose a path-policy-blocked compatibility diff candidate and verify CLI import rejects it without operation, revision, or generation IDs.
+- Completed slice `compat-import-path-policy-cli-coverage`: integrated as `0c4894d`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
+- Active verification slice `aggregate-smoke-suite-refresh-after-compat-import-path-policy`: run the default smoke suite after the compatibility path-policy import coverage lands.
 
 ## Candidate Next Slices
 

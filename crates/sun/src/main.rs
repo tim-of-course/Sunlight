@@ -5093,6 +5093,7 @@ fn compat_import_error(error: CompatImportValidationError) -> CliError {
             "\"imported_artifacts\":[],",
             "\"operation_transaction_id\":null,",
             "\"topic_revision_id\":null,",
+            "\"session_generation_id\":null,",
             "\"reason\":\"{}\"",
             "}}"
         ),

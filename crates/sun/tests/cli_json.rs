@@ -4222,6 +4222,166 @@ fn inspect_json_fixture_git_ref_missing_lookup_returns_object_not_found() {
 }
 
 #[test]
+fn status_round_trip_fixture_ids_through_matching_inspect_selectors() {
+    let repo = TestRepo::new("status-round-trip-fixture-selectors");
+    let projection_root = repo.path().join("projection-root");
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    let checkpoint_status = sun()
+        .arg("status")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status checkpoint should run");
+    assert_success(&checkpoint_status);
+    let checkpoint_id = json_string_field(&stdout(&checkpoint_status), "checkpoint_id");
+    assert_eq!(checkpoint_id, "checkpoint_auth_profile_ready_0001");
+    let checkpoint_inspect = sun()
+        .arg("inspect")
+        .arg(format!("checkpoint:{checkpoint_id}"))
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect checkpoint should run");
+    assert_success(&checkpoint_inspect);
+    assert!(stdout(&checkpoint_inspect).contains(&format!("\"checkpoint_id\":\"{checkpoint_id}\"")));
+
+    for (status_flag, inspect_prefix) in [("--export-map", "export_map"), ("--export", "export")] {
+        let export_status = sun()
+            .arg("status")
+            .arg(status_flag)
+            .arg("export_map_checkpoint_auth_profile_ready_0001")
+            .arg("--fixture")
+            .arg("basic-app")
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .expect("sun status export map should run");
+        assert_success(&export_status);
+        let export_map_id = json_string_field(&stdout(&export_status), "export_map_id");
+        assert_eq!(
+            export_map_id,
+            "export_map_checkpoint_auth_profile_ready_0001"
+        );
+        let export_inspect = sun()
+            .arg("inspect")
+            .arg(format!("{inspect_prefix}:{export_map_id}"))
+            .arg("--fixture")
+            .arg("basic-app")
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .expect("sun inspect export map should run");
+        assert_success(&export_inspect);
+        assert!(stdout(&export_inspect).contains(&format!("\"export_map_id\":\"{export_map_id}\"")));
+    }
+
+    for git_selector in [
+        "refs/heads/sunlight/auth-profile-ready",
+        "git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        let git_status = sun()
+            .arg("status")
+            .arg("--git")
+            .arg(git_selector)
+            .arg("--fixture")
+            .arg("basic-app")
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .expect("sun status git lookup should run");
+        assert_success(&git_status);
+        let export_map_id = json_string_field(&stdout(&git_status), "export_map_id");
+        let git_inspect = sun()
+            .arg("inspect")
+            .arg(format!("git:{git_selector}"))
+            .arg("--fixture")
+            .arg("basic-app")
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .expect("sun inspect git lookup should run");
+        assert_success(&git_inspect);
+        assert!(stdout(&git_inspect).contains(&format!("\"export_map_id\":\"{export_map_id}\"")));
+    }
+
+    let projection_status = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+    assert_success(&projection_status);
+    let projection_id = json_string_field(&stdout(&projection_status), "projection_id");
+    assert_eq!(projection_id, "projection_exec_auth_profile_0001");
+    let projection_inspect = sun()
+        .arg("inspect")
+        .arg(format!("projection:{projection_id}"))
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect projection should run");
+    assert_success(&projection_inspect);
+    assert!(stdout(&projection_inspect).contains(&format!("\"projection_id\":\"{projection_id}\"")));
+
+    let execution_status = sun()
+        .arg("status")
+        .arg("--execution")
+        .arg("exec_auth_profile_tests_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status execution should run");
+    assert_success(&execution_status);
+    let execution_id = json_string_field(&stdout(&execution_status), "execution_id");
+    assert_eq!(execution_id, "exec_auth_profile_tests_0001");
+    let execution_inspect = sun()
+        .arg("inspect")
+        .arg(format!("execution:{execution_id}"))
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect execution should run");
+    assert_success(&execution_inspect);
+    assert!(stdout(&execution_inspect).contains(&format!("\"execution_id\":\"{execution_id}\"")));
+}
+
+#[test]
 fn status_json_fixture_basic_app_returns_session_snapshot() {
     let repo = TestRepo::new("status-fixture-session");
 

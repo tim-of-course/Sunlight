@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `6be9da4` and covered `301477b`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 139 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
+- Verification: latest full pass ran after `6be9da4` and covered `301477b`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 139 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused compat import atomic-failure checks passed after `dff513f`. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -174,11 +174,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-artifact-provenance`: default `scripts/smoke-suite.ps1` passed after `055e73f`.
 - Completed slice `compat-projection-last-import-visibility`: integrated as `301477b`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-projection-import`: default `scripts/smoke-suite.ps1` passed after `6be9da4`.
-- Active slice `compat-import-atomic-failure-cli-coverage`: add focused CLI coverage that mixed safe and blocked compatibility import candidates fail atomically without operation, revision, or generation IDs.
+- Completed slice `compat-import-atomic-failure-cli-coverage`: integrated as `dff513f`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
+- Active verification slice `aggregate-smoke-suite-refresh-after-compat-import-atomic-failure`: rerun the default smoke suite after compat import atomic failure coverage.
 
 ## Candidate Next Slices
 
-- Next useful slice after active work: aggregate smoke refresh, then choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
+- Next useful slice after active verification: choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
 
 ## Decisions
 

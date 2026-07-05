@@ -83,6 +83,9 @@ use sunlight_core::resolver::{
     FIXTURE_BASE_RESOLVED_VIEW_ID,
 };
 
+const FIXTURE_STALE_COMPATIBILITY_PROJECTION_ID: &str =
+    "projection_compat_agent_a_stale_baseline_0001";
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let json = args.iter().any(|arg| arg == "--json");
@@ -933,7 +936,9 @@ fn compat_import(ctx: &CommandContext) -> Result<(), CliError> {
         CompatImportRequest {
             projection_id: options.projection_id,
             session_id: FIXTURE_SESSION_ID.to_string(),
-            session_generation_id: FIXTURE_SESSION_GENERATION_ID.to_string(),
+            session_generation_id: options
+                .session_generation_id
+                .unwrap_or_else(|| FIXTURE_SESSION_GENERATION_ID.to_string()),
             resolved_view_id: current_view.resolved_view_id.clone(),
             write_topic_id: FIXTURE_WRITE_TOPIC_ID.to_string(),
             parent_topic_revision_id: None,
@@ -1273,6 +1278,7 @@ struct CompatDiffOptions {
 struct CompatImportOptions {
     fixture: String,
     projection_id: String,
+    session_generation_id: Option<String>,
     candidate_delta_ids: Vec<String>,
 }
 
@@ -1363,6 +1369,7 @@ fn parse_compat_diff_options(ctx: &CommandContext) -> Result<CompatDiffOptions, 
 fn parse_compat_import_options(ctx: &CommandContext) -> Result<CompatImportOptions, CliError> {
     let mut fixture = None;
     let mut projection_id = None;
+    let mut session_generation_id = None;
     let mut candidate_delta_ids = Vec::new();
     let mut args = ctx.args.iter().skip(2);
 
@@ -1381,6 +1388,14 @@ fn parse_compat_import_options(ctx: &CommandContext) -> Result<CompatImportOptio
                     )
                 })?;
                 projection_id = Some(value.clone());
+            }
+            "--session-generation" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun compat import requires --session-generation <generation-id>",
+                    )
+                })?;
+                session_generation_id = Some(value.clone());
             }
             "--candidate" => {
                 let value = args.next().ok_or_else(|| {
@@ -1403,18 +1418,19 @@ fn parse_compat_import_options(ctx: &CommandContext) -> Result<CompatImportOptio
 
     let fixture = fixture.ok_or_else(|| {
         invalid_request(
-            "usage: sun compat import --projection <projection-id> --candidate <candidate-id> --fixture basic-app",
+            "usage: sun compat import --projection <projection-id> --candidate <candidate-id> [--session-generation <generation-id>] --fixture basic-app",
         )
     })?;
     let projection_id = projection_id.ok_or_else(|| {
         invalid_request(
-            "usage: sun compat import --projection <projection-id> --candidate <candidate-id> --fixture basic-app",
+            "usage: sun compat import --projection <projection-id> --candidate <candidate-id> [--session-generation <generation-id>] --fixture basic-app",
         )
     })?;
 
     Ok(CompatImportOptions {
         fixture,
         projection_id,
+        session_generation_id,
         candidate_delta_ids,
     })
 }
@@ -4599,6 +4615,18 @@ fn fixture_compat_import_projection_by_id(
             &view,
             "gen_agent_a_0001",
         ))
+    } else if projection_id == FIXTURE_STALE_COMPATIBILITY_PROJECTION_ID {
+        let view = fixture_base_resolved_content_view();
+        Some(
+            fixture_compatibility_projection_from_resolved_view(&view, "gen_agent_a_0001").map(
+                |mut projection| {
+                    projection.id = FIXTURE_STALE_COMPATIBILITY_PROJECTION_ID.to_string();
+                    projection.tree_identity.tree_hash =
+                        "tree_stale_compat_projection_baseline_0001".to_string();
+                    projection
+                },
+            ),
+        )
     } else {
         fixture_projection_by_id(projection_id)
     }

@@ -672,8 +672,11 @@ fn validate_request_preconditions(
             CompatImportErrorCode::PreconditionFailed,
             &request.projection_id,
             &request.session_id,
-            Vec::new(),
-            "session generation does not match the fixture current generation",
+            request.selected_candidate_delta_ids.clone(),
+            format!(
+                "session generation `{}` does not match current generation `gen_agent_a_0001`",
+                request.session_generation_id
+            ),
         ));
     }
     if request.resolved_view_id != current_view.resolved_view_id {

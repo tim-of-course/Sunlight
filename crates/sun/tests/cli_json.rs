@@ -3459,6 +3459,78 @@ fn compat_import_json_fixture_missing_candidate_returns_diff_failed() {
 }
 
 #[test]
+fn compat_import_stale_session_generation_json_fixture_returns_precondition_failed() {
+    let repo = TestRepo::new("compat-import-stale-session-generation");
+
+    let output = sun()
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--candidate")
+        .arg("compat_delta_src_auth_ts_0001")
+        .arg("--session-generation")
+        .arg("gen_agent_a_stale_0000")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat import should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"compat_precondition_failed\""));
+    assert!(stdout.contains("\"message\":\"compatibility import precondition failed\""));
+    assert!(stdout.contains("\"candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
+    assert!(stdout.contains(
+        "\"reason\":\"session generation `gen_agent_a_stale_0000` does not match current generation `gen_agent_a_0001`\""
+    ));
+    assert!(stdout.contains("\"operation_transaction_id\":null"));
+    assert!(stdout.contains("\"topic_revision_id\":null"));
+    assert!(stdout.contains("\"session_generation_id\":null"));
+    assert!(!stdout.contains("\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
+    assert!(!stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
+    assert!(!stdout.contains("\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+}
+
+#[test]
+fn compat_import_stale_projection_baseline_json_fixture_returns_projection_stale() {
+    let repo = TestRepo::new("compat-import-stale-projection-baseline");
+
+    let output = sun()
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_stale_baseline_0001")
+        .arg("--candidate")
+        .arg("compat_delta_src_auth_ts_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat import should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"compat_projection_stale\""));
+    assert!(stdout.contains("\"message\":\"compatibility projection is stale\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_stale_baseline_0001\""));
+    assert!(stdout.contains("\"candidate_delta_ids\":[]"));
+    assert!(stdout
+        .contains("\"reason\":\"projection baseline does not match the supplied current view\""));
+    assert!(stdout.contains("\"operation_transaction_id\":null"));
+    assert!(stdout.contains("\"topic_revision_id\":null"));
+    assert!(stdout.contains("\"session_generation_id\":null"));
+    assert!(!stdout.contains("\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
+    assert!(!stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
+    assert!(!stdout.contains("\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+}
+
+#[test]
 fn compat_import_json_fixture_secret_candidate_is_policy_blocked() {
     let repo = TestRepo::new("compat-import-secret-candidate");
 

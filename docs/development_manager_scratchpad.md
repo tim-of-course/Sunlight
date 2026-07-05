@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `5aa6275`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 118 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`. After `c6376d8`, policy command docs passed `git diff --check`, product-doc stale failure-code searches, old CLI spelling searches, and intended policy reference searches.
+- Verification: latest full pass ran after `5aa6275`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 118 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`. After `e4ec794`, policy explain passed `cargo fmt --check`, `cargo test -p sun --test cli_json policy_explain`, and `git diff --check HEAD~1..HEAD`.
 
 ## Active Work
 
@@ -151,11 +151,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh`: default `scripts/smoke-suite.ps1` passed after `5aa6275`.
 - Completed slice `policy-failure-operator-docs`: integrated as `297e22d`; WSL implementation was `b646648`.
 - Completed slice `policy-command-docs-sweep`: integrated as `c6376d8`; WSL implementation was `3624b10`.
-- Active slice `policy-explain-cli-fixture`: WSL Codex should add the documented `sun policy explain <validation-report-id> --json` CLI fixture only if it can be done with existing report data patterns.
+- Completed slice `policy-explain-cli-fixture`: integrated as `e4ec794`; WSL implementation was `6f03921` plus manager-side Windows rustfmt amendment.
 
 ## Candidate Next Slices
 
-- Next useful slice after active work: add policy explain to focused validation smoke if the CLI fixture lands cleanly.
+- Next useful slice: add policy explain to focused validation smoke.
 
 ## Decisions
 

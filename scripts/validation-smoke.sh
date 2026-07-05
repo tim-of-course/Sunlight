@@ -232,4 +232,21 @@ assert_contains "$out" '"command":"git.export.write_plan"' "git export write pla
 assert_contains "$out" '"validation_report_id":"validation_export_auth_profile_ready_0001"' "git export validation report"
 assert_contains "$out" '"planned_commit_id":"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "git export planned commit"
 
+step "Look up fixture Git export by ref and commit"
+out="$(run_ok status-git-ref sun status --git refs/heads/sunlight/auth-profile-ready --fixture basic-app --json)"
+assert_contains "$out" '"command":"status.git"' "status git command"
+assert_contains "$out" '"git_ref":"refs/heads/sunlight/auth-profile-ready"' "status git ref"
+assert_contains "$out" '"export_map_id":"export_map_checkpoint_auth_profile_ready_0001"' "status git export map"
+assert_contains "$out" '"checkpoint_id":"checkpoint_auth_profile_ready_0001"' "status git checkpoint"
+assert_contains "$out" '"validation_report_id":"validation_export_auth_profile_ready_0001"' "status git validation report"
+assert_contains "$out" '"git_commit_ids":["git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]' "status git commit ids"
+
+out="$(run_ok inspect-git-commit sun inspect git:git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --fixture basic-app --json)"
+assert_contains "$out" '"command":"inspect.git"' "inspect git command"
+assert_contains "$out" '"git_ref":"refs/heads/sunlight/auth-profile-ready"' "inspect git ref"
+assert_contains "$out" '"export_map_id":"export_map_checkpoint_auth_profile_ready_0001"' "inspect git export map"
+assert_contains "$out" '"checkpoint_id":"checkpoint_auth_profile_ready_0001"' "inspect git checkpoint"
+assert_contains "$out" '"validation_report":{"id":"validation_export_auth_profile_ready_0001"' "inspect git validation report"
+assert_contains "$out" '"export_map":{"record_type":"git_export_map","id":"export_map_checkpoint_auth_profile_ready_0001"' "inspect git export map record type"
+
 step "Validation smoke passed"

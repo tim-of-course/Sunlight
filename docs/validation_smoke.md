@@ -53,7 +53,8 @@ patch/write preconditions, compatible and conflicted view resolution,
 projection materialization with the current `sun project materialize` spelling,
 fixture `sun run -- cargo test`, checkpoint creation, export policy validation,
 policy validation explanation, compatibility project creation, compatibility
-diff, compatibility import, and Git export write planning with `--write-plan`.
+diff, compatibility import, Git export write planning with `--write-plan`, and
+fixture Git ref/commit lookup through `sun status --git` and `sun inspect git:`.
 
 For focused projection strategy coverage, run
 `scripts/projection-strategy-smoke.sh`. It verifies copy fallback, explicit

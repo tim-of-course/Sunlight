@@ -75,6 +75,8 @@ Real-repo flows are limited to repository bootstrap and local export execution a
 | Compat diff | `sun compat diff --projection projection_compat_agent_a_0001 --fixture basic-app --json` | Fixture | Returns `compat.diff`, projection ID, baseline view and tree, candidate counts, quarantine refs, and selected safe default candidate `compat_delta_src_auth_ts_0001`. |
 | Compat import | `sun compat import --projection projection_compat_agent_a_0001 --candidate compat_delta_src_auth_ts_0001 --fixture basic-app --json` | Fixture | Returns `compat.import`, one operation transaction, one topic revision, selected candidate delta refs, and generation advance. Repeat `--candidate <candidate-delta-id>` for multi-candidate imports; the smoke path stays single-candidate for concise output. |
 | Git export write planning | `sun git export --checkpoint checkpoint_auth_profile_ready_0001 --branch refs/heads/sunlight/auth-profile-ready --fixture basic-app --write-plan --json` | Fixture plus local Git state | Returns `git.export.write_plan`, export shape `single_checkpoint_commit`, validation report, selected parent, ref update plan, planned commit ID, and no working-tree content dependency. |
+| Git status lookup | `sun status --git refs/heads/sunlight/auth-profile-ready --fixture basic-app --json` | Fixture | Returns `status.git`, Git ref, export map ID, checkpoint ID, validation report ID, and commit ID mapping for the exported fixture ref. |
+| Git inspect lookup | `sun inspect git:git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --fixture basic-app --json` | Fixture | Returns `inspect.git`, Git ref, export map ID, checkpoint ID, validation report body, and `git_export_map` record body for the exported fixture commit. |
 
 ## Smoke Flow Order
 
@@ -89,6 +91,7 @@ Run smoke flows in this order so failures point to the earliest broken contract:
 7. Create a checkpoint from the conflict-free resolved view and passing execution evidence.
 8. Create a compatibility projection, diff it, import one selected candidate delta, and verify normal operation provenance.
 9. Write-plan Git export for `single_checkpoint_commit`; writer tests may create the real commit after policy gates are implemented.
+10. Look up the fixture Git export by ref with `sun status --git` and by commit with `sun inspect git:`.
 
 ## Expected CI Commands
 

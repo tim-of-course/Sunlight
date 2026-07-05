@@ -233,6 +233,23 @@ try {
     Assert-Contains $out '"validation_report_id":"validation_export_auth_profile_ready_0001"' 'git export validation report'
     Assert-Contains $out '"planned_commit_id":"git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' 'git export planned commit'
 
+    Step 'Look up fixture Git export by ref and commit'
+    $out = Invoke-SunOk 'status-git-ref' @('status', '--git', 'refs/heads/sunlight/auth-profile-ready', '--fixture', 'basic-app', '--json')
+    Assert-Contains $out '"command":"status.git"' 'status git command'
+    Assert-Contains $out '"git_ref":"refs/heads/sunlight/auth-profile-ready"' 'status git ref'
+    Assert-Contains $out '"export_map_id":"export_map_checkpoint_auth_profile_ready_0001"' 'status git export map'
+    Assert-Contains $out '"checkpoint_id":"checkpoint_auth_profile_ready_0001"' 'status git checkpoint'
+    Assert-Contains $out '"validation_report_id":"validation_export_auth_profile_ready_0001"' 'status git validation report'
+    Assert-Contains $out '"git_commit_ids":["git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]' 'status git commit ids'
+
+    $out = Invoke-SunOk 'inspect-git-commit' @('inspect', 'git:git_sha1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '--fixture', 'basic-app', '--json')
+    Assert-Contains $out '"command":"inspect.git"' 'inspect git command'
+    Assert-Contains $out '"git_ref":"refs/heads/sunlight/auth-profile-ready"' 'inspect git ref'
+    Assert-Contains $out '"export_map_id":"export_map_checkpoint_auth_profile_ready_0001"' 'inspect git export map'
+    Assert-Contains $out '"checkpoint_id":"checkpoint_auth_profile_ready_0001"' 'inspect git checkpoint'
+    Assert-Contains $out '"validation_report":{"id":"validation_export_auth_profile_ready_0001"' 'inspect git validation report'
+    Assert-Contains $out '"export_map":{"record_type":"git_export_map","id":"export_map_checkpoint_auth_profile_ready_0001"' 'inspect git export map record type'
+
     Step 'Validation smoke passed'
 } finally {
     Remove-Item -Recurse -Force -LiteralPath $tmpRoot -ErrorAction SilentlyContinue

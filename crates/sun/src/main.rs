@@ -184,6 +184,9 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         [scope, command, ..] if scope == "checkpoint" && command == "create" => {
             checkpoint_create(&ctx)
         }
+        [scope, command, ..] if scope == "policy" && command == "check-export" => {
+            policy_check_export(&ctx)
+        }
         [scope, command, ..] if scope == "git" && command == "export" => git_export(&ctx),
         [scope, command, ..] if scope == "compat" && command == "project" => compat_project(&ctx),
         [scope, command, ..] if scope == "compat" && command == "diff" => compat_diff(&ctx),
@@ -764,6 +767,40 @@ fn git_export(ctx: &CommandContext) -> Result<(), CliError> {
     Ok(())
 }
 
+fn policy_check_export(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_policy_check_export_options(ctx)?;
+    if options.fixture != "basic-app" {
+        return Err(
+            invalid_request(format!("unknown fixture `{}`", options.fixture))
+                .with_detail("fixture", options.fixture),
+        );
+    }
+
+    let checkpoint = fixture_checkpoint()?;
+    if checkpoint.id != options.checkpoint_id {
+        return Err(object_not_found("checkpoint", &options.checkpoint_id));
+    }
+
+    let mut request = GitExportRequest::from_checkpoint(&checkpoint);
+    if let Some(git_ref) = options.git_ref {
+        request.git_ref = git_ref;
+    }
+    apply_fixture_generated_output_export_gate(&mut request);
+
+    let report = sunlight_core::git_export::validate_git_export_request(&request);
+    if !report.ok {
+        return Err(policy_check_export_error(&report));
+    }
+
+    if ctx.json {
+        println!("{}", policy_check_export_success_envelope(&report));
+    } else {
+        println!("{} {}", report.checkpoint_id, report.id);
+    }
+
+    Ok(())
+}
+
 fn compat_project(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_compat_project_options(ctx)?;
     if options.fixture != "basic-app" {
@@ -1063,6 +1100,13 @@ struct ExecutionRunOptions {
 struct CheckpointCreateOptions {
     fixture: String,
     view_id: String,
+}
+
+#[derive(Debug)]
+struct PolicyCheckExportOptions {
+    fixture: String,
+    checkpoint_id: String,
+    git_ref: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1618,6 +1662,71 @@ fn parse_git_export_options(ctx: &CommandContext) -> Result<GitExportOptions, Cl
         execute_local,
         repo,
         simulate_export_map_write_failure,
+    })
+}
+
+fn parse_policy_check_export_options(
+    ctx: &CommandContext,
+) -> Result<PolicyCheckExportOptions, CliError> {
+    let mut fixture = None;
+    let mut checkpoint_id = None;
+    let mut git_ref = None;
+    let mut args = ctx.args.iter().skip(2);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun policy check-export requires --fixture basic-app")
+                        .with_detail("missing", "fixture")
+                })?;
+                fixture = Some(value.clone());
+            }
+            "--checkpoint" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun policy check-export requires --checkpoint <checkpoint-id>",
+                    )
+                    .with_detail("missing", "checkpoint")
+                })?;
+                checkpoint_id = Some(value.clone());
+            }
+            "--branch" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun policy check-export --branch requires <git-ref>")
+                })?;
+                git_ref = Some(value.clone());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun policy check-export"
+                )));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected policy check-export argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    let fixture = fixture.ok_or_else(|| {
+        invalid_request(
+            "usage: sun policy check-export --checkpoint <checkpoint-id> --fixture basic-app",
+        )
+        .with_detail("missing", "fixture")
+    })?;
+    let checkpoint_id = checkpoint_id.ok_or_else(|| {
+        invalid_request(
+            "usage: sun policy check-export --checkpoint <checkpoint-id> --fixture basic-app",
+        )
+        .with_detail("missing", "checkpoint")
+    })?;
+
+    Ok(PolicyCheckExportOptions {
+        fixture,
+        checkpoint_id,
+        git_ref,
     })
 }
 
@@ -4074,6 +4183,17 @@ fn git_export_error(error: GitExportError) -> CliError {
     ))
 }
 
+fn policy_check_export_error(report: &GitExportValidationReport) -> CliError {
+    CliError::new(
+        "export_policy_failed",
+        "checkpoint failed Git export validation",
+    )
+    .with_raw_details_json(format!(
+        "{{\"validation_report\":{}}}",
+        git_export_validation_report_json(report),
+    ))
+}
+
 fn generated_output_git_export_error(error: GitExportError) -> CliError {
     CliError::new(
         error.code.as_str(),
@@ -4289,6 +4409,31 @@ fn git_export_success_envelope(response: &GitExportResponse) -> String {
         json_escape(&response.git_ref),
         string_array_json(response.git_commit_ids.iter().map(String::as_str)),
         git_export_map_json(&response.export_map),
+    )
+}
+
+fn policy_check_export_success_envelope(report: &GitExportValidationReport) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"policy.check-export\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"validation_report_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"checkpoint_id\":\"{}\",",
+            "\"validation_report_id\":\"{}\"",
+            "}},",
+            "\"validation_report\":{}",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(&report.checkpoint_id),
+        json_escape(&report.id),
+        json_escape(&report.checkpoint_id),
+        json_escape(&report.id),
+        git_export_validation_report_json(report),
     )
 }
 

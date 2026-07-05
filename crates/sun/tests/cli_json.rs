@@ -3185,6 +3185,61 @@ fn checkpoint_create_json_fixture_stale_view_returns_stable_error() {
 }
 
 #[test]
+fn policy_check_export_json_fixture_checkpoint_returns_validation_envelope() {
+    let repo = TestRepo::new("policy-check-export-fixture-ready");
+
+    let output = sun()
+        .arg("policy")
+        .arg("check-export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun policy check-export should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":true"));
+    assert!(stdout.contains("\"command\":\"policy.check-export\""));
+    assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
+    assert!(
+        stdout.contains("\"validation_report_id\":\"validation_export_auth_profile_ready_0001\"")
+    );
+    assert!(stdout.contains("\"validation_report\":{"));
+    assert!(stdout.contains("\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\""));
+    assert!(stdout.contains("\"summary\":{\"records_checked\":4,\"payloads_checked\":0"));
+    assert!(stdout.contains("\"failures\":[]"));
+    assert!(stdout.contains("\"warnings\":[]"));
+}
+
+#[test]
+fn policy_check_export_json_fixture_missing_fixture_returns_invalid_request() {
+    let repo = TestRepo::new("policy-check-export-missing-fixture");
+
+    let output = sun()
+        .arg("policy")
+        .arg("check-export")
+        .arg("--checkpoint")
+        .arg("checkpoint_auth_profile_ready_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun policy check-export should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"invalid_request\""));
+    assert!(stdout.contains(
+        "\"message\":\"usage: sun policy check-export --checkpoint <checkpoint-id> --fixture basic-app\""
+    ));
+    assert!(stdout.contains("\"details\":{\"missing\":\"fixture\"}"));
+}
+
+#[test]
 fn git_export_json_fixture_checkpoint_returns_export_envelope() {
     let repo = TestRepo::new("git-export-fixture-ready");
 

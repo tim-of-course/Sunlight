@@ -3954,6 +3954,59 @@ fn status_json_fixture_basic_app_returns_repository_snapshot() {
 }
 
 #[test]
+fn repository_inspect_json_fixture_basic_app_returns_repository_record() {
+    let repo = TestRepo::new("inspect-fixture-repository");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("repository:repo_fixture_basic_app")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect repository should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":true"));
+    assert!(stdout.contains("\"command\":\"inspect.repository\""));
+    assert!(stdout.contains("\"repository_id\":\"repo_fixture_basic_app\""));
+    assert!(stdout.contains("\"ids\":{\"repository_id\":\"repo_fixture_basic_app\"}"));
+    assert!(stdout.contains("\"view\":null"));
+    assert!(stdout.contains("\"record_type\":\"repository\""));
+    assert!(stdout.contains("\"lifecycle_state\":\"initialized\""));
+    assert!(stdout.contains("\"initialized\":true"));
+    assert!(stdout.contains("\"path_policy_id\":\"path_policy_posix_case_sensitive_v1\""));
+    assert!(stdout.contains("\"projection_policy\":{"));
+    assert!(stdout.contains("\"git_interop_policy\":\"default_local_mvp\""));
+    assert!(stdout.contains("\"storage_health\":{\"status\":\"ok\""));
+    assert!(stdout.contains("\"privacy_export_defaults\":{"));
+}
+
+#[test]
+fn repository_inspect_json_fixture_missing_repository_returns_object_not_found() {
+    let repo = TestRepo::new("inspect-fixture-repository-missing");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("repository:repo_fixture_missing")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect missing repository should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"object_not_found\""));
+    assert!(stdout.contains("\"selector\":\"repo_fixture_missing\""));
+    assert!(stdout.contains("\"object_type\":\"repository\""));
+}
+
+#[test]
 fn status_json_fixture_checkpoint_returns_checkpoint_snapshot() {
     let repo = TestRepo::new("status-fixture-checkpoint");
 
@@ -4225,6 +4278,30 @@ fn inspect_json_fixture_git_ref_missing_lookup_returns_object_not_found() {
 fn status_round_trip_fixture_ids_through_matching_inspect_selectors() {
     let repo = TestRepo::new("status-round-trip-fixture-selectors");
     let projection_root = repo.path().join("projection-root");
+
+    let repository_status = sun()
+        .arg("status")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status repository should run");
+    assert_success(&repository_status);
+    let repository_id = json_string_field(&stdout(&repository_status), "repository_id");
+    assert_eq!(repository_id, "repo_fixture_basic_app");
+    let repository_inspect = sun()
+        .arg("inspect")
+        .arg(format!("repository:{repository_id}"))
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect repository should run");
+    assert_success(&repository_inspect);
+    assert!(stdout(&repository_inspect).contains(&format!("\"repository_id\":\"{repository_id}\"")));
+
     let materialize = sun()
         .arg("project")
         .arg("materialize")

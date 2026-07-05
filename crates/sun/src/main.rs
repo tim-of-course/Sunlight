@@ -2475,6 +2475,16 @@ fn fixture_inspect(options: &InspectOptions, json: bool) -> Result<String, CliEr
         }
         return Err(object_not_found("operation", operation_id));
     }
+    if let Some(repository_id) = selector.strip_prefix("repository:") {
+        if repository_id != FIXTURE_REPOSITORY_ID {
+            return Err(object_not_found("repository", repository_id));
+        }
+        return Ok(if json {
+            fixture_inspect_repository_json()
+        } else {
+            format!("repository {FIXTURE_REPOSITORY_ID} initialized")
+        });
+    }
     if let Some(operation_id) = selector
         .strip_prefix("compat_import:")
         .or_else(|| selector.strip_prefix("compat-import:"))
@@ -2732,6 +2742,62 @@ fn fixture_status_repository_json() -> String {
         FILE_OPERATION_SEMANTICS_VERSION,
         fixture_topic_summary_json(),
         fixture_session_summary_json(),
+    )
+}
+
+fn fixture_inspect_repository_json() -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.repository\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"repository_id\":\"{}\"}},",
+            "\"view\":null,",
+            "\"repository\":{{",
+            "\"id\":\"{}\",",
+            "\"record_type\":\"repository\",",
+            "\"lifecycle_state\":\"initialized\",",
+            "\"initialized\":true,",
+            "\"storage_schema_version\":{},",
+            "\"path_policy_id\":\"{}\",",
+            "\"path_policy\":{{",
+            "\"policy_id\":\"{}\",",
+            "\"case_sensitive\":true,",
+            "\"separator\":\"/\"",
+            "}},",
+            "\"operation_semantics_version\":\"{}\",",
+            "\"projection_policy\":{{",
+            "\"default_strategy\":\"copy\",",
+            "\"writable_default\":false,",
+            "\"local_root_privacy\":\"local_only\"",
+            "}},",
+            "\"git_interop_policy\":\"default_local_mvp\",",
+            "\"git_policy\":{{",
+            "\"interop_policy\":\"default_local_mvp\",",
+            "\"export_shape\":\"single_checkpoint_commit\",",
+            "\"moving_refs_require_validation\":true",
+            "}},",
+            "\"base_checkpoint_refs\":[\"checkpoint_base_0001\"],",
+            "\"storage_health\":{{",
+            "\"status\":\"ok\",",
+            "\"native_errors\":[],",
+            "\"quarantine_refs\":[]",
+            "}},",
+            "\"privacy_export_defaults\":{{",
+            "\"commit_default\":\"source\",",
+            "\"local_only_paths_excluded\":true,",
+            "\"generated_output_requires_promotion\":true",
+            "}}",
+            "}}",
+            "}},\"warnings\":[]}}"
+        ),
+        FIXTURE_REPOSITORY_ID,
+        FIXTURE_REPOSITORY_ID,
+        FIXTURE_REPOSITORY_ID,
+        CURRENT_STORAGE_SCHEMA_VERSION,
+        POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
+        POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
+        FILE_OPERATION_SEMANTICS_VERSION,
     )
 }
 

@@ -45,6 +45,9 @@ use sunlight_core::git_export::{
     GitExportValidationReport, GitExportWriterInput, GitExportWriterPlan, GitRefState,
     ImportedBaseGitCommit, InMemoryGitExportMapStore, PersistedGitExportMap,
 };
+use sunlight_core::policy::{
+    validate_candidate_paths, validate_managed_ignore_block, ValidationFailure, ValidationReport,
+};
 use sunlight_core::projection::{
     cleanup_projection_quarantine_local_records,
     fixture_compatibility_projection_from_resolved_view,
@@ -186,6 +189,9 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         }
         [scope, command, ..] if scope == "policy" && command == "check-export" => {
             policy_check_export(&ctx)
+        }
+        [scope, command, ..] if scope == "policy" && command == "check-commit" => {
+            policy_check_commit(&ctx)
         }
         [scope, command, ..] if scope == "git" && command == "export" => git_export(&ctx),
         [scope, command, ..] if scope == "compat" && command == "project" => compat_project(&ctx),
@@ -801,6 +807,35 @@ fn policy_check_export(ctx: &CommandContext) -> Result<(), CliError> {
     Ok(())
 }
 
+fn policy_check_commit(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_policy_check_commit_options(ctx)?;
+    let config = require_repository_config(".")?;
+    let gitignore = fs::read_to_string(".sunlight/.gitignore").unwrap_or_default();
+
+    let ignore_report = validate_managed_ignore_block(&gitignore);
+    let path_report = validate_candidate_paths(options.paths.iter().map(String::as_str));
+    let report = combine_policy_check_commit_reports(ignore_report, path_report);
+
+    if !report.ok {
+        return Err(policy_check_commit_error(&report, options.paths.len()));
+    }
+
+    if ctx.json {
+        println!(
+            "{}",
+            policy_check_commit_success_envelope(
+                &config.repository_id,
+                &report,
+                options.paths.len(),
+            )
+        );
+    } else {
+        println!("policy.check-commit ok");
+    }
+
+    Ok(())
+}
+
 fn compat_project(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_compat_project_options(ctx)?;
     if options.fixture != "basic-app" {
@@ -1107,6 +1142,11 @@ struct PolicyCheckExportOptions {
     fixture: String,
     checkpoint_id: String,
     git_ref: Option<String>,
+}
+
+#[derive(Debug)]
+struct PolicyCheckCommitOptions {
+    paths: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1728,6 +1768,47 @@ fn parse_policy_check_export_options(
         checkpoint_id,
         git_ref,
     })
+}
+
+fn parse_policy_check_commit_options(
+    ctx: &CommandContext,
+) -> Result<PolicyCheckCommitOptions, CliError> {
+    let mut paths = Vec::new();
+    let mut args = ctx.args.iter().skip(2).peekable();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--paths" => {
+                let mut saw_path = false;
+                while let Some(value) = args.peek() {
+                    if value.starts_with("--") {
+                        break;
+                    }
+                    paths.push((*value).clone());
+                    saw_path = true;
+                    args.next();
+                }
+                if !saw_path {
+                    return Err(invalid_request(
+                        "usage: sun policy check-commit --paths requires <path>...",
+                    )
+                    .with_detail("missing", "paths"));
+                }
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun policy check-commit"
+                )));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected policy check-commit argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    Ok(PolicyCheckCommitOptions { paths })
 }
 
 fn parse_git_export_execution_fixture(
@@ -4194,6 +4275,20 @@ fn policy_check_export_error(report: &GitExportValidationReport) -> CliError {
     ))
 }
 
+fn policy_check_commit_error(
+    report: &ValidationReport,
+    candidate_paths_checked: usize,
+) -> CliError {
+    CliError::new(
+        "commit_policy_failed",
+        "repository failed commit policy validation",
+    )
+    .with_raw_details_json(format!(
+        "{{\"validation_report\":{}}}",
+        policy_check_commit_validation_report_json(report, candidate_paths_checked),
+    ))
+}
+
 fn generated_output_git_export_error(error: GitExportError) -> CliError {
     CliError::new(
         error.code.as_str(),
@@ -4434,6 +4529,29 @@ fn policy_check_export_success_envelope(report: &GitExportValidationReport) -> S
         json_escape(&report.checkpoint_id),
         json_escape(&report.id),
         git_export_validation_report_json(report),
+    )
+}
+
+fn policy_check_commit_success_envelope(
+    repository_id: &str,
+    report: &ValidationReport,
+    candidate_paths_checked: usize,
+) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"policy.check-commit\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"repository_id\":\"{}\"}},",
+            "\"validation_report\":{}",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(repository_id),
+        json_escape(repository_id),
+        policy_check_commit_validation_report_json(report, candidate_paths_checked),
     )
 }
 
@@ -5538,6 +5656,61 @@ fn git_export_validation_failure_json(failure: &GitExportValidationFailure) -> S
         failure.code.as_str(),
         optional_string_json(failure.field.as_deref()),
         optional_string_json(failure.value.as_deref()),
+        json_escape(&failure.reason),
+    )
+}
+
+fn combine_policy_check_commit_reports(
+    ignore_report: ValidationReport,
+    path_report: ValidationReport,
+) -> ValidationReport {
+    let mut failures = ignore_report.failures;
+    failures.extend(path_report.failures);
+    ValidationReport::from_failures(failures)
+}
+
+fn policy_check_commit_validation_report_json(
+    report: &ValidationReport,
+    candidate_paths_checked: usize,
+) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"ok\":{},",
+            "\"summary\":{{",
+            "\"managed_ignore_blocks_checked\":1,",
+            "\"candidate_paths_checked\":{},",
+            "\"warnings\":0,",
+            "\"blocked\":{}",
+            "}},",
+            "\"failures\":[{}]",
+            "}}"
+        ),
+        report.ok,
+        candidate_paths_checked,
+        report.failures.len(),
+        report
+            .failures
+            .iter()
+            .map(policy_check_commit_validation_failure_json)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn policy_check_commit_validation_failure_json(failure: &ValidationFailure) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"check\":\"{}\",",
+            "\"code\":\"{}\",",
+            "\"path\":{},",
+            "\"reason\":\"{}\"",
+            "}}"
+        ),
+        failure.check.as_str(),
+        failure.code.as_str(),
+        optional_string_json(failure.path.as_deref()),
         json_escape(&failure.reason),
     )
 }
@@ -8219,6 +8392,7 @@ Usage:
   sun run --view <resolved-view-id> --fixture basic-app [--integrity-fixture store-mismatch|scan-missing-blob|verified] --json -- cargo test
   sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> --fixture basic-app [--json]
   sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
+  sun policy check-commit [--paths <path>...] --json
   sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan|--execute-fixture success|ref-update-failure|export-map-failure|--execute-local --repo <path>] --json
   sun status --projection <projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|scan-missing-blob|verified] [--json]
   sun status --execution <execution-id> --fixture basic-app [--promoted] [--json]
@@ -8240,6 +8414,7 @@ Commands:
   run        Record a fixture execution for an exact resolved view
   execution  Promote a declared fixture execution output into a topic operation
   checkpoint Freeze a fixture resolved view as an in-memory checkpoint
+  policy    Validate Sunlight commit and export policy checks
   git        Export a fixture checkpoint to a Git ref
   status     Show fixture object status, including projection integrity diagnostics
   inspect    Inspect fixture objects and local-only projection diagnostics

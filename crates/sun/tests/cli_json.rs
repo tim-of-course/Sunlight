@@ -30,6 +30,121 @@ fn init_json_returns_repository_success_envelope() {
 }
 
 #[test]
+fn policy_check_commit_json_after_init_returns_success_envelope() {
+    let repo = TestRepo::new("policy-check-commit-success");
+
+    let init = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun init should run");
+    assert_success(&init);
+
+    let output = sun()
+        .arg("policy")
+        .arg("check-commit")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun policy check-commit should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":true"));
+    assert!(stdout.contains("\"command\":\"policy.check-commit\""));
+    assert!(stdout.contains("\"repository_id\":\"repo-"));
+    assert!(stdout.contains("\"validation_report\":{\"ok\":true"));
+    assert!(stdout.contains("\"managed_ignore_blocks_checked\":1"));
+    assert!(stdout.contains("\"candidate_paths_checked\":0"));
+    assert!(stdout.contains("\"blocked\":0"));
+    assert!(stdout.contains("\"failures\":[]"));
+}
+
+#[test]
+fn policy_check_commit_json_paths_rejects_blocked_local_path() {
+    let repo = TestRepo::new("policy-check-commit-blocked-path");
+
+    let init = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun init should run");
+    assert_success(&init);
+
+    let output = sun()
+        .arg("policy")
+        .arg("check-commit")
+        .arg("--paths")
+        .arg(".sunlight/local/lease.json")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun policy check-commit should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"commit_policy_failed\""));
+    assert!(stdout.contains("\"validation_report\":{\"ok\":false"));
+    assert!(stdout.contains("\"candidate_paths_checked\":1"));
+    assert!(stdout.contains("\"blocked\":1"));
+    assert!(stdout.contains("\"check\":\"policy_class\""));
+    assert!(stdout.contains("\"code\":\"blocked_local_path\""));
+    assert!(stdout.contains("\"path\":\".sunlight/local/lease.json\""));
+}
+
+#[test]
+fn policy_check_commit_json_missing_gitignore_reports_managed_block_failure() {
+    let repo = TestRepo::new("policy-check-commit-missing-gitignore");
+
+    let init = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun init should run");
+    assert_success(&init);
+    fs::remove_file(repo.path().join(".sunlight/.gitignore")).unwrap();
+
+    let output = sun()
+        .arg("policy")
+        .arg("check-commit")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun policy check-commit should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"commit_policy_failed\""));
+    assert!(stdout.contains("\"check\":\"ignore_policy\""));
+    assert!(stdout.contains("\"code\":\"managed_ignore_block_missing\""));
+    assert!(stdout.contains("\"path\":\".gitignore\""));
+}
+
+#[test]
+fn policy_check_commit_json_rejects_missing_paths_values() {
+    let repo = TestRepo::new("policy-check-commit-missing-paths");
+
+    let output = sun()
+        .arg("policy")
+        .arg("check-commit")
+        .arg("--paths")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun policy check-commit should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"invalid_request\""));
+    assert!(stdout.contains("\"missing\":\"paths\""));
+}
+
+#[test]
 fn global_json_unknown_command_returns_failure_envelope() {
     let repo = TestRepo::new("unknown-json");
 

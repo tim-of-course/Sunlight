@@ -47,7 +47,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `mvp-readiness-audit`: ready next. Audit current implementation against the consolidated architecture and identify the next narrow acceptance gap.
+- Active slice `phase1-native-lifecycle-acceptance`: ready next. Start with fixture-backed `topic create` and `session start` CLI acceptance, then continue into structural mutation commands.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Earlier integrated work through `6fb413d` includes policy command fixtures/docs, operator status round trips, repository/artifact/view/status visibility, external Super Search validation, compatibility import breadth and variants, projection-only checkpoint boundaries, and compatibility status docs reconcile. Full slice detail is in Git history.
@@ -64,10 +64,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-projection-cache-cleanup`: default `scripts/smoke-suite.ps1` passed after `67e40d6`.
 - Completed slice `projection-cache-reuse-lifecycle-audit`: integrated as `8ddbb6f`; WSL test implementation was imported manager-side after the WSL Git sandbox blocked committing, with WSL core projection/execution and CLI projection filters passing, plus Windows `cargo fmt --check`, `git diff --check`, and focused quarantine cleanup CLI verification.
 - Completed verification slice `external-validation-post-cache-hardening`: integrated harness sync as `44775b8`; initial target-side preflight flake passed on narrow rerun, then full optional Super Search validation passed after syncing the canonical compatibility fixture count to 13.
+- Completed slice `mvp-readiness-audit`: integrated as `168783b`; WSL docs audit identified Phase 1 native lifecycle and structural mutation CLI acceptance as the next narrow gap, with `git diff --check` passing.
 
 ## Candidate Next Slices
 
-- Next useful slices after the active one: perform an MVP readiness audit against the consolidated architecture, then delegate the next narrow acceptance gap.
+- Next useful slices after the active one: close Phase 1 topic/session CLI acceptance, then delegate structural mutation acceptance for move/delete/metadata.
 
 ## Decisions
 

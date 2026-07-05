@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `9bd5e0f`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 102 CLI tests, 141 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional `scripts/external-validation-super-search.ps1` passed earlier this heartbeat against local Super Search with `mix test`, `bun run test`, temp clone, and `sun init --json`. Scratchpad guard must run after this edit.
+- Verification: latest full pass ran after `f5066f1`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 105 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional `scripts/external-validation-super-search.ps1` passed in the prior heartbeat against local Super Search with `mix test`, `bun run test`, temp clone, and `sun init --json`. Scratchpad guard must run after this edit.
 
 ## Active Work
 
@@ -137,12 +137,13 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-quarantine-durable-record`: integrated as `24feb6e`; formatting checkpoint `2f8b533`.
 - Completed slice `external-validation-super-search`: integrated as `5800c0b`; envelope assertion fix checkpoint `2f1da1e`.
 - Completed slice `projection-quarantine-record-persistence`: integrated as `0849e94`; formatting checkpoint `7aa4c6a`; scan-count fix `b384f03`; formatting checkpoint `9bd5e0f`.
-- Active WSL slice `projection-quarantine-retention-cleanup`: add narrow local-only cleanup/retention handling for persisted projection quarantine records; do not expand into broad projection cache GC.
+- Completed slice `projection-quarantine-retention-cleanup`: integrated as `e8ec961`; formatting checkpoint `f5066f1`.
+- No active WSL slice.
 
 ## Candidate Next Slices
 
+- Projection quarantine docs should be reconciled with durable local records and cleanup command.
 - External validation can deepen from init-only Super Search coverage toward compatibility import/export planning against a temp clone when the product is ready.
-- Projection quarantine retention/GC is active; next external validation can deepen from init-only coverage afterward.
 
 ## Decisions
 

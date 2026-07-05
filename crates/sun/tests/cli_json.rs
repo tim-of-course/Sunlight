@@ -211,6 +211,160 @@ fn inspect_json_in_initialized_repository_returns_object_not_found() {
 }
 
 #[test]
+fn topic_create_json_fixture_basic_app_returns_lifecycle_envelope() {
+    let repo = TestRepo::new("topic-create-fixture");
+
+    let output = sun()
+        .arg("topic")
+        .arg("create")
+        .arg("auth-nullability")
+        .arg("--display-name")
+        .arg("Auth Nullability")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun topic create should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":true"));
+    assert!(stdout.contains("\"command\":\"topic.create\""));
+    assert!(stdout.contains("\"repository_id\":\"repo_fixture_basic_app\""));
+    assert!(stdout.contains("\"ids\":{\"topic_id\":\"topic_auth_nullability\""));
+    assert!(stdout.contains("\"slug\":\"auth-nullability\""));
+    assert!(stdout.contains("\"display_name\":\"Auth Nullability\""));
+    assert!(stdout.contains("\"status\":\"open\""));
+    assert!(stdout.contains("\"lifecycle\":\"open\""));
+    assert!(stdout.contains("\"head_revision_id\":null"));
+    assert!(stdout.contains("\"warnings\":[]"));
+}
+
+#[test]
+fn session_start_json_fixture_basic_app_returns_pinned_lifecycle_envelope() {
+    let repo = TestRepo::new("session-start-fixture");
+
+    let output = sun()
+        .arg("session")
+        .arg("start")
+        .arg("--topic")
+        .arg("topic_auth_nullability")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--actor")
+        .arg("agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun session start should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":true"));
+    assert!(stdout.contains("\"command\":\"session.start\""));
+    assert!(stdout.contains("\"repository_id\":\"repo_fixture_basic_app\""));
+    assert!(stdout.contains("\"topic_id\":\"topic_auth_nullability\""));
+    assert!(stdout.contains("\"session_id\":\"session_agent_a\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_base_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0001\""));
+    assert!(stdout.contains("\"write_topic_id\":\"topic_auth_nullability\""));
+    assert!(stdout.contains("\"actor_id\":\"agent_a\""));
+    assert!(stdout.contains("\"refresh_policy\":\"pinned_except_own_topic\""));
+    assert!(stdout.contains(
+        "\"capabilities\":[\"read\",\"list\",\"search\",\"inspect\",\"patch\",\"write\",\"move\",\"delete\",\"metadata\"]"
+    ));
+    assert!(stdout.contains(
+        "\"topic_frontier\":[{\"topic_id\":\"topic_auth_nullability\",\"revision_id\":null,\"mode\":\"write\"}]"
+    ));
+    assert!(stdout.contains("\"warnings\":[]"));
+}
+
+#[test]
+fn topic_create_json_unknown_fixture_returns_invalid_request() {
+    let repo = TestRepo::new("topic-create-unknown-fixture");
+
+    let output = sun()
+        .arg("topic")
+        .arg("create")
+        .arg("auth-nullability")
+        .arg("--display-name")
+        .arg("Auth Nullability")
+        .arg("--fixture")
+        .arg("missing")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun topic create should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"invalid_request\""));
+    assert!(stdout.contains("\"message\":\"unknown fixture `missing`\""));
+    assert!(stdout.contains("\"details\":{\"fixture\":\"missing\"}"));
+}
+
+#[test]
+fn session_start_json_missing_topic_returns_topic_not_found() {
+    let repo = TestRepo::new("session-start-missing-topic");
+
+    let output = sun()
+        .arg("session")
+        .arg("start")
+        .arg("--topic")
+        .arg("topic_missing")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--actor")
+        .arg("agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun session start should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"topic_not_found\""));
+    assert!(stdout.contains("\"message\":\"topic `topic_missing` was not found\""));
+    assert!(stdout.contains("\"details\":{\"topic\":\"topic_missing\"}"));
+}
+
+#[test]
+fn session_start_json_missing_view_returns_object_not_found() {
+    let repo = TestRepo::new("session-start-missing-view");
+
+    let output = sun()
+        .arg("session")
+        .arg("start")
+        .arg("--topic")
+        .arg("topic_auth_nullability")
+        .arg("--view")
+        .arg("view_missing")
+        .arg("--actor")
+        .arg("agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun session start should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"object_not_found\""));
+    assert!(stdout.contains("\"message\":\"Sunlight object was not found\""));
+    assert!(stdout.contains("\"selector\":\"view_missing\""));
+    assert!(stdout.contains("\"object_type\":\"view\""));
+}
+
+#[test]
 fn read_json_fixture_basic_app_returns_artifact_and_content() {
     let repo = TestRepo::new("read-fixture");
 

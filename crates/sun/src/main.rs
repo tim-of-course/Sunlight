@@ -82,6 +82,7 @@ use sunlight_core::resolver::{
     TopicRevisionRef, TopicRevisionSelection, TreeEntryState, FIXTURE_BASE_CHECKPOINT_ID,
     FIXTURE_BASE_RESOLVED_VIEW_ID,
 };
+use sunlight_core::topics::{TopicSlug, PHASE1_SESSION_CAPABILITIES};
 
 const FIXTURE_STALE_COMPATIBILITY_PROJECTION_ID: &str =
     "projection_compat_agent_a_stale_baseline_0001";
@@ -166,18 +167,8 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         [command, ..] if command == "init" => {
             Err(invalid_request("usage: sun init [--repo <path>]"))
         }
-        [scope, command, ..] if scope == "topic" && command == "create" => {
-            Err(unimplemented_command(
-                "topic.create",
-                "sun topic create is parsed, but topic records are not persisted yet",
-            ))
-        }
-        [scope, command, ..] if scope == "session" && command == "start" => {
-            Err(unimplemented_command(
-                "session.start",
-                "sun session start is parsed, but session records are not persisted yet",
-            ))
-        }
+        [scope, command, ..] if scope == "topic" && command == "create" => topic_create(&ctx),
+        [scope, command, ..] if scope == "session" && command == "start" => session_start(&ctx),
         [scope, command, ..] if scope == "view" && command == "resolve" => view_resolve(&ctx),
         [scope, command, ..] if scope == "project" && command == "materialize" => {
             project_materialize(&ctx)
@@ -243,6 +234,51 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
         println!("created_config = {}", report.created_config);
         println!("created_gitignore = {}", report.created_gitignore);
         println!("created_directories = {}", report.created_directories.len());
+    }
+
+    Ok(())
+}
+
+fn topic_create(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_topic_create_options(ctx)?;
+    ensure_basic_app_fixture(&options.fixture)?;
+    TopicSlug::new(options.slug.clone()).map_err(|error| {
+        invalid_request(error.to_string()).with_detail("slug", options.slug.clone())
+    })?;
+
+    if options.slug != "auth-nullability" {
+        return Err(invalid_request(
+            "fixture basic-app supports only topic slug `auth-nullability`",
+        )
+        .with_detail("slug", options.slug));
+    }
+
+    if ctx.json {
+        println!("{}", topic_create_success_envelope(&options.display_name));
+    } else {
+        println!("created topic {}", FIXTURE_WRITE_TOPIC_ID);
+    }
+
+    Ok(())
+}
+
+fn session_start(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_session_start_options(ctx)?;
+    ensure_basic_app_fixture(&options.fixture)?;
+    ensure_fixture_topic(&options.topic)?;
+    if options.actor_id != FIXTURE_ACTOR_ID {
+        return Err(invalid_request(
+            "fixture basic-app supports only actor `agent_a` for session start",
+        )
+        .with_detail("actor_id", options.actor_id));
+    }
+    fixture_resolved_view_by_id(&options.view_id)
+        .ok_or_else(|| object_not_found("view", &options.view_id))?;
+
+    if ctx.json {
+        println!("{}", session_start_success_envelope(&options.view_id));
+    } else {
+        println!("started session {}", FIXTURE_SESSION_ID);
     }
 
     Ok(())
@@ -4064,6 +4100,21 @@ fn unimplemented_command(command: &'static str, message: impl Into<String>) -> C
 }
 
 #[derive(Debug)]
+struct TopicCreateOptions {
+    slug: String,
+    display_name: String,
+    fixture: String,
+}
+
+#[derive(Debug)]
+struct SessionStartOptions {
+    topic: String,
+    view_id: String,
+    actor_id: String,
+    fixture: String,
+}
+
+#[derive(Debug)]
 struct ArtifactCommandOptions {
     session_id: String,
     fixture: String,
@@ -4088,6 +4139,112 @@ struct ExecutionPromoteOutputOptions {
     path: Option<String>,
     session_id: Option<String>,
     classification: Option<String>,
+}
+
+fn parse_topic_create_options(ctx: &CommandContext) -> Result<TopicCreateOptions, CliError> {
+    let mut display_name = None;
+    let mut fixture = None;
+    let mut operands = Vec::new();
+    let mut args = ctx.args.iter().skip(2);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--display-name" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun topic create requires --display-name <name>")
+                })?;
+                display_name = Some(value.clone());
+            }
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun topic create requires --fixture basic-app")
+                })?;
+                fixture = Some(value.clone());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun topic create"
+                )));
+            }
+            value => operands.push(value.to_string()),
+        }
+    }
+
+    if operands.len() != 1 {
+        return Err(invalid_request(
+            "usage: sun topic create <slug> --display-name <name> --fixture basic-app",
+        ));
+    }
+
+    Ok(TopicCreateOptions {
+        slug: operands.remove(0),
+        display_name: display_name.ok_or_else(|| {
+            invalid_request("usage: sun topic create requires --display-name <name>")
+        })?,
+        fixture: fixture.ok_or_else(|| {
+            invalid_request("usage: sun topic create requires --fixture basic-app")
+        })?,
+    })
+}
+
+fn parse_session_start_options(ctx: &CommandContext) -> Result<SessionStartOptions, CliError> {
+    let mut topic = None;
+    let mut view_id = None;
+    let mut actor_id = None;
+    let mut fixture = None;
+    let mut args = ctx.args.iter().skip(2);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--topic" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun session start requires --topic <topic>")
+                })?;
+                topic = Some(value.clone());
+            }
+            "--view" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun session start requires --view <view>")
+                })?;
+                view_id = Some(value.clone());
+            }
+            "--actor" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun session start requires --actor <actor-id>")
+                })?;
+                actor_id = Some(value.clone());
+            }
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun session start requires --fixture basic-app")
+                })?;
+                fixture = Some(value.clone());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun session start"
+                )));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected session start argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    Ok(SessionStartOptions {
+        topic: topic
+            .ok_or_else(|| invalid_request("usage: sun session start requires --topic <topic>"))?,
+        view_id: view_id
+            .ok_or_else(|| invalid_request("usage: sun session start requires --view <view>"))?,
+        actor_id: actor_id.ok_or_else(|| {
+            invalid_request("usage: sun session start requires --actor <actor-id>")
+        })?,
+        fixture: fixture.ok_or_else(|| {
+            invalid_request("usage: sun session start requires --fixture basic-app")
+        })?,
+    })
 }
 
 fn parse_artifact_options(
@@ -4248,6 +4405,15 @@ fn fixture_store(fixture: &str) -> Result<InMemoryArtifactStore, CliError> {
         "basic-app" => Ok(InMemoryArtifactStore::fixture_basic_app()),
         _ => Err(invalid_request(format!("unknown fixture `{fixture}`"))
             .with_detail("fixture", fixture.to_string())),
+    }
+}
+
+fn ensure_basic_app_fixture(fixture: &str) -> Result<(), CliError> {
+    if fixture == "basic-app" {
+        Ok(())
+    } else {
+        Err(invalid_request(format!("unknown fixture `{fixture}`"))
+            .with_detail("fixture", fixture.to_string()))
     }
 }
 
@@ -5181,6 +5347,112 @@ fn init_success_envelope(
         created_config,
         created_gitignore,
         created_directories,
+    )
+}
+
+fn topic_create_success_envelope(display_name: &str) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"topic.create\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"topic_id\":\"{}\",",
+            "\"base_checkpoint_id\":\"{}\",",
+            "\"head_revision_id\":null",
+            "}},",
+            "\"view\":null,",
+            "\"topic\":{{",
+            "\"topic_id\":\"{}\",",
+            "\"slug\":\"auth-nullability\",",
+            "\"display_name\":\"{}\",",
+            "\"status\":\"open\",",
+            "\"lifecycle\":\"open\",",
+            "\"base_checkpoint_id\":\"{}\",",
+            "\"head_revision_id\":null,",
+            "\"owner_actor_id\":\"{}\",",
+            "\"visibility\":\"local\"",
+            "}}",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        FIXTURE_REPOSITORY_ID,
+        FIXTURE_WRITE_TOPIC_ID,
+        FIXTURE_BASE_CHECKPOINT_ID,
+        FIXTURE_WRITE_TOPIC_ID,
+        json_escape(display_name),
+        FIXTURE_BASE_CHECKPOINT_ID,
+        FIXTURE_ACTOR_ID,
+    )
+}
+
+fn session_start_success_envelope(resolved_view_id: &str) -> String {
+    let view = SessionView {
+        resolved_view_id: resolved_view_id.to_string(),
+        session_generation_id: FIXTURE_SESSION_GENERATION_ID.to_string(),
+        tree_identity: TreeIdentityView {
+            kind: "SingleRepoTree".to_string(),
+            repository_id: FIXTURE_REPOSITORY_ID.to_string(),
+            tree_hash: FIXTURE_TREE_HASH.to_string(),
+        },
+    };
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"session.start\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"topic_id\":\"{}\",",
+            "\"session_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\"",
+            "}},",
+            "\"view\":{},",
+            "\"session\":{{",
+            "\"session_id\":\"{}\",",
+            "\"actor_id\":\"{}\",",
+            "\"write_topic_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"refresh_policy\":\"pinned_except_own_topic\",",
+            "\"capabilities\":{}",
+            "}},",
+            "\"topic_frontier\":[{{",
+            "\"topic_id\":\"{}\",",
+            "\"revision_id\":null,",
+            "\"mode\":\"write\"",
+            "}}]",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        FIXTURE_REPOSITORY_ID,
+        FIXTURE_WRITE_TOPIC_ID,
+        FIXTURE_SESSION_ID,
+        json_escape(resolved_view_id),
+        FIXTURE_SESSION_GENERATION_ID,
+        view_json(&view),
+        FIXTURE_SESSION_ID,
+        FIXTURE_ACTOR_ID,
+        FIXTURE_WRITE_TOPIC_ID,
+        json_escape(resolved_view_id),
+        FIXTURE_SESSION_GENERATION_ID,
+        phase1_capabilities_json(),
+        FIXTURE_WRITE_TOPIC_ID,
+    )
+}
+
+fn phase1_capabilities_json() -> String {
+    format!(
+        "[{}]",
+        PHASE1_SESSION_CAPABILITIES
+            .iter()
+            .map(|capability| format!("\"{}\"", json_escape(capability.as_str())))
+            .collect::<Vec<_>>()
+            .join(",")
     )
 }
 

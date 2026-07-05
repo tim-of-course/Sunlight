@@ -42,12 +42,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `80a356f` and covered execution projection cache boundary hardening. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 157 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `2faf5dd`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat project/diff/status/inspect, happy-path and generated-failure compat import, and fixture Git export.
+- Verification: latest full pass ran after `67e40d6` and covered scoped projection quarantine cleanup reporting. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 158 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `2faf5dd`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat project/diff/status/inspect, happy-path and generated-failure compat import, and fixture Git export.
 
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `projection-cache-cleanup-invalidation`: ready next. Add focused acceptance around projection cache cleanup, invalidation, or execution store-integrity reuse now that unsafe fast paths are explicitly deferred.
+- Active slice `projection-cache-reuse-lifecycle-audit`: ready next. Audit the projection/execution cache reuse lifecycle after cleanup/invalidation hardening, then add the smallest missing acceptance or docs correction if one is found.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
@@ -123,10 +123,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-non-temp-probe`: default `scripts/smoke-suite.ps1` passed after `80db1ef`.
 - Completed slice `execution-projection-cache-hardening`: integrated as `80a356f`; WSL implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check`, focused projection/execution/CLI tests, and default smoke passing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-execution-cache-boundary`: default `scripts/smoke-suite.ps1` passed after `80a356f`.
+- Completed slice `projection-cache-cleanup-invalidation`: integrated as `67e40d6`; WSL test implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check`, `git diff --check`, and focused quarantine cleanup CLI verification.
+- Completed verification slice `aggregate-smoke-suite-refresh-after-projection-cache-cleanup`: default `scripts/smoke-suite.ps1` passed after `67e40d6`.
 
 ## Candidate Next Slices
 
-- Next useful slices after the active one: continue execution projection/cache hardening with cleanup/invalidation evidence, then rerun aggregate smoke.
+- Next useful slices after the active one: close any projection/execution cache reuse lifecycle gap, then refresh external validation or move to the next architecture-aligned MVP readiness audit.
 
 ## Decisions
 

@@ -3355,6 +3355,63 @@ fn policy_check_export_json_fixture_missing_fixture_returns_invalid_request() {
 }
 
 #[test]
+fn policy_explain_json_fixture_validation_report_returns_report_envelope() {
+    let repo = TestRepo::new("policy-explain-fixture-validation-report");
+
+    let output = sun()
+        .arg("policy")
+        .arg("explain")
+        .arg("validation_export_auth_profile_ready_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun policy explain should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":true"));
+    assert!(stdout.contains("\"command\":\"policy.explain\""));
+    assert!(
+        stdout.contains("\"validation_report_id\":\"validation_export_auth_profile_ready_0001\"")
+    );
+    assert!(stdout.contains(
+        "\"ids\":{\"validation_report_id\":\"validation_export_auth_profile_ready_0001\"}"
+    ));
+    assert!(stdout
+        .contains("\"validation_report\":{\"id\":\"validation_export_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""));
+    assert!(stdout.contains("\"git_ref\":\"refs/heads/sunlight/auth-profile-ready\""));
+    assert!(stdout.contains("\"summary\":{\"records_checked\":4,\"payloads_checked\":0"));
+    assert!(stdout.contains("\"failures\":[]"));
+    assert!(stdout.contains("\"warnings\":[]"));
+}
+
+#[test]
+fn policy_explain_json_missing_validation_report_returns_not_found() {
+    let repo = TestRepo::new("policy-explain-missing-validation-report");
+
+    let output = sun()
+        .arg("policy")
+        .arg("explain")
+        .arg("validation_missing_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun policy explain should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"object_not_found\""));
+    assert!(stdout.contains("\"message\":\"Sunlight object was not found\""));
+    assert!(stdout.contains("\"selector\":\"validation_missing_0001\""));
+    assert!(stdout.contains("\"object_type\":\"validation_report\""));
+    assert!(stdout.contains(
+        "\"available_fixture_validation_report_id\":\"validation_export_auth_profile_ready_0001\""
+    ));
+}
+
+#[test]
 fn git_export_json_fixture_checkpoint_returns_export_envelope() {
     let repo = TestRepo::new("git-export-fixture-ready");
 

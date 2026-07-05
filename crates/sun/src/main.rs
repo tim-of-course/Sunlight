@@ -16,7 +16,7 @@ use sunlight_core::artifacts::{
 use sunlight_core::checkpoint::{
     fixture_checkpoint_from_resolved_view, CheckpointRecord, CheckpointValidationError,
     EvidenceRef, GitExportMapRecord, FIXTURE_CREATED_AT, FIXTURE_EXPORT_MAP_ID,
-    FIXTURE_GIT_COMMIT_ID,
+    FIXTURE_GIT_COMMIT_ID, FIXTURE_VALIDATION_REPORT_ID,
 };
 use sunlight_core::compat_import::{
     fixture_basic_app_candidate_deltas, plan_fixture_basic_app_import, CompatCandidateDelta,
@@ -190,6 +190,7 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         [scope, command, ..] if scope == "policy" && command == "check-export" => {
             policy_check_export(&ctx)
         }
+        [scope, command, ..] if scope == "policy" && command == "explain" => policy_explain(&ctx),
         [scope, command, ..] if scope == "policy" && command == "check-commit" => {
             policy_check_commit(&ctx)
         }
@@ -836,6 +837,21 @@ fn policy_check_commit(ctx: &CommandContext) -> Result<(), CliError> {
     Ok(())
 }
 
+fn policy_explain(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_policy_explain_options(ctx)?;
+    if !ctx.json {
+        return Err(
+            invalid_request("usage: sun policy explain <validation-report-id> --json")
+                .with_detail("missing", "json"),
+        );
+    }
+
+    let report = fixture_policy_explain_validation_report(&options.validation_report_id)?;
+    println!("{}", policy_explain_success_envelope(&report));
+
+    Ok(())
+}
+
 fn compat_project(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_compat_project_options(ctx)?;
     if options.fixture != "basic-app" {
@@ -1147,6 +1163,11 @@ struct PolicyCheckExportOptions {
 #[derive(Debug)]
 struct PolicyCheckCommitOptions {
     paths: Vec<String>,
+}
+
+#[derive(Debug)]
+struct PolicyExplainOptions {
+    validation_report_id: String,
 }
 
 #[derive(Debug)]
@@ -1809,6 +1830,38 @@ fn parse_policy_check_commit_options(
     }
 
     Ok(PolicyCheckCommitOptions { paths })
+}
+
+fn parse_policy_explain_options(ctx: &CommandContext) -> Result<PolicyExplainOptions, CliError> {
+    let mut validation_report_id = None;
+    let args = ctx.args.iter().skip(2);
+
+    for arg in args {
+        match arg.as_str() {
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun policy explain"
+                )));
+            }
+            value => {
+                if validation_report_id.is_some() {
+                    return Err(invalid_request(format!(
+                        "unexpected policy explain argument `{value}`"
+                    )));
+                }
+                validation_report_id = Some(value.to_string());
+            }
+        }
+    }
+
+    let validation_report_id = validation_report_id.ok_or_else(|| {
+        invalid_request("usage: sun policy explain <validation-report-id> --json")
+            .with_detail("missing", "validation_report_id")
+    })?;
+
+    Ok(PolicyExplainOptions {
+        validation_report_id,
+    })
 }
 
 fn parse_git_export_execution_fixture(
@@ -3705,6 +3758,25 @@ fn fixture_git_export_writer_input(request: GitExportRequest) -> GitExportWriter
     }
 }
 
+fn fixture_policy_explain_validation_report(
+    validation_report_id: &str,
+) -> Result<GitExportValidationReport, CliError> {
+    if validation_report_id != FIXTURE_VALIDATION_REPORT_ID {
+        return Err(
+            object_not_found("validation_report", validation_report_id).with_detail(
+                "available_fixture_validation_report_id",
+                FIXTURE_VALIDATION_REPORT_ID,
+            ),
+        );
+    }
+
+    let checkpoint = fixture_checkpoint()?;
+    let request = GitExportRequest::from_checkpoint(&checkpoint);
+    Ok(sunlight_core::git_export::validate_git_export_request(
+        &request,
+    ))
+}
+
 fn local_fixture_git_export_writer_input(
     options: &GitExportOptions,
     request: GitExportRequest,
@@ -4552,6 +4624,27 @@ fn policy_check_commit_success_envelope(
         json_escape(repository_id),
         json_escape(repository_id),
         policy_check_commit_validation_report_json(report, candidate_paths_checked),
+    )
+}
+
+fn policy_explain_success_envelope(report: &GitExportValidationReport) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"policy.explain\",",
+            "\"validation_report_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"validation_report_id\":\"{}\"",
+            "}},",
+            "\"validation_report\":{}",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(&report.id),
+        json_escape(&report.id),
+        git_export_validation_report_json(report),
     )
 }
 
@@ -8393,6 +8486,7 @@ Usage:
   sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> --fixture basic-app [--json]
   sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
   sun policy check-commit [--paths <path>...] --json
+  sun policy explain <validation-report-id> --json
   sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan|--execute-fixture success|ref-update-failure|export-map-failure|--execute-local --repo <path>] --json
   sun status --projection <projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|scan-missing-blob|verified] [--json]
   sun status --execution <execution-id> --fixture basic-app [--promoted] [--json]

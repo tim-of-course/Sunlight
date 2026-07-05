@@ -47,6 +47,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
+- Active slice `compat-status-docs-reconcile`: delegated next. Align the status/inspect and validation docs with the current fixture-backed compatibility projection/import surface after recent Phase 6 boundary coverage.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
@@ -115,7 +116,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 
 ## Candidate Next Slices
 
-- Next useful slices after the active one: remaining Phase 6 docs/test reconciliation gaps.
+- Next useful slices after the active one: final Phase 6 acceptance audit, then decide whether to keep hardening compatibility import or move back to platform projection work.
 
 ## Decisions
 

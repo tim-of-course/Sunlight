@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `5aa6275`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 118 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`. After `297e22d`, policy failure docs passed `git diff --check` and targeted wording searches for `commit_policy_failed`, `export_policy_failed`, and stale policy command failure claims. Current docs sweep precheck found no direct stale `check-commit`/`check-export` command claims using `policy_validation_failed`.
+- Verification: latest full pass ran after `5aa6275`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 118 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`. After `c6376d8`, policy command docs passed `git diff --check`, product-doc stale failure-code searches, old CLI spelling searches, and intended policy reference searches.
 
 ## Active Work
 
@@ -150,11 +150,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `policy-command-smoke-coverage`: integrated as `12af17d`; WSL implementation was `d2c7071`.
 - Completed verification slice `aggregate-smoke-suite-refresh`: default `scripts/smoke-suite.ps1` passed after `5aa6275`.
 - Completed slice `policy-failure-operator-docs`: integrated as `297e22d`; WSL implementation was `b646648`.
-- Active slice `policy-command-docs-sweep`: WSL Codex will sweep docs for stale policy command examples and error-code wording after the policy CLI and failure-docs updates.
+- Completed slice `policy-command-docs-sweep`: integrated as `c6376d8`; WSL implementation was `3624b10`.
 
 ## Candidate Next Slices
 
-- Next useful slice: focused docs sweep for stale policy command examples and error-code wording.
+- Next useful slice: policy explain CLI fixture, if current implementation lacks the documented `sun policy explain <validation-report-id> --json` surface.
 
 ## Decisions
 

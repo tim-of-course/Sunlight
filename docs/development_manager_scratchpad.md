@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `abdac17`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 133 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
+- Verification: latest full pass ran after `abdac17`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 133 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused view/conflict visibility checks passed after `483fac8`. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -166,11 +166,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-repository-inspect`: default `scripts/smoke-suite.ps1` passed after `eb6255a`.
 - Completed slice `artifact-export-trace-visibility`: integrated as `6665ba7`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-artifact-export-trace`: default `scripts/smoke-suite.ps1` passed after `abdac17`.
-- Active slice `view-conflict-status-inspect`: add focused fixture support for `sun status --view`, `sun inspect view:`, and `sun inspect conflict:` so resolver conflict state is operator-visible.
+- Completed slice `view-conflict-status-inspect`: integrated as `483fac8`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
+- Active verification slice `aggregate-smoke-suite-refresh-after-view-conflict`: rerun the default smoke suite after view/conflict status-inspect visibility.
 
 ## Candidate Next Slices
 
-- Next useful slice after active work: aggregate smoke refresh, then choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
+- Next useful slice after active verification: choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
 
 ## Decisions
 

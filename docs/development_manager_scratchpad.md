@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `fd33835` and covered `0c4894d`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 141 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused compat conflicted-delta checks passed after `6052cd8`. Optional Super Search validation passed after `e02debe`.
+- Verification: latest full pass ran after `09a56d6` and covered `6052cd8`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 142 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -179,11 +179,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `compat-import-path-policy-cli-coverage`: integrated as `0c4894d`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-path-policy`: default `scripts/smoke-suite.ps1` passed after `fd33835`.
 - Completed slice `compat-import-conflicted-delta-cli-coverage`: integrated as `6052cd8`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
-- Active verification slice `aggregate-smoke-suite-refresh-after-compat-import-conflicted-delta`: run the default smoke suite after the compatibility conflicted-delta import coverage lands.
+- Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-conflicted-delta`: default `scripts/smoke-suite.ps1` passed after `09a56d6`.
 
 ## Candidate Next Slices
 
-- Next useful slice after active work: aggregate smoke refresh, then choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
+- Next useful slices: continue small Phase 6 compatibility-validation coverage, likely generated/binary policy failure, ambiguous rename failure, or delete/rename success behavior after a scoped design review.
 
 ## Decisions
 

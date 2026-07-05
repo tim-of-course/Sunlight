@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `d8b8f8a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 111 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. After `ff0caf6`, focused multi-candidate import verification passed `cargo fmt --check`, `git diff --check`, targeted CLI test, full `cargo test -p sun --test cli_json` with 112 tests, and default `validation-smoke.ps1` through the CRLF fallback. Optional Super Search validation passed after `03a1e43`. After `16d167e`, docs CLI spelling checks passed for stale compat import, Git export planning, and projection materialization commands. After `41fc082`, `cargo fmt --check`, `git diff --check`, and focused policy check-export CLI tests passed. Next guard must run after this edit.
+- Verification: latest full pass ran after `d8b8f8a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 111 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. After `ff0caf6`, focused multi-candidate import verification passed `cargo fmt --check`, `git diff --check`, targeted CLI test, full `cargo test -p sun --test cli_json` with 112 tests, and default `validation-smoke.ps1` through the CRLF fallback. Optional Super Search validation passed after `03a1e43`. After `16d167e`, docs CLI spelling checks passed for stale compat import, Git export planning, and projection materialization commands. After `41fc082` and `7b5b839`, Windows `cargo fmt --check`, `git diff --check`, and focused policy CLI tests passed. Next guard must run after this edit.
 
 ## Active Work
 
@@ -146,11 +146,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `cli-compat-import-multiple-candidates`: integrated as `ff0caf6`.
 - Completed slice `validation-plan-cli-reconcile`: integrated as `16d167e`; manager tracking checkpoint `3cce17c`.
 - Completed slice `policy-check-export-cli-fixture`: integrated as `41fc082`; WSL implementation was `aff2f61` plus manager-side rustfmt review fix.
-- Active WSL slice `policy-check-commit-cli-fixture`: expose documented `sun policy check-commit` over the existing `.sunlight` commit policy validator with focused CLI tests.
+- Completed slice `policy-check-commit-cli-fixture`: integrated as `7b5b839`; WSL implementation was `14edbd2`.
+- Active WSL slice `policy-command-smoke-coverage`: add concise validation-smoke coverage for commit/export policy commands and align smoke docs.
 
 ## Candidate Next Slices
 
-- After commit/export policy commands are both surfaced, consider adding policy command coverage to validation smoke if it stays concise.
+- After policy command smoke coverage, consider failure-path operator docs for commit/export policy validation.
 
 ## Decisions
 

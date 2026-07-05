@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `8f4212d`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 120 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`. After `297843e`, Git ref lookup smoke/docs passed WSL validation smoke with Zig caches redirected to `/tmp`, Windows `scripts/validation-smoke.ps1`, `git diff --check HEAD~1..HEAD`, and targeted smoke reference checks.
+- Verification: latest full pass ran after `c6a58c3`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 126 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`.
 
 ## Active Work
 
@@ -156,11 +156,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-policy-explain`: default `scripts/smoke-suite.ps1` passed after `8f4212d`.
 - Completed slice `git-ref-status-inspect-fixture`: integrated as `d862c5c`; WSL implementation was `950065c` plus manager-side Windows rustfmt amendment.
 - Completed slice `git-ref-smoke-docs-coverage`: integrated as `297843e`; WSL implementation was `ae83d0f`.
-- Active verification slice `aggregate-smoke-suite-refresh-after-git-ref-smoke`: run the default smoke suite after Git ref lookup smoke coverage.
+- Completed verification slice `aggregate-smoke-suite-refresh-after-git-ref-smoke`: default `scripts/smoke-suite.ps1` passed after `c6a58c3`.
+- Active slice `export-selector-alias-fixture-coverage`: WSL Codex should cover documented `sun status --export <export-map-id>` and `sun inspect export:<export-map-id>` aliases against the existing export-map fixture without changing storage behavior.
 
 ## Candidate Next Slices
 
-- Next useful slice after active verification: choose the next small Phase 5 operator ergonomics gap from the architecture and current CLI surface.
+- Next useful slice after active work: focused smoke/docs only if export alias coverage changes the validation-surface expectations.
 
 ## Decisions
 

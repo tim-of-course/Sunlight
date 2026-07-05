@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `09a56d6` and covered `6052cd8`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 142 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused compat generated-policy checks passed after `e17fa71`. Optional Super Search validation passed after `e02debe`.
+- Verification: latest full pass ran after `36e49b8` and covered `e17fa71`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 143 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -181,11 +181,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `compat-import-conflicted-delta-cli-coverage`: integrated as `6052cd8`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-conflicted-delta`: default `scripts/smoke-suite.ps1` passed after `09a56d6`.
 - Completed slice `compat-import-generated-policy-cli-coverage`: integrated as `e17fa71`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
-- Active verification slice `aggregate-smoke-suite-refresh-after-compat-import-generated-policy`: run the default smoke suite after the compatibility generated-policy import coverage lands.
+- Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-generated-policy`: default `scripts/smoke-suite.ps1` passed after `36e49b8`.
+- Active slice `compat-import-ambiguous-rename-cli-coverage`: expose an ambiguous rename compatibility diff candidate and verify CLI import rejects it with `compat_ambiguous_rename` and no operation, revision, or generation IDs.
 
 ## Candidate Next Slices
 
-- Next useful slices: continue small Phase 6 compatibility-validation coverage, likely ambiguous rename failure or delete/rename success behavior after a scoped design review.
+- Next useful slices: continue small Phase 6 compatibility-validation coverage, likely delete/rename success behavior after a scoped design review.
 
 ## Decisions
 

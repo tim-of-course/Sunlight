@@ -104,6 +104,191 @@ json_number_field() {
     printf '%s' "$json" | sed -n "s/.*\"$field\":\\([0-9][0-9]*\\).*/\\1/p" | head -n 1
 }
 
+hash_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        cksum "$1" | awk '{print $1 ":" $2}'
+    fi
+}
+
+classify_probe_error() {
+    local error_text="$1"
+    local lower
+    lower="$(printf '%s' "$error_text" | tr '[:upper:]' '[:lower:]')"
+
+    case "$lower" in
+        *"operation not supported"* | *"not supported"*)
+            printf 'operation_not_supported'
+            ;;
+        *"invalid argument"*)
+            printf 'invalid_argument'
+            ;;
+        *"permission denied"* | *"must be superuser"* | *"not permitted"*)
+            printf 'permission_denied'
+            ;;
+        *"command not found"* | *"not found"*)
+            printf 'command_not_found'
+            ;;
+        "")
+            printf 'none'
+            ;;
+        *)
+            printf 'other'
+            ;;
+    esac
+}
+
+probe_reflink_capability() {
+    local probe_root="$1"
+    local fs_type="$2"
+    local src="$probe_root/reflink-source"
+    local dst="$probe_root/reflink-dest"
+    local stderr_file="$probe_root/reflink.stderr"
+    local before_hash
+    local after_hash
+    local private_writes
+    local reason
+
+    printf 'sunlight-projection-reflink-source\n' >"$src"
+    before_hash="$(hash_file "$src")"
+
+    if cp --reflink=always "$src" "$dst" 2>"$stderr_file"; then
+        printf 'sunlight-projection-reflink-dest-mutation\n' >"$dst"
+        after_hash="$(hash_file "$src")"
+        if [[ "$before_hash" == "$after_hash" ]]; then
+            private_writes="yes"
+            reason="reflink_copy_succeeded_and_dest_write_left_source_hash_unchanged"
+        else
+            private_writes="no"
+            reason="dest_write_changed_source_hash"
+        fi
+        printf 'projection_fs_capability strategy=reflink fs_type=%s reflink_attempt=ok writes_private=%s accepted=%s reason=%s\n' \
+            "$fs_type" "$private_writes" "$([[ "$private_writes" == "yes" ]] && printf accepted || printf deferred)" "$reason"
+    else
+        reason="$(classify_probe_error "$(cat "$stderr_file")")"
+        printf 'projection_fs_capability strategy=reflink fs_type=%s reflink_attempt=failed writes_private=unknown accepted=deferred reason=%s\n' \
+            "$fs_type" "$reason"
+    fi
+}
+
+probe_hardlink_readonly_capability() {
+    local probe_root="$1"
+    local fs_type="$2"
+    local store="$probe_root/hardlink-store"
+    local link="$probe_root/hardlink-projection"
+    local stderr_file="$probe_root/hardlink.stderr"
+    local before_hash
+    local after_hash
+    local read_only_write_blocked="unknown"
+    local chmod_write_mutated_store="unknown"
+    local mutation_risk="unknown"
+    local reason
+    local status
+
+    printf 'sunlight-projection-hardlink-store\n' >"$store"
+    chmod 0444 "$store"
+    before_hash="$(hash_file "$store")"
+
+    if ln "$store" "$link" 2>"$stderr_file"; then
+        set +e
+        sh -c 'printf "%s\n" "hardlink-write-without-chmod" >"$1"' sh "$link" 2>"$stderr_file"
+        status=$?
+        set -e
+        if [[ $status -ne 0 ]]; then
+            read_only_write_blocked="yes"
+        else
+            read_only_write_blocked="no"
+        fi
+
+        chmod u+w "$link"
+        printf 'hardlink-write-after-chmod\n' >"$link"
+        after_hash="$(hash_file "$store")"
+        chmod u+w "$store"
+
+        if [[ "$before_hash" == "$after_hash" ]]; then
+            chmod_write_mutated_store="no"
+            mutation_risk="absent_in_probe"
+            reason="read_only_hardlink_did_not_mutate_store_after_chmod_probe"
+        else
+            chmod_write_mutated_store="yes"
+            mutation_risk="present"
+            reason="shared_inode_owner_can_chmod_projection_and_mutate_store"
+        fi
+
+        printf 'projection_fs_capability strategy=hardlink_readonly fs_type=%s hardlink_attempt=ok read_only_write_blocked=%s chmod_write_mutated_store=%s mutation_isolation_risk=%s accepted=deferred reason=%s\n' \
+            "$fs_type" "$read_only_write_blocked" "$chmod_write_mutated_store" "$mutation_risk" "$reason"
+    else
+        chmod u+w "$store"
+        reason="$(classify_probe_error "$(cat "$stderr_file")")"
+        printf 'projection_fs_capability strategy=hardlink_readonly fs_type=%s hardlink_attempt=failed read_only_write_blocked=unknown chmod_write_mutated_store=unknown mutation_isolation_risk=unknown accepted=deferred reason=%s\n' \
+            "$fs_type" "$reason"
+    fi
+}
+
+probe_overlay_copyup_capability() {
+    local probe_root="$1"
+    local fs_type="$2"
+    local lower="$probe_root/overlay-lower"
+    local upper="$probe_root/overlay-upper"
+    local work="$probe_root/overlay-work"
+    local merged="$probe_root/overlay-merged"
+    local stderr_file="$probe_root/overlay.stderr"
+    local lower_before
+    local lower_after
+    local private_writes="unknown"
+    local reason
+
+    mkdir -p "$lower" "$upper" "$work" "$merged"
+    printf 'sunlight-projection-overlay-lower\n' >"$lower/file.txt"
+    lower_before="$(hash_file "$lower/file.txt")"
+
+    if mount -t overlay overlay -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$merged" 2>"$stderr_file"; then
+        printf 'sunlight-projection-overlay-merged-mutation\n' >"$merged/file.txt"
+        lower_after="$(hash_file "$lower/file.txt")"
+        if [[ "$lower_before" == "$lower_after" && -f "$upper/file.txt" ]]; then
+            private_writes="yes"
+            reason="overlay_mount_succeeded_and_write_copied_up"
+        else
+            private_writes="no"
+            reason="overlay_write_did_not_preserve_lower_file"
+        fi
+        umount "$merged" 2>/dev/null || true
+        printf 'projection_fs_capability strategy=overlay_copyup fs_type=%s overlay_attempt=ok copyup_writes_private=%s accepted=%s reason=%s\n' \
+            "$fs_type" "$private_writes" "$([[ "$private_writes" == "yes" ]] && printf accepted || printf deferred)" "$reason"
+    elif command -v fuse-overlayfs >/dev/null 2>&1 \
+        && fuse-overlayfs -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$merged" 2>"$stderr_file"; then
+        printf 'sunlight-projection-overlay-merged-mutation\n' >"$merged/file.txt"
+        lower_after="$(hash_file "$lower/file.txt")"
+        if [[ "$lower_before" == "$lower_after" && -f "$upper/file.txt" ]]; then
+            private_writes="yes"
+            reason="fuse_overlayfs_mount_succeeded_and_write_copied_up"
+        else
+            private_writes="no"
+            reason="fuse_overlayfs_write_did_not_preserve_lower_file"
+        fi
+        fusermount -u "$merged" 2>/dev/null || umount "$merged" 2>/dev/null || true
+        printf 'projection_fs_capability strategy=overlay_copyup fs_type=%s overlay_attempt=ok copyup_writes_private=%s accepted=%s reason=%s\n' \
+            "$fs_type" "$private_writes" "$([[ "$private_writes" == "yes" ]] && printf accepted || printf deferred)" "$reason"
+    else
+        reason="$(classify_probe_error "$(cat "$stderr_file")")"
+        printf 'projection_fs_capability strategy=overlay_copyup fs_type=%s overlay_attempt=failed copyup_writes_private=unknown accepted=deferred reason=%s\n' \
+            "$fs_type" "$reason"
+    fi
+}
+
+probe_real_filesystem_capabilities() {
+    local probe_root="$tmp_dir/real-fs-probe"
+    local fs_type
+
+    mkdir -p "$probe_root"
+    fs_type="$(stat -f -c %T "$probe_root" 2>/dev/null || printf 'unknown')"
+    printf 'projection_fs_capability host_scope=current_wsl_linux_tempdir fs_type=%s probe_root=tempdir absolute_paths=omitted\n' "$fs_type"
+    probe_reflink_capability "$probe_root" "$fs_type"
+    probe_hardlink_readonly_capability "$probe_root" "$fs_type"
+    probe_overlay_copyup_capability "$probe_root" "$fs_type"
+}
+
 sun() {
     "$sun_bin" "$@"
 }
@@ -161,6 +346,9 @@ assert_contains "$out" '"cleanup":{"projection_root":{' "copy metrics cleanup"
 [[ -n "$manifest_entries" && -n "$manifest_directories" && -n "$manifest_files" && -n "$manifest_bytes" ]] || fail "could not extract manifest counts"
 printf 'projection_metric fixture=basic-app view=%s purpose=execution selected_strategy=copy elapsed_ms=%s files_written=%s directories_created=%s bytes_written=%s executable_files=%s manifest_entries=%s manifest_files=%s manifest_directories=%s manifest_bytes=%s deferred_strategies=reflink_real_fs,hardlink_readonly_real_fs,overlay_copyup_real_fs scope=fixture_copy_materialization_only\n' \
     "$metrics_view_id" "$elapsed_ms" "$files_written" "$directories_created" "$bytes_written" "$executable_files" "$manifest_entries" "$manifest_files" "$manifest_directories" "$manifest_bytes"
+
+step "Probing observed WSL/Linux filesystem capabilities"
+probe_real_filesystem_capabilities
 
 step "Verifying explicit reflink strategy selection JSON"
 out="$(run_ok reflink sun project materialize --view "$view_id" --purpose execution --strategy reflink --fixture basic-app --json)"

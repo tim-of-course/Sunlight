@@ -99,3 +99,32 @@ The spike is complete when:
 - local-only data boundaries are documented
 - Phase 3 can proceed with a clear default and no dependency on mutable working-tree files
 
+## Observed WSL/Linux Temp Filesystem Probe
+
+On July 5, 2026, `scripts/projection-strategy-smoke.sh` added a scoped
+temp-directory capability probe. The rows are local observations for the
+current WSL/Linux temp filesystem only; they omit absolute paths and do not
+claim support on other mounts or hosts.
+
+```text
+projection_fs_capability host_scope=current_wsl_linux_tempdir fs_type=tmpfs probe_root=tempdir absolute_paths=omitted
+projection_fs_capability strategy=reflink fs_type=tmpfs reflink_attempt=failed writes_private=unknown accepted=deferred reason=operation_not_supported
+projection_fs_capability strategy=hardlink_readonly fs_type=tmpfs hardlink_attempt=ok read_only_write_blocked=yes chmod_write_mutated_store=yes mutation_isolation_risk=present accepted=deferred reason=shared_inode_owner_can_chmod_projection_and_mutate_store
+projection_fs_capability strategy=overlay_copyup fs_type=tmpfs overlay_attempt=failed copyup_writes_private=unknown accepted=deferred reason=permission_denied
+```
+
+Decision from this host probe:
+
+- `copy` remains the accepted correctness fallback.
+- `reflink` is deferred for this temp filesystem because the real reflink
+  attempt failed as unsupported.
+- `hardlink_readonly` is deferred because read-only file mode blocked a direct
+  write but did not protect immutable store content from owner `chmod` followed
+  by mutation through the linked projection path.
+- `overlay_copyup` is deferred because unprivileged overlay/copy-up was not
+  observable without sudo or package installation.
+
+The next useful probe is a non-temp WSL/Linux filesystem slice if product work
+needs a faster-than-copy default. That slice should still keep `copy` as the
+fallback and must include command compatibility plus store-integrity checks.
+

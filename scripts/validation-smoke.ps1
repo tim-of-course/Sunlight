@@ -109,6 +109,18 @@ try {
     Assert-Contains $out '"command":"repository.init"' 'init idempotent command'
     Assert-Contains $out '"ok":true' 'init idempotent ok'
 
+    Push-Location $initRepo
+    try {
+        $out = Invoke-SunOk 'policy-check-commit' @('policy', 'check-commit', '--json')
+    } finally {
+        Pop-Location
+    }
+    Assert-Contains $out '"command":"policy.check-commit"' 'policy check commit command'
+    Assert-Contains $out '"ok":true' 'policy check commit ok'
+    Assert-Contains $out '"managed_ignore_blocks_checked":1' 'policy check commit managed ignore blocks'
+    Assert-Contains $out '"candidate_paths_checked":0' 'policy check commit candidate paths'
+    Assert-Contains $out '"blocked":0' 'policy check commit blocked'
+
     Step 'Read/list/search fixture artifacts'
     $out = Invoke-SunOk 'read' @('read', 'src/auth.ts', '--session', 'session_agent_a', '--fixture', 'basic-app', '--json')
     Assert-Contains $out '"command":"artifact.read"' 'read command'
@@ -187,6 +199,11 @@ try {
     Assert-Contains $out '"command":"checkpoint.create"' 'checkpoint command'
     Assert-Contains $out '"checkpoint_id":"checkpoint_auth_profile_ready_0001"' 'checkpoint id'
     Assert-Contains $out '"export_ready":true' 'checkpoint export ready'
+
+    $out = Invoke-SunOk 'policy-check-export' @('policy', 'check-export', '--checkpoint', 'checkpoint_auth_profile_ready_0001', '--fixture', 'basic-app', '--json')
+    Assert-Contains $out '"command":"policy.check-export"' 'policy check export command'
+    Assert-Contains $out '"validation_report_id":"validation_export_auth_profile_ready_0001"' 'policy check export validation report'
+    Assert-Contains $out '"failures":[]' 'policy check export failures'
 
     Step 'Compatibility project, diff, import, and Git export write plan'
     $out = Invoke-SunOk 'compat-project' @('compat', 'project', '--session', 'session_agent_a', '--fixture', 'basic-app', '--json')

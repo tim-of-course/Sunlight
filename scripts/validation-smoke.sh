@@ -112,6 +112,13 @@ out="$(run_ok init-idempotent sun init --json --repo "$init_repo")"
 assert_contains "$out" '"command":"repository.init"' "init idempotent command"
 assert_contains "$out" '"ok":true' "init idempotent ok"
 
+out="$(cd "$init_repo" && run_ok policy-check-commit sun policy check-commit --json)"
+assert_contains "$out" '"command":"policy.check-commit"' "policy check commit command"
+assert_contains "$out" '"ok":true' "policy check commit ok"
+assert_contains "$out" '"managed_ignore_blocks_checked":1' "policy check commit managed ignore blocks"
+assert_contains "$out" '"candidate_paths_checked":0' "policy check commit candidate paths"
+assert_contains "$out" '"blocked":0' "policy check commit blocked"
+
 step "Read/list/search fixture artifacts"
 out="$(run_ok read sun read src/auth.ts --session session_agent_a --fixture basic-app --json)"
 assert_contains "$out" '"command":"artifact.read"' "read command"
@@ -191,6 +198,11 @@ out="$(run_ok checkpoint sun checkpoint create --view "$view_id" --fixture basic
 assert_contains "$out" '"command":"checkpoint.create"' "checkpoint command"
 assert_contains "$out" '"checkpoint_id":"checkpoint_auth_profile_ready_0001"' "checkpoint id"
 assert_contains "$out" '"export_ready":true' "checkpoint export ready"
+
+out="$(run_ok policy-check-export sun policy check-export --checkpoint checkpoint_auth_profile_ready_0001 --fixture basic-app --json)"
+assert_contains "$out" '"command":"policy.check-export"' "policy check export command"
+assert_contains "$out" '"validation_report_id":"validation_export_auth_profile_ready_0001"' "policy check export validation report"
+assert_contains "$out" '"failures":[]' "policy check export failures"
 
 step "Compatibility project, diff, import, and Git export write plan"
 out="$(run_ok compat-project sun compat project --session session_agent_a --fixture basic-app --json)"

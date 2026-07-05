@@ -42,12 +42,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `b2ae867` and covered the ignored-path Phase 6 gap closure. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 155 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `2faf5dd`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat project/diff/status/inspect, happy-path and generated-failure compat import, and fixture Git export.
+- Verification: latest full pass ran after `80db1ef` and covered the projection filesystem probe updates. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 155 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `2faf5dd`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat project/diff/status/inspect, happy-path and generated-failure compat import, and fixture Git export.
 
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `projection-non-temp-fs-capability-probe`: ready next. Probe the WSL `/home` repo filesystem separately from `tmpfs` before deciding whether any faster-than-copy projection path can be accepted or must remain deferred.
+- Active slice `execution-projection-cache-hardening`: ready next. Use the filesystem probe results to tighten execution projection/cache behavior around copy fallback, cache keys, cleanup, and store-integrity boundaries without accepting unsafe hardlink or unavailable overlay paths.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
@@ -119,10 +119,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-ignored-path-coverage`: default `scripts/smoke-suite.ps1` passed after `b2ae867`.
 - Completed slice `projection-platform-spike-metrics`: integrated as `6342747`; WSL scripts/docs implementation was imported manager-side after the WSL Git sandbox blocked committing, with WSL shell smoke/focused projection tests and Windows projection-strategy smoke passing.
 - Completed slice `projection-real-fs-capability-probe`: integrated as `0a35e2f`; WSL Bash harness/docs implementation was imported manager-side after the WSL Git sandbox blocked committing. Tempdir probe observed `tmpfs`, unsupported reflink, unsafe read-only hardlink after owner chmod, unavailable unprivileged overlay/copy-up, and kept copy as accepted fallback. WSL shell smoke/projection tests, CRLF-stripped Bash syntax check, Windows projection-strategy smoke, and `git diff --check` passed.
+- Completed slice `projection-non-temp-fs-capability-probe`: integrated as `80db1ef`; WSL Bash harness/docs implementation was imported manager-side after the WSL Git sandbox blocked committing. Non-temp WSL home clone probe observed `ext2/ext3`; reflink stayed unsupported, read-only hardlink stayed unsafe after owner chmod, overlay/copy-up stayed unavailable, and copy stayed the accepted fallback.
+- Completed verification slice `aggregate-smoke-suite-refresh-after-non-temp-probe`: default `scripts/smoke-suite.ps1` passed after `80db1ef`.
 
 ## Candidate Next Slices
 
-- Next useful slices after the active one: turn non-temp filesystem results into accepted/deferred strategy decisions, then continue execution projection/cache hardening.
+- Next useful slices after the active one: add focused acceptance around cache cleanup/invalidation or execution store-integrity reuse, then rerun aggregate smoke.
 
 ## Decisions
 

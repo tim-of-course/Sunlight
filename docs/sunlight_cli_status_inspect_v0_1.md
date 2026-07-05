@@ -15,7 +15,7 @@ Phase 1 status and inspect must not rely on `git status`, filesystem projections
 
 Projection status and inspect are operator diagnostics over a projection record plus optional caller-supplied local root verification. Local root paths are local-only metadata and are never source truth. Content verification requires a persisted projection manifest; scan summaries alone are not proof of correctness.
 
-The v0.1 CLI fixture also accepts `--integrity-fixture store-mismatch` on projection status and inspect for `projection_exec_auth_profile_0001`. This is a narrow operator-visibility fixture for a failed immutable-store integrity check. It reports local-only quarantine and integrity metadata; it does not create a durable source record, scan the filesystem as source truth, or implement a general persistent quarantine database.
+The v0.1 CLI fixture also accepts `--integrity-fixture store-mismatch` on projection status and inspect for `projection_exec_auth_profile_0001`. This is a narrow operator-visibility fixture for a failed immutable-store integrity check. It reports local-only quarantine and integrity metadata. With `--projection-root`, it also persists a local-only quarantine JSON record under that projection root; without `--projection-root`, it reports only the local URI reference where that record would live. The record is diagnostic metadata, not source truth, not a durable native source record, and not a general persistent quarantine database.
 
 ## Common JSON Envelope
 
@@ -115,6 +115,7 @@ Use stable dotted command names in `data.command`. The left side names the objec
 | `sun status --session <session> --json` | `status.session` |
 | `sun status --topic <topic> --json` | `status.topic` |
 | `sun status --projection <projection> --json` | `status.projection` |
+| `sun projection quarantine-cleanup --projection <projection> --projection-root <path> --fixture basic-app --json` | `projection.quarantine_cleanup` |
 | `sun inspect <path-or-artifact> --session <session> --json` | `inspect.artifact` |
 | `sun inspect topic:<topic> --json` | `inspect.topic` |
 | `sun inspect session:<session> --json` | `inspect.session` |
@@ -194,6 +195,7 @@ Required rules:
 - `verification_state` is `present` when the root exists and is a directory, `missing` when it does not exist, and `not_directory` when the supplied path is a non-directory.
 - `content_verification` remains `not_available_without_persisted_manifest` until projection materialization records comparable manifest metadata for the local root.
 - Counts and `sample_paths` are scan summaries for operator visibility, not native provenance and not proof of content correctness.
+- Local root scans exclude Sunlight projection metadata under `.sunlight/projections` and projection quarantine metadata under `.sunlight/quarantine`. Other local content, including arbitrary `.sunlight/other` files, remains visible as extra local content.
 - Without `--projection-root`, projection status embeds no local root verification details and projection inspect returns `local_root_verification: null`.
 
 ### Persisted Projection Manifest Contract
@@ -370,7 +372,7 @@ For the basic-app execution projection, `sun status --projection projection_exec
     "projection_id": "projection_exec_auth_profile_0001",
     "source_truth": "immutable_store_manifest",
     "local_filesystem_source_truth": false,
-    "durable_record": null
+    "durable_record": "local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json"
   }
 }
 ```
@@ -380,8 +382,25 @@ Required fixture rules:
 - `store-mismatch` is accepted only for the basic-app execution projection ID.
 - Status includes `native_errors[0].code: "execution_store_integrity_failed"` and stable projection, root, cache, manifest, quarantine reason, and provenance refs.
 - Inspect includes matching `local_store_integrity` and `local_quarantine` blocks next to the unchanged projection record.
-- Without `--projection-root`, `local_root_verification` remains `null`; the failure path must not synthesize `content_verification: verified` from local bytes.
-- The fixture is local-only diagnostic metadata. It must not add a store scanner, durable quarantine table, or source record.
+- With `--projection-root`, status or inspect writes local-only quarantine metadata to `.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json` under the supplied projection root. The record's `durable_record` value is the local URI shown above.
+- Without `--projection-root`, `local_root_verification` remains `null`; status and inspect report the same `durable_record` local URI reference but do not write a file. The failure path must not synthesize `content_verification: verified` from local bytes.
+- The fixture is local-only diagnostic metadata. It must not add a store scanner, native source record, or broad cache/object garbage collection.
+
+### Projection Quarantine Cleanup
+
+The local-only cleanup command removes persisted projection quarantine metadata for one projection:
+
+```text
+sun projection quarantine-cleanup --projection projection_exec_auth_profile_0001 --projection-root <local-root> --fixture basic-app --json
+```
+
+The JSON response uses `command: "projection.quarantine_cleanup"` and reports the selected projection, local-only quarantine directory, whether records existed, removed local URI records, removed directories, and the retention state after cleanup. Cleanup is idempotent: when the selected projection has no persisted local quarantine record, it returns success with empty removal lists and `retention_state_after: "absent"`.
+
+Required cleanup rules:
+
+- Cleanup removes only `.sunlight/quarantine/projections/<projection-id>/execution_store_integrity_failed.json` and now-empty directories for the selected projection under the supplied projection root.
+- Cleanup preserves sibling projection quarantine directories and arbitrary local content such as `.sunlight/other`.
+- Cleanup is local-only maintenance. It does not change native source truth, projection manifests, execution records, caches, object stores, or unrelated retention state.
 
 ### Artifact Summary
 
@@ -1060,9 +1079,15 @@ Use the `fixture-basic-app` repository and stable labels from the artifact IO an
 | `status_projection_no_synthetic_root_mismatch` | Supply a different directory without a persisted binding for that directory. | Shows dirty or missing content results from manifest entry comparison, not `root_mismatch`. |
 | `status_projection_local_root_missing` | Run projection status with a missing local root. | Shows `verification_state: missing`, zero counts, and unchanged native projection refs. |
 | `status_projection_local_root_not_directory` | Run projection status with a file path as the local root. | Shows `verification_state: not_directory`, no file content verification, and no native mutation. |
+| `status_projection_store_mismatch_persists_local_quarantine` | Run projection status with `--projection-root`, `--fixture basic-app`, and `--integrity-fixture store-mismatch`. | Shows quarantined lifecycle, failed integrity, local-only `durable_record` URI, native error `execution_store_integrity_failed`, and writes `.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json` under the projection root. |
+| `status_projection_store_mismatch_without_root_no_write` | Run projection status with `--fixture basic-app` and `--integrity-fixture store-mismatch` but no projection root. | Shows the same local-only `durable_record` URI and failed integrity metadata, keeps `local_root_verification: null`, and writes no local quarantine file. |
 | `inspect_artifact_after_patch` | Patch `src/auth.ts`, then inspect it through the same session. | Shows current after hash, path history, latest operation, topic, revision, session, and before/after refs. |
 | `inspect_projection_local_root` | Inspect `projection:projection_exec_auth_profile_0001` with a local root. | Shows projection record metadata, `local_only_path` root refs, and the same local-root verification block used by projection status. |
 | `inspect_projection_manifest_contract` | Inspect `projection:projection_exec_auth_profile_0001` after manifest creation. | Shows manifest identity inputs, local-only manifest ref/digest, summary counts, and content-verification status without exposing public host paths or raw local bytes. |
+| `inspect_projection_store_mismatch_persists_local_quarantine` | Run projection inspect with `--projection-root`, `--fixture basic-app`, and `--integrity-fixture store-mismatch`. | Shows matching `local_store_integrity` and `local_quarantine` blocks and writes the same local-only quarantine JSON record under the projection root. |
+| `projection_quarantine_cleanup_removes_selected_record` | After creating the store-mismatch local quarantine record, run `sun projection quarantine-cleanup --projection projection_exec_auth_profile_0001 --projection-root <local-root> --fixture basic-app --json`. | Returns `command: "projection.quarantine_cleanup"`, `existed: true`, the removed local URI record, `retention_state_after: "removed"`, and removes only the selected projection quarantine record/directory. |
+| `projection_quarantine_cleanup_preserves_siblings_and_other_sunlight` | Create a selected projection quarantine record, a sibling projection quarantine directory, and arbitrary `.sunlight/other` content, then run cleanup for the selected projection. | Removes only the selected projection quarantine metadata and preserves the sibling projection quarantine directory plus `.sunlight/other` content. |
+| `projection_quarantine_cleanup_idempotent_absent` | Run quarantine cleanup when the selected projection has no persisted local quarantine record. | Returns success with `existed: false`, empty removed record/dir lists, and `retention_state_after: "absent"`. |
 | `inspect_operation_authored_context` | Inspect `operation:op_auth_trim_guard_0001`. | View block is the prior authored context `gen_agent_a_0001`/`view_base_0001`; operation includes preconditions, write set, before refs, after refs, and created revision. |
 | `inspect_topic_revision_chain` | Inspect `topic:auth-nullability` after two revisions. | Revisions are ordered by revision number and each links to operation, parent revision, and changed artifacts. |
 | `inspect_session_generations` | Inspect `session:session_agent_a` after patch and write. | Generation list includes session start plus each accepted mutation; current view is the latest generation. |

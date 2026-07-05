@@ -125,6 +125,6 @@ CI must run in offline mode where practical and must not depend on global Git co
 - Resolver smoke tests distinguish compatible composition from same-artifact conflicts.
 - Projection and execution flows prove projections are adapters and local-only runtime state is not source truth.
 - Checkpoint creation accepts only conflict-free exact resolved views with matching evidence.
-- Compatibility import captures fixture projection deltas into one normal operation transaction and one topic revision, including selected delta payloads for modified source, multi-candidate, delete, rename, metadata, and rename-plus-edit cases, plus atomic failure envelopes for generated, ambiguous, conflicted, policy-blocked, secret, cache, missing-candidate, and no-candidate cases.
+- Compatibility import captures fixture projection deltas into one normal operation transaction and one topic revision, including selected delta payloads for modified source, created source through the multi-candidate fixture, delete, rename, metadata, and rename-plus-edit cases, plus atomic failure envelopes for generated, ambiguous, conflicted, policy-blocked, secret, cache, missing-candidate, and no-candidate cases. A distinct `ignored_path` candidate remains outside the current fixture-backed smoke surface.
 - Git export planning selects `single_checkpoint_commit`, validates parent/ref policy, and never reads export source bytes from the working tree.
 - `cargo test --workspace`, `cargo test -p sun --test cli_json`, and `git diff --check` pass before the plan is accepted.

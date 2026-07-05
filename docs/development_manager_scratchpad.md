@@ -162,10 +162,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `operator-status-round-trip-coverage`: integrated as `6322652`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-round-trip`: default `scripts/smoke-suite.ps1` passed after `17780c1`.
 - Completed verification slice `external-validation-super-search-refresh`: optional `scripts/external-validation-super-search.ps1` passed after `e02debe` with Super Search `mix test`, `bun run test`, temp-clone `sun init`, fixture compat import, and fixture-backed Git export.
+- Active slice `repository-inspect-selector`: add focused CLI fixture support and coverage for `sun inspect repository:<repository-id>` to close the operator status matrix repository round-trip gap.
 
 ## Candidate Next Slices
 
-- Next useful slice after active verification: choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
+- Next useful slice after active work: aggregate smoke refresh, then choose the next small Phase 5 operator ergonomics or compatibility-validation gap from architecture/current CLI surface.
 
 ## Decisions
 

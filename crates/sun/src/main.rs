@@ -58,12 +58,12 @@ use sunlight_core::projection::{
     ProjectionManifestRecord, ProjectionMaterializationCapabilities,
     ProjectionMaterializationError, ProjectionMaterializationErrorCode,
     ProjectionMaterializationLocalMetadata, ProjectionMaterializationPlan,
-    ProjectionMaterializationRequest, ProjectionPurpose, ProjectionRecord, ProjectionRootRef,
-    ProjectionQuarantineLocalCleanup,
-    ProjectionStoreIntegrityReasonCode, ProjectionStoreIntegrityResult,
-    ProjectionStoreIntegrityStatus, ProjectionStrategy, ProjectionValidationError,
-    FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
-    FIXTURE_EXPORT_PROJECTION_ID, FIXTURE_INSPECTION_PROJECTION_ID,
+    ProjectionMaterializationRequest, ProjectionPurpose, ProjectionQuarantineLocalCleanup,
+    ProjectionRecord, ProjectionRootRef, ProjectionStoreIntegrityReasonCode,
+    ProjectionStoreIntegrityResult, ProjectionStoreIntegrityStatus, ProjectionStrategy,
+    ProjectionValidationError, FIXTURE_COMPATIBILITY_PROJECTION_ID,
+    FIXTURE_EXECUTION_PROJECTION_ID, FIXTURE_EXPORT_PROJECTION_ID,
+    FIXTURE_INSPECTION_PROJECTION_ID,
 };
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repository::{
@@ -622,15 +622,15 @@ fn projection_quarantine_cleanup(ctx: &CommandContext) -> Result<(), CliError> {
         &options.projection_id,
     )
     .map_err(|error| {
-        invalid_request(format!(
-            "projection quarantine cleanup failed: {}",
-            error
-        ))
-        .with_detail("projection_id", options.projection_id.clone())
+        invalid_request(format!("projection quarantine cleanup failed: {}", error))
+            .with_detail("projection_id", options.projection_id.clone())
     })?;
 
     if ctx.json {
-        println!("{}", projection_quarantine_cleanup_success_envelope(&cleanup));
+        println!(
+            "{}",
+            projection_quarantine_cleanup_success_envelope(&cleanup)
+        );
     } else {
         println!(
             "{} {}",

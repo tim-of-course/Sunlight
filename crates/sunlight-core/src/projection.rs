@@ -3065,12 +3065,11 @@ mod tests {
         );
         assert_eq!(cleanup.removed_files, vec![target_record]);
         assert!(cleanup.removed_dirs.contains(
-            &root.join(PROJECTION_QUARANTINE_LOCAL_METADATA_DIR)
+            &root
+                .join(PROJECTION_QUARANTINE_LOCAL_METADATA_DIR)
                 .join(FIXTURE_EXECUTION_PROJECTION_ID)
         ));
-        assert!(!cleanup
-            .quarantine_dir
-            .exists());
+        assert!(!cleanup.quarantine_dir.exists());
         assert!(!root
             .join(PROJECTION_QUARANTINE_LOCAL_METADATA_DIR)
             .join(FIXTURE_EXECUTION_PROJECTION_ID)

@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `5aa6275`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 118 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`. After `f4f0f1f`, policy explain smoke coverage passed WSL validation smoke with Zig caches redirected to `/tmp`, Windows `scripts/validation-smoke.ps1`, `git diff --check HEAD~1..HEAD`, and targeted policy-explain smoke reference checks.
+- Verification: latest full pass ran after `8f4212d`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 120 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`.
 
 ## Active Work
 
@@ -153,11 +153,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `policy-command-docs-sweep`: integrated as `c6376d8`; WSL implementation was `3624b10`.
 - Completed slice `policy-explain-cli-fixture`: integrated as `e4ec794`; WSL implementation was `6f03921` plus manager-side Windows rustfmt amendment.
 - Completed slice `policy-explain-smoke-coverage`: integrated as `f4f0f1f`; WSL implementation was `cc33f29`.
-- Active verification slice `aggregate-smoke-suite-refresh-after-policy-explain`: run the default smoke suite after policy explain CLI and smoke coverage updates.
+- Completed verification slice `aggregate-smoke-suite-refresh-after-policy-explain`: default `scripts/smoke-suite.ps1` passed after `8f4212d`.
+- Active slice `git-ref-status-inspect-fixture`: WSL Codex should add the documented Git ref lookup fixture surfaces for `sun status --git <commit-or-ref> --json` and `sun inspect git:<commit-or-ref> --json` if the existing export-map fixture data supports it.
 
 ## Candidate Next Slices
 
-- Next useful slice after active verification: choose the next small Phase 5 operator ergonomics gap from the architecture and current CLI surface.
+- Next useful slice after active work: add Git ref lookup to focused smoke/docs if the CLI fixture lands cleanly.
 
 ## Decisions
 

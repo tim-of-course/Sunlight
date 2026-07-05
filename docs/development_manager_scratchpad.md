@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `8f4212d`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 120 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`.
+- Verification: latest full pass ran after `8f4212d`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 120 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation last passed after `03a1e43`. After `d862c5c`, Git ref status/inspect passed `cargo fmt --check`, `cargo test -p sun --test cli_json git_ref`, and `git diff --check HEAD~1..HEAD`.
 
 ## Active Work
 
@@ -154,11 +154,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `policy-explain-cli-fixture`: integrated as `e4ec794`; WSL implementation was `6f03921` plus manager-side Windows rustfmt amendment.
 - Completed slice `policy-explain-smoke-coverage`: integrated as `f4f0f1f`; WSL implementation was `cc33f29`.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-policy-explain`: default `scripts/smoke-suite.ps1` passed after `8f4212d`.
-- Active slice `git-ref-status-inspect-fixture`: WSL Codex should add the documented Git ref lookup fixture surfaces for `sun status --git <commit-or-ref> --json` and `sun inspect git:<commit-or-ref> --json` if the existing export-map fixture data supports it.
+- Completed slice `git-ref-status-inspect-fixture`: integrated as `d862c5c`; WSL implementation was `950065c` plus manager-side Windows rustfmt amendment.
 
 ## Candidate Next Slices
 
-- Next useful slice after active work: add Git ref lookup to focused smoke/docs if the CLI fixture lands cleanly.
+- Next useful slice: add Git ref lookup to focused smoke/docs coverage.
 
 ## Decisions
 

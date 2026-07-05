@@ -161,6 +161,7 @@ pub struct CompatCandidateDelta {
     pub operation_kind: CompatFileOperationKind,
     pub artifact_id: Option<String>,
     pub path: String,
+    pub source_path: Option<String>,
     pub before_hash: Option<String>,
     pub after_hash: Option<String>,
     pub byte_length: u64,
@@ -298,6 +299,7 @@ pub fn fixture_basic_app_candidate_deltas() -> Vec<CompatCandidateDelta> {
             operation_kind: CompatFileOperationKind::Patch,
             artifact_id: Some("artifact_src_auth_ts".to_string()),
             path: "src/auth.ts".to_string(),
+            source_path: None,
             before_hash: Some("sha256:auth_base".to_string()),
             after_hash: Some("sha256:auth_projection_after".to_string()),
             byte_length: 109,
@@ -318,6 +320,7 @@ pub fn fixture_basic_app_candidate_deltas() -> Vec<CompatCandidateDelta> {
             operation_kind: CompatFileOperationKind::Delete,
             artifact_id: Some("artifact_src_auth_ts".to_string()),
             path: "src/auth.ts".to_string(),
+            source_path: None,
             before_hash: Some("sha256:auth_base".to_string()),
             after_hash: None,
             byte_length: 109,
@@ -338,6 +341,7 @@ pub fn fixture_basic_app_candidate_deltas() -> Vec<CompatCandidateDelta> {
             operation_kind: CompatFileOperationKind::Move,
             artifact_id: Some("artifact_src_auth_ts".to_string()),
             path: "src/auth-renamed.ts".to_string(),
+            source_path: None,
             before_hash: Some("sha256:auth_base".to_string()),
             after_hash: Some("sha256:auth_projection_after".to_string()),
             byte_length: 109,
@@ -353,11 +357,33 @@ pub fn fixture_basic_app_candidate_deltas() -> Vec<CompatCandidateDelta> {
             quarantine_ref: None,
         },
         CompatCandidateDelta {
+            candidate_delta_id: "compat_delta_src_auth_rename_0001".to_string(),
+            kind: CompatCandidateKind::MovedOrRenamed,
+            operation_kind: CompatFileOperationKind::Move,
+            artifact_id: Some("artifact_src_auth_ts".to_string()),
+            path: "src/auth.renamed.ts".to_string(),
+            source_path: Some("src/auth.ts".to_string()),
+            before_hash: Some("sha256:auth_base".to_string()),
+            after_hash: Some("sha256:auth_base".to_string()),
+            byte_length: 109,
+            executable: false,
+            media_type: "text/typescript; charset=utf-8".to_string(),
+            classification: "source".to_string(),
+            privacy_class: PrivacyClass::PolicyGated,
+            path_policy_result: CompatPathPolicyResult {
+                allowed: true,
+                normalized_path: Some("src/auth.renamed.ts".to_string()),
+                reason: None,
+            },
+            quarantine_ref: None,
+        },
+        CompatCandidateDelta {
             candidate_delta_id: "compat_delta_src_session_ts_0001".to_string(),
             kind: CompatCandidateKind::CreatedSource,
             operation_kind: CompatFileOperationKind::Write,
             artifact_id: Some("artifact_src_session_ts".to_string()),
             path: "src/session.ts".to_string(),
+            source_path: None,
             before_hash: None,
             after_hash: Some("sha256:session_projection_new".to_string()),
             byte_length: 44,
@@ -378,6 +404,7 @@ pub fn fixture_basic_app_candidate_deltas() -> Vec<CompatCandidateDelta> {
             operation_kind: CompatFileOperationKind::Patch,
             artifact_id: Some("artifact_src_auth_ts".to_string()),
             path: "src/auth.conflicted.ts".to_string(),
+            source_path: None,
             before_hash: Some("sha256:auth_base".to_string()),
             after_hash: Some("sha256:auth_conflicted_projection_after".to_string()),
             byte_length: 121,
@@ -398,6 +425,7 @@ pub fn fixture_basic_app_candidate_deltas() -> Vec<CompatCandidateDelta> {
             operation_kind: CompatFileOperationKind::Write,
             artifact_id: None,
             path: "src/generated/schema.ts".to_string(),
+            source_path: None,
             before_hash: None,
             after_hash: Some("sha256:generated_schema_projection".to_string()),
             byte_length: 512,
@@ -418,6 +446,7 @@ pub fn fixture_basic_app_candidate_deltas() -> Vec<CompatCandidateDelta> {
             operation_kind: CompatFileOperationKind::Write,
             artifact_id: None,
             path: "dist/bundle.js".to_string(),
+            source_path: None,
             before_hash: None,
             after_hash: Some("sha256:dist_bundle_local".to_string()),
             byte_length: 2048,
@@ -438,6 +467,7 @@ pub fn fixture_basic_app_candidate_deltas() -> Vec<CompatCandidateDelta> {
             operation_kind: CompatFileOperationKind::Write,
             artifact_id: None,
             path: ".env".to_string(),
+            source_path: None,
             before_hash: None,
             after_hash: Some("sha256:env_secret_local".to_string()),
             byte_length: 32,
@@ -460,6 +490,7 @@ pub fn fixture_basic_app_candidate_deltas() -> Vec<CompatCandidateDelta> {
             operation_kind: CompatFileOperationKind::Write,
             artifact_id: None,
             path: ".sunlight/config.toml".to_string(),
+            source_path: None,
             before_hash: None,
             after_hash: Some("sha256:reserved_sunlight_config".to_string()),
             byte_length: 8,
@@ -684,6 +715,17 @@ fn validate_selected_candidates(
                 path_error_message(&path_error),
             ));
         }
+        if let Some(source_path) = candidate.source_path.as_deref() {
+            if let Err(path_error) = path_policy.validate(source_path) {
+                return Err(error(
+                    CompatImportErrorCode::PathPolicyFailed,
+                    &request.projection_id,
+                    &request.session_id,
+                    candidate_ids,
+                    path_error_message(&path_error),
+                ));
+            }
+        }
         match candidate.kind {
             CompatCandidateKind::SecretLike => {
                 return Err(error(
@@ -731,13 +773,15 @@ fn validate_selected_candidates(
                 ));
             }
             CompatCandidateKind::MovedOrRenamed => {
-                return Err(error(
-                    CompatImportErrorCode::AmbiguousRename,
-                    &request.projection_id,
-                    &request.session_id,
-                    candidate_ids,
-                    "fixture foundation does not resolve rename identity",
-                ));
+                if candidate.source_path.is_none() {
+                    return Err(error(
+                        CompatImportErrorCode::AmbiguousRename,
+                        &request.projection_id,
+                        &request.session_id,
+                        candidate_ids,
+                        "fixture foundation does not resolve rename identity",
+                    ));
+                }
             }
             CompatCandidateKind::ModifiedSource
             | CompatCandidateKind::CreatedSource
@@ -756,7 +800,11 @@ fn validate_candidate_precondition(
     request: &CompatImportRequest,
     candidate: &CompatCandidateDelta,
 ) -> Result<(), CompatImportValidationError> {
-    let active_entry = current_view.tree_entries.get(&candidate.path);
+    let precondition_path = candidate
+        .source_path
+        .as_deref()
+        .unwrap_or(candidate.path.as_str());
+    let active_entry = current_view.tree_entries.get(precondition_path);
     match (&candidate.before_hash, active_entry) {
         (Some(expected), Some(entry)) if entry.content_hash == *expected => Ok(()),
         (Some(expected), Some(entry)) => Err(error(
@@ -784,7 +832,22 @@ fn validate_candidate_precondition(
             "candidate expects a new path that already exists in the current view",
         )),
         (None, None) => Ok(()),
+    }?;
+
+    if candidate.kind == CompatCandidateKind::MovedOrRenamed
+        && candidate.source_path.as_deref() != Some(candidate.path.as_str())
+        && current_view.tree_entries.contains_key(&candidate.path)
+    {
+        return Err(error(
+            CompatImportErrorCode::PreconditionFailed,
+            &request.projection_id,
+            &request.session_id,
+            vec![candidate.candidate_delta_id.clone()],
+            "move candidate target path already exists in the current view",
+        ));
     }
+
+    Ok(())
 }
 
 fn build_response(
@@ -841,7 +904,10 @@ fn build_response(
                 .before_hash
                 .as_ref()
                 .map(|_| artifact_id_for_candidate(candidate)),
-            path: candidate.path.clone(),
+            path: candidate
+                .source_path
+                .clone()
+                .unwrap_or_else(|| candidate.path.clone()),
             path_state: if candidate.before_hash.is_some() {
                 "active".to_string()
             } else {
@@ -1171,6 +1237,7 @@ mod tests {
             operation_kind: CompatFileOperationKind::Write,
             artifact_id: None,
             path: ".sunlight/config.toml".to_string(),
+            source_path: None,
             before_hash: None,
             after_hash: Some("sha256:reserved".to_string()),
             byte_length: 8,

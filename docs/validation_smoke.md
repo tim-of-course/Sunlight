@@ -39,7 +39,8 @@ currently define a `.github` workflow or another provider-specific CI file.
 
 By default the PowerShell wrapper uses WSL when `wsl.exe` is available so the
 same Bash script runs on Windows/WSL. Set `SUNLIGHT_SMOKE_USE_WSL=0` to run the
-native PowerShell implementation instead.
+native PowerShell implementation instead. If the paired Bash script has CRLF
+line endings, the wrapper warns and uses the native lane.
 
 The Linux/WSL lane expects a local Rust toolchain, `cargo`, and `git` on
 `PATH`. The Windows-native lane expects those tools on the Windows `PATH`; when

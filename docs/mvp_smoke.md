@@ -10,11 +10,16 @@ Run on Linux, macOS, or WSL:
 scripts/mvp-smoke.sh
 ```
 
-Run in native Windows PowerShell:
+Run on Windows PowerShell:
 
 ```powershell
 scripts/mvp-smoke.ps1
 ```
+
+By default the PowerShell wrapper uses WSL when `wsl.exe` is available and the
+paired Bash script is LF-clean. Set `SUNLIGHT_SMOKE_USE_WSL=0` to run the native
+PowerShell implementation; if the paired Bash script has CRLF line endings, the
+wrapper warns and uses the native lane.
 
 The smoke builds `sun`, then exercises the `basic-app` fixture end to end:
 

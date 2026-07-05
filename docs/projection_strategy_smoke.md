@@ -18,6 +18,11 @@ Run on Windows PowerShell:
 scripts/projection-strategy-smoke.ps1
 ```
 
+By default the PowerShell wrapper uses WSL when `wsl.exe` is available and the
+paired Bash script is LF-clean. Set `SUNLIGHT_SMOKE_USE_WSL=0` to run the native
+PowerShell implementation; if the paired Bash script has CRLF line endings, the
+wrapper warns and uses the native lane.
+
 The smoke covers:
 
 - exact resolved-view materialization from `resolved_content_tree`

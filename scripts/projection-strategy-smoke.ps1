@@ -1,14 +1,29 @@
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$bashScript = Join-Path $PSScriptRoot 'projection-strategy-smoke.sh'
+
+function Test-HasCrlf($Path) {
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    for ($i = 0; $i -lt ($bytes.Length - 1); $i++) {
+        if ($bytes[$i] -eq 13 -and $bytes[$i + 1] -eq 10) {
+            return $true
+        }
+    }
+    return $false
+}
 
 if ($env:SUNLIGHT_SMOKE_USE_WSL -ne '0') {
     $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
     if ($wsl) {
         $wslRoot = wsl.exe wslpath -a $repoRoot
         if ($LASTEXITCODE -eq 0 -and $wslRoot) {
-            wsl.exe bash "$wslRoot/scripts/projection-strategy-smoke.sh"
-            exit $LASTEXITCODE
+            if (Test-HasCrlf $bashScript) {
+                Write-Warning 'Falling back to Windows-native smoke lane because projection-strategy-smoke.sh has CRLF line endings'
+            } else {
+                wsl.exe bash "$wslRoot/scripts/projection-strategy-smoke.sh"
+                exit $LASTEXITCODE
+            }
         }
     }
 }

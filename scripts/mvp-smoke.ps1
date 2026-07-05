@@ -1,6 +1,33 @@
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$bashScript = Join-Path $PSScriptRoot 'mvp-smoke.sh'
+
+function Test-HasCrlf($Path) {
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    for ($i = 0; $i -lt ($bytes.Length - 1); $i++) {
+        if ($bytes[$i] -eq 13 -and $bytes[$i + 1] -eq 10) {
+            return $true
+        }
+    }
+    return $false
+}
+
+if ($env:SUNLIGHT_SMOKE_USE_WSL -ne '0') {
+    $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if ($wsl) {
+        $wslRoot = wsl.exe wslpath -a $repoRoot
+        if ($LASTEXITCODE -eq 0 -and $wslRoot) {
+            if (Test-HasCrlf $bashScript) {
+                Write-Warning 'Falling back to Windows-native smoke lane because mvp-smoke.sh has CRLF line endings'
+            } else {
+                wsl.exe bash "$wslRoot/scripts/mvp-smoke.sh"
+                exit $LASTEXITCODE
+            }
+        }
+    }
+}
+
 $cargo = if ($env:CARGO) { $env:CARGO } else { 'cargo' }
 $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('sun-mvp-smoke-' + [System.Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmpRoot | Out-Null

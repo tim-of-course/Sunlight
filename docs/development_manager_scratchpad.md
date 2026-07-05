@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `a371669` and covered `3584d7b`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 145 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
+- Verification: latest full pass ran after `a371669` and covered `3584d7b`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 145 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused compat-import rename checks passed after `4cd2dcf`. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -95,7 +95,8 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-ambiguous-rename`: default `scripts/smoke-suite.ps1` passed after `973da56`.
 - Completed slice `compat-import-delete-success-cli-coverage`: integrated as `3584d7b`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-delete-success`: default `scripts/smoke-suite.ps1` passed after `a371669`.
-- Active slice `compat-import-rename-success-cli-coverage`: add an unambiguous rename compatibility candidate and verify CLI import preserves artifact identity, source path before-ref, target path after-ref, and move operation kind.
+- Completed slice `compat-import-rename-success-cli-coverage`: integrated as `4cd2dcf`; WSL implementation was imported manager-side after the WSL sandbox blocked committing, with Windows `cargo fmt` and focused CLI verification.
+- Active verification slice `aggregate-smoke-suite-refresh-after-compat-import-rename-success`: refresh the default smoke suite after the rename-only import success path.
 
 ## Candidate Next Slices
 

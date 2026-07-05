@@ -101,10 +101,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-metadata-success`: default `scripts/smoke-suite.ps1` passed after `f970f10`.
 - Completed slice `compat-import-rename-plus-edit-cli-coverage`: integrated as `815b49a`; WSL implementation was imported manager-side after WSL `cargo-fmt` was unavailable, with Windows `cargo fmt` and focused CLI verification.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-rename-plus-edit`: default `scripts/smoke-suite.ps1` passed after `d72b79d`.
+- Active slice `compat-import-docs-acceptance-sync`: align compatibility import docs and validation plan notes with the implemented delete, rename, metadata, and rename-plus-edit coverage and nested operation-detail JSON.
 
 ## Candidate Next Slices
 
-- Next useful slices: continue Phase 6 compatibility import coverage, likely rename-plus-edit semantics or multi-operation follow-up after metadata-only coverage.
+- Next useful slices: continue Phase 6 compatibility import hardening, likely stale projection/session CLI preconditions or broader external validation refresh after docs alignment.
 
 ## Decisions
 

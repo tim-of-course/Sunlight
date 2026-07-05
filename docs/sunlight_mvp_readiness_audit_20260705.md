@@ -6,16 +6,16 @@ This audit compares the current implementation against the MVP phases in `docs/s
 
 ## Executive Summary
 
-Sunlight has a strong fixture-backed MVP spine through Phase 6: repository init and policy, native artifact reads and writes, deterministic resolver conflicts, projection materialization and integrity, execution records and output promotion, checkpoint creation, Git export planning/execution, operator status/inspect, compatibility import, and optional external validation against a temporary Super Search clone.
+Sunlight has a strong fixture-backed MVP spine through Phase 6: repository init and policy, native artifact reads and writes, Phase 1 topic/session lifecycle, Phase 1 structural mutation commands, deterministic resolver conflicts, projection materialization and integrity, execution records and output promotion, checkpoint creation, Git export planning/execution, operator status/inspect, compatibility import, and optional external validation against a temporary Super Search clone.
 
-The main remaining acceptance gap is narrower than a full phase: complete the Phase 1 native authoring lifecycle CLI for `topic create`, `session start`, and structural mutation commands (`move`, `delete`, `metadata set`) so an MVP agent can start from a fresh Sunlight repo and perform the whole native authoring path through stable commands rather than fixture session IDs.
+The prior Phase 1 lifecycle gap is now closed for fixture CLI acceptance: `topic create`, `session start`, `move`, `delete`, and `metadata set` return stable JSON envelopes with topic/session IDs, session generation advancement, operation/revision IDs, precondition failure behavior, tombstone/path binding details, and metadata classification changes. The next narrow gap is not another native IO command; it is synchronizing CLI help and command documentation so the accepted Phase 1 commands are no longer described as parse-only or incomplete.
 
 ## Phase Readiness Matrix
 
 | MVP phase | Current coverage | Verification evidence | Readiness note |
 | --- | --- | --- | --- |
 | Phase 0: schemas, hashing, path policy, operation format, tree identity, session generation, `.sunlight` policy, projection spike | Core modules cover records, identity, repository init, policy, operation transaction records, `TreeIdentity::SingleRepoTree`, projection strategy planning, manifests, root binding, and quarantine metadata. | `crates/sunlight-core/src/records.rs`, `identity.rs`, `repository.rs`, `policy.rs`, `artifacts.rs`, `projection.rs`; `scripts/projection-strategy-smoke.ps1`; `scripts/smoke-suite.ps1`; `crates/sun/tests/cli_json.rs` projection/policy/init tests. | Functionally covered for the local fixture MVP and real temp repo init. |
-| Phase 1: native artifact IO vertical slice | `sun init`, `read`, `list`, `search`, `patch`, `write`, status, inspect, authored context, read-after-write generation, and precondition failures are covered. Topic/session record helpers exist in core. | `crates/sun/tests/cli_json.rs` tests for init, read/list/search, patch/write, stale writes, status/inspect provenance; `crates/sunlight-core/src/artifacts.rs`; `topics.rs`; `docs/sunlight_native_io_phase1_spec_v0_1.md`. | Partially covered. `topic create` and `session start` are parsed but return unimplemented errors, and structural mutation commands are not CLI-complete. |
+| Phase 1: native artifact IO vertical slice | `sun init`, `topic create`, `session start`, `read`, `list`, `search`, `patch`, `write`, `move`, `delete`, `metadata set`, status, inspect, authored context, read-after-write generation, structural mutation provenance, and precondition failures are covered for fixture CLI acceptance. | `crates/sun/tests/cli_json.rs` tests for topic/session lifecycle, read/list/search, patch/write, move/delete/metadata, stale write/move preconditions, status/inspect provenance; `crates/sunlight-core/src/artifacts.rs`; `crates/sun/src/main.rs`; `docs/sunlight_native_io_phase1_spec_v0_1.md`. Latest aggregate baseline in `docs/development_manager_scratchpad.md`: after `de5c5cb`, default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 168 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. | Covered for fixture CLI acceptance. Remaining polish should synchronize help/docs and may add deeper status/inspect round trips, but the lifecycle and structural mutation commands are no longer the blocking Phase 1 gap. |
 | Phase 2: resolver and conflicts | Deterministic view resolution, reversed frontier stability, independent-file composition, same-artifact conflict objects, staleness, and conflict visibility through status/inspect are covered. | `crates/sunlight-core/src/resolver.rs`; `docs/sunlight_resolver_conflict_fixtures_v0_1.md`; `crates/sun/tests/cli_json.rs` resolver/conflict/staleness tests; `scripts/validation-smoke.ps1`. | Covered for same-repo fixture acceptance. |
 | Phase 3: execution projections | `sun run`, projection materialization, execution records, integrity rejection before execution, failed execution records, generated output promotion, and status/inspect exposure are covered. Projection cache/integrity/quarantine lifecycle has extensive focused tests. | `crates/sunlight-core/src/execution.rs`; `projection.rs`; `docs/sunlight_execution_projection_v0_1.md`; `crates/sun/tests/cli_json.rs` run, promote-output, projection integrity, manifest, and quarantine tests; `scripts/mvp-smoke.ps1`. | Covered for fixture execution and local projection safety. |
 | Phase 4: checkpoints and Git export | Conflict-free checkpoint creation, conflict/stale rejection, policy check/export explain, write planning, local Git commit/ref export, export map persistence, dirty worktree isolation, and failure envelopes are covered. | `crates/sunlight-core/src/checkpoint.rs`; `git_export.rs`; `docs/sunlight_checkpoint_git_export_v0_1.md`; `docs/sunlight_git_export_writer_v0_1.md`; `crates/sun/tests/cli_json.rs` checkpoint/git export tests; `scripts/mvp-smoke.ps1`. | Covered for the single-checkpoint local Git export MVP. |
@@ -25,27 +25,27 @@ The main remaining acceptance gap is narrower than a full phase: complete the Ph
 ## Cross-Phase Verification Already Proving MVP Spine
 
 - `scripts/smoke-suite.ps1` is the aggregate gate: format, check, tests, validation smoke, projection strategy smoke, and MVP smoke.
+- Latest recorded full baseline: after `de5c5cb`, default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 168 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke.
 - `scripts/validation-smoke.ps1` covers real temp repo `sun init`, fixture artifact IO, resolver conflict, execution projection, checkpoint, policy, compatibility projection/import, and Git export write-plan envelopes.
 - `scripts/mvp-smoke.ps1` runs the end-to-end path from view resolve through filesystem projection, execution, checkpoint, and real local Git export into a temporary repo.
-- `scripts/external-validation-super-search.ps1` optionally verifies a real local Super Search baseline, temp clone init, fixture compatibility projection/import, atomic generated-output failure, and real local Git export against the disposable clone.
+- Latest recorded optional external validation: after `44775b8`, `scripts/external-validation-super-search.ps1` passed against Super Search, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat project/diff/status/inspect, happy-path and generated-failure compat import, and fixture Git export.
 - `crates/sun/tests/cli_json.rs` is the main regression suite for stable JSON contracts and negative envelopes across all MVP surfaces.
 
 ## Single Next Delegation Gap
 
-Delegate one narrow Phase 1 acceptance slice:
+Delegate one narrow acceptance slice:
 
-Implement fixture-backed CLI acceptance for native lifecycle and structural mutations:
+Synchronize CLI help and operator-facing command documentation for the newly accepted Phase 1 commands.
 
-- `sun topic create <slug> --display-name <name> --fixture basic-app --json`
-- `sun session start --topic <topic> --view <view-selector> --actor <actor-id> --fixture basic-app --json`
-- `sun move`, `sun delete`, and `sun metadata set` with the precondition and provenance shapes already specified in `docs/sunlight_native_io_phase1_spec_v0_1.md`.
+Rationale:
 
-Acceptance should be limited to stable JSON envelopes, core record reuse where available, and focused tests mirroring the existing `cli_json.rs` style:
+- The command implementation and CLI JSON fixtures now cover `topic create`, `session start`, `move`, `delete`, and `metadata set`; repeating that as an implementation slice would duplicate completed work.
+- The CLI help text in `crates/sun/src/main.rs` still describes `topic` and `session` as parse-only with persistence not implemented, which conflicts with the accepted lifecycle envelopes and would mislead operators or downstream agents.
+- External Super Search validation is older than the Phase 1 CLI completion, but it is optional and broader than the smallest acceptance gap; refresh it after help/docs stop advertising stale command state.
+- A dedicated status/inspect round-trip for move/delete/metadata provenance would be useful follow-up coverage, but the immediate correctness issue is that the command surface now says the wrong thing about accepted commands.
 
-- topic/session response includes topic ID, session ID, resolved view ID, session generation ID, pinned refresh policy, write topic, and capabilities.
-- move preserves artifact identity and leaves inspectable path history/tombstone state.
-- delete tombstones the path binding and leaves operation provenance inspectable.
-- metadata set records classification without changing content bytes.
-- status/inspect link artifact -> operation -> topic -> session -> revision for at least one structural mutation.
+Acceptance should be limited to help/docs synchronization and focused verification:
 
-This gap is the best next slice because the rest of the MVP spine already has strong fixture and smoke evidence, while these commands are explicitly called out by the Phase 1 spec and are currently not command-complete.
+- update `sun --help` command descriptions so topic/session are described as fixture-backed Phase 1 lifecycle commands, not parse-only placeholders.
+- ensure command docs mention the accepted fixture flags and stable JSON envelopes for topic/session and structural mutations.
+- add or update a focused help/docs assertion if the existing test style has a nearby command-help fixture; otherwise run `sun --help` plus `git diff --check`.

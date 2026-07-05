@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `f5066f1`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 105 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. After `b3a0f8b`, focused compat verification passed `cargo fmt --check`, `git diff --check`, `cargo test -p sun --test cli_json` with 109 tests, WSL `scripts/validation-smoke.sh`, and Windows-native `scripts/validation-smoke.ps1`; the default PowerShell wrapper still needs the existing WSL CRLF fallback behavior. Optional Super Search validation passed after `03a1e43`. Next guard must run after this edit.
+- Verification: latest full pass ran after `d8b8f8a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 111 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused compat status/inspect verification also passed `cargo fmt --check`, `git diff --check`, targeted CLI tests, full `cargo test -p sun --test cli_json`, and native `scripts/validation-smoke.ps1`. Optional Super Search validation passed after `03a1e43`. Next guard must run after this edit.
 
 ## Active Work
 
@@ -141,11 +141,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `projection-quarantine-docs-reconcile`: integrated as `0fbc28e`.
 - Completed slice `external-validation-super-search-export`: integrated as `2431fa7`; logging fix checkpoint `03a1e43`.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
-- Active WSL slice `compat-status-inspect-visibility`: broaden status/inspect around compatibility projection dirty candidates and import attempts after the new compat project/diff surfaces.
+- Completed slice `compat-status-inspect-visibility`: integrated as `6c1063a`; formatting checkpoint `d8b8f8a`.
+- Active WSL slice `focused-smoke-wrapper-crlf-hardening`: make focused PowerShell smoke wrappers handle CRLF shell scripts as cleanly as the aggregate smoke suite.
 
 ## Candidate Next Slices
 
-- After compat project/diff fixture coverage lands, broaden status/inspect around compatibility projection dirty state and import attempts.
+- After focused smoke wrapper hardening lands, consider promoting the compatibility projection visibility assertions into the relevant smoke scripts only if they remain stable and non-noisy.
 
 ## Decisions
 

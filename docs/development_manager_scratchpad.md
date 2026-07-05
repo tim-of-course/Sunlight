@@ -47,6 +47,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
+- Active slice `compat-projection-quarantine-retention-cli-coverage`: delegated next. Focus is compatibility projection retention/quarantine visibility and local-only cleanup boundaries, reusing the existing fixture surface without adding a broad retention scheduler.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
@@ -108,7 +109,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 
 ## Candidate Next Slices
 
-- Next useful slices: continue Phase 6 compatibility import hardening after stale precondition coverage, likely projection retention/quarantine cleanup or fixture external validation breadth.
+- Next useful slices after the active one: fixture external validation breadth, then remaining Phase 6 compatibility import hardening gaps found by docs/test reconciliation.
 
 ## Decisions
 

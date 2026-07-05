@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `61c9240` and covered `a4a7718`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 150 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `0bb5ae6`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat import, and fixture Git export.
+- Verification: latest full pass ran after `a6af00b` and covered `7e2d64e`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 151 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `0bb5ae6`, covering target `mix test`, `bun run test`, temp-clone `sun init`, fixture compat import, and fixture Git export.
 
 ## Active Work
 
@@ -106,6 +106,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `compat-import-stale-precondition-cli-coverage`: integrated as `a4a7718`; WSL implementation was imported manager-side after WSL `cargo-fmt` was unavailable, with Windows `cargo fmt` and focused CLI verification.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-stale-preconditions`: default `scripts/smoke-suite.ps1` passed after `61c9240`.
 - Completed slice `compat-projection-quarantine-retention-cli-coverage`: integrated as `7e2d64e`; WSL implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check` and focused CLI verification.
+- Completed verification slice `aggregate-smoke-suite-refresh-after-compat-projection-retention`: default `scripts/smoke-suite.ps1` passed after `a6af00b`.
 
 ## Candidate Next Slices
 

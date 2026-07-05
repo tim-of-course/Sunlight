@@ -3231,6 +3231,40 @@ fn compat_import_json_fixture_secret_candidate_is_policy_blocked() {
 }
 
 #[test]
+fn compat_import_atomic_failure_json_fixture_mixed_selected_candidate_is_policy_blocked() {
+    let repo = TestRepo::new("compat-import-atomic-failure");
+
+    let output = sun()
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--candidate")
+        .arg("compat_delta_src_auth_ts_0001")
+        .arg("--candidate")
+        .arg("compat_delta_env_secret_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat import should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"compat_secret_detected\""));
+    assert!(stdout.contains("\"message\":\"selected compatibility candidate contains secrets\""));
+    assert!(stdout.contains("\"candidate_delta_ids\":[\"compat_delta_env_secret_0001\"]"));
+    assert!(stdout.contains("\"reason\":\"secret-like candidate cannot be imported as source\""));
+    assert!(stdout.contains("\"imported_artifacts\":[]"));
+    assert!(stdout.contains("\"operation_transaction_id\":null"));
+    assert!(!stdout.contains("\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
+    assert!(!stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
+    assert!(!stdout.contains("\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+}
+
+#[test]
 fn compat_import_json_fixture_cache_candidate_is_policy_blocked() {
     let repo = TestRepo::new("compat-import-cache-candidate");
 

@@ -151,10 +151,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh`: default `scripts/smoke-suite.ps1` passed after `5aa6275`.
 - Completed slice `policy-failure-operator-docs`: integrated as `297e22d`; WSL implementation was `b646648`.
 - Completed slice `policy-command-docs-sweep`: integrated as `c6376d8`; WSL implementation was `3624b10`.
+- Active slice `policy-explain-cli-fixture`: WSL Codex should add the documented `sun policy explain <validation-report-id> --json` CLI fixture only if it can be done with existing report data patterns.
 
 ## Candidate Next Slices
 
-- Next useful slice: policy explain CLI fixture, if current implementation lacks the documented `sun policy explain <validation-report-id> --json` surface.
+- Next useful slice after active work: add policy explain to focused validation smoke if the CLI fixture lands cleanly.
 
 ## Decisions
 

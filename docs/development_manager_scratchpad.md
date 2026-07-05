@@ -148,10 +148,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `policy-check-export-cli-fixture`: integrated as `41fc082`; WSL implementation was `aff2f61` plus manager-side rustfmt review fix.
 - Completed slice `policy-check-commit-cli-fixture`: integrated as `7b5b839`; WSL implementation was `14edbd2`.
 - Completed slice `policy-command-smoke-coverage`: integrated as `12af17d`; WSL implementation was `d2c7071`.
+- Active verification slice `aggregate-smoke-suite-refresh`: run the default aggregate smoke suite after policy CLI and validation smoke changes.
 
 ## Candidate Next Slices
 
-- Next useful slice: aggregate smoke-suite refresh after policy CLI and smoke coverage changes; then consider failure-path operator docs for commit/export policy validation.
+- After aggregate smoke refresh, consider failure-path operator docs for commit/export policy validation.
 
 ## Decisions
 

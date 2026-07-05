@@ -19,8 +19,9 @@ use sunlight_core::checkpoint::{
     FIXTURE_GIT_COMMIT_ID,
 };
 use sunlight_core::compat_import::{
-    fixture_basic_app_candidate_deltas, plan_fixture_basic_app_import, CompatImportErrorCode,
-    CompatImportRequest, CompatImportResponse, CompatImportValidationError, CompatImportedArtifact,
+    fixture_basic_app_candidate_deltas, plan_fixture_basic_app_import, CompatCandidateDelta,
+    CompatCandidateKind, CompatImportErrorCode, CompatImportRequest, CompatImportResponse,
+    CompatImportValidationError, CompatImportedArtifact, FIXTURE_COMPAT_BASELINE_MANIFEST_DIGEST,
     FIXTURE_COMPAT_IMPORT_OPERATION_ID,
 };
 use sunlight_core::execution::{
@@ -184,6 +185,8 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
             checkpoint_create(&ctx)
         }
         [scope, command, ..] if scope == "git" && command == "export" => git_export(&ctx),
+        [scope, command, ..] if scope == "compat" && command == "project" => compat_project(&ctx),
+        [scope, command, ..] if scope == "compat" && command == "diff" => compat_diff(&ctx),
         [scope, command, ..] if scope == "compat" && command == "import" => compat_import(&ctx),
         [scope, command, ..] if scope == "execution" && command == "promote-output" => {
             execution_promote_output(&ctx)
@@ -761,6 +764,68 @@ fn git_export(ctx: &CommandContext) -> Result<(), CliError> {
     Ok(())
 }
 
+fn compat_project(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_compat_project_options(ctx)?;
+    if options.fixture != "basic-app" {
+        return Err(
+            invalid_request(format!("unknown fixture `{}`", options.fixture))
+                .with_detail("fixture", options.fixture),
+        );
+    }
+    ensure_fixture_session(&options.session_id)?;
+
+    let view = fixture_base_resolved_content_view();
+    let projection =
+        fixture_compatibility_projection_from_resolved_view(&view, FIXTURE_SESSION_GENERATION_ID)
+            .map_err(projection_error)?;
+
+    if ctx.json {
+        println!(
+            "{}",
+            compat_project_success_envelope(&projection, &options.session_id)
+        );
+    } else {
+        println!("{} {}", projection.id, projection.root_ref.value);
+    }
+
+    Ok(())
+}
+
+fn compat_diff(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_compat_diff_options(ctx)?;
+    if options.fixture != "basic-app" {
+        return Err(
+            invalid_request(format!("unknown fixture `{}`", options.fixture))
+                .with_detail("fixture", options.fixture),
+        );
+    }
+
+    let projection = fixture_compat_import_projection_by_id(&options.projection_id)
+        .ok_or_else(|| object_not_found("projection", &options.projection_id))?
+        .map_err(projection_error)?;
+    if projection.id != FIXTURE_COMPATIBILITY_PROJECTION_ID {
+        return Err(CliError::new(
+            "compat_projection_invalid",
+            "compat diff requires a compatibility projection",
+        )
+        .with_detail("projection_id", options.projection_id));
+    }
+    let current_view = fixture_compat_import_view_for_projection(&projection);
+    let candidates = fixture_basic_app_candidate_deltas();
+
+    if ctx.json {
+        println!("{}", compat_diff_success_envelope(&projection, &current_view, &candidates));
+    } else {
+        println!(
+            "{} {} candidates",
+            projection.id,
+            candidates.len()
+        );
+    }
+
+    Ok(())
+}
+
 fn compat_import(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_compat_import_options(ctx)?;
     if options.fixture != "basic-app" {
@@ -1062,10 +1127,106 @@ struct ProjectionQuarantineCleanupOptions {
 }
 
 #[derive(Debug)]
+struct CompatProjectOptions {
+    fixture: String,
+    session_id: String,
+}
+
+#[derive(Debug)]
+struct CompatDiffOptions {
+    fixture: String,
+    projection_id: String,
+}
+
+#[derive(Debug)]
 struct CompatImportOptions {
     fixture: String,
     projection_id: String,
     candidate_delta_ids: Vec<String>,
+}
+
+fn parse_compat_project_options(ctx: &CommandContext) -> Result<CompatProjectOptions, CliError> {
+    let mut fixture = None;
+    let mut session_id = None;
+    let mut args = ctx.args.iter().skip(2);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun compat project requires --fixture basic-app")
+                })?;
+                fixture = Some(value.clone());
+            }
+            "--session" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun compat project requires --session <session-id>")
+                })?;
+                session_id = Some(value.clone());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun compat project"
+                )));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected compat project argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    let usage = "usage: sun compat project --session <session-id> --fixture basic-app";
+    let fixture = fixture.ok_or_else(|| invalid_request(usage))?;
+    let session_id = session_id.ok_or_else(|| invalid_request(usage))?;
+
+    Ok(CompatProjectOptions {
+        fixture,
+        session_id,
+    })
+}
+
+fn parse_compat_diff_options(ctx: &CommandContext) -> Result<CompatDiffOptions, CliError> {
+    let mut fixture = None;
+    let mut projection_id = None;
+    let mut args = ctx.args.iter().skip(2);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun compat diff requires --fixture basic-app")
+                })?;
+                fixture = Some(value.clone());
+            }
+            "--projection" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun compat diff requires --projection <projection-id>")
+                })?;
+                projection_id = Some(value.clone());
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun compat diff"
+                )));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected compat diff argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    let usage = "usage: sun compat diff --projection <projection-id> --fixture basic-app";
+    let fixture = fixture.ok_or_else(|| invalid_request(usage))?;
+    let projection_id = projection_id.ok_or_else(|| invalid_request(usage))?;
+
+    Ok(CompatDiffOptions {
+        fixture,
+        projection_id,
+    })
 }
 
 fn parse_compat_import_options(ctx: &CommandContext) -> Result<CompatImportOptions, CliError> {
@@ -3521,7 +3682,7 @@ fn fixture_compat_import_projection_by_id(
     projection_id: &str,
 ) -> Option<Result<ProjectionRecord, ProjectionValidationError>> {
     if projection_id == FIXTURE_COMPATIBILITY_PROJECTION_ID {
-        let view = fixture_resolved_view(Vec::new());
+        let view = fixture_base_resolved_content_view();
         Some(fixture_compatibility_projection_from_resolved_view(
             &view,
             "gen_agent_a_0001",
@@ -3533,7 +3694,7 @@ fn fixture_compat_import_projection_by_id(
 
 fn fixture_compat_import_view_for_projection(projection: &ProjectionRecord) -> ResolvedViewResult {
     if projection.id == FIXTURE_COMPATIBILITY_PROJECTION_ID {
-        fixture_resolved_view(Vec::new())
+        fixture_base_resolved_content_view()
     } else {
         fixture_resolved_view_by_id(&projection.resolved_view_id)
             .unwrap_or_else(|| fixture_resolved_view(Vec::new()))
@@ -4213,6 +4374,154 @@ fn git_export_execution_success_envelope(
     )
 }
 
+fn compat_project_success_envelope(projection: &ProjectionRecord, session_id: &str) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"compat.project\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"projection_id\":\"{}\",",
+            "\"session_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"projection_id\":\"{}\",",
+            "\"session_id\":\"{}\",",
+            "\"baseline\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"manifest_ref\":{},",
+            "\"manifest_digest\":\"{}\"",
+            "}},",
+            "\"purpose\":\"{}\",",
+            "\"root_ref\":{},",
+            "\"strategy\":\"{}\",",
+            "\"baseline_manifest_ref\":{},",
+            "\"baseline_manifest_digest\":\"{}\",",
+            "\"retention_state\":\"{}\",",
+            "\"privacy_class\":\"{}\",",
+            "\"path_policy\":{},",
+            "\"projection\":{}",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(&projection.repository_id),
+        json_escape(&projection.id),
+        json_escape(session_id),
+        json_escape(&projection.resolved_view_id),
+        json_escape(
+            projection
+                .session_generation_id
+                .as_deref()
+                .unwrap_or(FIXTURE_SESSION_GENERATION_ID)
+        ),
+        json_escape(&projection.resolved_view_id),
+        json_escape(
+            projection
+                .session_generation_id
+                .as_deref()
+                .unwrap_or(FIXTURE_SESSION_GENERATION_ID)
+        ),
+        single_repo_tree_json(&projection.tree_identity),
+        json_escape(&projection.id),
+        json_escape(session_id),
+        json_escape(&projection.resolved_view_id),
+        json_escape(
+            projection
+                .session_generation_id
+                .as_deref()
+                .unwrap_or(FIXTURE_SESSION_GENERATION_ID)
+        ),
+        single_repo_tree_json(&projection.tree_identity),
+        optional_string_json(projection.baseline_manifest_ref.as_deref()),
+        json_escape(FIXTURE_COMPAT_BASELINE_MANIFEST_DIGEST),
+        projection.purpose.as_str(),
+        projection_root_ref_json(projection),
+        projection.strategy.as_str(),
+        optional_string_json(projection.baseline_manifest_ref.as_deref()),
+        json_escape(FIXTURE_COMPAT_BASELINE_MANIFEST_DIGEST),
+        projection.retention_state.as_str(),
+        projection.privacy_class.as_str(),
+        compat_path_policy_json(projection),
+        projection_record_json(projection),
+    )
+}
+
+fn compat_diff_success_envelope(
+    projection: &ProjectionRecord,
+    current_view: &ResolvedViewResult,
+    candidates: &[CompatCandidateDelta],
+) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"compat.diff\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"projection_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\"",
+            "}},",
+            "\"view\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{}",
+            "}},",
+            "\"projection_id\":\"{}\",",
+            "\"baseline\":{{",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"manifest_ref\":{},",
+            "\"manifest_digest\":\"{}\"",
+            "}},",
+            "\"candidate_counts\":{},",
+            "\"selected_candidate_delta_ids\":{},",
+            "\"selected_safe_default_candidate\":{},",
+            "\"quarantine_refs\":{},",
+            "\"candidates\":[{}],",
+            "\"native_operation_ids\":[],",
+            "\"native_revision_ids\":[]",
+            "}},",
+            "\"warnings\":[]",
+            "}}"
+        ),
+        json_escape(&projection.repository_id),
+        json_escape(&projection.id),
+        json_escape(&projection.resolved_view_id),
+        json_escape(&current_view.resolved_view_id),
+        optional_single_repo_tree_json(current_view.tree_identity.as_ref()),
+        json_escape(&projection.id),
+        json_escape(&projection.resolved_view_id),
+        single_repo_tree_json(&projection.tree_identity),
+        optional_string_json(projection.baseline_manifest_ref.as_deref()),
+        json_escape(FIXTURE_COMPAT_BASELINE_MANIFEST_DIGEST),
+        compat_candidate_counts_json(candidates),
+        string_array_json(["compat_delta_src_auth_ts_0001"].into_iter()),
+        compat_candidate_json(
+            candidates
+                .iter()
+                .find(|candidate| candidate.candidate_delta_id == "compat_delta_src_auth_ts_0001")
+                .expect("fixture safe default candidate should exist"),
+        ),
+        string_array_json(candidates.iter().filter_map(|candidate| {
+            candidate.quarantine_ref.as_deref()
+        })),
+        candidates
+            .iter()
+            .map(compat_candidate_json)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
 fn compat_import_success_envelope(response: &CompatImportResponse) -> String {
     format!(
         concat!(
@@ -4485,6 +4794,118 @@ fn fixture_inspect_compat_operation_json(response: &CompatImportResponse) -> Str
         compat_topic_revision_json(response),
         compat_session_generation_json(response),
     )
+}
+
+fn compat_path_policy_json(projection: &ProjectionRecord) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"path_policy_id\":\"{}\",",
+            "\"operation_semantics_version\":\"{}\",",
+            "\"case_sensitive\":true,",
+            "\"root_ref_privacy\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&projection.path_policy_id),
+        json_escape(&projection.operation_semantics_version),
+        projection.root_ref.privacy.as_str(),
+    )
+}
+
+fn compat_candidate_counts_json(candidates: &[CompatCandidateDelta]) -> String {
+    let mut by_classification = BTreeMap::<&str, usize>::new();
+    let mut by_kind = BTreeMap::<&str, usize>::new();
+    for candidate in candidates {
+        *by_classification
+            .entry(candidate.classification.as_str())
+            .or_default() += 1;
+        *by_kind.entry(candidate.kind.as_str()).or_default() += 1;
+    }
+
+    format!(
+        concat!(
+            "{{",
+            "\"total\":{},",
+            "\"by_classification\":{},",
+            "\"by_kind\":{},",
+            "\"safe_default\":{}",
+            "}}"
+        ),
+        candidates.len(),
+        usize_map_json(&by_classification),
+        usize_map_json(&by_kind),
+        candidates
+            .iter()
+            .filter(|candidate| is_safe_default_compat_candidate(candidate))
+            .count(),
+    )
+}
+
+fn compat_candidate_json(candidate: &CompatCandidateDelta) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"candidate_delta_id\":\"{}\",",
+            "\"kind\":\"{}\",",
+            "\"operation_kind\":\"{}\",",
+            "\"artifact_id\":{},",
+            "\"path\":\"{}\",",
+            "\"before_hash\":{},",
+            "\"after_hash\":{},",
+            "\"byte_length\":{},",
+            "\"executable\":{},",
+            "\"media_type\":\"{}\",",
+            "\"classification\":\"{}\",",
+            "\"privacy_class\":\"{}\",",
+            "\"path_policy_result\":{},",
+            "\"quarantine_ref\":{},",
+            "\"safe_default\":{}",
+            "}}"
+        ),
+        json_escape(&candidate.candidate_delta_id),
+        candidate.kind.as_str(),
+        candidate.operation_kind.as_str(),
+        optional_string_json(candidate.artifact_id.as_deref()),
+        json_escape(&candidate.path),
+        optional_string_json(candidate.before_hash.as_deref()),
+        optional_string_json(candidate.after_hash.as_deref()),
+        candidate.byte_length,
+        candidate.executable,
+        json_escape(&candidate.media_type),
+        json_escape(&candidate.classification),
+        candidate.privacy_class.as_str(),
+        compat_path_policy_result_json(candidate),
+        optional_string_json(candidate.quarantine_ref.as_deref()),
+        is_safe_default_compat_candidate(candidate),
+    )
+}
+
+fn compat_path_policy_result_json(candidate: &CompatCandidateDelta) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"allowed\":{},",
+            "\"normalized_path\":{},",
+            "\"reason\":{}",
+            "}}"
+        ),
+        candidate.path_policy_result.allowed,
+        optional_string_json(candidate.path_policy_result.normalized_path.as_deref()),
+        optional_string_json(candidate.path_policy_result.reason.as_deref()),
+    )
+}
+
+fn is_safe_default_compat_candidate(candidate: &CompatCandidateDelta) -> bool {
+    matches!(
+        candidate.kind,
+        CompatCandidateKind::ModifiedSource
+            | CompatCandidateKind::CreatedSource
+            | CompatCandidateKind::DeletedSource
+            | CompatCandidateKind::MovedOrRenamed
+            | CompatCandidateKind::MetadataChanged
+    ) && candidate.classification == "source"
+        && candidate.path_policy_result.allowed
+        && candidate.quarantine_ref.is_none()
 }
 
 fn compat_imported_artifact_json(artifact: &CompatImportedArtifact) -> String {
@@ -7379,6 +7800,15 @@ fn string_array_map_json(map: &std::collections::BTreeMap<String, Vec<String>>) 
                 string_array_json(values.iter().map(String::as_str))
             )
         })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{fields}}}")
+}
+
+fn usize_map_json(map: &BTreeMap<&str, usize>) -> String {
+    let fields = map
+        .iter()
+        .map(|(key, value)| format!("\"{}\":{}", json_escape(key), value))
         .collect::<Vec<_>>()
         .join(",");
     format!("{{{fields}}}")

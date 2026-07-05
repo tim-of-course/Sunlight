@@ -174,10 +174,16 @@ try {
     Assert-Contains $out '"checkpoint_id":"checkpoint_auth_profile_ready_0001"' 'checkpoint id'
     Assert-Contains $out '"export_ready":true' 'checkpoint export ready'
 
-    Step 'Compatibility import and Git export write plan'
-    $out = Invoke-SunOk 'project-compat' @('project', 'materialize', '--view', $viewId, '--purpose', 'compatibility', '--fixture', 'basic-app', '--json')
+    Step 'Compatibility project, diff, import, and Git export write plan'
+    $out = Invoke-SunOk 'compat-project' @('compat', 'project', '--session', 'session_agent_a', '--fixture', 'basic-app', '--json')
+    Assert-Contains $out '"command":"compat.project"' 'compat project command'
     Assert-Contains $out '"projection_id":"projection_compat_agent_a_0001"' 'compat projection id'
-    Assert-Contains $out '"writable_policy":"writable_with_explicit_import"' 'compat projection policy'
+    Assert-Contains $out '"baseline_manifest_digest":"sha256:compat_baseline"' 'compat project baseline manifest digest'
+
+    $out = Invoke-SunOk 'compat-diff' @('compat', 'diff', '--projection', 'projection_compat_agent_a_0001', '--fixture', 'basic-app', '--json')
+    Assert-Contains $out '"command":"compat.diff"' 'compat diff command'
+    Assert-Contains $out '"selected_candidate_delta_ids":["compat_delta_src_auth_ts_0001"]' 'compat diff selected safe default'
+    Assert-Contains $out '"quarantine_refs":["quarantine://compat/projection_compat_agent_a_0001/env"]' 'compat diff quarantine refs'
 
     $out = Invoke-SunOk 'compat-import' @('compat', 'import', '--projection', 'projection_compat_agent_a_0001', '--candidate', 'compat_delta_src_auth_ts_0001', '--fixture', 'basic-app', '--json')
     Assert-Contains $out '"command":"compat.import"' 'compat import command'

@@ -2586,6 +2586,132 @@ fn project_materialize_json_fixture_compatibility_records_import_policy() {
 }
 
 #[test]
+fn compat_project_json_fixture_basic_app_returns_projection_surface() {
+    let repo = TestRepo::new("compat-project-fixture");
+
+    let output = sun()
+        .arg("compat")
+        .arg("project")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat project should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"compat.project\""));
+    assert!(stdout.contains("\"repository_id\":\"repo_fixture_basic_app\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
+    assert!(stdout.contains("\"session_id\":\"session_agent_a\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_base_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0001\""));
+    assert!(stdout.contains("\"purpose\":\"compatibility\""));
+    assert!(stdout.contains(
+        "\"root_ref\":{\"value\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001\",\"privacy\":\"local_only_path\",\"privacy_class\":\"local_only\"}"
+    ));
+    assert!(stdout.contains("\"strategy\":\"copy\""));
+    assert!(stdout.contains(
+        "\"baseline_manifest_ref\":\"objects/projection-baselines/repo_fixture_basic_app/view_base_0001\""
+    ));
+    assert!(stdout.contains("\"baseline_manifest_digest\":\"sha256:compat_baseline\""));
+    assert!(stdout.contains("\"retention_state\":\"active\""));
+    assert!(stdout.contains("\"privacy_class\":\"local_only\""));
+    assert!(stdout.contains(
+        "\"path_policy\":{\"path_policy_id\":\"path_policy_posix_case_sensitive_v1\""
+    ));
+}
+
+#[test]
+fn compat_project_json_fixture_missing_session_returns_invalid_request() {
+    let repo = TestRepo::new("compat-project-missing-session");
+
+    let output = sun()
+        .arg("compat")
+        .arg("project")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat project should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"invalid_request\""));
+    assert!(stdout.contains(
+        "\"message\":\"usage: sun compat project --session <session-id> --fixture basic-app\""
+    ));
+}
+
+#[test]
+fn compat_diff_json_fixture_basic_app_returns_candidate_surface() {
+    let repo = TestRepo::new("compat-diff-fixture");
+
+    let output = sun()
+        .arg("compat")
+        .arg("diff")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat diff should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"compat.diff\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_base_0001\""));
+    assert!(stdout.contains(
+        "\"tree_identity\":{\"kind\":\"SingleRepoTree\",\"repository_id\":\"repo_fixture_basic_app\",\"tree_hash\":\"tree_fixture_base_0001\"}"
+    ));
+    assert!(stdout.contains("\"candidate_counts\":{\"total\":4"));
+    assert!(stdout.contains("\"by_classification\":{\"cache\":1,\"secret\":1,\"source\":2}"));
+    assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
+    assert!(stdout.contains(
+        "\"selected_safe_default_candidate\":{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""
+    ));
+    assert!(stdout.contains("\"quarantine_refs\":[\"quarantine://compat/projection_compat_agent_a_0001/env\"]"));
+    assert!(stdout.contains("\"candidate_delta_id\":\"compat_delta_dist_bundle_0001\""));
+    assert!(stdout.contains("\"candidate_delta_id\":\"compat_delta_env_secret_0001\""));
+    assert!(stdout.contains("\"native_operation_ids\":[]"));
+    assert!(stdout.contains("\"native_revision_ids\":[]"));
+    assert!(!stdout.contains("op_compat_import_auth_0001"));
+    assert!(!stdout.contains("rev_auth_nullability_compat_0001"));
+}
+
+#[test]
+fn compat_diff_json_fixture_invalid_projection_returns_not_found() {
+    let repo = TestRepo::new("compat-diff-invalid-projection");
+
+    let output = sun()
+        .arg("compat")
+        .arg("diff")
+        .arg("--projection")
+        .arg("projection_missing")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat diff should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"object_not_found\""));
+    assert!(stdout.contains("\"selector\":\"projection_missing\""));
+    assert!(stdout.contains("\"object_type\":\"projection\""));
+}
+
+#[test]
 fn compat_import_json_fixture_candidate_returns_operation_plan() {
     let repo = TestRepo::new("compat-import-fixture");
 

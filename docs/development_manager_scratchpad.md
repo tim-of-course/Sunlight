@@ -138,11 +138,10 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `external-validation-super-search`: integrated as `5800c0b`; envelope assertion fix checkpoint `2f1da1e`.
 - Completed slice `projection-quarantine-record-persistence`: integrated as `0849e94`; formatting checkpoint `7aa4c6a`; scan-count fix `b384f03`; formatting checkpoint `9bd5e0f`.
 - Completed slice `projection-quarantine-retention-cleanup`: integrated as `e8ec961`; formatting checkpoint `f5066f1`.
-- No active WSL slice.
+- Active WSL slice `projection-quarantine-docs-reconcile`: align status/inspect and projection docs with persisted local quarantine records plus the `projection quarantine-cleanup` command.
 
 ## Candidate Next Slices
 
-- Projection quarantine docs should be reconciled with durable local records and cleanup command.
 - External validation can deepen from init-only Super Search coverage toward compatibility import/export planning against a temp clone when the product is ready.
 
 ## Decisions

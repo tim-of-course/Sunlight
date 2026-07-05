@@ -194,7 +194,7 @@ try {
         Assert-JsonWarningsEmpty $compatDiff 'compat diff warnings'
         Assert-JsonValue $compatDiff.data.command 'compat.diff' 'compat diff command'
         Assert-JsonValue $compatDiff.data.projection_id 'projection_compat_agent_a_0001' 'compat diff projection id'
-        Assert-JsonValue $compatDiff.data.candidate_counts.total 12 'compat diff candidate count'
+        Assert-JsonValue $compatDiff.data.candidate_counts.total 13 'compat diff candidate count'
         Assert-JsonValue $compatDiff.data.selected_candidate_delta_ids[0] 'compat_delta_src_auth_ts_0001' 'compat diff selected safe default'
         Assert-JsonValue $compatDiff.data.quarantine_refs[0] 'quarantine://compat/projection_compat_agent_a_0001/env' 'compat diff quarantine ref'
 
@@ -205,7 +205,7 @@ try {
         Assert-JsonValue $statusProjection.data.command 'status.projection' 'status projection command'
         Assert-JsonValue $statusProjection.data.ids.projection_id 'projection_compat_agent_a_0001' 'status projection id'
         Assert-JsonValue $statusProjection.data.projection.purpose 'compatibility' 'status projection purpose'
-        Assert-JsonValue $statusProjection.data.projection.candidate_counts.total 12 'status projection candidate count'
+        Assert-JsonValue $statusProjection.data.projection.candidate_counts.total 13 'status projection candidate count'
         Assert-JsonValue $statusProjection.data.projection.last_import_attempt.operation_transaction_id 'op_compat_import_auth_0001' 'status projection last import operation id'
 
         $inspectProjectionResult = Invoke-SunJson 'sun inspect compatibility projection fixture command' @('inspect', 'projection:projection_compat_agent_a_0001', '--fixture', 'basic-app', '--json')
@@ -215,7 +215,7 @@ try {
         Assert-JsonValue $inspectProjection.data.command 'inspect.projection' 'inspect projection command'
         Assert-JsonValue $inspectProjection.data.ids.projection_id 'projection_compat_agent_a_0001' 'inspect projection id'
         Assert-JsonValue $inspectProjection.data.projection.purpose 'compatibility' 'inspect projection purpose'
-        Assert-JsonValue $inspectProjection.data.compatibility_projection.candidate_summary.candidate_counts.total 12 'inspect projection candidate count'
+        Assert-JsonValue $inspectProjection.data.compatibility_projection.candidate_summary.candidate_counts.total 13 'inspect projection candidate count'
         Assert-JsonValue $inspectProjection.data.compatibility_projection.last_import_attempt.operation_transaction_id 'op_compat_import_auth_0001' 'inspect projection last import operation id'
 
         $compatResult = Invoke-SunJson 'sun compat import fixture command' @('compat', 'import', '--projection', 'projection_compat_agent_a_0001', '--candidate', 'compat_delta_src_auth_ts_0001', '--fixture', 'basic-app', '--json')

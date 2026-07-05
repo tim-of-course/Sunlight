@@ -3306,6 +3306,7 @@ fn fixture_inspect_artifact_json(artifact: FixtureArtifact) -> String {
             "\"introduced_by_operation_id\":\"op_import_base_0001\"",
             "}}],",
             "\"provenance\":{},",
+            "\"compatibility_import\":{},",
             "\"before_refs\":{},",
             "\"after_refs\":{},",
             "\"checkpoint_export_trace\":{}",
@@ -3324,9 +3325,50 @@ fn fixture_inspect_artifact_json(artifact: FixtureArtifact) -> String {
         artifact.created_by_operation_id,
         json_escape(artifact.path),
         provenance,
+        fixture_artifact_compat_import_provenance_json(artifact),
         before_refs,
         after_refs,
         checkpoint_export_trace,
+    )
+}
+
+fn fixture_artifact_compat_import_provenance_json(artifact: FixtureArtifact) -> String {
+    if artifact.artifact_id != "artifact_src_auth_ts" || artifact.path != "src/auth.ts" {
+        return "null".to_string();
+    }
+
+    let response =
+        fixture_compat_import_response_by_operation_id(FIXTURE_COMPAT_IMPORT_OPERATION_ID)
+            .expect("fixture compatibility import should exist");
+    let imported_artifact = response
+        .imported_artifacts
+        .iter()
+        .find(|imported_artifact| {
+            imported_artifact.artifact_id == artifact.artifact_id
+                && imported_artifact.path == artifact.path
+        })
+        .expect("fixture compatibility import should include artifact_src_auth_ts");
+
+    format!(
+        concat!(
+            "{{",
+            "\"kind\":\"compat_import\",",
+            "\"operation_transaction_id\":\"{}\",",
+            "\"topic_revision_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"candidate_delta_ids\":{},",
+            "\"session_generation_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"imported_artifact\":{}",
+            "}}"
+        ),
+        json_escape(&response.operation_id),
+        json_escape(&response.topic_revision_id),
+        json_escape(&response.projection_id),
+        compat_import_candidate_delta_ids_json(&response),
+        json_escape(&response.session_generation_id),
+        json_escape(&response.resolved_view_id),
+        compat_imported_artifact_json(imported_artifact),
     )
 }
 

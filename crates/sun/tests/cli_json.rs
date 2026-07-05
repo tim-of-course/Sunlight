@@ -5083,6 +5083,37 @@ fn inspect_json_fixture_basic_app_path_returns_artifact_snapshot() {
 }
 
 #[test]
+fn compat_artifact_import_provenance_is_visible_on_artifact_inspect() {
+    let repo = TestRepo::new("compat-artifact-import-provenance");
+
+    let output = sun()
+        .arg("inspect")
+        .arg("artifact_src_auth_ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"inspect.artifact\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
+    assert!(stdout.contains("\"path\":\"src/auth.ts\""));
+    assert!(stdout.contains("\"compatibility_import\":{"));
+    assert!(stdout.contains("\"kind\":\"compat_import\""));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
+    assert!(stdout.contains("\"candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_compat_import_0001\""));
+    assert!(stdout.contains("\"imported_artifact\":{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\",\"artifact_id\":\"artifact_src_auth_ts\",\"path\":\"src/auth.ts\""));
+}
+
+#[test]
 fn checkpoint_export_trace_is_exact_for_changed_fixture_artifact() {
     let repo = TestRepo::new("artifact-checkpoint-export-trace-changed");
 

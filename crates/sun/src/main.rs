@@ -4550,6 +4550,8 @@ fn compat_import_success_envelope(response: &CompatImportResponse) -> String {
             "\"session_generation_id\":\"{}\",",
             "\"resolved_view_id\":\"{}\",",
             "\"tree_identity\":{},",
+            "\"selected_delta_count\":{},",
+            "\"candidate_delta_ids\":{},",
             "\"imported_artifacts\":[{}],",
             "\"ignored_candidate_delta_ids\":{},",
             "\"quarantine_refs\":{},",
@@ -4577,6 +4579,13 @@ fn compat_import_success_envelope(response: &CompatImportResponse) -> String {
         json_escape(&response.session_generation_id),
         json_escape(&response.resolved_view_id),
         single_repo_tree_json(&response.tree_identity),
+        response
+            .plan
+            .operation
+            .mutation_payload
+            .selected_deltas
+            .len(),
+        compat_import_candidate_delta_ids_json(response),
         response
             .imported_artifacts
             .iter()

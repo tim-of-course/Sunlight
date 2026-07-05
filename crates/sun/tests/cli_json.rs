@@ -2756,6 +2756,54 @@ fn compat_import_json_fixture_candidate_returns_operation_plan() {
 }
 
 #[test]
+fn compat_import_json_fixture_multiple_candidates_returns_one_operation_plan() {
+    let repo = TestRepo::new("compat-import-fixture-multiple-candidates");
+
+    let output = sun()
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--candidate")
+        .arg("compat_delta_src_auth_ts_0001")
+        .arg("--candidate")
+        .arg("compat_delta_src_session_ts_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat import should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"compat.import\""));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
+    assert!(stdout.contains("\"selected_delta_count\":2"));
+    assert!(stdout.contains(
+        "\"candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\",\"compat_delta_src_session_ts_0001\"]"
+    ));
+    assert!(stdout.contains(
+        "\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\",\"compat_delta_src_session_ts_0001\"]"
+    ));
+    assert!(stdout.contains(
+        "\"imported_artifacts\":[{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""
+    ));
+    assert!(stdout.contains("\"candidate_delta_id\":\"compat_delta_src_session_ts_0001\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_session_ts\""));
+    assert!(stdout.contains("\"path\":\"src/auth.ts\""));
+    assert!(stdout.contains("\"path\":\"src/session.ts\""));
+    assert!(stdout.contains(
+        "\"write_set\":[{\"artifact_id\":\"artifact_src_auth_ts\",\"path\":\"src/auth.ts\",\"mutation\":\"patch\"},{\"artifact_id\":\"artifact_src_session_ts\",\"path\":\"src/session.ts\",\"mutation\":\"write\"}]"
+    ));
+    assert!(stdout.contains(
+        "\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_compat_0001\"}"
+    ));
+}
+
+#[test]
 fn status_json_fixture_compat_import_returns_lifecycle_snapshot() {
     let repo = TestRepo::new("status-fixture-compat-import");
 

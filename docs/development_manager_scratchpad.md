@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `d8b8f8a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 111 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused compat status/inspect verification also passed `cargo fmt --check`, `git diff --check`, targeted CLI tests, full `cargo test -p sun --test cli_json`, and native `scripts/validation-smoke.ps1`. Optional Super Search validation passed after `03a1e43`. Next guard must run after this edit.
+- Verification: latest full pass ran after `d8b8f8a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 111 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. After `3ff62d1`, script verification passed `git diff --check`, PowerShell parser checks, and default `validation-smoke.ps1`, `projection-strategy-smoke.ps1`, and `mvp-smoke.ps1` with CRLF fallback warnings. Optional Super Search validation passed after `03a1e43`. Next guard must run after this edit.
 
 ## Active Work
 
@@ -142,11 +142,12 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `external-validation-super-search-export`: integrated as `2431fa7`; logging fix checkpoint `03a1e43`.
 - Completed slice `compat-project-diff-fixture`: integrated as `07c695a`; formatting checkpoint `b3a0f8b`.
 - Completed slice `compat-status-inspect-visibility`: integrated as `6c1063a`; formatting checkpoint `d8b8f8a`.
-- Active WSL slice `focused-smoke-wrapper-crlf-hardening`: make focused PowerShell smoke wrappers handle CRLF shell scripts as cleanly as the aggregate smoke suite.
+- Completed slice `focused-smoke-wrapper-crlf-hardening`: integrated as `3ff62d1`.
+- Active WSL slice `cli-compat-import-multiple-candidates`: add CLI fixture coverage for importing multiple safe compatibility candidates in one transaction.
 
 ## Candidate Next Slices
 
-- After focused smoke wrapper hardening lands, consider promoting the compatibility projection visibility assertions into the relevant smoke scripts only if they remain stable and non-noisy.
+- After multi-candidate CLI coverage lands, revisit whether compatibility import smoke should cover multiple selected candidates or stay single-candidate for concise output.
 
 ## Decisions
 

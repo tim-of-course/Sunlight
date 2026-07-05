@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `973da56` and covered `7d1c796`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 144 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused compat delete-tombstone checks passed after `3584d7b`. Optional Super Search validation passed after `e02debe`.
+- Verification: latest full pass ran after `a371669` and covered `3584d7b`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 145 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -185,11 +185,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `compat-import-ambiguous-rename-cli-coverage`: integrated as `7d1c796`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-ambiguous-rename`: default `scripts/smoke-suite.ps1` passed after `973da56`.
 - Completed slice `compat-import-delete-success-cli-coverage`: integrated as `3584d7b`; WSL implementation was imported manager-side after the WSL sandbox blocked committing.
-- Active verification slice `aggregate-smoke-suite-refresh-after-compat-import-delete-success`: run the default smoke suite after compatibility delete-tombstone import coverage lands.
+- Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-delete-success`: default `scripts/smoke-suite.ps1` passed after `a371669`.
 
 ## Candidate Next Slices
 
-- Next useful slices: continue small Phase 6 compatibility success-path coverage, likely rename-only success behavior after the delete slice.
+- Next useful slices: compact older scratchpad history, then continue Phase 6 compatibility success-path coverage, likely rename-only success behavior.
 
 ## Decisions
 

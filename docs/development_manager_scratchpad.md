@@ -47,7 +47,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 ## Active Work
 
 - WSL base clone: `/home/timothycard/code/Sunlight-2`.
-- Active slice `post-phase1-readiness-refresh`: in progress. Refresh the MVP readiness audit and identify the next narrow acceptance gap now that topic/session and structural mutation CLI acceptance are integrated.
+- Active slice `phase1-cli-help-docs-sync`: ready next. Synchronize CLI help and operator-facing docs for accepted Phase 1 topic/session and structural mutation commands.
 - Historical completed milestone range: bootstrap through policy, artifact IO, resolver, execution, checkpoints, projection, Git export, validation smoke, operator status, projection manifest/integrity/quarantine, and external Super Search validation are already integrated. Full detail remains in Git history; this scratchpad now keeps only the current management lane and recent compatibility work.
 - Key historical checkpoints: initial Rust workspace and core contracts; native artifact/session/mutation CLI fixtures; resolver and conflict foundation; execution/checkpoint/Git export foundations; projection materialization/manifest/root-binding/integrity hardening; policy check/explain commands and docs; aggregate smoke and optional external Super Search validations.
 - Earlier integrated work through `6fb413d` includes policy command fixtures/docs, operator status round trips, repository/artifact/view/status visibility, external Super Search validation, compatibility import breadth and variants, projection-only checkpoint boundaries, and compatibility status docs reconcile. Full slice detail is in Git history.
@@ -67,10 +67,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `mvp-readiness-audit`: integrated as `168783b`; WSL docs audit identified Phase 1 native lifecycle and structural mutation CLI acceptance as the next narrow gap, with `git diff --check` passing.
 - Completed slice `phase1-native-lifecycle-acceptance`: integrated as `e60e1ac`; WSL implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check`, focused topics/session CLI tests, and default smoke passing.
 - Completed slice `phase1-structural-mutation-acceptance`: integrated as `de5c5cb`; WSL implementation was imported manager-side after the WSL Git sandbox blocked committing, with Windows `cargo fmt --check`, focused artifact/move/delete/metadata tests, and default smoke passing.
+- Completed slice `post-phase1-readiness-refresh`: integrated as `e46e9ad`; WSL docs refresh updated MVP readiness after Phase 1 acceptance and identified stale CLI help/operator docs as the next narrow gap, with `git diff --check` and stale-phrase search passing.
 
 ## Candidate Next Slices
 
-- Next useful slices after the active one: refresh the MVP readiness audit, then delegate the next architecture-aligned gap it identifies.
+- Next useful slices after the active one: close CLI help/operator docs drift, then refresh optional external validation or add a status/inspect round-trip for structural mutation provenance.
 
 ## Decisions
 

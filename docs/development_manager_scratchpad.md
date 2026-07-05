@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `f970f10` and covered `5333445`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 147 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Focused rename-plus-edit compat-import checks passed after `815b49a`. Optional Super Search validation passed after `e02debe`.
+- Verification: latest full pass ran after `d72b79d` and covered `815b49a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 148 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -100,7 +100,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed slice `compat-import-metadata-success-cli-coverage`: integrated as `5333445`; WSL implementation was imported manager-side after WSL `cargo-fmt` was unavailable, with Windows `cargo fmt` and focused CLI verification.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-metadata-success`: default `scripts/smoke-suite.ps1` passed after `f970f10`.
 - Completed slice `compat-import-rename-plus-edit-cli-coverage`: integrated as `815b49a`; WSL implementation was imported manager-side after WSL `cargo-fmt` was unavailable, with Windows `cargo fmt` and focused CLI verification.
-- Active verification slice `aggregate-smoke-suite-refresh-after-compat-import-rename-plus-edit`: refresh the default smoke suite after move-plus-patch compatibility import planning details.
+- Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-rename-plus-edit`: default `scripts/smoke-suite.ps1` passed after `d72b79d`.
 
 ## Candidate Next Slices
 

@@ -3920,7 +3920,9 @@ fn status_json_fixture_compat_projection_reports_dirty_candidates() {
     assert!(stdout.contains("\"by_classification\":{\"cache\":1,\"secret\":1,\"source\":2}"));
     assert!(stdout.contains("\"by_kind\":{\"cache_or_build_output\":1,\"created_source\":1,\"modified_source\":1,\"secret_like\":1}"));
     assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
-    assert!(stdout.contains("\"quarantine_refs\":[\"quarantine://compat/projection_compat_agent_a_0001/env\"]"));
+    assert!(stdout.contains(
+        "\"quarantine_refs\":[\"quarantine://compat/projection_compat_agent_a_0001/env\"]"
+    ));
     assert!(stdout.contains("\"last_import_attempt\":null"));
     assert!(stdout.contains("\"local_projection_refs\":{\"root_ref\":{\"value\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001\""));
     assert!(stdout.contains("\"candidate_summary_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/compat-diff-summary.json\""));
@@ -3947,13 +3949,18 @@ fn inspect_json_fixture_compat_projection_reports_baseline_policy_and_candidates
     assert!(stdout.contains("\"id\":\"projection_compat_agent_a_0001\""));
     assert!(stdout.contains("\"purpose\":\"compatibility\""));
     assert!(stdout.contains("\"baseline_manifest_ref\":\"objects/projection-baselines/repo_fixture_basic_app/view_base_0001\""));
-    assert!(stdout.contains("\"compatibility_projection\":{\"baseline\":{\"resolved_view_id\":\"view_base_0001\""));
+    assert!(stdout.contains(
+        "\"compatibility_projection\":{\"baseline\":{\"resolved_view_id\":\"view_base_0001\""
+    ));
     assert!(stdout.contains("\"manifest_digest\":\"sha256:compat_baseline\""));
-    assert!(stdout.contains("\"path_policy\":{\"path_policy_id\":\"path_policy_posix_case_sensitive_v1\""));
+    assert!(stdout
+        .contains("\"path_policy\":{\"path_policy_id\":\"path_policy_posix_case_sensitive_v1\""));
     assert!(stdout.contains("\"writable_import_policy\":{\"writable_policy\":\"writable_with_explicit_import\",\"import_required\":true"));
     assert!(stdout.contains("\"candidate_summary\":{\"candidate_counts\":{\"total\":4"));
     assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
-    assert!(stdout.contains("\"candidate_detail_refs\":[{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""));
+    assert!(stdout.contains(
+        "\"candidate_detail_refs\":[{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""
+    ));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_env_secret_0001\""));
     assert!(stdout.contains("\"last_import_attempt\":null"));
     assert!(stdout.contains("\"native_operation_ids\":[]"));

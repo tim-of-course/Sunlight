@@ -161,7 +161,9 @@ Validation order:
 
 ## Operation Mapping
 
-Accepted imports become normal operation transactions. The mutation payload kind is `compat_import`, containing nested file operation payloads. Resolvers may either apply the nested operations directly or normalize them into the same internal patch/write/move/delete semantics used by Phase 1.
+Accepted imports become normal operation transactions. The mutation payload kind is `compat_import`, containing selected deltas and, when needed, nested file operation payloads. Resolvers may either apply the nested operations directly or normalize them into the same internal patch/write/move/delete/metadata semantics used by Phase 1.
+
+For single-operation candidates, the top-level `selected_deltas[]` fields are stable and sufficient: candidate ID, operation kind, path, before/result hashes, optional patch digest, classification, and privacy class. Composite candidates such as rename plus edit keep those top-level fields stable for compatibility, and may also include an `operations[]` array that exposes the ordered move plus patch/write semantics without splitting the selected candidate into multiple import requests.
 
 ```json
 {
@@ -261,9 +263,9 @@ Operation mapping rules:
 - Created files become whole-file writes with `expected_hash: "new"`.
 - Deleted files become delete operations with tombstoned path bindings.
 - Rename-only changes become move operations preserving artifact identity.
-- Rename-plus-edit changes become one transaction containing move plus patch/write deltas, preserving the original artifact identity when unambiguous.
-- Metadata changes become metadata operations when supported by the path policy and platform metadata model.
-- Generated source, lockfiles, migrations, and codegen outputs must be explicitly classified. They are not source by accident.
+- Rename-plus-edit changes become one selected candidate and one transaction containing nested move plus patch/write deltas, preserving the original artifact identity when unambiguous.
+- Metadata changes become metadata operations when supported by the path policy and platform metadata model; metadata-only imports preserve artifact identity and stable content hash.
+- Generated source, lockfiles, migrations, and codegen outputs must be explicitly classified and policy-approved. They are not imported as source by default.
 - Broad rewrites and formatter-like deltas may be imported, but they should be classified so later resolver checks can treat them as potentially non-commutative broad writes.
 
 ## Path Policy
@@ -356,13 +358,19 @@ Suggested error codes: `compat_projection_not_found`, `compat_projection_invalid
 | `compat_import_multiple_files_one_transaction` | Multiple selected safe deltas are imported atomically into one operation transaction owned by one topic/session. |
 | `compat_import_new_file_requires_new_precondition` | New source path imports as a write with absent before ref; if the path exists in the current session, import fails with unchanged state. |
 | `compat_import_delete_tombstones_path` | Selected deletion creates a delete delta, tombstones the path binding, and preserves artifact provenance. |
-| `compat_import_rename_preserves_artifact_id` | Unambiguous rename imports as move and keeps artifact ID/path history. |
-| `compat_import_rename_plus_edit_records_both` | Rename plus content change is one transaction with move and patch/write refs when source/target identity is unambiguous. |
+| `compat_import_rename_preserves_artifact_id` | Unambiguous rename imports as move, keeps artifact ID/path history, and records source before-ref plus target after-ref. |
+| `compat_import_metadata_preserves_artifact_id` | Metadata-only import keeps the artifact ID and unchanged content hash while recording the metadata operation. |
+| `compat_import_rename_plus_edit_records_both` | Rename plus content change is one selected candidate and one transaction with nested move plus patch/write operation details when source/target identity is unambiguous. |
 | `compat_import_rejects_stale_session_generation` | If the target session moved after diff, import returns `compat_precondition_failed` and writes no records. |
 | `compat_import_rejects_stale_projection_baseline` | If projection metadata no longer matches the baseline manifest or tree identity, import fails before diff bytes become durable. |
-| `compat_import_rejects_path_escape` | Symlink escape, absolute path, `..`, reserved `.sunlight` path, or normalization collision fails with path policy details. |
+| `compat_import_generated_source_policy_gated_by_default` | Generated source candidate remains a policy-gated failure unless an explicit policy conversion approves it. |
+| `compat_import_rejects_ambiguous_rename` | Ambiguous rename candidates fail atomically with candidate identity details and no operation/revision records. |
+| `compat_import_rejects_conflicted_delta` | Conflicted deltas fail atomically and require refresh, adaptation, or manual resolution before import. |
+| `compat_import_rejects_path_policy_blocked` | Symlink escape, absolute path, `..`, reserved `.sunlight` path, or normalization collision fails with path policy details. |
 | `compat_secret_quarantined_not_imported` | Secret-like selected delta creates quarantine metadata only, returns stable error, and no content blob/operation is reachable as source. |
 | `compat_cache_ignored_by_default` | Build/cache/editor output appears as ignored or cache classification and is not imported without explicit policy. |
+| `compat_import_no_candidate_returns_no_selected_changes` | Import with no selected candidate returns `compat_no_selected_changes` and leaves native state unchanged. |
+| `compat_import_missing_candidate_returns_diff_failed` | Import selecting a missing candidate ID returns a stable diff failure with the missing candidate ID and no partial write. |
 | `compat_import_atomic_failure_no_partial_write` | Mixed selected deltas with one blocked candidate create no operation or revision and leave session generation unchanged. |
 | `status_inspect_show_compat_projection_and_import` | `status --projection`, `status --session`, `inspect projection`, `inspect compat-import`, `inspect operation`, and `inspect artifact` expose matching projection/import/provenance IDs. |
 | `checkpoint_requires_imported_source_truth` | Checkpoint/export does not include projection-only edits; after successful import, the resulting topic revision can participate in resolved views and checkpoints. |

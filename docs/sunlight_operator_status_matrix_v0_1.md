@@ -54,6 +54,35 @@ If multiple conditions apply, expose the most blocking state and list supporting
 | Checkpoint | `frozen` requires exact conflict-free resolved view, tree identity, and selected evidence. `export_ready` additionally requires passing policy validation. Export refs may be appended after Git export, but the frozen tree and evidence do not change. |
 | Git export | `validated` is not exported. `exported` requires a persisted `git_export_map`. `partial` means Git artifacts were created but native mapping or ref update did not fully persist. Git commits remain compatibility artifacts, not native authorship. |
 
+## Policy Failure Operator Rules
+
+Commit and export policy failures are hard gates. Status and inspect surfaces
+may expose warnings for advisory conditions, but `commit_policy_failed` and
+`export_policy_failed` must keep the affected repository, checkpoint, or Git
+export in a blocked/failed state until native inputs are corrected. Validator
+report context may still name the abstract validator-layer code
+`policy_validation_failed`.
+
+For repository `policy_blocked` states caused by `policy.check-commit`, status
+must expose `commit_policy_failed`, the validation report ID when available,
+candidate path count, blocked path count, and the first blocking checks. Inspect
+must show the exact managed ignore block status, staged/requested `.sunlight`
+paths, blocked local/cache/quarantine/projection paths, raw execution paths,
+relevant `privacy_class` values, and any unsafe references found inside records.
+Safe operator actions are to restore the managed ignore block, remove local-only
+paths from the candidate set, promote generated output, import source through
+native IO, or rewrite native records through Sunlight commands.
+
+For checkpoint or Git export failures caused by `policy.check-export`, status
+must expose `export_policy_failed`, checkpoint ID, resolved view ID, tree
+identity, validation report ID, export target, hard-failure count, and the first
+blocking checks. Inspect must show checkpoint/view/evidence/export-map context,
+generated-output promotion requirements, local-only evidence references, invalid
+or moving refs, and target Git ref policy details. Safe operator actions are to
+rerun promotion/import/checkpoint/export planning with exact IDs and then rerun
+validation. Operators must not edit generated Git output, exported commits,
+target branches, or export-map records directly to bypass the gate.
+
 ## Cross-Surface Invariants
 
 - Every status response includes `data.command`, `data.repository_id` when initialized, `data.ids`, and `data.view` or `null`.

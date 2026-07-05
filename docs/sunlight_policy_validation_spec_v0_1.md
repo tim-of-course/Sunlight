@@ -151,7 +151,7 @@ export-map write with check `generated_policy` and code
 failure path; it is not a persistent execution store, provenance scanner, or
 filesystem diff inference mechanism.
 
-Failure responses use the standard envelope:
+Validator-layer failure responses use the standard envelope:
 
 ```json
 {
@@ -171,6 +171,72 @@ Failure responses use the standard envelope:
   }
 }
 ```
+
+## Operator Failure Guidance
+
+Policy validation failures are hard gates, not warnings. A failed
+`sun policy check-commit --json` surfaces the CLI error code
+`commit_policy_failed` and must stop Git transport until the native records or
+candidate path set are fixed. A failed
+`sun policy check-export --checkpoint <checkpoint-id> --json` surfaces
+`export_policy_failed`; `sun git export` uses the same CLI-facing error code
+when export validation blocks the operation. The lower-level validator report
+may still identify the abstract validator-layer failure as
+`policy_validation_failed`. Operators must not repair the failure by editing
+generated Git commits, export-map output, or projected Git files directly.
+
+For any failure, inspect the JSON fields before changing records:
+
+- `error.code` identifies the CLI blocking class, normally
+  `commit_policy_failed` for commit checks or `export_policy_failed` for export
+  checks. Nested validator report context may use `policy_validation_failed`.
+- `error.details.failures[].check` names the failed gate, such as
+  `ignore_policy`, `unsafe_reference`, `execution_raw_exclusion`,
+  `generated_policy`, `reachability`, or `size_budget`.
+- `error.details.failures[].path` identifies a blocked candidate path when the
+  problem is path based.
+- `error.details.failures[].record_id`, `checkpoint_id`, `resolved_view_id`,
+  `evidence_ref`, `export_target`, or `git_ref` identify the native object or
+  export target context when the problem is record based.
+- `error.details.failures[].reason` is the operator-facing explanation; it is
+  advisory text, while `check`, IDs, and paths are the stable repair handles.
+
+For `policy.check-commit` failures, first inspect the staged/requested
+`.sunlight` paths and the generated managed ignore block. The common repair is
+to rerun `sun init` or the relevant native command so the
+`# BEGIN SUNLIGHT MANAGED IGNORE` block again excludes `.sunlight/local/`,
+`.sunlight/cache/`, `.sunlight/projections/`, `.sunlight/quarantine/`, raw
+execution logs, and sandboxes. If a staged record points at those roots, a
+projection path, a cache path, a quarantine path, a local filesystem URI, or a
+raw execution path, fix the native record or rerun promotion/import so the
+record references an allowed summary, promoted operation output, exact object
+ID, or typed external reference instead.
+
+Safe operator actions for commit validation failures are limited to removing
+blocked local/cache/quarantine/projection paths from the candidate set,
+restoring the managed ignore block, promoting generated outputs into
+topic-owned operation transactions, importing source bytes through native IO,
+or rewriting the affected native record through Sunlight commands. Do not mark
+raw logs, sandboxes, caches, local leases, machine identity, or quarantine
+records as `commit_default` just to pass validation.
+
+For `policy.check-export` failures, inspect the checkpoint, resolved view,
+selected evidence, export-map draft, and target Git ref named in the report.
+Generated source, lockfiles, migrations, and formatter output selected into the
+exported project tree must have promotion provenance. Local-only evidence must
+stay represented as bounded summaries, digests, omission reasons, or approved
+external references. Moving refs such as `topic@head`, `main`, `latest`, or an
+unpinned Git target context must be replaced by exact checkpoint, topic
+revision, content, evidence, export-map, or allowed full Git ref identities
+before export validation runs again.
+
+Safe operator actions for export validation failures are to rerun checkpoint
+planning from an exact conflict-free resolved view, rerun promotion for
+generated outputs, import missing content into native records, select a
+different evidence policy, choose a valid non-moving export target, or rerun
+`sun policy check-export` after the native inputs are corrected. Do not edit
+the Git export output directly; exported Git history is a projection of the
+validated checkpoint and native records remain authoritative.
 
 ## Unsafe Reference Detection
 
@@ -239,6 +305,23 @@ sun policy explain <validation-report-id> --json
 ```
 
 Suggested success data:
+
+```json
+{
+  "command": "policy.check-commit",
+  "repository_id": "repo_01JZ0LOCAL",
+  "validation_report_id": "validation_sha256_1234",
+  "candidate": {
+    "kind": "sunlight_commit"
+  },
+  "summary": {
+    "records_checked": 8,
+    "payloads_checked": 1,
+    "warnings": 0,
+    "blocked": 0
+  }
+}
+```
 
 ```json
 {

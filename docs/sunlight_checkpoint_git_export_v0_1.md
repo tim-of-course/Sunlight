@@ -192,6 +192,49 @@ Policy-gated:
 
 Hard failures cannot be downgraded to warnings for `secret`, `local_only`, unsafe reference, missing reachability, raw execution inclusion, or conflicted view export.
 
+## Export Policy Failure Guidance
+
+`policy.check-export` failures are export blockers. When invoked directly,
+`sun policy check-export --checkpoint <checkpoint-id> --json` reports
+`export_policy_failed` and includes the validation report context. When the
+same hard failures are encountered through `sun git export`, the export command
+also reports `export_policy_failed`. In both cases, no Git commit, target ref
+update, or successful `git_export_map` may be claimed for the failed export.
+
+Operators should inspect these JSON fields before retrying:
+
+- `checkpoint_id`, `resolved_view_id`, `tree_identity`, and
+  `topic_frontier` to confirm the export is based on exact frozen native
+  inputs.
+- `validation_report_id` and `failures[].check` to identify the blocking gate.
+- `failures[].record_id`, `failures[].path`, `failures[].evidence_ref`, and
+  `failures[].export_target` to find the affected checkpoint, view, evidence,
+  content, or target-ref context.
+- `git_ref` or target-ref fields to confirm the ref is a valid full target ref
+  and not being used as native source truth.
+
+Common export repairs stay in native Sunlight records:
+
+- For `generated_policy` or `generated_output_requires_promotion`, rerun
+  promotion so generated source, lockfiles, migrations, formatter output, or
+  codegen output are represented by topic-owned operation transactions before
+  checkpoint/export planning.
+- For `unsafe_reference` or `execution_raw_exclusion`, replace raw logs,
+  sandbox paths, projection roots, local filesystem paths, cache refs, or
+  local-only evidence with safe execution summaries, redacted reports,
+  omission reasons, digests, or approved external references.
+- For `reachability`, import or recreate the missing native content, operation,
+  evidence, checkpoint, or export-map input and rerun checkpoint/export
+  planning from the exact IDs.
+- For moving selectors, replace `topic@head`, `main`, `latest`, unpinned view
+  specs, or ambiguous export target context with immutable checkpoint, topic
+  revision, content, evidence, export-map, and allowed full Git ref identities.
+
+Editing the exported Git tree, commit message, target branch, or export-map
+output directly is not a repair. The safe retry path is to correct native
+records or policy inputs, rerun promotion/import/checkpoint/export planning,
+rerun `policy.check-export`, and only then run Git export.
+
 ## Import Compatibility Boundaries
 
 Git import creates base checkpoints; Git export creates compatibility artifacts. Neither path changes native authorship rules.

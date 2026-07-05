@@ -42,7 +42,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Architecture source: `docs/sunlight_consolidated_architecture_v0_3.md`.
 - Integrated repo now has a Rust workspace with `sun` CLI and `sunlight-core`.
 - WSL Codex readiness: Ubuntu launches, Codex CLI responds, logged in using ChatGPT, bubblewrap available, and Rust/Cargo are available when launched with the helper PATH.
-- Verification: latest full pass ran after `d72b79d` and covered `815b49a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 148 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Optional Super Search validation passed after `e02debe`.
+- Verification: latest full pass ran after `d72b79d` and covered `815b49a`. Default `scripts/smoke-suite.ps1` passed via the Windows-native fallback with 148 CLI tests, 143 core tests, validation smoke, projection strategy smoke, and MVP smoke. Docs-only compat import alignment passed targeted `rg` and `git diff --check` after `d6162bd`. Optional Super Search validation passed after `e02debe`.
 
 ## Active Work
 
@@ -101,7 +101,7 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-metadata-success`: default `scripts/smoke-suite.ps1` passed after `f970f10`.
 - Completed slice `compat-import-rename-plus-edit-cli-coverage`: integrated as `815b49a`; WSL implementation was imported manager-side after WSL `cargo-fmt` was unavailable, with Windows `cargo fmt` and focused CLI verification.
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-rename-plus-edit`: default `scripts/smoke-suite.ps1` passed after `d72b79d`.
-- Active slice `compat-import-docs-acceptance-sync`: align compatibility import docs and validation plan notes with the implemented delete, rename, metadata, and rename-plus-edit coverage and nested operation-detail JSON.
+- Completed slice `compat-import-docs-acceptance-sync`: integrated as `d6162bd`; WSL docs-only implementation was imported manager-side after prompt quoting caused a nonzero helper exit, with targeted docs verification passing on Windows.
 
 ## Candidate Next Slices
 

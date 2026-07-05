@@ -571,6 +571,124 @@ fn write_json_fixture_basic_app_new_file_returns_mutation_success_envelope() {
 }
 
 #[test]
+fn move_json_fixture_basic_app_returns_structural_mutation_envelope() {
+    let repo = TestRepo::new("move-fixture");
+
+    let output = sun()
+        .arg("move")
+        .arg("src/auth.ts")
+        .arg("src/auth.renamed.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--expect-hash")
+        .arg("sha256:auth_base")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun move should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"artifact.move\""));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_auth_move_0001\""));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_0001\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_move_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
+    assert!(stdout.contains("\"path\":\"src/auth.renamed.ts\""));
+    assert!(stdout.contains("\"before_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"after_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"mutation\":\"move\""));
+    assert!(stdout.contains("\"expected_path\":\"src/auth.ts\""));
+    assert!(stdout.contains("\"expected_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"payload\":{\"kind\":\"move\""));
+    assert!(stdout.contains("\"source_path\":\"src/auth.ts\""));
+    assert!(stdout.contains("\"target_path\":\"src/auth.renamed.ts\""));
+    assert!(stdout
+        .contains("\"path_binding_removal\":{\"path\":\"src/auth.ts\",\"state\":\"tombstone\"}"));
+    assert!(stdout.contains(
+        "{\"artifact_id\":\"artifact_src_auth_ts\",\"path\":\"src/auth.ts\",\"path_state\":\"tombstone\",\"content_hash\":\"sha256:auth_base\""
+    ));
+    assert!(stdout.contains("\"warnings\":[]"));
+}
+
+#[test]
+fn delete_json_fixture_basic_app_returns_tombstone_mutation_envelope() {
+    let repo = TestRepo::new("delete-fixture");
+
+    let output = sun()
+        .arg("delete")
+        .arg("src/auth.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--expect-hash")
+        .arg("sha256:auth_base")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun delete should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"artifact.delete\""));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_auth_delete_0001\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_delete_0001\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
+    assert!(stdout.contains("\"path\":\"src/auth.ts\""));
+    assert!(stdout.contains("\"before_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"after_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"mutation\":\"delete\""));
+    assert!(stdout.contains("\"payload\":{\"kind\":\"delete\""));
+    assert!(stdout
+        .contains("\"path_binding_removal\":{\"path\":\"src/auth.ts\",\"state\":\"tombstone\"}"));
+    assert!(stdout.contains("\"tombstone\":true"));
+    assert!(stdout.contains("\"path_state\":\"tombstone\""));
+    assert!(stdout.contains("\"warnings\":[]"));
+}
+
+#[test]
+fn metadata_set_json_fixture_basic_app_returns_metadata_mutation_envelope() {
+    let repo = TestRepo::new("metadata-fixture");
+
+    let output = sun()
+        .arg("metadata")
+        .arg("set")
+        .arg("src/auth.ts")
+        .arg("--classification")
+        .arg("generated")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--expect-hash")
+        .arg("sha256:auth_base")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun metadata set should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"artifact.metadata_set\""));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_auth_metadata_0001\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_metadata_0001\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
+    assert!(stdout.contains("\"before_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"after_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"classification\":\"generated\""));
+    assert!(stdout.contains("\"mutation\":\"metadata_set\""));
+    assert!(stdout.contains("\"payload\":{\"kind\":\"metadata_set\""));
+    assert!(stdout.contains("\"classification_before\":\"source\""));
+    assert!(stdout.contains("\"classification_after\":\"generated\""));
+    assert!(stdout.contains("\"content_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"warnings\":[]"));
+}
+
+#[test]
 fn patch_json_fixture_basic_app_stale_hash_returns_precondition_failure() {
     let repo = TestRepo::new("patch-stale-fixture");
     let patch_file = repo.write_file("auth.patch", auth_trim_guard_patch());
@@ -590,6 +708,39 @@ fn patch_json_fixture_basic_app_stale_hash_returns_precondition_failure() {
         .current_dir(repo.path())
         .output()
         .expect("sun patch should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"ok\":false"));
+    assert!(stdout.contains("\"code\":\"precondition_failed\""));
+    assert!(stdout.contains("\"failed_precondition\":\"expected_hash\""));
+    assert!(stdout.contains("\"expected\":\"sha256:stale_auth\""));
+    assert!(stdout.contains("\"actual\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"artifact_id\":\"artifact_src_auth_ts\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_0001\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_base_0001\""));
+    assert!(!stdout.contains("operation_transaction_id"));
+    assert!(!stdout.contains("topic_revision_id"));
+}
+
+#[test]
+fn move_json_fixture_basic_app_stale_hash_returns_precondition_failure() {
+    let repo = TestRepo::new("move-stale-fixture");
+
+    let output = sun()
+        .arg("move")
+        .arg("src/auth.ts")
+        .arg("src/auth.renamed.ts")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--expect-hash")
+        .arg("sha256:stale_auth")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun move should run");
 
     assert_failure(&output);
     let stdout = stdout(&output);

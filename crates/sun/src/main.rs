@@ -5,13 +5,13 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 
 use sunlight_core::artifacts::{
-    ArtifactIoError, ArtifactKind, ContentBlob, ContentTree, ExpectedHash, InMemoryArtifactStore,
-    ListResponse, MutationArtifactView, MutationPayload, MutationRefs, MutationResponse,
-    PatchRequest, ReadResponse, SearchResponse, SessionView, SessionVisibleArtifactView, TreeEntry,
-    TreeIdentityView, WriteMode, WriteRequest, FILE_OPERATION_SEMANTICS_VERSION, FIXTURE_ACTOR_ID,
-    FIXTURE_REPOSITORY_ID, FIXTURE_RESOLVED_VIEW_ID, FIXTURE_SESSION_GENERATION_ID,
-    FIXTURE_SESSION_ID, FIXTURE_TREE_HASH, FIXTURE_WRITE_TOPIC_ID,
-    POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
+    ArtifactIoError, ArtifactKind, ContentBlob, ContentTree, DeleteRequest, ExpectedHash,
+    InMemoryArtifactStore, ListResponse, MetadataSetRequest, MoveRequest, MutationArtifactView,
+    MutationPayload, MutationRefs, MutationResponse, PatchRequest, ReadResponse, SearchResponse,
+    SessionView, SessionVisibleArtifactView, TreeEntry, TreeIdentityView, WriteMode, WriteRequest,
+    FILE_OPERATION_SEMANTICS_VERSION, FIXTURE_ACTOR_ID, FIXTURE_REPOSITORY_ID,
+    FIXTURE_RESOLVED_VIEW_ID, FIXTURE_SESSION_GENERATION_ID, FIXTURE_SESSION_ID, FIXTURE_TREE_HASH,
+    FIXTURE_WRITE_TOPIC_ID, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
 };
 use sunlight_core::checkpoint::{
     fixture_checkpoint_from_resolved_view, CheckpointRecord, CheckpointValidationError,
@@ -202,6 +202,11 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         [command, ..] if command == "search" => artifact_search(&ctx),
         [command, ..] if command == "patch" => artifact_patch(&ctx),
         [command, ..] if command == "write" => artifact_write(&ctx),
+        [command, ..] if command == "move" => artifact_move(&ctx),
+        [command, ..] if command == "delete" => artifact_delete(&ctx),
+        [scope, command, ..] if scope == "metadata" && command == "set" => {
+            artifact_metadata_set(&ctx)
+        }
         [command, ..] if command == "status" => status(&ctx),
         [command, ..] if command == "inspect" => inspect(&ctx),
         [command, ..] => Err(invalid_request(format!("unknown command `{command}`"))
@@ -413,6 +418,80 @@ fn artifact_write(ctx: &CommandContext) -> Result<(), CliError> {
             "wrote {} {}",
             response.artifact.path, response.artifact.after_hash
         );
+    }
+
+    Ok(())
+}
+
+fn artifact_move(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_mutation_options(ctx, "move", 2)?;
+    let expect_hash = options
+        .expect_hash
+        .ok_or_else(|| invalid_request("usage: sun move requires --expect-hash <hash>"))?;
+    let mut store = fixture_store(&options.fixture)?;
+    let response = store
+        .move_path(MoveRequest {
+            session_id: options.session_id,
+            source_path: options.operands[0].clone(),
+            target_path: options.operands[1].clone(),
+            expected_hash: expect_hash,
+        })
+        .map_err(artifact_error)?;
+
+    if ctx.json {
+        println!("{}", mutation_success_envelope(&response));
+    } else {
+        println!("moved {}", response.artifact.path);
+    }
+
+    Ok(())
+}
+
+fn artifact_delete(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_mutation_options(ctx, "delete", 1)?;
+    let expect_hash = options
+        .expect_hash
+        .ok_or_else(|| invalid_request("usage: sun delete requires --expect-hash <hash>"))?;
+    let mut store = fixture_store(&options.fixture)?;
+    let response = store
+        .delete_path(DeleteRequest {
+            session_id: options.session_id,
+            path: options.operands[0].clone(),
+            expected_hash: expect_hash,
+        })
+        .map_err(artifact_error)?;
+
+    if ctx.json {
+        println!("{}", mutation_success_envelope(&response));
+    } else {
+        println!("deleted {}", response.artifact.path);
+    }
+
+    Ok(())
+}
+
+fn artifact_metadata_set(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_mutation_options_with_skip(ctx, "metadata set", 1, 2)?;
+    let expect_hash = options
+        .expect_hash
+        .ok_or_else(|| invalid_request("usage: sun metadata set requires --expect-hash <hash>"))?;
+    let classification = options.classification.ok_or_else(|| {
+        invalid_request("usage: sun metadata set requires --classification <class>")
+    })?;
+    let mut store = fixture_store(&options.fixture)?;
+    let response = store
+        .metadata_set(MetadataSetRequest {
+            session_id: options.session_id,
+            path: options.operands[0].clone(),
+            expected_hash: expect_hash,
+            classification,
+        })
+        .map_err(artifact_error)?;
+
+    if ctx.json {
+        println!("{}", mutation_success_envelope(&response));
+    } else {
+        println!("updated metadata {}", response.artifact.path);
     }
 
     Ok(())
@@ -4310,6 +4389,15 @@ fn artifact_usage(command: &str) -> String {
         "write" => {
             "usage: sun write <path> --session <session> --fixture basic-app --expect-hash <hash-or-new> --content-file <file> --classification <class>"
         }
+        "move" => {
+            "usage: sun move <from> <to> --session <session> --fixture basic-app --expect-hash <hash>"
+        }
+        "delete" => {
+            "usage: sun delete <path> --session <session> --fixture basic-app --expect-hash <hash>"
+        }
+        "metadata set" => {
+            "usage: sun metadata set <path> --session <session> --fixture basic-app --expect-hash <hash> --classification <class>"
+        }
         _ => "usage: sun <artifact-command> --session <session> --fixture basic-app",
     }
     .to_string()
@@ -4320,6 +4408,15 @@ fn parse_mutation_options(
     command: &'static str,
     operand_count: usize,
 ) -> Result<MutationCommandOptions, CliError> {
+    parse_mutation_options_with_skip(ctx, command, operand_count, 1)
+}
+
+fn parse_mutation_options_with_skip(
+    ctx: &CommandContext,
+    command: &'static str,
+    operand_count: usize,
+    skip_args: usize,
+) -> Result<MutationCommandOptions, CliError> {
     let mut session_id = None;
     let mut fixture = None;
     let mut expect_hash = None;
@@ -4327,7 +4424,7 @@ fn parse_mutation_options(
     let mut content_file = None;
     let mut classification = None;
     let mut operands = Vec::new();
-    let mut args = ctx.args.iter().skip(1);
+    let mut args = ctx.args.iter().skip(skip_args);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -4365,7 +4462,9 @@ fn parse_mutation_options(
             }
             "--classification" => {
                 let value = args.next().ok_or_else(|| {
-                    invalid_request("usage: sun write requires --classification <class>")
+                    invalid_request(format!(
+                        "usage: sun {command} requires --classification <class>"
+                    ))
                 })?;
                 classification = Some(value.clone());
             }
@@ -9244,6 +9343,79 @@ fn mutation_payload_json(payload: &MutationPayload) -> String {
             executable,
             json_escape(classification),
         ),
+        MutationPayload::Move {
+            source_path,
+            target_path,
+            artifact_id,
+            content_hash,
+            source_path_state,
+            target_path_state,
+        } => format!(
+            concat!(
+                "{{",
+                "\"kind\":\"move\",",
+                "\"source_path\":\"{}\",",
+                "\"target_path\":\"{}\",",
+                "\"artifact_id\":\"{}\",",
+                "\"content_hash\":\"{}\",",
+                "\"path_binding_removal\":{{\"path\":\"{}\",\"state\":\"{}\"}},",
+                "\"path_binding_addition\":{{\"path\":\"{}\",\"state\":\"{}\"}}",
+                "}}"
+            ),
+            json_escape(source_path),
+            json_escape(target_path),
+            json_escape(artifact_id),
+            json_escape(content_hash),
+            json_escape(source_path),
+            json_escape(source_path_state),
+            json_escape(target_path),
+            json_escape(target_path_state),
+        ),
+        MutationPayload::Delete {
+            path,
+            artifact_id,
+            content_hash,
+            path_state,
+        } => format!(
+            concat!(
+                "{{",
+                "\"kind\":\"delete\",",
+                "\"path\":\"{}\",",
+                "\"artifact_id\":\"{}\",",
+                "\"content_hash\":\"{}\",",
+                "\"path_binding_removal\":{{\"path\":\"{}\",\"state\":\"{}\"}},",
+                "\"tombstone\":true",
+                "}}"
+            ),
+            json_escape(path),
+            json_escape(artifact_id),
+            json_escape(content_hash),
+            json_escape(path),
+            json_escape(path_state),
+        ),
+        MutationPayload::MetadataSet {
+            path,
+            artifact_id,
+            content_hash,
+            classification_before,
+            classification_after,
+        } => format!(
+            concat!(
+                "{{",
+                "\"kind\":\"metadata_set\",",
+                "\"path\":\"{}\",",
+                "\"artifact_id\":\"{}\",",
+                "\"content_hash\":\"{}\",",
+                "\"classification_before\":\"{}\",",
+                "\"classification_after\":\"{}\"",
+                "}}"
+            ),
+            json_escape(path),
+            json_escape(artifact_id),
+            json_escape(content_hash),
+            json_escape(classification_before),
+            json_escape(classification_after),
+        ),
     }
 }
 
@@ -9536,6 +9708,9 @@ Usage:
   sun search <query> --session <session> --fixture basic-app [--json]
   sun patch <path> --session <session> --fixture basic-app --expect-hash <hash> --patch-file <file> [--json]
   sun write <path> --session <session> --fixture basic-app --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]
+  sun move <from> <to> --session <session> --fixture basic-app --expect-hash <hash> [--json]
+  sun delete <path> --session <session> --fixture basic-app --expect-hash <hash> [--json]
+  sun metadata set <path> --session <session> --fixture basic-app --expect-hash <hash> --classification <class> [--json]
   sun view resolve --fixture basic-app --include topic:revision[,topic:revision] [--json]
   sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app [--projection-root <empty-path>] [--json]
   sun projection quarantine-cleanup --projection <projection-id> --projection-root <path> --fixture basic-app [--json]

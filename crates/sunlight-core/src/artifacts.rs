@@ -227,9 +227,35 @@ pub struct WriteRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveRequest {
+    pub session_id: String,
+    pub source_path: String,
+    pub target_path: String,
+    pub expected_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRequest {
+    pub session_id: String,
+    pub path: String,
+    pub expected_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataSetRequest {
+    pub session_id: String,
+    pub path: String,
+    pub expected_hash: String,
+    pub classification: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MutationKind {
     Patch,
     Write,
+    Move,
+    Delete,
+    MetadataSet,
 }
 
 impl MutationKind {
@@ -237,6 +263,9 @@ impl MutationKind {
         match self {
             Self::Patch => "patch",
             Self::Write => "write",
+            Self::Move => "move",
+            Self::Delete => "delete",
+            Self::MetadataSet => "metadata_set",
         }
     }
 }
@@ -273,6 +302,27 @@ pub enum MutationPayload {
         media_type: String,
         executable: bool,
         classification: String,
+    },
+    Move {
+        source_path: String,
+        target_path: String,
+        artifact_id: String,
+        content_hash: String,
+        source_path_state: String,
+        target_path_state: String,
+    },
+    Delete {
+        path: String,
+        artifact_id: String,
+        content_hash: String,
+        path_state: String,
+    },
+    MetadataSet {
+        path: String,
+        artifact_id: String,
+        content_hash: String,
+        classification_before: String,
+        classification_after: String,
     },
 }
 
@@ -887,6 +937,200 @@ impl InMemoryArtifactStore {
         })
     }
 
+    pub fn move_path(&mut self, request: MoveRequest) -> Result<MutationResponse, ArtifactIoError> {
+        self.ensure_session(&request.session_id)?;
+        let source_path = self.path_policy.validate(&request.source_path)?;
+        let target_path = self.path_policy.validate(&request.target_path)?;
+        let entry = self.entry_for_path(&source_path)?.clone();
+        if self
+            .tree
+            .entries
+            .iter()
+            .any(|entry| entry.path == target_path && !entry.tombstone)
+        {
+            return Err(ArtifactIoError::PreconditionFailed {
+                failed_precondition: "expected_target_absent".to_string(),
+                path: target_path,
+                artifact_id: Some(entry.artifact_id),
+                expected: "absent".to_string(),
+                actual: Some("active".to_string()),
+                session_generation_id: self.view.session_generation_id.clone(),
+                resolved_view_id: self.view.resolved_view_id.clone(),
+            });
+        }
+        if entry.content_ref != request.expected_hash {
+            return Err(ArtifactIoError::PreconditionFailed {
+                failed_precondition: "expected_hash".to_string(),
+                path: source_path,
+                artifact_id: Some(entry.artifact_id),
+                expected: request.expected_hash,
+                actual: Some(entry.content_ref),
+                session_generation_id: self.view.session_generation_id.clone(),
+                resolved_view_id: self.view.resolved_view_id.clone(),
+            });
+        }
+
+        self.accept_structural_mutation(StructuralMutation {
+            session_id: request.session_id,
+            kind: MutationKind::Move,
+            path: target_path.clone(),
+            artifact_id: entry.artifact_id.clone(),
+            before_hash: Some(entry.content_ref.clone()),
+            after_hash: entry.content_ref.clone(),
+            classification: self.artifact_classification(&entry.artifact_id)?,
+            executable: entry.executable,
+            expected_path: source_path.clone(),
+            expected_hash: ExpectedHash::Existing(request.expected_hash),
+            payload: MutationPayload::Move {
+                source_path: source_path.clone(),
+                target_path: target_path.clone(),
+                artifact_id: entry.artifact_id.clone(),
+                content_hash: entry.content_ref.clone(),
+                source_path_state: "tombstone".to_string(),
+                target_path_state: "active".to_string(),
+            },
+            before_refs: vec![MutationArtifactRef {
+                artifact_id: Some(entry.artifact_id.clone()),
+                path: source_path.clone(),
+                path_state: "active".to_string(),
+                content_hash: Some(entry.content_ref.clone()),
+                executable: Some(entry.executable),
+                classification: Some(self.artifact_classification(&entry.artifact_id)?),
+            }],
+            after_refs: vec![
+                MutationArtifactRef {
+                    artifact_id: Some(entry.artifact_id.clone()),
+                    path: source_path.clone(),
+                    path_state: "tombstone".to_string(),
+                    content_hash: Some(entry.content_ref.clone()),
+                    executable: Some(entry.executable),
+                    classification: Some(self.artifact_classification(&entry.artifact_id)?),
+                },
+                MutationArtifactRef {
+                    artifact_id: Some(entry.artifact_id.clone()),
+                    path: target_path.clone(),
+                    path_state: "active".to_string(),
+                    content_hash: Some(entry.content_ref.clone()),
+                    executable: Some(entry.executable),
+                    classification: Some(self.artifact_classification(&entry.artifact_id)?),
+                },
+            ],
+        })
+    }
+
+    pub fn delete_path(
+        &mut self,
+        request: DeleteRequest,
+    ) -> Result<MutationResponse, ArtifactIoError> {
+        self.ensure_session(&request.session_id)?;
+        let path = self.path_policy.validate(&request.path)?;
+        let entry = self.entry_for_path(&path)?.clone();
+        if entry.content_ref != request.expected_hash {
+            return Err(ArtifactIoError::PreconditionFailed {
+                failed_precondition: "expected_hash".to_string(),
+                path,
+                artifact_id: Some(entry.artifact_id),
+                expected: request.expected_hash,
+                actual: Some(entry.content_ref),
+                session_generation_id: self.view.session_generation_id.clone(),
+                resolved_view_id: self.view.resolved_view_id.clone(),
+            });
+        }
+        let classification = self.artifact_classification(&entry.artifact_id)?;
+
+        self.accept_structural_mutation(StructuralMutation {
+            session_id: request.session_id,
+            kind: MutationKind::Delete,
+            path: path.clone(),
+            artifact_id: entry.artifact_id.clone(),
+            before_hash: Some(entry.content_ref.clone()),
+            after_hash: entry.content_ref.clone(),
+            classification: classification.clone(),
+            executable: entry.executable,
+            expected_path: path.clone(),
+            expected_hash: ExpectedHash::Existing(request.expected_hash),
+            payload: MutationPayload::Delete {
+                path: path.clone(),
+                artifact_id: entry.artifact_id.clone(),
+                content_hash: entry.content_ref.clone(),
+                path_state: "tombstone".to_string(),
+            },
+            before_refs: vec![MutationArtifactRef {
+                artifact_id: Some(entry.artifact_id.clone()),
+                path: path.clone(),
+                path_state: "active".to_string(),
+                content_hash: Some(entry.content_ref.clone()),
+                executable: Some(entry.executable),
+                classification: Some(classification.clone()),
+            }],
+            after_refs: vec![MutationArtifactRef {
+                artifact_id: Some(entry.artifact_id.clone()),
+                path: path.clone(),
+                path_state: "tombstone".to_string(),
+                content_hash: Some(entry.content_ref.clone()),
+                executable: Some(entry.executable),
+                classification: Some(classification),
+            }],
+        })
+    }
+
+    pub fn metadata_set(
+        &mut self,
+        request: MetadataSetRequest,
+    ) -> Result<MutationResponse, ArtifactIoError> {
+        self.ensure_session(&request.session_id)?;
+        let path = self.path_policy.validate(&request.path)?;
+        let entry = self.entry_for_path(&path)?.clone();
+        if entry.content_ref != request.expected_hash {
+            return Err(ArtifactIoError::PreconditionFailed {
+                failed_precondition: "expected_hash".to_string(),
+                path,
+                artifact_id: Some(entry.artifact_id),
+                expected: request.expected_hash,
+                actual: Some(entry.content_ref),
+                session_generation_id: self.view.session_generation_id.clone(),
+                resolved_view_id: self.view.resolved_view_id.clone(),
+            });
+        }
+        let classification_before = self.artifact_classification(&entry.artifact_id)?;
+
+        self.accept_structural_mutation(StructuralMutation {
+            session_id: request.session_id,
+            kind: MutationKind::MetadataSet,
+            path: path.clone(),
+            artifact_id: entry.artifact_id.clone(),
+            before_hash: Some(entry.content_ref.clone()),
+            after_hash: entry.content_ref.clone(),
+            classification: request.classification.clone(),
+            executable: entry.executable,
+            expected_path: path.clone(),
+            expected_hash: ExpectedHash::Existing(request.expected_hash),
+            payload: MutationPayload::MetadataSet {
+                path: path.clone(),
+                artifact_id: entry.artifact_id.clone(),
+                content_hash: entry.content_ref.clone(),
+                classification_before: classification_before.clone(),
+                classification_after: request.classification.clone(),
+            },
+            before_refs: vec![MutationArtifactRef {
+                artifact_id: Some(entry.artifact_id.clone()),
+                path: path.clone(),
+                path_state: "active".to_string(),
+                content_hash: Some(entry.content_ref.clone()),
+                executable: Some(entry.executable),
+                classification: Some(classification_before),
+            }],
+            after_refs: vec![MutationArtifactRef {
+                artifact_id: Some(entry.artifact_id.clone()),
+                path: path.clone(),
+                path_state: "active".to_string(),
+                content_hash: Some(entry.content_ref.clone()),
+                executable: Some(entry.executable),
+                classification: Some(request.classification),
+            }],
+        })
+    }
+
     pub fn operations(&self) -> &[OperationTransactionRecord] {
         &self.operations
     }
@@ -1104,6 +1348,9 @@ impl InMemoryArtifactStore {
             command: match mutation.kind {
                 MutationKind::Patch => "artifact.patch",
                 MutationKind::Write => "artifact.write",
+                MutationKind::Move => "artifact.move",
+                MutationKind::Delete => "artifact.delete",
+                MutationKind::MetadataSet => "artifact.metadata_set",
             },
             repository_id: self.repository_id.clone(),
             session_id: mutation.session_id,
@@ -1121,6 +1368,207 @@ impl InMemoryArtifactStore {
             topic_revision,
             session_generation,
         })
+    }
+
+    fn accept_structural_mutation(
+        &mut self,
+        mutation: StructuralMutation,
+    ) -> Result<MutationResponse, ArtifactIoError> {
+        let prior_view = self.view.clone();
+        let prior_tree_identity = self.view.tree_identity.clone();
+        let next_revision_number = self.revision_number + 1;
+        let parent_revision_id = self.parent_topic_revision_id.clone();
+        let tree_hash = fixture_tree_hash(&mutation.kind, next_revision_number);
+        let resolved_view_id = fixture_resolved_view_id(&mutation.kind, next_revision_number);
+        let session_generation_id = format!("gen_agent_a_{:04}", self.generation_number + 1);
+        let operation_id =
+            fixture_operation_id(&mutation.kind, &mutation.path, next_revision_number);
+        let topic_revision_id = format!("rev_auth_nullability_{next_revision_number:04}");
+        let after_tree_identity = TreeIdentityView {
+            kind: "SingleRepoTree".to_string(),
+            repository_id: self.repository_id.clone(),
+            tree_hash: tree_hash.clone(),
+        };
+        let preconditions = MutationPreconditions {
+            resolved_view_id: prior_view.resolved_view_id.clone(),
+            session_generation_id: prior_view.session_generation_id.clone(),
+            write_topic_id: self.write_topic_id.clone(),
+            parent_topic_revision_id: parent_revision_id.clone(),
+            path_policy_id: self.path_policy.id.clone(),
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            expected_path: mutation.expected_path.clone(),
+            expected_hash: mutation.expected_hash.clone(),
+        };
+        let write_set = vec![WriteSetEntry {
+            artifact_id: mutation.artifact_id.clone(),
+            path: mutation.path.clone(),
+            mutation: mutation.kind.clone(),
+        }];
+        let operation = OperationTransactionRecord {
+            id: operation_id.clone(),
+            repository_id: self.repository_id.clone(),
+            topic_id: self.write_topic_id.clone(),
+            session_id: mutation.session_id.clone(),
+            session_generation_id: prior_view.session_generation_id.clone(),
+            actor_id: self.actor_id.clone(),
+            authored_context_id: format!("ctx_agent_a_gen_{:04}", self.generation_number),
+            preconditions,
+            read_set: "full_authored_context".to_string(),
+            write_set: write_set.clone(),
+            mutation_payload: mutation.payload.clone(),
+            before_refs: MutationRefs {
+                artifacts: mutation.before_refs.clone(),
+                tree_identity: prior_tree_identity,
+            },
+            after_refs: MutationRefs {
+                artifacts: mutation.after_refs.clone(),
+                tree_identity: after_tree_identity.clone(),
+            },
+            classification: mutation.classification.clone(),
+            parent_topic_revision_id: parent_revision_id.clone(),
+            next_topic_revision_number: next_revision_number,
+            parents: parent_revision_id.iter().cloned().collect(),
+        };
+        let topic_revision = TopicRevisionRecord {
+            id: topic_revision_id.clone(),
+            repository_id: self.repository_id.clone(),
+            topic_id: self.write_topic_id.clone(),
+            revision_number: next_revision_number,
+            parent_revision_id,
+            operation_transaction_id: operation_id.clone(),
+            tree_delta_ref: format!("delta_mutation_{next_revision_number:04}"),
+            dependency_revision_ids: Vec::new(),
+        };
+        let session_generation = SessionGenerationMutationRecord {
+            id: session_generation_id.clone(),
+            repository_id: self.repository_id.clone(),
+            session_id: mutation.session_id.clone(),
+            write_topic_id: self.write_topic_id.clone(),
+            base_resolved_view_id: FIXTURE_RESOLVED_VIEW_ID.to_string(),
+            resolved_view_id: resolved_view_id.clone(),
+            topic_frontier: BTreeMap::from([(
+                self.write_topic_id.clone(),
+                topic_revision_id.clone(),
+            )]),
+            generation_number: self.generation_number + 1,
+            refresh_policy: "pinned_except_own_topic".to_string(),
+            created_by_operation_id: operation_id,
+        };
+
+        match &mutation.payload {
+            MutationPayload::Move {
+                source_path,
+                target_path,
+                ..
+            } => {
+                if let Some(entry) = self
+                    .tree
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.path == *source_path && !entry.tombstone)
+                {
+                    entry.tombstone = true;
+                }
+                self.tree.entries.push(TreeEntry {
+                    path: target_path.clone(),
+                    artifact_id: mutation.artifact_id.clone(),
+                    content_ref: mutation.after_hash.clone(),
+                    kind: ArtifactKind::File,
+                    executable: mutation.executable,
+                    tombstone: false,
+                });
+                if let Some(artifact) = self.artifacts.get_mut(&mutation.artifact_id) {
+                    artifact.path_bindings.push(PathBinding {
+                        path: source_path.clone(),
+                        state: PathBindingState::Tombstone,
+                        introduced_by_operation_id: operation.id.clone(),
+                    });
+                    artifact.path_bindings.push(PathBinding {
+                        path: target_path.clone(),
+                        state: PathBindingState::Active,
+                        introduced_by_operation_id: operation.id.clone(),
+                    });
+                }
+            }
+            MutationPayload::Delete { path, .. } => {
+                if let Some(entry) = self
+                    .tree
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.path == *path && !entry.tombstone)
+                {
+                    entry.tombstone = true;
+                }
+                if let Some(artifact) = self.artifacts.get_mut(&mutation.artifact_id) {
+                    artifact.path_bindings.push(PathBinding {
+                        path: path.clone(),
+                        state: PathBindingState::Tombstone,
+                        introduced_by_operation_id: operation.id.clone(),
+                    });
+                }
+            }
+            MutationPayload::MetadataSet { .. } => {
+                if let Some(artifact) = self.artifacts.get_mut(&mutation.artifact_id) {
+                    artifact.classification = mutation.classification.clone();
+                }
+                if let Some(blob) = self.blobs.get_mut(&mutation.after_hash) {
+                    blob.classification = mutation.classification.clone();
+                }
+            }
+            MutationPayload::Patch { .. } | MutationPayload::Write { .. } => {}
+        }
+
+        self.tree
+            .entries
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        self.tree.tree_hash = tree_hash.clone();
+        self.tree.id = tree_hash;
+        self.view = SessionView {
+            resolved_view_id,
+            session_generation_id,
+            tree_identity: after_tree_identity,
+        };
+        self.generation_number += 1;
+        self.revision_number = next_revision_number;
+        self.parent_topic_revision_id = Some(topic_revision_id);
+        self.operations.push(operation.clone());
+        self.topic_revisions.push(topic_revision.clone());
+        self.session_generations.push(session_generation.clone());
+
+        Ok(MutationResponse {
+            command: match mutation.kind {
+                MutationKind::Patch => "artifact.patch",
+                MutationKind::Write => "artifact.write",
+                MutationKind::Move => "artifact.move",
+                MutationKind::Delete => "artifact.delete",
+                MutationKind::MetadataSet => "artifact.metadata_set",
+            },
+            repository_id: self.repository_id.clone(),
+            session_id: mutation.session_id,
+            view: self.view.clone(),
+            artifact: MutationArtifactView {
+                artifact_id: mutation.artifact_id,
+                path: mutation.path,
+                kind: ArtifactKind::File,
+                before_hash: mutation.before_hash,
+                after_hash: mutation.after_hash,
+                classification: mutation.classification,
+                executable: mutation.executable,
+            },
+            operation,
+            topic_revision,
+            session_generation,
+        })
+    }
+
+    fn artifact_classification(&self, artifact_id: &str) -> Result<String, ArtifactIoError> {
+        self.artifacts
+            .get(artifact_id)
+            .map(|artifact| artifact.classification.clone())
+            .ok_or_else(|| ArtifactIoError::PathNotFound {
+                path: artifact_id.to_string(),
+                session_generation_id: self.view.session_generation_id.clone(),
+            })
     }
 
     fn ensure_session(&self, session_id: &str) -> Result<(), ArtifactIoError> {
@@ -1240,6 +1688,22 @@ struct AcceptMutation {
     expected_hash: ExpectedHash,
 }
 
+struct StructuralMutation {
+    session_id: String,
+    kind: MutationKind,
+    path: String,
+    artifact_id: String,
+    before_hash: Option<String>,
+    after_hash: String,
+    classification: String,
+    executable: bool,
+    expected_path: String,
+    expected_hash: ExpectedHash,
+    payload: MutationPayload,
+    before_refs: Vec<MutationArtifactRef>,
+    after_refs: Vec<MutationArtifactRef>,
+}
+
 #[derive(Clone, Copy)]
 struct FixtureFile {
     path: &'static str,
@@ -1325,6 +1789,9 @@ fn fixture_patch_digest(patch: &str) -> String {
 fn fixture_tree_hash(kind: &MutationKind, revision_number: u64) -> String {
     match (kind, revision_number) {
         (MutationKind::Patch, 1) => "tree_after_auth_patch_0001".to_string(),
+        (MutationKind::Move, 1) => "tree_after_auth_move_0001".to_string(),
+        (MutationKind::Delete, 1) => "tree_after_auth_delete_0001".to_string(),
+        (MutationKind::MetadataSet, 1) => "tree_after_auth_metadata_0001".to_string(),
         (MutationKind::Write, 2) => "tree_after_session_write_0002".to_string(),
         (MutationKind::Write, 1) => "tree_after_session_write_0001".to_string(),
         _ => format!("tree_after_mutation_{revision_number:04}"),
@@ -1334,6 +1801,9 @@ fn fixture_tree_hash(kind: &MutationKind, revision_number: u64) -> String {
 fn fixture_resolved_view_id(kind: &MutationKind, revision_number: u64) -> String {
     match (kind, revision_number) {
         (MutationKind::Patch, 1) => "view_agent_a_after_patch_0001".to_string(),
+        (MutationKind::Move, 1) => "view_agent_a_after_move_0001".to_string(),
+        (MutationKind::Delete, 1) => "view_agent_a_after_delete_0001".to_string(),
+        (MutationKind::MetadataSet, 1) => "view_agent_a_after_metadata_0001".to_string(),
         (MutationKind::Write, 2) => "view_agent_a_after_write_0002".to_string(),
         (MutationKind::Write, 1) => "view_agent_a_after_write_0001".to_string(),
         _ => format!("view_agent_a_after_mutation_{revision_number:04}"),
@@ -1343,6 +1813,9 @@ fn fixture_resolved_view_id(kind: &MutationKind, revision_number: u64) -> String
 fn fixture_operation_id(kind: &MutationKind, path: &str, revision_number: u64) -> String {
     match (kind, path, revision_number) {
         (MutationKind::Patch, "src/auth.ts", 1) => "op_auth_trim_guard_0001".to_string(),
+        (MutationKind::Move, "src/auth.renamed.ts", 1) => "op_auth_move_0001".to_string(),
+        (MutationKind::Delete, "src/auth.ts", 1) => "op_auth_delete_0001".to_string(),
+        (MutationKind::MetadataSet, "src/auth.ts", 1) => "op_auth_metadata_0001".to_string(),
         (MutationKind::Write, "src/session.ts", 2) => "op_write_session_ts_0001".to_string(),
         (MutationKind::Write, "src/session.ts", 1) => "op_write_session_ts_0001".to_string(),
         _ => format!("op_mutation_{revision_number:04}"),

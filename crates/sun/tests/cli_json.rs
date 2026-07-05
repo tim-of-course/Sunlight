@@ -2905,12 +2905,12 @@ fn compat_diff_json_fixture_basic_app_returns_candidate_surface() {
     assert!(stdout.contains(
         "\"tree_identity\":{\"kind\":\"SingleRepoTree\",\"repository_id\":\"repo_fixture_basic_app\",\"tree_hash\":\"tree_fixture_base_0001\"}"
     ));
-    assert!(stdout.contains("\"candidate_counts\":{\"total\":8"));
+    assert!(stdout.contains("\"candidate_counts\":{\"total\":9"));
     assert!(stdout.contains(
-        "\"by_classification\":{\"cache\":1,\"generated\":1,\"policy\":1,\"secret\":1,\"source\":4}"
+        "\"by_classification\":{\"cache\":1,\"generated\":1,\"policy\":1,\"secret\":1,\"source\":5}"
     ));
     assert!(stdout.contains(
-        "\"by_kind\":{\"cache_or_build_output\":1,\"conflicted_delta\":1,\"created_source\":1,\"generated_source\":1,\"modified_source\":1,\"moved_or_renamed\":1,\"path_policy_blocked\":1,\"secret_like\":1}"
+        "\"by_kind\":{\"cache_or_build_output\":1,\"conflicted_delta\":1,\"created_source\":1,\"deleted_source\":1,\"generated_source\":1,\"modified_source\":1,\"moved_or_renamed\":1,\"path_policy_blocked\":1,\"secret_like\":1}"
     ));
     assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
     assert!(stdout.contains(
@@ -2926,6 +2926,14 @@ fn compat_diff_json_fixture_basic_app_returns_candidate_surface() {
     assert!(stdout.contains("\"path\":\"src/auth.conflicted.ts\""));
     assert!(stdout.contains(
         "\"path_policy_result\":{\"allowed\":true,\"normalized_path\":\"src/auth.conflicted.ts\",\"reason\":null}"
+    ));
+    assert!(stdout.contains("\"candidate_delta_id\":\"compat_delta_src_auth_delete_0001\""));
+    assert!(stdout.contains("\"kind\":\"deleted_source\""));
+    assert!(stdout.contains("\"operation_kind\":\"delete\""));
+    assert!(stdout.contains("\"before_hash\":\"sha256:auth_base\""));
+    assert!(stdout.contains("\"after_hash\":null"));
+    assert!(stdout.contains(
+        "\"path_policy_result\":{\"allowed\":true,\"normalized_path\":\"src/auth.ts\",\"reason\":null}"
     ));
     assert!(stdout.contains("\"candidate_delta_id\":\"compat_delta_auth_rename_ambiguous_0001\""));
     assert!(stdout.contains("\"kind\":\"moved_or_renamed\""));
@@ -3017,6 +3025,56 @@ fn compat_import_json_fixture_candidate_returns_operation_plan() {
     assert!(stdout.contains("\"projection_purpose\":\"compatibility\""));
     assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
     assert!(stdout.contains("\"baseline_manifest_digest\":\"sha256:compat_baseline\""));
+    assert!(stdout.contains(
+        "\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_compat_0001\"}"
+    ));
+}
+
+#[test]
+fn compat_import_delete_tombstones_path_json_fixture_returns_operation_plan() {
+    let repo = TestRepo::new("compat-import-delete-tombstones-path");
+
+    let output = sun()
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg("projection_compat_agent_a_0001")
+        .arg("--candidate")
+        .arg("compat_delta_src_auth_delete_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat import should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"command\":\"compat.import\""));
+    assert!(stdout.contains("\"operation_transaction_id\":\"op_compat_import_auth_0001\""));
+    assert!(stdout.contains("\"topic_revision_id\":\"rev_auth_nullability_compat_0001\""));
+    assert!(stdout.contains("\"session_generation_id\":\"gen_agent_a_compat_0002\""));
+    assert!(stdout.contains("\"resolved_view_id\":\"view_agent_a_after_compat_import_0001\""));
+    assert!(stdout.contains("\"selected_delta_count\":1"));
+    assert!(stdout.contains("\"candidate_delta_ids\":[\"compat_delta_src_auth_delete_0001\"]"));
+    assert!(
+        stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_delete_0001\"]")
+    );
+    assert!(stdout.contains(
+        "\"imported_artifacts\":[{\"candidate_delta_id\":\"compat_delta_src_auth_delete_0001\",\"artifact_id\":\"artifact_src_auth_ts\",\"path\":\"src/auth.ts\",\"operation_kind\":\"delete\",\"before_hash\":\"sha256:auth_base\",\"after_hash\":null"
+    ));
+    assert!(stdout.contains(
+        "\"selected_deltas\":[{\"candidate_delta_id\":\"compat_delta_src_auth_delete_0001\",\"operation_kind\":\"delete\",\"path\":\"src/auth.ts\",\"patch_digest\":null,\"base_content_hash\":\"sha256:auth_base\",\"result_content_hash\":null"
+    ));
+    assert!(stdout.contains(
+        "\"write_set\":[{\"artifact_id\":\"artifact_src_auth_ts\",\"path\":\"src/auth.ts\",\"mutation\":\"write\"}]"
+    ));
+    assert!(stdout.contains(
+        "\"before_refs\":{\"artifacts\":[{\"artifact_id\":\"artifact_src_auth_ts\",\"path\":\"src/auth.ts\",\"path_state\":\"active\",\"content_hash\":\"sha256:auth_base\""
+    ));
+    assert!(stdout.contains(
+        "\"after_refs\":{\"artifacts\":[{\"artifact_id\":\"artifact_src_auth_ts\",\"path\":\"src/auth.ts\",\"path_state\":\"tombstone\",\"content_hash\":null"
+    ));
     assert!(stdout.contains(
         "\"topic_frontier\":{\"topic_auth_nullability\":\"rev_auth_nullability_compat_0001\"}"
     ));
@@ -5009,12 +5067,12 @@ fn status_json_fixture_compat_projection_reports_dirty_candidates() {
     assert!(stdout.contains("\"projection_id\":\"projection_compat_agent_a_0001\""));
     assert!(stdout.contains("\"purpose\":\"compatibility\""));
     assert!(stdout.contains("\"retention_state\":\"active\""));
-    assert!(stdout.contains("\"candidate_counts\":{\"total\":8"));
+    assert!(stdout.contains("\"candidate_counts\":{\"total\":9"));
     assert!(stdout.contains(
-        "\"by_classification\":{\"cache\":1,\"generated\":1,\"policy\":1,\"secret\":1,\"source\":4}"
+        "\"by_classification\":{\"cache\":1,\"generated\":1,\"policy\":1,\"secret\":1,\"source\":5}"
     ));
     assert!(stdout.contains(
-        "\"by_kind\":{\"cache_or_build_output\":1,\"conflicted_delta\":1,\"created_source\":1,\"generated_source\":1,\"modified_source\":1,\"moved_or_renamed\":1,\"path_policy_blocked\":1,\"secret_like\":1}"
+        "\"by_kind\":{\"cache_or_build_output\":1,\"conflicted_delta\":1,\"created_source\":1,\"deleted_source\":1,\"generated_source\":1,\"modified_source\":1,\"moved_or_renamed\":1,\"path_policy_blocked\":1,\"secret_like\":1}"
     ));
     assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
     assert!(stdout.contains(
@@ -5087,17 +5145,18 @@ fn inspect_json_fixture_compat_projection_reports_baseline_policy_and_candidates
     assert!(stdout
         .contains("\"path_policy\":{\"path_policy_id\":\"path_policy_posix_case_sensitive_v1\""));
     assert!(stdout.contains("\"writable_import_policy\":{\"writable_policy\":\"writable_with_explicit_import\",\"import_required\":true"));
-    assert!(stdout.contains("\"candidate_summary\":{\"candidate_counts\":{\"total\":8"));
+    assert!(stdout.contains("\"candidate_summary\":{\"candidate_counts\":{\"total\":9"));
     assert!(stdout.contains(
-        "\"by_classification\":{\"cache\":1,\"generated\":1,\"policy\":1,\"secret\":1,\"source\":4}"
+        "\"by_classification\":{\"cache\":1,\"generated\":1,\"policy\":1,\"secret\":1,\"source\":5}"
     ));
     assert!(stdout.contains(
-        "\"by_kind\":{\"cache_or_build_output\":1,\"conflicted_delta\":1,\"created_source\":1,\"generated_source\":1,\"modified_source\":1,\"moved_or_renamed\":1,\"path_policy_blocked\":1,\"secret_like\":1}"
+        "\"by_kind\":{\"cache_or_build_output\":1,\"conflicted_delta\":1,\"created_source\":1,\"deleted_source\":1,\"generated_source\":1,\"modified_source\":1,\"moved_or_renamed\":1,\"path_policy_blocked\":1,\"secret_like\":1}"
     ));
     assert!(stdout.contains("\"selected_candidate_delta_ids\":[\"compat_delta_src_auth_ts_0001\"]"));
     assert!(stdout.contains(
         "\"candidate_detail_refs\":[{\"candidate_delta_id\":\"compat_delta_src_auth_ts_0001\""
     ));
+    assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_src_auth_delete_0001\""));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_src_auth_conflict_0001\""));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_auth_rename_ambiguous_0001\""));
     assert!(stdout.contains("\"detail_ref\":\"local://.sunlight/projections/compatibility/projection_compat_agent_a_0001/candidate-deltas/compat_delta_generated_schema_0001\""));

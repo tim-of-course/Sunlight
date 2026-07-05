@@ -515,6 +515,27 @@ pub fn fixture_basic_app_candidate_deltas() -> Vec<CompatCandidateDelta> {
             quarantine_ref: None,
         },
         CompatCandidateDelta {
+            candidate_delta_id: "compat_delta_ignored_editor_swap_0001".to_string(),
+            kind: CompatCandidateKind::IgnoredPath,
+            operation_kind: CompatFileOperationKind::Write,
+            artifact_id: None,
+            path: "tmp/auth.ts.swp".to_string(),
+            source_path: None,
+            before_hash: None,
+            after_hash: Some("sha256:ignored_editor_swap_local".to_string()),
+            byte_length: 96,
+            executable: false,
+            media_type: "application/octet-stream".to_string(),
+            classification: "ignored".to_string(),
+            privacy_class: PrivacyClass::LocalOnly,
+            path_policy_result: CompatPathPolicyResult {
+                allowed: true,
+                normalized_path: Some("tmp/auth.ts.swp".to_string()),
+                reason: Some("ignored_path".to_string()),
+            },
+            quarantine_ref: None,
+        },
+        CompatCandidateDelta {
             candidate_delta_id: "compat_delta_env_secret_0001".to_string(),
             kind: CompatCandidateKind::SecretLike,
             operation_kind: CompatFileOperationKind::Write,
@@ -1386,6 +1407,15 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(cache_error.code, CompatImportErrorCode::CacheBlocked);
+
+        let ignored_error = plan_fixture_basic_app_import(
+            &projection,
+            &view,
+            request(vec!["compat_delta_ignored_editor_swap_0001"]),
+            &fixture_basic_app_candidate_deltas(),
+        )
+        .unwrap_err();
+        assert_eq!(ignored_error.code, CompatImportErrorCode::CacheBlocked);
     }
 
     #[test]

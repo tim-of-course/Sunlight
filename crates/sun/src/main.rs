@@ -5086,7 +5086,7 @@ fn compat_import_error(error: CompatImportValidationError) -> CliError {
             "selected compatibility candidate contains secrets"
         }
         CompatImportErrorCode::CacheBlocked => {
-            "selected compatibility candidate is cache or build output"
+            "selected compatibility candidate is cache, build, or ignored path"
         }
         CompatImportErrorCode::ProjectionNotFound => "compatibility projection was not found",
         CompatImportErrorCode::ProjectionInvalid => {

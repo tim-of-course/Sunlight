@@ -374,6 +374,26 @@ pub fn fixture_basic_app_candidate_deltas() -> Vec<CompatCandidateDelta> {
                 "quarantine://compat/projection_compat_agent_a_0001/env".to_string(),
             ),
         },
+        CompatCandidateDelta {
+            candidate_delta_id: "compat_delta_reserved_sunlight_0001".to_string(),
+            kind: CompatCandidateKind::PathPolicyBlocked,
+            operation_kind: CompatFileOperationKind::Write,
+            artifact_id: None,
+            path: ".sunlight/config.toml".to_string(),
+            before_hash: None,
+            after_hash: Some("sha256:reserved_sunlight_config".to_string()),
+            byte_length: 8,
+            executable: false,
+            media_type: "text/plain; charset=utf-8".to_string(),
+            classification: "policy".to_string(),
+            privacy_class: PrivacyClass::LocalOnly,
+            path_policy_result: CompatPathPolicyResult {
+                allowed: false,
+                normalized_path: None,
+                reason: Some("reserved_path".to_string()),
+            },
+            quarantine_ref: None,
+        },
     ]
 }
 
@@ -566,7 +586,13 @@ fn validate_selected_candidates(
                 &request.projection_id,
                 &request.session_id,
                 candidate_ids,
-                "selected candidate is blocked by recorded path policy result",
+                candidate
+                    .path_policy_result
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| {
+                        "selected candidate is blocked by recorded path policy result".to_string()
+                    }),
             ));
         }
         if let Err(path_error) = path_policy.validate(&candidate.path) {

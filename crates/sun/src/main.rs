@@ -9701,8 +9701,8 @@ sun
 
 Usage:
   sun init [--repo <path>]
-  sun topic create <slug> --display-name <name> --json
-  sun session start --topic <topic> --view <view-selector> --actor <actor-id> --json
+  sun topic create <slug> --display-name <name> --fixture basic-app --json
+  sun session start --topic <topic> --view <view-selector> --actor <actor-id> --fixture basic-app --json
   sun read <path> --session <session> --fixture basic-app [--json]
   sun list [path-prefix] --session <session> --fixture basic-app [--json]
   sun search <query> --session <session> --fixture basic-app [--json]
@@ -9734,13 +9734,16 @@ Usage:
 
 Commands:
   init       Create the conservative local .sunlight repository layout
-  topic      Parse Phase 1 topic commands; persistence is not implemented yet
-  session    Parse Phase 1 session commands; persistence is not implemented yet
+  topic      Create fixture-backed Phase 1 topics with stable JSON envelopes
+  session    Start fixture-backed Phase 1 sessions with stable JSON envelopes
   read       Read a fixture artifact by repository-relative path
   list       List fixture artifacts by optional path prefix
   search     Search fixture artifact text literally
-  patch      Apply a fixture-only unified diff to one artifact
-  write      Write fixture-only content to one artifact path
+  patch      Apply a fixture-backed unified diff to one artifact
+  write      Write fixture-backed content to one artifact path
+  move       Move a fixture artifact path and preserve artifact identity
+  delete     Tombstone a fixture artifact path with provenance
+  metadata   Set fixture artifact metadata without changing content bytes
   view       Resolve fixture topic revisions into a candidate view
   project    Materialize fixture projections for exact resolved views
   projection Clean up local-only fixture projection quarantine records

@@ -72,7 +72,7 @@ Success data includes `repository_id`, `base_checkpoint_id`, `resolved_view_id`,
 Purpose: create a durable write topic above the imported base checkpoint.
 
 ```text
-sun topic create <slug> --display-name <name> --json
+sun topic create <slug> --display-name <name> --fixture basic-app --json
 ```
 
 Success data includes `topic_id`, `slug`, `base_checkpoint_id`, `head_revision_id: null`, `status: "open"`, and owner/actor metadata. Slug collisions return `invalid_request` with the existing `topic_id`.
@@ -82,7 +82,7 @@ Success data includes `topic_id`, `slug`, `base_checkpoint_id`, `head_revision_i
 Purpose: bind an actor to one write topic and one pinned resolved view.
 
 ```text
-sun session start --topic <topic> --view <view-selector> --actor <actor-id> --json
+sun session start --topic <topic> --view <view-selector> --actor <actor-id> --fixture basic-app --json
 ```
 
 Success data includes `session_id`, `write_topic_id`, `resolved_view_id`, `session_generation_id`, `topic_frontier`, `refresh_policy: "pinned_except_own_topic"`, and capabilities for `read`, `list`, `search`, `inspect`, `patch`, `write`, `move`, `delete`, and `metadata`.
@@ -117,12 +117,14 @@ Success returns before/after refs, write set, new topic revision, new session ge
 Purpose: record structural and metadata changes without filesystem inference.
 
 ```text
-sun move <from> <to> --session <session> --expect-artifact <artifact-id> --expect-hash <hash> --json
-sun delete <path-or-artifact-id> --session <session> --expect-hash <hash> --json
-sun metadata set <path-or-artifact-id> --session <session> --classification <class> --json
+sun move <from> <to> --session <session> --fixture basic-app --expect-artifact <artifact-id> --expect-hash <hash> --json
+sun delete <path-or-artifact-id> --session <session> --fixture basic-app --expect-hash <hash> --json
+sun metadata set <path-or-artifact-id> --session <session> --fixture basic-app --expect-hash <hash> --classification <class> --json
 ```
 
 `move` preserves `artifact_id` and adds a new path binding. `delete` tombstones the path binding and retains artifact provenance. `metadata set` records classification or other Phase 1 metadata without changing content bytes. All three commands require resolved-view and path/artifact preconditions and advance the write topic on success.
+
+The accepted Phase 1 CLI fixture surface uses `--fixture basic-app` and `--json` for stable response envelopes on `topic.create`, `session.start`, `artifact.move`, `artifact.delete`, and `artifact.metadata_set`.
 
 ### `sun status` and `sun inspect`
 

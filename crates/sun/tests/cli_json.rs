@@ -8,6 +8,33 @@ fn sun() -> Command {
 }
 
 #[test]
+fn global_help_describes_phase1_fixture_lifecycle_commands() {
+    let output = sun().arg("--help").output().expect("sun --help should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.contains("sun topic create <slug> --display-name <name> --fixture basic-app --json")
+    );
+    assert!(stdout.contains(
+        "sun session start --topic <topic> --view <view-selector> --actor <actor-id> --fixture basic-app --json"
+    ));
+    assert!(stdout
+        .contains("topic      Create fixture-backed Phase 1 topics with stable JSON envelopes"));
+    assert!(stdout
+        .contains("session    Start fixture-backed Phase 1 sessions with stable JSON envelopes"));
+    assert!(
+        stdout.contains("move       Move a fixture artifact path and preserve artifact identity")
+    );
+    assert!(stdout.contains("delete     Tombstone a fixture artifact path with provenance"));
+    assert!(
+        stdout.contains("metadata   Set fixture artifact metadata without changing content bytes")
+    );
+    assert!(!stdout.contains("parse-only"));
+    assert!(!stdout.contains("persistence is not implemented"));
+}
+
+#[test]
 fn init_json_returns_repository_success_envelope() {
     let repo = TestRepo::new("init-json");
 

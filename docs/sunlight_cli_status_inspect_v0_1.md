@@ -103,16 +103,16 @@ Use stable dotted command names in `data.command`. The left side names the objec
 | CLI | `data.command` |
 | --- | --- |
 | `sun init --json` | `repository.init` |
-| `sun topic create ... --json` | `topic.create` |
-| `sun session start ... --json` | `session.start` |
+| `sun topic create ... --fixture basic-app --json` | `topic.create` |
+| `sun session start ... --fixture basic-app --json` | `session.start` |
 | `sun read ... --json` | `artifact.read` |
 | `sun list ... --json` | `artifact.list` |
 | `sun search ... --json` | `artifact.search` |
 | `sun patch ... --json` | `artifact.patch` |
 | `sun write ... --json` | `artifact.write` |
-| `sun move ... --json` | `artifact.move` |
-| `sun delete ... --json` | `artifact.delete` |
-| `sun metadata set ... --json` | `artifact.metadata_set` |
+| `sun move ... --fixture basic-app --json` | `artifact.move` |
+| `sun delete ... --fixture basic-app --json` | `artifact.delete` |
+| `sun metadata set ... --fixture basic-app --json` | `artifact.metadata_set` |
 | `sun status --json` | `status.repository` |
 | `sun status --session <session> --json` | `status.session` |
 | `sun status --topic <topic> --json` | `status.topic` |
@@ -126,6 +126,8 @@ Use stable dotted command names in `data.command`. The left side names the objec
 | `sun inspect projection:<projection> --json` | `inspect.projection` |
 
 Selectors should be explicit when IDs can overlap. Bare path/artifact inspect is allowed only with `--session` or another explicit view selector.
+
+The accepted Phase 1 fixture commands above return stable JSON envelopes for `basic-app` topic/session lifecycle and structural mutation acceptance. Topic and session commands are fixture-backed lifecycle commands.
 
 ## Common Blocks
 

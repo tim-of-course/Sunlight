@@ -45,6 +45,7 @@ use sunlight_core::git_export::{
     ImportedBaseGitCommit, InMemoryGitExportMapStore, PersistedGitExportMap,
 };
 use sunlight_core::projection::{
+    cleanup_projection_quarantine_local_records,
     fixture_compatibility_projection_from_resolved_view,
     fixture_execution_projection_from_resolved_view, fixture_export_projection_from_resolved_view,
     fixture_inspection_projection_from_resolved_view,
@@ -58,6 +59,7 @@ use sunlight_core::projection::{
     ProjectionMaterializationError, ProjectionMaterializationErrorCode,
     ProjectionMaterializationLocalMetadata, ProjectionMaterializationPlan,
     ProjectionMaterializationRequest, ProjectionPurpose, ProjectionRecord, ProjectionRootRef,
+    ProjectionQuarantineLocalCleanup,
     ProjectionStoreIntegrityReasonCode, ProjectionStoreIntegrityResult,
     ProjectionStoreIntegrityStatus, ProjectionStrategy, ProjectionValidationError,
     FIXTURE_COMPATIBILITY_PROJECTION_ID, FIXTURE_EXECUTION_PROJECTION_ID,
@@ -174,6 +176,9 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         }
         [scope, command, ..] if scope == "projection" && command == "create" => {
             project_materialize(&ctx)
+        }
+        [scope, command, ..] if scope == "projection" && command == "quarantine-cleanup" => {
+            projection_quarantine_cleanup(&ctx)
         }
         [scope, command, ..] if scope == "checkpoint" && command == "create" => {
             checkpoint_create(&ctx)
@@ -599,6 +604,44 @@ fn project_materialize(ctx: &CommandContext) -> Result<(), CliError> {
     Ok(())
 }
 
+fn projection_quarantine_cleanup(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_projection_quarantine_cleanup_options(ctx)?;
+    if options.fixture != "basic-app" {
+        return Err(
+            invalid_request(format!("unknown fixture `{}`", options.fixture))
+                .with_detail("fixture", options.fixture),
+        );
+    }
+
+    fixture_projection_by_id(&options.projection_id)
+        .ok_or_else(|| object_not_found("projection", &options.projection_id))?
+        .map_err(projection_error)?;
+
+    let cleanup = cleanup_projection_quarantine_local_records(
+        &options.projection_root,
+        &options.projection_id,
+    )
+    .map_err(|error| {
+        invalid_request(format!(
+            "projection quarantine cleanup failed: {}",
+            error
+        ))
+        .with_detail("projection_id", options.projection_id.clone())
+    })?;
+
+    if ctx.json {
+        println!("{}", projection_quarantine_cleanup_success_envelope(&cleanup));
+    } else {
+        println!(
+            "{} {}",
+            cleanup.projection_id,
+            cleanup.retention_state_after.as_str()
+        );
+    }
+
+    Ok(())
+}
+
 fn checkpoint_create(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_checkpoint_create_options(ctx)?;
     if options.fixture != "basic-app" {
@@ -1012,6 +1055,13 @@ struct ProjectMaterializeOptions {
 }
 
 #[derive(Debug)]
+struct ProjectionQuarantineCleanupOptions {
+    fixture: String,
+    projection_id: String,
+    projection_root: PathBuf,
+}
+
+#[derive(Debug)]
 struct CompatImportOptions {
     fixture: String,
     projection_id: String,
@@ -1074,6 +1124,65 @@ fn parse_compat_import_options(ctx: &CommandContext) -> Result<CompatImportOptio
         fixture,
         projection_id,
         candidate_delta_ids,
+    })
+}
+
+fn parse_projection_quarantine_cleanup_options(
+    ctx: &CommandContext,
+) -> Result<ProjectionQuarantineCleanupOptions, CliError> {
+    let mut fixture = None;
+    let mut projection_id = None;
+    let mut projection_root = None;
+    let mut args = ctx.args.iter().skip(2);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun projection quarantine-cleanup requires --fixture basic-app",
+                    )
+                })?;
+                fixture = Some(value.clone());
+            }
+            "--projection" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun projection quarantine-cleanup requires --projection <projection-id>",
+                    )
+                })?;
+                projection_id = Some(value.clone());
+            }
+            "--projection-root" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun projection quarantine-cleanup requires --projection-root <path>",
+                    )
+                })?;
+                projection_root = Some(PathBuf::from(value));
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun projection quarantine-cleanup"
+                )));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected projection quarantine-cleanup argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    let usage = "usage: sun projection quarantine-cleanup --projection <projection-id> --projection-root <path> --fixture basic-app";
+    let fixture = fixture.ok_or_else(|| invalid_request(usage))?;
+    let projection_id = projection_id.ok_or_else(|| invalid_request(usage))?;
+    let projection_root = projection_root.ok_or_else(|| invalid_request(usage))?;
+
+    Ok(ProjectionQuarantineCleanupOptions {
+        fixture,
+        projection_id,
+        projection_root,
     })
 }
 
@@ -2215,6 +2324,60 @@ fn fixture_status_session_json() -> String {
         FIXTURE_WRITE_TOPIC_ID,
         fixture_changed_artifact_json(),
     )
+}
+
+fn projection_quarantine_cleanup_success_envelope(
+    cleanup: &ProjectionQuarantineLocalCleanup,
+) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"projection.quarantine_cleanup\",",
+            "\"cleanup\":{{",
+            "\"projection_id\":\"{}\",",
+            "\"quarantine_dir\":{{\"path\":\"{}\",\"local_only\":true}},",
+            "\"existed\":{},",
+            "\"removed_records\":{},",
+            "\"removed_dirs\":{},",
+            "\"local_only\":{},",
+            "\"retention_state_after\":\"{}\"",
+            "}}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&cleanup.projection_id),
+        json_escape(&cleanup.quarantine_dir.display().to_string()),
+        cleanup.existed,
+        cleanup_paths_json(cleanup, &cleanup.removed_files),
+        cleanup_paths_json(cleanup, &cleanup.removed_dirs),
+        cleanup.local_only,
+        cleanup.retention_state_after.as_str(),
+    )
+}
+
+fn cleanup_paths_json(cleanup: &ProjectionQuarantineLocalCleanup, paths: &[PathBuf]) -> String {
+    let root = cleanup
+        .quarantine_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .and_then(|path| path.parent())
+        .and_then(|path| path.parent());
+    let values = paths
+        .iter()
+        .map(|path| {
+            let value = root
+                .and_then(|root| path.strip_prefix(root).ok())
+                .map(|relative| {
+                    format!(
+                        "local://{}",
+                        relative.display().to_string().replace('\\', "/")
+                    )
+                })
+                .unwrap_or_else(|| path.display().to_string());
+            format!("\"{}\"", json_escape(&value))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{values}]")
 }
 
 fn fixture_status_topic_json() -> String {
@@ -7301,6 +7464,7 @@ Usage:
   sun write <path> --session <session> --fixture basic-app --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]
   sun view resolve --fixture basic-app --include topic:revision[,topic:revision] [--json]
   sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app [--projection-root <empty-path>] [--json]
+  sun projection quarantine-cleanup --projection <projection-id> --projection-root <path> --fixture basic-app [--json]
   sun run --view <resolved-view-id> --fixture basic-app [--integrity-fixture store-mismatch|scan-missing-blob|verified] --json -- cargo test
   sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> --fixture basic-app [--json]
   sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
@@ -7321,6 +7485,7 @@ Commands:
   write      Write fixture-only content to one artifact path
   view       Resolve fixture topic revisions into a candidate view
   project    Materialize fixture projections for exact resolved views
+  projection Clean up local-only fixture projection quarantine records
   run        Record a fixture execution for an exact resolved view
   execution  Promote a declared fixture execution output into a topic operation
   checkpoint Freeze a fixture resolved view as an in-memory checkpoint

@@ -1237,6 +1237,153 @@ fn status_json_fixture_projection_store_mismatch_writes_quarantine_record_with_r
 }
 
 #[test]
+fn projection_quarantine_cleanup_json_removes_persisted_record() {
+    let repo = TestRepo::new("projection-quarantine-cleanup-remove");
+    let projection_root = repo.path().join("projection-root");
+
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--purpose")
+        .arg("execution")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+
+    let quarantine = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--integrity-fixture")
+        .arg("store-mismatch")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+    assert_success(&quarantine);
+    assert!(quarantine_record_path(&projection_root).is_file());
+
+    let cleanup = sun()
+        .arg("projection")
+        .arg("quarantine-cleanup")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun projection quarantine-cleanup should run");
+
+    assert_success(&cleanup);
+    let stdout = stdout(&cleanup);
+    assert!(stdout.contains("\"command\":\"projection.quarantine_cleanup\""));
+    assert!(stdout.contains("\"projection_id\":\"projection_exec_auth_profile_0001\""));
+    assert!(stdout.contains("\"existed\":true"));
+    assert!(stdout.contains("\"local_only\":true"));
+    assert!(stdout.contains("\"retention_state_after\":\"removed\""));
+    assert!(stdout.contains("\"removed_records\":[\"local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json\"]"));
+    assert!(!quarantine_record_path(&projection_root).exists());
+    assert!(!projection_root
+        .join(".sunlight/quarantine/projections/projection_exec_auth_profile_0001")
+        .exists());
+}
+
+#[test]
+fn projection_quarantine_cleanup_preserves_other_sunlight_content_and_projection_dirs() {
+    let repo = TestRepo::new("projection-quarantine-cleanup-preserve");
+    let projection_root = repo.path().join("projection-root");
+
+    let quarantine = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--integrity-fixture")
+        .arg("store-mismatch")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+    assert_success(&quarantine);
+
+    write_nested_file(
+        &projection_root,
+        ".sunlight/other/local.txt",
+        "not projection metadata\n",
+    );
+    let other_projection_record = projection_root
+        .join(".sunlight/quarantine/projections/projection_inspect_auth_profile_0001")
+        .join("execution_store_integrity_failed.json");
+    fs::create_dir_all(other_projection_record.parent().unwrap()).unwrap();
+    fs::write(&other_projection_record, "{}\n").unwrap();
+
+    let cleanup = sun()
+        .arg("projection")
+        .arg("quarantine-cleanup")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun projection quarantine-cleanup should run");
+
+    assert_success(&cleanup);
+    assert!(!quarantine_record_path(&projection_root).exists());
+    assert!(projection_root.join(".sunlight/other/local.txt").is_file());
+    assert!(other_projection_record.is_file());
+}
+
+#[test]
+fn projection_quarantine_cleanup_json_is_idempotent_when_absent() {
+    let repo = TestRepo::new("projection-quarantine-cleanup-absent");
+    let projection_root = repo.path().join("projection-root");
+
+    let cleanup = sun()
+        .arg("projection")
+        .arg("quarantine-cleanup")
+        .arg("--projection")
+        .arg("projection_exec_auth_profile_0001")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun projection quarantine-cleanup should run");
+
+    assert_success(&cleanup);
+    let stdout = stdout(&cleanup);
+    assert!(stdout.contains("\"command\":\"projection.quarantine_cleanup\""));
+    assert!(stdout.contains("\"existed\":false"));
+    assert!(stdout.contains("\"removed_records\":[]"));
+    assert!(stdout.contains("\"removed_dirs\":[]"));
+    assert!(stdout.contains("\"retention_state_after\":\"absent\""));
+}
+
+#[test]
 fn status_json_fixture_projection_ignores_persisted_quarantine_record_in_root_scan() {
     let repo = TestRepo::new("projection-status-quarantine-record-root-scan");
     let projection_root = repo.path().join("projection-root");

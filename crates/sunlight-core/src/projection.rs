@@ -438,6 +438,32 @@ pub struct ProjectionCleanupCheck {
     pub local_only: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionQuarantineLocalCleanup {
+    pub projection_id: String,
+    pub quarantine_dir: PathBuf,
+    pub existed: bool,
+    pub removed_files: Vec<PathBuf>,
+    pub removed_dirs: Vec<PathBuf>,
+    pub local_only: bool,
+    pub retention_state_after: ProjectionQuarantineRetentionStateAfter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionQuarantineRetentionStateAfter {
+    Removed,
+    Absent,
+}
+
+impl ProjectionQuarantineRetentionStateAfter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Removed => "removed",
+            Self::Absent => "absent",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectionMaterializationSource {
     ResolvedContentTree,
@@ -2027,6 +2053,16 @@ pub fn projection_quarantine_local_record_path(
         .join(format!("{}.json", quarantine.reason_code.as_str()))
 }
 
+pub fn projection_quarantine_local_dir_path(
+    projection_root: impl AsRef<Path>,
+    projection_id: &str,
+) -> PathBuf {
+    projection_root
+        .as_ref()
+        .join(PROJECTION_QUARANTINE_LOCAL_METADATA_DIR)
+        .join(projection_id)
+}
+
 pub fn persist_projection_quarantine_local_record(
     projection_root: impl AsRef<Path>,
     quarantine: &ProjectionQuarantineResult,
@@ -2043,6 +2079,95 @@ pub fn persist_projection_quarantine_local_record(
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     fs::write(&path, bytes)?;
     Ok(path)
+}
+
+pub fn cleanup_projection_quarantine_local_records(
+    projection_root: impl AsRef<Path>,
+    projection_id: &str,
+) -> std::io::Result<ProjectionQuarantineLocalCleanup> {
+    if !is_single_path_component(projection_id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "projection id must be a single path component",
+        ));
+    }
+
+    let projection_root = projection_root.as_ref();
+    let quarantine_dir = projection_quarantine_local_dir_path(projection_root, projection_id);
+    let mut removed_files = Vec::new();
+    let mut removed_dirs = Vec::new();
+
+    if !quarantine_dir.exists() {
+        return Ok(ProjectionQuarantineLocalCleanup {
+            projection_id: projection_id.to_string(),
+            quarantine_dir,
+            existed: false,
+            removed_files,
+            removed_dirs,
+            local_only: true,
+            retention_state_after: ProjectionQuarantineRetentionStateAfter::Absent,
+        });
+    }
+
+    if quarantine_dir.is_dir() {
+        collect_files_under(&quarantine_dir, &mut removed_files)?;
+        fs::remove_dir_all(&quarantine_dir)?;
+        removed_dirs.push(quarantine_dir.clone());
+    } else {
+        fs::remove_file(&quarantine_dir)?;
+        removed_files.push(quarantine_dir.clone());
+    }
+
+    prune_empty_quarantine_parent_dirs(projection_root, &mut removed_dirs)?;
+
+    Ok(ProjectionQuarantineLocalCleanup {
+        projection_id: projection_id.to_string(),
+        quarantine_dir,
+        existed: true,
+        removed_files,
+        removed_dirs,
+        local_only: true,
+        retention_state_after: ProjectionQuarantineRetentionStateAfter::Removed,
+    })
+}
+
+fn is_single_path_component(value: &str) -> bool {
+    !value.is_empty()
+        && Path::new(value)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && Path::new(value).components().count() == 1
+}
+
+fn collect_files_under(path: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_under(&path, files)?;
+        } else {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(())
+}
+
+fn prune_empty_quarantine_parent_dirs(
+    projection_root: &Path,
+    removed_dirs: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    for relative in [
+        PROJECTION_QUARANTINE_LOCAL_METADATA_DIR,
+        ".sunlight/quarantine",
+        ".sunlight",
+    ] {
+        let path = projection_root.join(relative);
+        if path.is_dir() && fs::remove_dir(&path).is_ok() {
+            removed_dirs.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn persist_projection_manifest_local_record(
@@ -2905,6 +3030,74 @@ mod tests {
             Some(&JsonValue::String(
                 "local://.sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn projection_quarantine_local_cleanup_removes_only_one_projection_records() {
+        let root = temp_projection_root("quarantine-cleanup-one-projection");
+        let target_record = root
+            .join(PROJECTION_QUARANTINE_LOCAL_METADATA_DIR)
+            .join(FIXTURE_EXECUTION_PROJECTION_ID)
+            .join("execution_store_integrity_failed.json");
+        let sibling_record = root
+            .join(PROJECTION_QUARANTINE_LOCAL_METADATA_DIR)
+            .join(FIXTURE_INSPECTION_PROJECTION_ID)
+            .join("execution_store_integrity_failed.json");
+        let other_local = root.join(".sunlight").join("other").join("local.txt");
+        fs::create_dir_all(target_record.parent().unwrap()).unwrap();
+        fs::create_dir_all(sibling_record.parent().unwrap()).unwrap();
+        fs::create_dir_all(other_local.parent().unwrap()).unwrap();
+        fs::write(&target_record, "{}").unwrap();
+        fs::write(&sibling_record, "{}").unwrap();
+        fs::write(&other_local, "local").unwrap();
+
+        let cleanup =
+            cleanup_projection_quarantine_local_records(&root, FIXTURE_EXECUTION_PROJECTION_ID)
+                .unwrap();
+
+        assert_eq!(cleanup.projection_id, FIXTURE_EXECUTION_PROJECTION_ID);
+        assert!(cleanup.existed);
+        assert!(cleanup.local_only);
+        assert_eq!(
+            cleanup.retention_state_after,
+            ProjectionQuarantineRetentionStateAfter::Removed
+        );
+        assert_eq!(cleanup.removed_files, vec![target_record]);
+        assert!(cleanup.removed_dirs.contains(
+            &root.join(PROJECTION_QUARANTINE_LOCAL_METADATA_DIR)
+                .join(FIXTURE_EXECUTION_PROJECTION_ID)
+        ));
+        assert!(!cleanup
+            .quarantine_dir
+            .exists());
+        assert!(!root
+            .join(PROJECTION_QUARANTINE_LOCAL_METADATA_DIR)
+            .join(FIXTURE_EXECUTION_PROJECTION_ID)
+            .exists());
+        assert!(sibling_record.is_file());
+        assert!(other_local.is_file());
+    }
+
+    #[test]
+    fn projection_quarantine_local_cleanup_is_idempotent_when_absent() {
+        let root = temp_projection_root("quarantine-cleanup-absent");
+
+        let cleanup =
+            cleanup_projection_quarantine_local_records(&root, FIXTURE_EXECUTION_PROJECTION_ID)
+                .unwrap();
+
+        assert!(!cleanup.existed);
+        assert!(cleanup.removed_files.is_empty());
+        assert!(cleanup.removed_dirs.is_empty());
+        assert_eq!(
+            cleanup.retention_state_after,
+            ProjectionQuarantineRetentionStateAfter::Absent
+        );
+        assert_eq!(
+            cleanup.quarantine_dir,
+            root.join(PROJECTION_QUARANTINE_LOCAL_METADATA_DIR)
+                .join(FIXTURE_EXECUTION_PROJECTION_ID)
         );
     }
 

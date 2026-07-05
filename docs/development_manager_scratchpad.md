@@ -103,10 +103,11 @@ Sunlight is a native, event-sourced, multi-version source artifact database. Git
 - Completed verification slice `aggregate-smoke-suite-refresh-after-compat-import-rename-plus-edit`: default `scripts/smoke-suite.ps1` passed after `d72b79d`.
 - Completed slice `compat-import-docs-acceptance-sync`: integrated as `d6162bd`; WSL docs-only implementation was imported manager-side after prompt quoting caused a nonzero helper exit, with targeted docs verification passing on Windows.
 - Completed verification slice `external-validation-super-search-refresh-after-compat-import-hardening`: optional `scripts/external-validation-super-search.ps1` passed after `0bb5ae6` with Super Search `mix test`, `bun run test`, temp-clone `sun init`, fixture compat import, and fixture-backed Git export.
+- Active slice `compat-import-stale-precondition-cli-coverage`: add product-shaped CLI fixture coverage for stale compatibility import projection/session preconditions, preserving atomic failure behavior with no operation, revision, or generation advance.
 
 ## Candidate Next Slices
 
-- Next useful slices: continue Phase 6 compatibility import hardening, likely stale projection/session CLI preconditions after external validation refresh.
+- Next useful slices: continue Phase 6 compatibility import hardening after stale precondition coverage, likely projection retention/quarantine cleanup or fixture external validation breadth.
 
 ## Decisions
 

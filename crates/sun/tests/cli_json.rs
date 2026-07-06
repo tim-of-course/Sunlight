@@ -57,6 +57,306 @@ fn init_json_returns_repository_success_envelope() {
 }
 
 #[test]
+fn no_fixture_real_repo_artifact_io_vertical_slice() {
+    let repo = TestRepo::new("real-repo-artifact-io");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    write_nested_file(
+        repo.path(),
+        "src/lib.rs",
+        "pub fn answer() -> u32 {\n    42\n}\n",
+    );
+    repo.write_file("README.md", "# Real repo\n\nneedle\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+
+    let init = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun init should run");
+    assert_success(&init);
+    assert!(repo
+        .path()
+        .join(".sunlight/records/native-state.tsv")
+        .is_file());
+
+    let topic = sun()
+        .arg("topic")
+        .arg("create")
+        .arg("real-io")
+        .arg("--display-name")
+        .arg("Real IO")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun topic create should run");
+    assert_success(&topic);
+    assert!(stdout(&topic).contains("\"topic_id\":\"topic_real_io\""));
+
+    let session = sun()
+        .arg("session")
+        .arg("start")
+        .arg("--topic")
+        .arg("topic_real_io")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--actor")
+        .arg("agent-a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun session start should run");
+    assert_success(&session);
+    assert!(stdout(&session).contains("\"session_id\":\"session_agent_a\""));
+
+    let read = sun()
+        .arg("read")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun read should run");
+    assert_success(&read);
+    let read_stdout = stdout(&read);
+    assert!(read_stdout.contains("pub fn answer()"));
+    let before_hash = json_string_field(&read_stdout, "content_hash");
+
+    let content = repo.write_file("new-lib.rs", "pub fn answer() -> u32 {\n    43\n}\n");
+    let write = sun()
+        .arg("write")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--expect-hash")
+        .arg(&before_hash)
+        .arg("--content-file")
+        .arg(&content)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun write should run");
+    assert_success(&write);
+    let write_stdout = stdout(&write);
+    assert!(write_stdout.contains("\"command\":\"artifact.write\""));
+    let resolved_view = json_string_field(&write_stdout, "resolved_view_id");
+
+    let reread = sun()
+        .arg("read")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun read should run");
+    assert_success(&reread);
+    assert!(stdout(&reread).contains("43"));
+
+    let search = sun()
+        .arg("search")
+        .arg("needle")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun search should run");
+    assert_success(&search);
+    assert!(stdout(&search).contains("\"path\":\"README.md\""));
+
+    let projection_root = repo.path().join("projection");
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&resolved_view)
+        .arg("--purpose")
+        .arg("inspection")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+    assert_eq!(
+        fs::read_to_string(projection_root.join("src/lib.rs")).unwrap(),
+        "pub fn answer() -> u32 {\n    43\n}\n"
+    );
+
+    let checkpoint = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg("--view")
+        .arg(&resolved_view)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun checkpoint create should run");
+    assert_success(&checkpoint);
+    let checkpoint_id = json_string_field(&stdout(&checkpoint), "checkpoint_id");
+
+    let export = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg(&checkpoint_id)
+        .arg("--branch")
+        .arg("sunlight/real-io")
+        .arg("--execute-local")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export should run");
+    assert_success(&export);
+    assert!(stdout(&export).contains("\"lifecycle_state\":\"exported\""));
+    assert_eq!(
+        git(repo.path(), &["show", "sunlight/real-io:src/lib.rs"]),
+        "pub fn answer() -> u32 {\n    43\n}\n"
+    );
+}
+
+#[test]
+fn no_fixture_move_after_sort_uses_moved_artifact_for_response() {
+    let repo = TestRepo::new("real-move-sort-order");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    repo.write_file("b.txt", "b\n");
+    repo.write_file("c.txt", "c\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+    start_native_session(&repo, "move-sort");
+
+    let read = sun()
+        .arg("read")
+        .arg("c.txt")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun read should run");
+    assert_success(&read);
+    let content_hash = json_string_field(&stdout(&read), "content_hash");
+
+    let moved = sun()
+        .arg("move")
+        .arg("c.txt")
+        .arg("a.txt")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--expect-hash")
+        .arg(&content_hash)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun move should run");
+    assert_success(&moved);
+    let moved_stdout = stdout(&moved);
+    assert!(moved_stdout.contains("\"command\":\"artifact.move\""));
+    assert!(moved_stdout.contains("\"artifact_id\":\"artifact_c_txt\""));
+    assert!(moved_stdout.contains("\"path\":\"a.txt\""));
+    assert!(moved_stdout.contains("\"path_state\":\"active\""));
+    assert!(!moved_stdout.contains("\"artifact_id\":\"artifact_b_txt\",\"path\":\"b.txt\""));
+}
+
+#[test]
+fn no_fixture_delete_is_removed_from_local_git_export() {
+    let repo = TestRepo::new("real-delete-export");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    repo.write_file("keep.txt", "keep\n");
+    repo.write_file("remove.txt", "remove\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+    start_native_session(&repo, "delete-export");
+
+    let read = sun()
+        .arg("read")
+        .arg("remove.txt")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun read should run");
+    assert_success(&read);
+    let content_hash = json_string_field(&stdout(&read), "content_hash");
+
+    let deleted = sun()
+        .arg("delete")
+        .arg("remove.txt")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--expect-hash")
+        .arg(&content_hash)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun delete should run");
+    assert_success(&deleted);
+    let resolved_view = json_string_field(&stdout(&deleted), "resolved_view_id");
+
+    let checkpoint = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg("--view")
+        .arg(&resolved_view)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun checkpoint create should run");
+    assert_success(&checkpoint);
+    let checkpoint_id = json_string_field(&stdout(&checkpoint), "checkpoint_id");
+
+    let export = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg(&checkpoint_id)
+        .arg("--branch")
+        .arg("sunlight/delete-export")
+        .arg("--execute-local")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export should run");
+    assert_success(&export);
+    assert_eq!(
+        git(repo.path(), &["show", "sunlight/delete-export:keep.txt"]),
+        "keep\n"
+    );
+    let missing = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["cat-file", "-e", "sunlight/delete-export:remove.txt"])
+        .output()
+        .expect("git cat-file should run");
+    assert!(
+        !missing.status.success(),
+        "remove.txt should be absent from exported commit"
+    );
+}
+
+#[test]
 fn policy_check_commit_json_after_init_returns_success_envelope() {
     let repo = TestRepo::new("policy-check-commit-success");
 
@@ -6898,6 +7198,44 @@ fn init_local_git_repo(repo: &TestRepo) -> String {
     git(repo.path(), &["add", "base.txt"]);
     git(repo.path(), &["commit", "-m", "base"]);
     git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string()
+}
+
+fn start_native_session(repo: &TestRepo, slug: &str) {
+    let init = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun init should run");
+    assert_success(&init);
+
+    let topic = sun()
+        .arg("topic")
+        .arg("create")
+        .arg(slug)
+        .arg("--display-name")
+        .arg("Native Test")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun topic create should run");
+    assert_success(&topic);
+
+    let topic_id = format!("topic_{}", slug.replace('-', "_"));
+    let session = sun()
+        .arg("session")
+        .arg("start")
+        .arg("--topic")
+        .arg(&topic_id)
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--actor")
+        .arg("agent-a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun session start should run");
+    assert_success(&session);
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {

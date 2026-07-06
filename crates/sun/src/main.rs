@@ -3,13 +3,16 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use sunlight_core::artifacts::{
     ArtifactIoError, ArtifactKind, ContentBlob, ContentTree, DeleteRequest, ExpectedHash,
     InMemoryArtifactStore, ListResponse, MetadataSetRequest, MoveRequest, MutationArtifactView,
-    MutationPayload, MutationRefs, MutationResponse, PatchRequest, ReadResponse, SearchResponse,
-    SessionView, SessionVisibleArtifactView, TreeEntry, TreeIdentityView, WriteMode, WriteRequest,
-    FILE_OPERATION_SEMANTICS_VERSION, FIXTURE_ACTOR_ID, FIXTURE_REPOSITORY_ID,
+    MutationKind, MutationPayload, MutationRefs, MutationResponse, OperationTransactionRecord,
+    PatchRequest, ReadResponse, SearchResponse, SessionGenerationMutationRecord, SessionView,
+    SessionVisibleArtifactView, TopicRevisionRecord, TreeEntry, TreeIdentityView, WriteMode,
+    WriteRequest, FILE_OPERATION_SEMANTICS_VERSION, FIXTURE_ACTOR_ID, FIXTURE_REPOSITORY_ID,
     FIXTURE_RESOLVED_VIEW_ID, FIXTURE_SESSION_GENERATION_ID, FIXTURE_SESSION_ID, FIXTURE_TREE_HASH,
     FIXTURE_WRITE_TOPIC_ID, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
 };
@@ -218,6 +221,8 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
     let report = init_repository(&repo_root).map_err(|error| {
         invalid_request(error.to_string()).with_detail("command", "repository.init")
     })?;
+    let ingest = RealRepoState::ingest(&report.repo_root, &report.repository_id)?;
+    ingest.save(&report.repo_root)?;
 
     if ctx.json {
         println!(
@@ -246,7 +251,11 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
 
 fn topic_create(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_topic_create_options(ctx)?;
-    ensure_basic_app_fixture(&options.fixture)?;
+    if let Some(fixture) = &options.fixture {
+        ensure_basic_app_fixture(fixture)?;
+    } else {
+        return real_topic_create(ctx, options);
+    }
     TopicSlug::new(options.slug.clone()).map_err(|error| {
         invalid_request(error.to_string()).with_detail("slug", options.slug.clone())
     })?;
@@ -269,7 +278,11 @@ fn topic_create(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn session_start(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_session_start_options(ctx)?;
-    ensure_basic_app_fixture(&options.fixture)?;
+    if let Some(fixture) = &options.fixture {
+        ensure_basic_app_fixture(fixture)?;
+    } else {
+        return real_session_start(ctx, options);
+    }
     ensure_fixture_topic(&options.topic)?;
     if options.actor_id != FIXTURE_ACTOR_ID {
         return Err(invalid_request(
@@ -291,7 +304,10 @@ fn session_start(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn artifact_read(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_artifact_options(ctx, "read", 1, 1)?;
-    let store = fixture_store(&options.fixture)?;
+    let Some(fixture) = &options.fixture else {
+        return real_artifact_read(ctx, options);
+    };
+    let store = fixture_store(fixture)?;
     let response = store
         .read(&options.session_id, &options.operands[0])
         .map_err(artifact_error)?;
@@ -308,7 +324,10 @@ fn artifact_read(ctx: &CommandContext) -> Result<(), CliError> {
 fn artifact_list(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_artifact_options(ctx, "list", 0, 1)?;
     let prefix = options.operands.first().map(String::as_str).unwrap_or("");
-    let store = fixture_store(&options.fixture)?;
+    let Some(fixture) = &options.fixture else {
+        return real_artifact_list(ctx, options);
+    };
+    let store = fixture_store(fixture)?;
     let response = store
         .list(&options.session_id, prefix)
         .map_err(artifact_error)?;
@@ -326,7 +345,10 @@ fn artifact_list(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn artifact_search(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_artifact_options(ctx, "search", 1, 1)?;
-    let store = fixture_store(&options.fixture)?;
+    let Some(fixture) = &options.fixture else {
+        return real_artifact_search(ctx, options);
+    };
+    let store = fixture_store(fixture)?;
     let response = store
         .search(&options.session_id, &options.operands[0])
         .map_err(artifact_error)?;
@@ -346,15 +368,20 @@ fn artifact_patch(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_mutation_options(ctx, "patch", 1)?;
     let expect_hash = options
         .expect_hash
+        .clone()
         .ok_or_else(|| invalid_request("usage: sun patch requires --expect-hash <hash>"))?;
     let patch_file = options
         .patch_file
+        .clone()
         .ok_or_else(|| invalid_request("usage: sun patch requires --patch-file <file>"))?;
     let patch = fs::read_to_string(&patch_file).map_err(|error| {
         invalid_request(format!("failed to read patch file `{patch_file}`"))
             .with_detail("source", error.to_string())
     })?;
-    let mut store = fixture_store(&options.fixture)?;
+    let Some(fixture) = &options.fixture else {
+        return real_artifact_patch(ctx, options, patch);
+    };
+    let mut store = fixture_store(fixture)?;
     let response = store
         .patch(PatchRequest {
             session_id: options.session_id,
@@ -382,12 +409,15 @@ fn artifact_write(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_mutation_options(ctx, "write", 1)?;
     let expect_hash = options
         .expect_hash
+        .clone()
         .ok_or_else(|| invalid_request("usage: sun write requires --expect-hash <hash-or-new>"))?;
     let content_file = options
         .content_file
+        .clone()
         .ok_or_else(|| invalid_request("usage: sun write requires --content-file <file>"))?;
     let classification = options
         .classification
+        .clone()
         .ok_or_else(|| invalid_request("usage: sun write requires --classification <class>"))?;
     let content = fs::read(&content_file).map_err(|error| {
         invalid_request(format!("failed to read content file `{content_file}`"))
@@ -398,7 +428,10 @@ fn artifact_write(ctx: &CommandContext) -> Result<(), CliError> {
     } else {
         ExpectedHash::Existing(expect_hash)
     };
-    let mut store = fixture_store(&options.fixture)?;
+    let Some(fixture) = &options.fixture else {
+        return real_artifact_write(ctx, options, content, expected_hash);
+    };
+    let mut store = fixture_store(fixture)?;
     let response = store
         .write(WriteRequest {
             session_id: options.session_id,
@@ -427,8 +460,12 @@ fn artifact_move(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_mutation_options(ctx, "move", 2)?;
     let expect_hash = options
         .expect_hash
+        .clone()
         .ok_or_else(|| invalid_request("usage: sun move requires --expect-hash <hash>"))?;
-    let mut store = fixture_store(&options.fixture)?;
+    let Some(fixture) = &options.fixture else {
+        return real_artifact_move(ctx, options, expect_hash);
+    };
+    let mut store = fixture_store(fixture)?;
     let response = store
         .move_path(MoveRequest {
             session_id: options.session_id,
@@ -451,8 +488,12 @@ fn artifact_delete(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_mutation_options(ctx, "delete", 1)?;
     let expect_hash = options
         .expect_hash
+        .clone()
         .ok_or_else(|| invalid_request("usage: sun delete requires --expect-hash <hash>"))?;
-    let mut store = fixture_store(&options.fixture)?;
+    let Some(fixture) = &options.fixture else {
+        return real_artifact_delete(ctx, options, expect_hash);
+    };
+    let mut store = fixture_store(fixture)?;
     let response = store
         .delete_path(DeleteRequest {
             session_id: options.session_id,
@@ -474,11 +515,15 @@ fn artifact_metadata_set(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_mutation_options_with_skip(ctx, "metadata set", 1, 2)?;
     let expect_hash = options
         .expect_hash
+        .clone()
         .ok_or_else(|| invalid_request("usage: sun metadata set requires --expect-hash <hash>"))?;
-    let classification = options.classification.ok_or_else(|| {
+    let classification = options.classification.clone().ok_or_else(|| {
         invalid_request("usage: sun metadata set requires --classification <class>")
     })?;
-    let mut store = fixture_store(&options.fixture)?;
+    let Some(fixture) = &options.fixture else {
+        return real_artifact_metadata_set(ctx, options, expect_hash, classification);
+    };
+    let mut store = fixture_store(fixture)?;
     let response = store
         .metadata_set(MetadataSetRequest {
             session_id: options.session_id,
@@ -499,11 +544,12 @@ fn artifact_metadata_set(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn view_resolve(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_view_resolve_options(ctx)?;
-    if options.fixture != "basic-app" {
-        return Err(
-            invalid_request(format!("unknown fixture `{}`", options.fixture))
-                .with_detail("fixture", options.fixture),
-        );
+    let Some(fixture) = &options.fixture else {
+        return real_view_resolve(ctx, options);
+    };
+    if fixture != "basic-app" {
+        return Err(invalid_request(format!("unknown fixture `{}`", fixture))
+            .with_detail("fixture", fixture.clone()));
     }
 
     if let Some(base_checkpoint_id) = &options.base_checkpoint_id {
@@ -684,11 +730,12 @@ fn execution_promote_output(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn project_materialize(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_project_materialize_options(ctx)?;
-    if options.fixture != "basic-app" {
-        return Err(
-            invalid_request(format!("unknown fixture `{}`", options.fixture))
-                .with_detail("fixture", options.fixture),
-        );
+    let Some(fixture) = &options.fixture else {
+        return real_project_materialize(ctx, options);
+    };
+    if fixture != "basic-app" {
+        return Err(invalid_request(format!("unknown fixture `{}`", fixture))
+            .with_detail("fixture", fixture.clone()));
     }
 
     let view = fixture_resolved_view_by_id(&options.view_id)
@@ -776,11 +823,12 @@ fn projection_quarantine_cleanup(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn checkpoint_create(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_checkpoint_create_options(ctx)?;
-    if options.fixture != "basic-app" {
-        return Err(
-            invalid_request(format!("unknown fixture `{}`", options.fixture))
-                .with_detail("fixture", options.fixture),
-        );
+    let Some(fixture) = &options.fixture else {
+        return real_checkpoint_create(ctx, options);
+    };
+    if fixture != "basic-app" {
+        return Err(invalid_request(format!("unknown fixture `{}`", fixture))
+            .with_detail("fixture", fixture.clone()));
     }
 
     let view = fixture_resolved_view_by_id(&options.view_id)
@@ -804,11 +852,12 @@ fn checkpoint_create(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn git_export(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_git_export_options(ctx)?;
-    if options.fixture != "basic-app" {
-        return Err(
-            invalid_request(format!("unknown fixture `{}`", options.fixture))
-                .with_detail("fixture", options.fixture),
-        );
+    let Some(fixture) = &options.fixture else {
+        return real_git_export(ctx, options);
+    };
+    if fixture != "basic-app" {
+        return Err(invalid_request(format!("unknown fixture `{}`", fixture))
+            .with_detail("fixture", fixture.clone()));
     }
 
     let checkpoint = fixture_checkpoint()?;
@@ -1193,6 +1242,10 @@ fn status(ctx: &CommandContext) -> Result<(), CliError> {
         return Ok(());
     }
 
+    if real_status(ctx)? {
+        return Ok(());
+    }
+
     let config = require_repository_config(".")?;
     let command = match ctx.args.as_slice() {
         [_, flag, _] if flag == "--session" => "status.session",
@@ -1222,7 +1275,1564 @@ fn inspect(ctx: &CommandContext) -> Result<(), CliError> {
         return Ok(());
     }
 
+    if real_inspect(ctx)? {
+        return Ok(());
+    }
+
     require_repository_config(".")?;
+    Err(CliError::new(
+        "object_not_found",
+        "Sunlight object was not found",
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct RealRepoState {
+    repository_id: String,
+    base_checkpoint_id: String,
+    base_resolved_view_id: String,
+    resolved_view_id: String,
+    tree_hash: String,
+    topic_id: Option<String>,
+    topic_slug: Option<String>,
+    topic_display_name: Option<String>,
+    session_id: Option<String>,
+    actor_id: Option<String>,
+    generation_number: u64,
+    revision_number: u64,
+    head_revision_id: Option<String>,
+    entries: Vec<RealArtifactEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct RealArtifactEntry {
+    path: String,
+    artifact_id: String,
+    content_hash: String,
+    executable: bool,
+    classification: String,
+    tombstone: bool,
+    bytes: Vec<u8>,
+}
+
+impl RealRepoState {
+    fn ingest(repo_root: &PathBuf, repository_id: &str) -> Result<Self, CliError> {
+        let mut entries = Vec::new();
+        scan_real_repo_files(repo_root, repo_root, &mut entries)?;
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let tree_hash = real_tree_hash(&entries);
+        let state = Self {
+            repository_id: repository_id.to_string(),
+            base_checkpoint_id: "checkpoint_base_0001".to_string(),
+            base_resolved_view_id: "view_base_0001".to_string(),
+            resolved_view_id: "view_base_0001".to_string(),
+            tree_hash,
+            topic_id: None,
+            topic_slug: None,
+            topic_display_name: None,
+            session_id: None,
+            actor_id: None,
+            generation_number: 0,
+            revision_number: 0,
+            head_revision_id: None,
+            entries,
+        };
+        state.persist_blobs(repo_root)?;
+        state.persist_record(
+            repo_root,
+            "checkpoints",
+            &state.base_checkpoint_id,
+            &format!(
+                "{{\"record_type\":\"checkpoint\",\"id\":\"{}\",\"repository_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"source\":\"worktree_ingest\"}}\n",
+                json_escape(&state.base_checkpoint_id),
+                json_escape(&state.repository_id),
+                json_escape(&state.base_resolved_view_id),
+                json_escape(&state.tree_hash),
+            ),
+        )?;
+        state.persist_record(
+            repo_root,
+            "views",
+            &state.base_resolved_view_id,
+            &format!(
+                "{{\"record_type\":\"resolved_view\",\"id\":\"{}\",\"repository_id\":\"{}\",\"base_checkpoint_ids\":[\"{}\"],\"tree_hash\":\"{}\"}}\n",
+                json_escape(&state.base_resolved_view_id),
+                json_escape(&state.repository_id),
+                json_escape(&state.base_checkpoint_id),
+                json_escape(&state.tree_hash),
+            ),
+        )?;
+        Ok(state)
+    }
+
+    fn load(repo_root: &PathBuf) -> Result<Self, CliError> {
+        let path = real_state_path(repo_root);
+        let body = fs::read_to_string(&path).map_err(|_| {
+            CliError::new("not_initialized", "Sunlight repository is not initialized")
+                .with_detail("missing", path.display().to_string())
+        })?;
+        let mut state = Self {
+            repository_id: String::new(),
+            base_checkpoint_id: String::new(),
+            base_resolved_view_id: String::new(),
+            resolved_view_id: String::new(),
+            tree_hash: String::new(),
+            topic_id: None,
+            topic_slug: None,
+            topic_display_name: None,
+            session_id: None,
+            actor_id: None,
+            generation_number: 0,
+            revision_number: 0,
+            head_revision_id: None,
+            entries: Vec::new(),
+        };
+        for line in body.lines() {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            match fields.as_slice() {
+                ["repo", repository_id, base_checkpoint_id, base_view, resolved_view, tree_hash, topic_id, topic_slug, topic_display_name, session_id, actor_id, generation, revision, head_revision] =>
+                {
+                    state.repository_id = (*repository_id).to_string();
+                    state.base_checkpoint_id = (*base_checkpoint_id).to_string();
+                    state.base_resolved_view_id = (*base_view).to_string();
+                    state.resolved_view_id = (*resolved_view).to_string();
+                    state.tree_hash = (*tree_hash).to_string();
+                    state.topic_id = non_empty_string(topic_id);
+                    state.topic_slug = non_empty_string(topic_slug);
+                    state.topic_display_name = non_empty_string(topic_display_name);
+                    state.session_id = non_empty_string(session_id);
+                    state.actor_id = non_empty_string(actor_id);
+                    state.generation_number = generation.parse().unwrap_or(0);
+                    state.revision_number = revision.parse().unwrap_or(0);
+                    state.head_revision_id = non_empty_string(head_revision);
+                }
+                ["file", path, artifact_id, content_hash, executable, classification, tombstone] => {
+                    let bytes = read_real_blob(repo_root, content_hash)?;
+                    state.entries.push(RealArtifactEntry {
+                        path: (*path).to_string(),
+                        artifact_id: (*artifact_id).to_string(),
+                        content_hash: (*content_hash).to_string(),
+                        executable: *executable == "true",
+                        classification: (*classification).to_string(),
+                        tombstone: *tombstone == "true",
+                        bytes,
+                    });
+                }
+                _ => {}
+            }
+        }
+        if state.repository_id.is_empty() {
+            return Err(invalid_request("invalid native Sunlight state")
+                .with_detail("path", path.display().to_string()));
+        }
+        Ok(state)
+    }
+
+    fn save(&self, repo_root: &PathBuf) -> Result<(), CliError> {
+        self.persist_blobs(repo_root)?;
+        let path = real_state_path(repo_root);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                invalid_request(format!("failed to create {}: {error}", parent.display()))
+            })?;
+        }
+        let mut body = String::new();
+        body.push_str(&format!(
+            "repo\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            self.repository_id,
+            self.base_checkpoint_id,
+            self.base_resolved_view_id,
+            self.resolved_view_id,
+            self.tree_hash,
+            self.topic_id.as_deref().unwrap_or(""),
+            self.topic_slug.as_deref().unwrap_or(""),
+            self.topic_display_name.as_deref().unwrap_or(""),
+            self.session_id.as_deref().unwrap_or(""),
+            self.actor_id.as_deref().unwrap_or(""),
+            self.generation_number,
+            self.revision_number,
+            self.head_revision_id.as_deref().unwrap_or(""),
+        ));
+        for entry in &self.entries {
+            body.push_str(&format!(
+                "file\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                entry.path,
+                entry.artifact_id,
+                entry.content_hash,
+                entry.executable,
+                entry.classification,
+                entry.tombstone,
+            ));
+        }
+        fs::write(&path, body).map_err(|error| {
+            invalid_request(format!("failed to write native Sunlight state: {error}"))
+                .with_detail("path", path.display().to_string())
+        })
+    }
+
+    fn persist_blobs(&self, repo_root: &PathBuf) -> Result<(), CliError> {
+        for entry in &self.entries {
+            let path = real_blob_path(repo_root, &entry.content_hash);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|error| {
+                    invalid_request(format!("failed to create {}: {error}", parent.display()))
+                })?;
+            }
+            if !path.exists() {
+                fs::write(&path, &entry.bytes).map_err(|error| {
+                    invalid_request(format!("failed to write content blob: {error}"))
+                        .with_detail("path", path.display().to_string())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_record(
+        &self,
+        repo_root: &PathBuf,
+        dir: &str,
+        id: &str,
+        json: &str,
+    ) -> Result<(), CliError> {
+        let path = repo_root
+            .join(".sunlight")
+            .join(dir)
+            .join(format!("{id}.json"));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                invalid_request(format!("failed to create {}: {error}", parent.display()))
+            })?;
+        }
+        fs::write(&path, json).map_err(|error| {
+            invalid_request(format!("failed to write Sunlight record: {error}"))
+                .with_detail("path", path.display().to_string())
+        })
+    }
+
+    fn session_id(&self) -> Result<&str, CliError> {
+        self.session_id
+            .as_deref()
+            .ok_or_else(|| CliError::new("session_not_found", "no native Sunlight session exists"))
+    }
+
+    fn ensure_session(&self, session_id: &str) -> Result<(), CliError> {
+        if self.session_id()? == session_id {
+            Ok(())
+        } else {
+            Err(CliError::new(
+                "session_not_found",
+                format!("session `{session_id}` was not found"),
+            )
+            .with_detail("session_id", session_id))
+        }
+    }
+
+    fn view(&self) -> SessionView {
+        SessionView {
+            resolved_view_id: self.resolved_view_id.clone(),
+            session_generation_id: format!("gen_native_{:04}", self.generation_number.max(1)),
+            tree_identity: TreeIdentityView {
+                kind: "SingleRepoTree".to_string(),
+                repository_id: self.repository_id.clone(),
+                tree_hash: self.tree_hash.clone(),
+            },
+        }
+    }
+
+    fn resolved_view(&self) -> ResolvedViewResult {
+        let tree_entries = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.tombstone)
+            .map(|entry| {
+                (
+                    entry.path.clone(),
+                    TreeEntryState {
+                        artifact_id: entry.artifact_id.clone(),
+                        path: entry.path.clone(),
+                        content_hash: entry.content_hash.clone(),
+                    },
+                )
+            })
+            .collect();
+        let topic_frontier = self
+            .topic_id
+            .as_ref()
+            .zip(self.head_revision_id.as_ref())
+            .map(|(topic, revision)| BTreeMap::from([(topic.clone(), revision.clone())]))
+            .unwrap_or_default();
+        ResolvedViewResult {
+            resolved_view_id: self.resolved_view_id.clone(),
+            repository_id: self.repository_id.clone(),
+            base_checkpoint_ids: vec![self.base_checkpoint_id.clone()],
+            topic_frontier,
+            dependency_closure: DependencyClosure {
+                revision_ids: Vec::new(),
+            },
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            resolver_order: DeterministicResolverOrder {
+                operation_ids: Vec::new(),
+            },
+            tree_identity: Some(SingleRepoTree {
+                repository_id: self.repository_id.clone(),
+                tree_hash: self.tree_hash.clone(),
+            }),
+            records: Vec::new(),
+            tree_entries,
+        }
+    }
+
+    fn entry(&self, path: &str) -> Result<&RealArtifactEntry, CliError> {
+        self.entries
+            .iter()
+            .find(|entry| entry.path == path && !entry.tombstone)
+            .ok_or_else(|| {
+                CliError::new("path_not_found", format!("path `{path}` was not found"))
+                    .with_detail("path", path)
+                    .with_detail("session_generation_id", self.view().session_generation_id)
+            })
+    }
+}
+
+fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Result<(), CliError> {
+    TopicSlug::new(options.slug.clone()).map_err(|error| {
+        invalid_request(error.to_string()).with_detail("slug", options.slug.clone())
+    })?;
+    let repo_root = PathBuf::from(".");
+    let mut state = RealRepoState::load(&repo_root)?;
+    let topic_id = format!("topic_{}", options.slug.replace('-', "_"));
+    state.topic_id = Some(topic_id.clone());
+    state.topic_slug = Some(options.slug.clone());
+    state.topic_display_name = Some(options.display_name.clone());
+    state.save(&repo_root)?;
+    state.persist_record(
+        &repo_root,
+        "topics",
+        &topic_id,
+        &format!(
+            "{{\"record_type\":\"topic\",\"id\":\"{}\",\"repository_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":null}}\n",
+            json_escape(&topic_id),
+            json_escape(&state.repository_id),
+            json_escape(&options.slug),
+            json_escape(&options.display_name),
+            json_escape(&state.base_checkpoint_id),
+        ),
+    )?;
+
+    if ctx.json {
+        println!("{}", real_topic_create_success_envelope(&state));
+    } else {
+        println!("created topic {topic_id}");
+    }
+    Ok(())
+}
+
+fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Result<(), CliError> {
+    let repo_root = PathBuf::from(".");
+    let mut state = RealRepoState::load(&repo_root)?;
+    let topic_id = state
+        .topic_id
+        .clone()
+        .ok_or_else(|| CliError::new("topic_not_found", "topic was not found"))?;
+    if options.topic != topic_id && state.topic_slug.as_deref() != Some(options.topic.as_str()) {
+        return Err(CliError::new(
+            "topic_not_found",
+            format!("topic `{}` was not found", options.topic),
+        )
+        .with_detail("topic", options.topic));
+    }
+    if options.view_id != state.resolved_view_id && options.view_id != state.base_resolved_view_id {
+        return Err(object_not_found("view", &options.view_id));
+    }
+    state.session_id = Some(format!("session_{}", options.actor_id.replace('-', "_")));
+    state.actor_id = Some(options.actor_id.clone());
+    state.generation_number = state.generation_number.max(1);
+    state.save(&repo_root)?;
+    let session_id = state.session_id.clone().unwrap();
+    state.persist_record(
+        &repo_root,
+        "records",
+        &session_id,
+        &format!(
+            "{{\"record_type\":\"session\",\"id\":\"{}\",\"repository_id\":\"{}\",\"write_topic_id\":\"{}\",\"resolved_view_id\":\"{}\",\"session_generation_id\":\"{}\",\"actor_id\":\"{}\"}}\n",
+            json_escape(&session_id),
+            json_escape(&state.repository_id),
+            json_escape(&topic_id),
+            json_escape(&state.resolved_view_id),
+            json_escape(&state.view().session_generation_id),
+            json_escape(&options.actor_id),
+        ),
+    )?;
+
+    if ctx.json {
+        println!("{}", real_session_start_success_envelope(&state));
+    } else {
+        println!("started session {session_id}");
+    }
+    Ok(())
+}
+
+fn real_artifact_read(
+    ctx: &CommandContext,
+    options: ArtifactCommandOptions,
+) -> Result<(), CliError> {
+    let state = RealRepoState::load(&PathBuf::from("."))?;
+    state.ensure_session(&options.session_id)?;
+    let entry = state.entry(&options.operands[0])?;
+    let bytes = std::str::from_utf8(&entry.bytes)
+        .map_err(|_| CliError::new("invalid_content_encoding", "path is not UTF-8 text"))?;
+    let response = ReadResponse {
+        command: "artifact.read",
+        repository_id: state.repository_id.clone(),
+        session_id: options.session_id,
+        view: state.view(),
+        artifact: real_artifact_view(entry),
+        content: sunlight_core::artifacts::ContentView {
+            encoding: "utf-8".to_string(),
+            bytes: bytes.to_string(),
+        },
+    };
+    if ctx.json {
+        println!("{}", read_success_envelope(&response));
+    } else {
+        print!("{}", response.content.bytes);
+    }
+    Ok(())
+}
+
+fn real_artifact_list(
+    ctx: &CommandContext,
+    options: ArtifactCommandOptions,
+) -> Result<(), CliError> {
+    let state = RealRepoState::load(&PathBuf::from("."))?;
+    state.ensure_session(&options.session_id)?;
+    let prefix = options.operands.first().map(String::as_str).unwrap_or("");
+    let response = ListResponse {
+        command: "artifact.list",
+        repository_id: state.repository_id.clone(),
+        session_id: options.session_id,
+        view: state.view(),
+        artifacts: state
+            .entries
+            .iter()
+            .filter(|entry| {
+                !entry.tombstone
+                    && (prefix.is_empty()
+                        || entry.path == prefix
+                        || entry.path.starts_with(&format!("{prefix}/")))
+            })
+            .map(real_artifact_view)
+            .collect(),
+    };
+    if ctx.json {
+        println!("{}", list_success_envelope(&response));
+    } else {
+        for artifact in response.artifacts {
+            println!("{}", artifact.path);
+        }
+    }
+    Ok(())
+}
+
+fn real_artifact_search(
+    ctx: &CommandContext,
+    options: ArtifactCommandOptions,
+) -> Result<(), CliError> {
+    let state = RealRepoState::load(&PathBuf::from("."))?;
+    state.ensure_session(&options.session_id)?;
+    let query = &options.operands[0];
+    let mut matches = Vec::new();
+    for entry in state.entries.iter().filter(|entry| !entry.tombstone) {
+        if let Ok(text) = std::str::from_utf8(&entry.bytes) {
+            for (line_index, line) in text.lines().enumerate() {
+                if line.contains(query) {
+                    matches.push(sunlight_core::artifacts::SearchMatch {
+                        artifact_id: entry.artifact_id.clone(),
+                        path: entry.path.clone(),
+                        content_hash: entry.content_hash.clone(),
+                        line: line_index + 1,
+                        snippet: line.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    let response = SearchResponse {
+        command: "artifact.search",
+        repository_id: state.repository_id.clone(),
+        session_id: options.session_id,
+        view: state.view(),
+        matches,
+    };
+    if ctx.json {
+        println!("{}", search_success_envelope(&response));
+    } else {
+        for item in response.matches {
+            println!("{}:{}:{}", item.path, item.line, item.snippet);
+        }
+    }
+    Ok(())
+}
+
+fn real_artifact_patch(
+    ctx: &CommandContext,
+    options: MutationCommandOptions,
+    patch: String,
+) -> Result<(), CliError> {
+    let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    let path = options.operands[0].clone();
+    let index = real_entry_index(&state, &path)?;
+    let before = state.entries[index].clone();
+    if before.content_hash != options.expect_hash.as_deref().unwrap_or("") {
+        return Err(real_precondition_error(
+            &state,
+            &before,
+            options.expect_hash.as_deref().unwrap_or(""),
+        ));
+    }
+    let before_text = std::str::from_utf8(&before.bytes)
+        .map_err(|_| CliError::new("invalid_content_encoding", "path is not UTF-8 text"))?;
+    let (after_text, _) = apply_real_patch(before_text, &patch)?;
+    state.entries[index].bytes = after_text.into_bytes();
+    state.entries[index].content_hash = real_content_hash(&state.entries[index].bytes);
+    let response = real_accept_mutation(
+        &mut state,
+        &options.session_id,
+        "patch",
+        &path,
+        Some(before),
+        index,
+    )?;
+    finish_real_mutation(ctx, state, response)
+}
+
+fn real_artifact_write(
+    ctx: &CommandContext,
+    options: MutationCommandOptions,
+    content: Vec<u8>,
+    expected_hash: ExpectedHash,
+) -> Result<(), CliError> {
+    let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    state.ensure_session(&options.session_id)?;
+    let path = options.operands[0].clone();
+    let existing = state
+        .entries
+        .iter()
+        .position(|entry| entry.path == path && !entry.tombstone);
+    let before = existing.map(|index| state.entries[index].clone());
+    match (&expected_hash, &before) {
+        (ExpectedHash::New, Some(entry)) => {
+            return Err(real_precondition_error(&state, entry, "new"))
+        }
+        (ExpectedHash::Existing(expected), Some(entry)) if entry.content_hash != *expected => {
+            return Err(real_precondition_error(&state, entry, expected));
+        }
+        (ExpectedHash::Existing(expected), None) => {
+            return Err(CliError::new(
+                "precondition_failed",
+                "mutation precondition failed: expected_hash",
+            )
+            .with_detail("path", path)
+            .with_detail("expected", expected)
+            .with_detail("session_generation_id", state.view().session_generation_id)
+            .with_detail("resolved_view_id", state.resolved_view_id.clone()));
+        }
+        _ => {}
+    }
+    let index = if let Some(index) = existing {
+        state.entries[index].bytes = content;
+        state.entries[index].content_hash = real_content_hash(&state.entries[index].bytes);
+        state.entries[index].classification = options
+            .classification
+            .clone()
+            .unwrap_or_else(|| "source".to_string());
+        index
+    } else {
+        state.entries.push(RealArtifactEntry {
+            artifact_id: real_artifact_id_for_path(&path),
+            path: path.clone(),
+            content_hash: real_content_hash(&content),
+            executable: false,
+            classification: options
+                .classification
+                .clone()
+                .unwrap_or_else(|| "source".to_string()),
+            tombstone: false,
+            bytes: content,
+        });
+        state.entries.len() - 1
+    };
+    let response = real_accept_mutation(
+        &mut state,
+        &options.session_id,
+        "write",
+        &path,
+        before,
+        index,
+    )?;
+    finish_real_mutation(ctx, state, response)
+}
+
+fn real_artifact_move(
+    ctx: &CommandContext,
+    options: MutationCommandOptions,
+    expected: String,
+) -> Result<(), CliError> {
+    let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    let source = options.operands[0].clone();
+    let target = options.operands[1].clone();
+    let index = real_entry_index(&state, &source)?;
+    let before = state.entries[index].clone();
+    if before.content_hash != expected {
+        return Err(real_precondition_error(&state, &before, &expected));
+    }
+    state.entries[index].path = target.clone();
+    let mut tombstone = before.clone();
+    tombstone.tombstone = true;
+    state.entries.push(tombstone);
+    let response = real_accept_mutation(
+        &mut state,
+        &options.session_id,
+        "move",
+        &target,
+        Some(before),
+        index,
+    )?;
+    finish_real_mutation(ctx, state, response)
+}
+
+fn real_artifact_delete(
+    ctx: &CommandContext,
+    options: MutationCommandOptions,
+    expected: String,
+) -> Result<(), CliError> {
+    let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    let path = options.operands[0].clone();
+    let index = real_entry_index(&state, &path)?;
+    let before = state.entries[index].clone();
+    if before.content_hash != expected {
+        return Err(real_precondition_error(&state, &before, &expected));
+    }
+    state.entries[index].tombstone = true;
+    let response = real_accept_mutation(
+        &mut state,
+        &options.session_id,
+        "delete",
+        &path,
+        Some(before),
+        index,
+    )?;
+    finish_real_mutation(ctx, state, response)
+}
+
+fn real_artifact_metadata_set(
+    ctx: &CommandContext,
+    options: MutationCommandOptions,
+    expected: String,
+    classification: String,
+) -> Result<(), CliError> {
+    let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    let path = options.operands[0].clone();
+    let index = real_entry_index(&state, &path)?;
+    let before = state.entries[index].clone();
+    if before.content_hash != expected {
+        return Err(real_precondition_error(&state, &before, &expected));
+    }
+    state.entries[index].classification = classification;
+    let response = real_accept_mutation(
+        &mut state,
+        &options.session_id,
+        "metadata_set",
+        &path,
+        Some(before),
+        index,
+    )?;
+    finish_real_mutation(ctx, state, response)
+}
+
+fn real_view_resolve(ctx: &CommandContext, options: ViewResolveOptions) -> Result<(), CliError> {
+    let state = RealRepoState::load(&PathBuf::from("."))?;
+    if let Some(base) = &options.base_checkpoint_id {
+        if base != &state.base_checkpoint_id {
+            return Err(object_not_found("checkpoint", base));
+        }
+    }
+    let view = state.resolved_view();
+    if ctx.json {
+        println!("{}", view_resolve_success_envelope(&view));
+    } else {
+        println!("{} {}", view.resolved_view_id, state.tree_hash);
+    }
+    Ok(())
+}
+
+fn real_project_materialize(
+    ctx: &CommandContext,
+    options: ProjectMaterializeOptions,
+) -> Result<(), CliError> {
+    let state = RealRepoState::load(&PathBuf::from("."))?;
+    if options.view_id != state.resolved_view_id && options.view_id != state.base_resolved_view_id {
+        return Err(object_not_found("resolved_view", &options.view_id));
+    }
+    let projection_id = format!(
+        "projection_{}_native_{:04}",
+        options.purpose.as_str(),
+        state.generation_number.max(1)
+    );
+    if let Some(root) = options.projection_root {
+        materialize_real_files(&state, &root)?;
+        if ctx.json {
+            println!(
+                "{}",
+                real_projection_materialized_envelope(
+                    &state,
+                    &projection_id,
+                    options.purpose,
+                    &root
+                )
+            );
+        } else {
+            println!("{} {}", projection_id, root.display());
+        }
+    } else if ctx.json {
+        println!(
+            "{}",
+            real_projection_plan_envelope(&state, &projection_id, options.purpose)
+        );
+    } else {
+        println!("{} .sunlight/projections/{}", projection_id, projection_id);
+    }
+    Ok(())
+}
+
+fn real_checkpoint_create(
+    ctx: &CommandContext,
+    options: CheckpointCreateOptions,
+) -> Result<(), CliError> {
+    let state = RealRepoState::load(&PathBuf::from("."))?;
+    if options.view_id != state.resolved_view_id && options.view_id != state.base_resolved_view_id {
+        return Err(object_not_found("resolved_view", &options.view_id));
+    }
+    let checkpoint = real_checkpoint(&state);
+    state.persist_record(
+        &PathBuf::from("."),
+        "checkpoints",
+        &checkpoint.id,
+        &format!("{}\n", checkpoint_json(&checkpoint)),
+    )?;
+    if ctx.json {
+        println!("{}", checkpoint_create_success_envelope(&checkpoint));
+    } else {
+        println!("{} {}", checkpoint.id, checkpoint.resolved_view_id);
+    }
+    Ok(())
+}
+
+fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<(), CliError> {
+    let repo_root = options.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+    let state = RealRepoState::load(&repo_root)?;
+    let checkpoint = real_checkpoint(&state);
+    if checkpoint.id != options.checkpoint_id {
+        return Err(object_not_found("checkpoint", &options.checkpoint_id));
+    }
+    if options.write_plan {
+        let plan_json = format!(
+            "{{\"ok\":true,\"data\":{{\"command\":\"git.export.plan\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\"}},\"git_ref\":\"{}\",\"content_files\":{}}},\"warnings\":[]}}",
+            json_escape(&state.repository_id),
+            json_escape(&checkpoint.id),
+            json_escape(&options.git_ref),
+            state.entries.iter().filter(|entry| !entry.tombstone).count(),
+        );
+        println!("{plan_json}");
+        return Ok(());
+    }
+    if options.execute_local {
+        write_real_files_overwrite(&state, &repo_root)?;
+        run_git_capture(&repo_root, &["add", "-A"]).map_err(invalid_request)?;
+        let commit_message = format!("Sunlight export {}", checkpoint.id);
+        let commit = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["commit", "-m", &commit_message])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| invalid_request(format!("failed to start git commit: {error}")))?;
+        if !commit.status.success() {
+            let stderr = String::from_utf8_lossy(&commit.stderr);
+            if !stderr.contains("nothing to commit") {
+                return Err(invalid_request(format!(
+                    "git commit failed: {}",
+                    stderr.trim()
+                )));
+            }
+        }
+        run_git_capture(&repo_root, &["branch", "-f", &options.git_ref])
+            .map_err(invalid_request)?;
+        let commit_id =
+            run_git_capture(&repo_root, &["rev-parse", "HEAD"]).map_err(invalid_request)?;
+        let export_id = format!("export_map_{}", checkpoint.id);
+        state.persist_record(
+            &repo_root,
+            "export-map",
+            &export_id,
+            &format!(
+                "{{\"record_type\":\"git_export_map\",\"id\":\"{}\",\"repository_id\":\"{}\",\"checkpoint_id\":\"{}\",\"git_ref\":\"{}\",\"git_commit_ids\":[\"{}\"]}}\n",
+                json_escape(&export_id),
+                json_escape(&state.repository_id),
+                json_escape(&checkpoint.id),
+                json_escape(&options.git_ref),
+                json_escape(commit_id.trim()),
+            ),
+        )?;
+        if ctx.json {
+            println!(
+                "{{\"ok\":true,\"data\":{{\"command\":\"git.export.execute\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\",\"export_map_id\":\"{}\"}},\"checkpoint_id\":\"{}\",\"git_ref\":\"{}\",\"git_commit_ids\":[\"{}\"],\"lifecycle_state\":\"exported\"}},\"warnings\":[]}}",
+                json_escape(&state.repository_id),
+                json_escape(&checkpoint.id),
+                json_escape(&export_id),
+                json_escape(&checkpoint.id),
+                json_escape(&options.git_ref),
+                json_escape(commit_id.trim()),
+            );
+        } else {
+            println!("{} exported", checkpoint.id);
+        }
+        return Ok(());
+    }
+    let response = git_export_checkpoint(GitExportRequest::from_checkpoint(&checkpoint))
+        .map_err(git_export_error)?;
+    if ctx.json {
+        println!("{}", git_export_success_envelope(&response));
+    } else {
+        println!("{} {}", response.checkpoint_id, response.git_ref);
+    }
+    Ok(())
+}
+
+fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
+    let state = match RealRepoState::load(&PathBuf::from(".")) {
+        Ok(state) => state,
+        Err(_) => return Ok(false),
+    };
+    let command = match ctx.args.as_slice() {
+        [_, flag, value] if flag == "--session" => {
+            state.ensure_session(value)?;
+            "status.session"
+        }
+        [_, flag, value] if flag == "--topic" => {
+            if state.topic_id.as_deref() != Some(value.as_str())
+                && state.topic_slug.as_deref() != Some(value.as_str())
+            {
+                return Err(CliError::new(
+                    "topic_not_found",
+                    format!("topic `{value}` was not found"),
+                )
+                .with_detail("topic", value.clone()));
+            }
+            "status.topic"
+        }
+        [_, flag, value] if flag == "--view" => {
+            if value != &state.resolved_view_id && value != &state.base_resolved_view_id {
+                return Err(object_not_found("resolved_view", value));
+            }
+            "status.view"
+        }
+        [_] => "status.repository",
+        _ => return Ok(false),
+    };
+    if ctx.json {
+        println!("{}", real_status_envelope(&state, command));
+    } else {
+        println!(
+            "{} files={} tree={}",
+            state.repository_id,
+            state
+                .entries
+                .iter()
+                .filter(|entry| !entry.tombstone)
+                .count(),
+            state.tree_hash
+        );
+    }
+    Ok(true)
+}
+
+fn real_inspect(ctx: &CommandContext) -> Result<bool, CliError> {
+    let state = match RealRepoState::load(&PathBuf::from(".")) {
+        Ok(state) => state,
+        Err(_) => return Ok(false),
+    };
+    let selector = match ctx.args.iter().skip(1).find(|arg| !arg.starts_with("--")) {
+        Some(selector) => selector,
+        None => return Ok(false),
+    };
+    if ctx.json {
+        println!("{}", real_inspect_envelope(&state, selector)?);
+    } else {
+        println!("{selector}");
+    }
+    Ok(true)
+}
+
+fn real_accept_mutation(
+    state: &mut RealRepoState,
+    session_id: &str,
+    mutation: &str,
+    path: &str,
+    before: Option<RealArtifactEntry>,
+    index: usize,
+) -> Result<MutationResponse, CliError> {
+    state.ensure_session(session_id)?;
+    let topic_id = state
+        .topic_id
+        .clone()
+        .ok_or_else(|| CliError::new("topic_not_found", "topic was not found"))?;
+    let prior_view = state.view();
+    let parent_revision_id = state.head_revision_id.clone();
+    let mutated_artifact_id = before
+        .as_ref()
+        .map(|entry| entry.artifact_id.clone())
+        .or_else(|| {
+            state
+                .entries
+                .get(index)
+                .map(|entry| entry.artifact_id.clone())
+        })
+        .ok_or_else(|| CliError::new("path_not_found", "mutated artifact was not found"))?;
+    state.revision_number += 1;
+    state.generation_number += 1;
+    state
+        .entries
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    state.tree_hash = real_tree_hash(&state.entries);
+    state.resolved_view_id = format!("view_native_{:04}", state.generation_number);
+    let operation_id = format!("op_native_{:04}", state.revision_number);
+    let revision_id = format!(
+        "rev_{}_{:04}",
+        topic_id.trim_start_matches("topic_"),
+        state.revision_number
+    );
+    state.head_revision_id = Some(revision_id.clone());
+    let after = state
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.artifact_id == mutated_artifact_id && (mutation == "delete" || !entry.tombstone)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            CliError::new(
+                "path_not_found",
+                "mutated artifact was not found after mutation",
+            )
+        })?;
+    let tree_identity = state.view().tree_identity;
+    let before_hash = before.as_ref().map(|entry| entry.content_hash.clone());
+    let after_hash = after.content_hash.clone();
+    let kind = match mutation {
+        "patch" => MutationKind::Patch,
+        "move" => MutationKind::Move,
+        "delete" => MutationKind::Delete,
+        "metadata_set" => MutationKind::MetadataSet,
+        _ => MutationKind::Write,
+    };
+    let payload = MutationPayload::Write {
+        write_mode: if before.is_some() {
+            WriteMode::Replace
+        } else {
+            WriteMode::Create
+        },
+        content_hash: after_hash.clone(),
+        byte_length: after.bytes.len(),
+        media_type: media_type_for_path(&after.path).to_string(),
+        executable: after.executable,
+        classification: after.classification.clone(),
+    };
+    let operation = OperationTransactionRecord {
+        id: operation_id.clone(),
+        repository_id: state.repository_id.clone(),
+        topic_id: topic_id.clone(),
+        session_id: session_id.to_string(),
+        session_generation_id: prior_view.session_generation_id.clone(),
+        actor_id: state
+            .actor_id
+            .clone()
+            .unwrap_or_else(|| "local".to_string()),
+        authored_context_id: format!("ctx_native_{:04}", state.generation_number - 1),
+        preconditions: sunlight_core::artifacts::MutationPreconditions {
+            resolved_view_id: prior_view.resolved_view_id.clone(),
+            session_generation_id: prior_view.session_generation_id.clone(),
+            write_topic_id: topic_id.clone(),
+            parent_topic_revision_id: parent_revision_id.clone(),
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            expected_path: path.to_string(),
+            expected_hash: before_hash
+                .clone()
+                .map(ExpectedHash::Existing)
+                .unwrap_or(ExpectedHash::New),
+        },
+        read_set: "full_authored_context".to_string(),
+        write_set: vec![sunlight_core::artifacts::WriteSetEntry {
+            artifact_id: after.artifact_id.clone(),
+            path: after.path.clone(),
+            mutation: kind.clone(),
+        }],
+        mutation_payload: payload,
+        before_refs: MutationRefs {
+            artifacts: vec![real_mutation_ref(before.as_ref(), path, before.is_none())],
+            tree_identity: prior_view.tree_identity,
+        },
+        after_refs: MutationRefs {
+            artifacts: vec![real_mutation_ref(Some(&after), &after.path, false)],
+            tree_identity: tree_identity.clone(),
+        },
+        classification: after.classification.clone(),
+        parent_topic_revision_id: parent_revision_id.clone(),
+        next_topic_revision_number: state.revision_number,
+        parents: parent_revision_id.iter().cloned().collect(),
+    };
+    let topic_revision = TopicRevisionRecord {
+        id: revision_id.clone(),
+        repository_id: state.repository_id.clone(),
+        topic_id: topic_id.clone(),
+        revision_number: state.revision_number,
+        parent_revision_id,
+        operation_transaction_id: operation_id.clone(),
+        tree_delta_ref: format!("delta_native_{:04}", state.revision_number),
+        dependency_revision_ids: Vec::new(),
+    };
+    let session_generation = SessionGenerationMutationRecord {
+        id: state.view().session_generation_id.clone(),
+        repository_id: state.repository_id.clone(),
+        session_id: session_id.to_string(),
+        write_topic_id: topic_id.clone(),
+        base_resolved_view_id: state.base_resolved_view_id.clone(),
+        resolved_view_id: state.resolved_view_id.clone(),
+        topic_frontier: BTreeMap::from([(topic_id, revision_id.clone())]),
+        generation_number: state.generation_number,
+        refresh_policy: "pinned_except_own_topic".to_string(),
+        created_by_operation_id: operation_id,
+    };
+    Ok(MutationResponse {
+        command: match mutation {
+            "patch" => "artifact.patch",
+            "move" => "artifact.move",
+            "delete" => "artifact.delete",
+            "metadata_set" => "artifact.metadata_set",
+            _ => "artifact.write",
+        },
+        repository_id: state.repository_id.clone(),
+        session_id: session_id.to_string(),
+        view: state.view(),
+        artifact: MutationArtifactView {
+            artifact_id: after.artifact_id,
+            path: after.path,
+            kind: ArtifactKind::File,
+            before_hash,
+            after_hash,
+            classification: after.classification,
+            executable: after.executable,
+        },
+        operation,
+        topic_revision,
+        session_generation,
+    })
+}
+
+fn finish_real_mutation(
+    ctx: &CommandContext,
+    state: RealRepoState,
+    response: MutationResponse,
+) -> Result<(), CliError> {
+    let repo_root = PathBuf::from(".");
+    state.save(&repo_root)?;
+    state.persist_record(
+        &repo_root,
+        "operations",
+        &response.operation.id,
+        &format!("{}\n", operation_json(&response)),
+    )?;
+    state.persist_record(
+        &repo_root,
+        "topics",
+        &response.topic_revision.id,
+        &format!("{}\n", topic_revision_json(&response)),
+    )?;
+    state.persist_record(
+        &repo_root,
+        "views",
+        &state.resolved_view_id,
+        &format!("{}\n", resolved_view_record_json(&state.resolved_view())),
+    )?;
+    if ctx.json {
+        println!("{}", mutation_success_envelope(&response));
+    } else {
+        println!(
+            "{} {}",
+            response.artifact.path, response.artifact.after_hash
+        );
+    }
+    Ok(())
+}
+
+fn scan_real_repo_files(
+    repo_root: &PathBuf,
+    current: &PathBuf,
+    entries: &mut Vec<RealArtifactEntry>,
+) -> Result<(), CliError> {
+    let children = fs::read_dir(current).map_err(|error| {
+        invalid_request(format!("failed to scan repository worktree: {error}"))
+            .with_detail("path", current.display().to_string())
+    })?;
+    for child in children {
+        let child = child.map_err(|error| {
+            invalid_request(format!("failed to scan repository worktree: {error}"))
+        })?;
+        let path = child.path();
+        let name = child.file_name();
+        if matches!(name.to_str(), Some(".git" | ".sunlight")) {
+            continue;
+        }
+        let metadata = child.metadata().map_err(|error| {
+            invalid_request(format!("failed to inspect worktree path: {error}"))
+                .with_detail("path", path.display().to_string())
+        })?;
+        if metadata.is_dir() {
+            scan_real_repo_files(repo_root, &path, entries)?;
+        } else if metadata.is_file() {
+            let bytes = fs::read(&path).map_err(|error| {
+                invalid_request(format!("failed to read worktree file: {error}"))
+                    .with_detail("path", path.display().to_string())
+            })?;
+            let relative = path
+                .strip_prefix(repo_root)
+                .map_err(|_| invalid_request("failed to normalize worktree path"))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            entries.push(RealArtifactEntry {
+                artifact_id: real_artifact_id_for_path(&relative),
+                path: relative,
+                content_hash: real_content_hash(&bytes),
+                executable: is_executable(&metadata),
+                classification: "source".to_string(),
+                tombstone: false,
+                bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn real_state_path(repo_root: &PathBuf) -> PathBuf {
+    repo_root
+        .join(".sunlight")
+        .join("records")
+        .join("native-state.tsv")
+}
+
+fn real_blob_path(repo_root: &PathBuf, content_hash: &str) -> PathBuf {
+    repo_root
+        .join(".sunlight")
+        .join("objects")
+        .join("blobs")
+        .join("sha256")
+        .join(content_hash.trim_start_matches("sha256:"))
+}
+
+fn read_real_blob(repo_root: &PathBuf, content_hash: &str) -> Result<Vec<u8>, CliError> {
+    let path = real_blob_path(repo_root, content_hash);
+    fs::read(&path).map_err(|error| {
+        invalid_request(format!("failed to read content blob: {error}"))
+            .with_detail("path", path.display().to_string())
+    })
+}
+
+fn real_content_hash(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn real_tree_hash(entries: &[RealArtifactEntry]) -> String {
+    let mut hasher = Sha256::new();
+    for entry in entries.iter().filter(|entry| !entry.tombstone) {
+        hasher.update(entry.path.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.content_hash.as_bytes());
+        hasher.update([u8::from(entry.executable)]);
+    }
+    format!("tree_{:x}", hasher.finalize())
+}
+
+fn real_artifact_id_for_path(path: &str) -> String {
+    format!("artifact_{}", path.replace(['/', '.', '-'], "_"))
+}
+
+fn real_now_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("unix_ms_{millis}")
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn real_artifact_view(entry: &RealArtifactEntry) -> SessionVisibleArtifactView {
+    SessionVisibleArtifactView {
+        artifact_id: entry.artifact_id.clone(),
+        path: entry.path.clone(),
+        kind: ArtifactKind::File,
+        content_hash: entry.content_hash.clone(),
+        byte_length: entry.bytes.len(),
+        classification: entry.classification.clone(),
+        executable: entry.executable,
+        tombstone: entry.tombstone,
+    }
+}
+
+fn real_entry_index(state: &RealRepoState, path: &str) -> Result<usize, CliError> {
+    state
+        .entries
+        .iter()
+        .position(|entry| entry.path == path && !entry.tombstone)
+        .ok_or_else(|| {
+            CliError::new("path_not_found", format!("path `{path}` was not found"))
+                .with_detail("path", path)
+                .with_detail("session_generation_id", state.view().session_generation_id)
+        })
+}
+
+fn real_precondition_error(
+    state: &RealRepoState,
+    entry: &RealArtifactEntry,
+    expected: &str,
+) -> CliError {
+    CliError::new(
+        "precondition_failed",
+        "mutation precondition failed: expected_hash",
+    )
+    .with_detail("failed_precondition", "expected_hash")
+    .with_detail("path", entry.path.clone())
+    .with_detail("artifact_id", entry.artifact_id.clone())
+    .with_detail("expected", expected)
+    .with_detail("actual", entry.content_hash.clone())
+    .with_detail("session_generation_id", state.view().session_generation_id)
+    .with_detail("resolved_view_id", state.resolved_view_id.clone())
+}
+
+fn apply_real_patch(before: &str, patch: &str) -> Result<(String, usize), CliError> {
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let mut hunk_count = 0;
+    for line in patch.lines() {
+        if line.starts_with("@@") {
+            hunk_count += 1;
+        } else if line.starts_with("---") || line.starts_with("+++") || line.starts_with("diff ") {
+        } else if let Some(rest) = line.strip_prefix('-') {
+            removed.push(format!("{rest}\n"));
+        } else if let Some(rest) = line.strip_prefix('+') {
+            added.push(format!("{rest}\n"));
+        }
+    }
+    let before_block = removed.concat();
+    let after_block = added.concat();
+    let Some(start) = before.find(&before_block) else {
+        return Err(CliError::new("patch_apply_failed", "patch did not apply"));
+    };
+    let mut output = String::new();
+    output.push_str(&before[..start]);
+    output.push_str(&after_block);
+    output.push_str(&before[start + before_block.len()..]);
+    Ok((output, hunk_count))
+}
+
+fn real_mutation_ref(
+    entry: Option<&RealArtifactEntry>,
+    path: &str,
+    absent: bool,
+) -> sunlight_core::artifacts::MutationArtifactRef {
+    sunlight_core::artifacts::MutationArtifactRef {
+        artifact_id: entry.map(|entry| entry.artifact_id.clone()),
+        path: entry
+            .map(|entry| entry.path.clone())
+            .unwrap_or_else(|| path.to_string()),
+        path_state: if absent {
+            "absent".to_string()
+        } else if entry.is_some_and(|entry| entry.tombstone) {
+            "tombstone".to_string()
+        } else {
+            "active".to_string()
+        },
+        content_hash: entry.map(|entry| entry.content_hash.clone()),
+        executable: entry.map(|entry| entry.executable),
+        classification: entry.map(|entry| entry.classification.clone()),
+    }
+}
+
+fn materialize_real_files(state: &RealRepoState, root: &PathBuf) -> Result<(), CliError> {
+    if root.exists()
+        && fs::read_dir(root)
+            .map_err(|error| invalid_request(error.to_string()))?
+            .next()
+            .is_some()
+    {
+        return Err(CliError::new(
+            "projection_materialization_projection_root_unavailable",
+            "projection root must be an empty directory or a creatable path",
+        ));
+    }
+    fs::create_dir_all(root)
+        .map_err(|error| invalid_request(format!("failed to create projection root: {error}")))?;
+    for entry in state.entries.iter().filter(|entry| !entry.tombstone) {
+        let path = root.join(&entry.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                invalid_request(format!("failed to create projection directory: {error}"))
+            })?;
+        }
+        fs::write(&path, &entry.bytes).map_err(|error| {
+            invalid_request(format!("failed to write projection file: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn write_real_files_overwrite(state: &RealRepoState, root: &PathBuf) -> Result<(), CliError> {
+    for entry in state.entries.iter().filter(|entry| entry.tombstone) {
+        let path = root.join(&entry.path);
+        if path.is_file() {
+            fs::remove_file(&path).map_err(|error| {
+                invalid_request(format!("failed to remove tombstoned export file: {error}"))
+            })?;
+        }
+    }
+    for entry in state.entries.iter().filter(|entry| !entry.tombstone) {
+        let path = root.join(&entry.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                invalid_request(format!("failed to create export directory: {error}"))
+            })?;
+        }
+        fs::write(&path, &entry.bytes)
+            .map_err(|error| invalid_request(format!("failed to write export file: {error}")))?;
+    }
+    Ok(())
+}
+
+fn real_checkpoint(state: &RealRepoState) -> CheckpointRecord {
+    CheckpointRecord {
+        id: format!(
+            "checkpoint_{}",
+            state
+                .tree_hash
+                .trim_start_matches("tree_")
+                .chars()
+                .take(16)
+                .collect::<String>()
+        ),
+        repository_id: state.repository_id.clone(),
+        resolved_view_id: state.resolved_view_id.clone(),
+        tree_identity: SingleRepoTree {
+            repository_id: state.repository_id.clone(),
+            tree_hash: state.tree_hash.clone(),
+        },
+        topic_frontier: state
+            .topic_id
+            .as_ref()
+            .zip(state.head_revision_id.as_ref())
+            .map(
+                |(topic_id, revision_id)| sunlight_core::checkpoint::TopicFrontierEntry {
+                    topic_id: topic_id.clone(),
+                    topic_revision_id: revision_id.clone(),
+                },
+            )
+            .into_iter()
+            .collect(),
+        evidence_refs: Vec::new(),
+        conflict_free: true,
+        created_by: sunlight_core::checkpoint::CreatedBy {
+            actor_id: state
+                .actor_id
+                .clone()
+                .unwrap_or_else(|| "operator".to_string()),
+            command: "checkpoint.create".to_string(),
+        },
+        created_at: real_now_id(),
+        retention_class: sunlight_core::checkpoint::RetentionClass::Landable,
+        export_refs: Vec::new(),
+        privacy_class: sunlight_core::records::PrivacyClass::CommitDefault,
+    }
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn media_type_for_path(path: &str) -> &'static str {
+    if path.ends_with(".md") {
+        "text/markdown; charset=utf-8"
+    } else if path.ends_with(".rs") {
+        "text/rust; charset=utf-8"
+    } else if path.ends_with(".ts") {
+        "text/typescript; charset=utf-8"
+    } else if path.ends_with(".sh") {
+        "text/x-shellscript; charset=utf-8"
+    } else {
+        "text/plain; charset=utf-8"
+    }
+}
+
+fn real_topic_create_success_envelope(state: &RealRepoState) -> String {
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"topic.create\",\"repository_id\":\"{}\",\"ids\":{{\"topic_id\":\"{}\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":null}},\"view\":null,\"topic\":{{\"topic_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"status\":\"open\",\"lifecycle\":\"open\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":null,\"owner_actor_id\":\"local\",\"visibility\":\"local\"}}}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(state.topic_id.as_deref().unwrap_or("")),
+        json_escape(&state.base_checkpoint_id),
+        json_escape(state.topic_id.as_deref().unwrap_or("")),
+        json_escape(state.topic_slug.as_deref().unwrap_or("")),
+        json_escape(state.topic_display_name.as_deref().unwrap_or("")),
+        json_escape(&state.base_checkpoint_id),
+    )
+}
+
+fn real_session_start_success_envelope(state: &RealRepoState) -> String {
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"session.start\",\"repository_id\":\"{}\",\"ids\":{{\"topic_id\":\"{}\",\"session_id\":\"{}\",\"resolved_view_id\":\"{}\",\"session_generation_id\":\"{}\"}},\"view\":{},\"session\":{{\"session_id\":\"{}\",\"actor_id\":\"{}\",\"write_topic_id\":\"{}\",\"resolved_view_id\":\"{}\",\"session_generation_id\":\"{}\",\"refresh_policy\":\"pinned_except_own_topic\",\"capabilities\":{}}},\"topic_frontier\":[{{\"topic_id\":\"{}\",\"revision_id\":{},\"mode\":\"write\"}}]}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(state.topic_id.as_deref().unwrap_or("")),
+        json_escape(state.session_id.as_deref().unwrap_or("")),
+        json_escape(&state.resolved_view_id),
+        json_escape(&state.view().session_generation_id),
+        view_json(&state.view()),
+        json_escape(state.session_id.as_deref().unwrap_or("")),
+        json_escape(state.actor_id.as_deref().unwrap_or("")),
+        json_escape(state.topic_id.as_deref().unwrap_or("")),
+        json_escape(&state.resolved_view_id),
+        json_escape(&state.view().session_generation_id),
+        phase1_capabilities_json(),
+        json_escape(state.topic_id.as_deref().unwrap_or("")),
+        optional_string_json(state.head_revision_id.as_deref()),
+    )
+}
+
+fn real_projection_plan_envelope(
+    state: &RealRepoState,
+    projection_id: &str,
+    purpose: ProjectionPurpose,
+) -> String {
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"projection.materialize\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"view\":{{\"resolved_view_id\":\"{}\",\"tree_identity\":{}}},\"projection_id\":\"{}\",\"purpose\":\"{}\",\"selected_strategy\":\"copy\",\"strategy\":\"copy\",\"tree_identity\":{},\"source\":\"resolved_content_tree\",\"local_materialization\":null}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(projection_id),
+        json_escape(&state.resolved_view_id),
+        json_escape(&state.resolved_view_id),
+        single_repo_tree_json(&SingleRepoTree { repository_id: state.repository_id.clone(), tree_hash: state.tree_hash.clone() }),
+        json_escape(projection_id),
+        purpose.as_str(),
+        single_repo_tree_json(&SingleRepoTree { repository_id: state.repository_id.clone(), tree_hash: state.tree_hash.clone() }),
+    )
+}
+
+fn real_projection_materialized_envelope(
+    state: &RealRepoState,
+    projection_id: &str,
+    purpose: ProjectionPurpose,
+    root: &PathBuf,
+) -> String {
+    let files = state
+        .entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .count();
+    let bytes: usize = state
+        .entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .map(|entry| entry.bytes.len())
+        .sum();
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"projection.materialize\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"view\":{{\"resolved_view_id\":\"{}\",\"tree_identity\":{}}},\"projection_id\":\"{}\",\"purpose\":\"{}\",\"selected_strategy\":\"copy\",\"strategy\":\"copy\",\"tree_identity\":{},\"source\":\"resolved_content_tree\",\"projection_root\":\"{}\",\"files_written\":{},\"bytes_written\":{},\"retention_state\":\"local_only\"}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(projection_id),
+        json_escape(&state.resolved_view_id),
+        json_escape(&state.resolved_view_id),
+        single_repo_tree_json(&SingleRepoTree { repository_id: state.repository_id.clone(), tree_hash: state.tree_hash.clone() }),
+        json_escape(projection_id),
+        purpose.as_str(),
+        single_repo_tree_json(&SingleRepoTree { repository_id: state.repository_id.clone(), tree_hash: state.tree_hash.clone() }),
+        json_escape(&root.display().to_string()),
+        files,
+        bytes,
+    )
+}
+
+fn real_status_envelope(state: &RealRepoState, command: &str) -> String {
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\"}},\"topic\":{{\"topic_id\":{},\"head_revision_id\":{}}},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\"}}}},\"warnings\":[]}}",
+        command,
+        json_escape(&state.repository_id),
+        json_escape(&state.repository_id),
+        optional_string_json(state.session_id.as_deref()),
+        optional_string_json(state.topic_id.as_deref()),
+        json_escape(&state.resolved_view_id),
+        view_json(&state.view()),
+        state.entries.iter().filter(|entry| !entry.tombstone).count(),
+        json_escape(&state.tree_hash),
+        json_escape(&state.base_checkpoint_id),
+        optional_string_json(state.topic_id.as_deref()),
+        optional_string_json(state.head_revision_id.as_deref()),
+        optional_string_json(state.session_id.as_deref()),
+        json_escape(&state.view().session_generation_id),
+    )
+}
+
+fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String, CliError> {
+    if let Some(path) = selector
+        .strip_prefix("artifact:")
+        .or_else(|| selector.strip_prefix("path:"))
+    {
+        let entry = state.entry(path)?;
+        return Ok(format!(
+            "{{\"ok\":true,\"data\":{{\"command\":\"inspect.artifact\",\"repository_id\":\"{}\",\"ids\":{{\"artifact_id\":\"{}\"}},\"view\":{},\"artifact\":{}}},\"warnings\":[]}}",
+            json_escape(&state.repository_id),
+            json_escape(&entry.artifact_id),
+            view_json(&state.view()),
+            artifact_json(&real_artifact_view(entry)),
+        ));
+    }
+    if selector == format!("repository:{}", state.repository_id) || selector == "repository" {
+        return Ok(real_status_envelope(state, "inspect.repository"));
+    }
+    if let Some(topic) = selector.strip_prefix("topic:") {
+        if state.topic_id.as_deref() == Some(topic) || state.topic_slug.as_deref() == Some(topic) {
+            return Ok(real_status_envelope(state, "inspect.topic"));
+        }
+    }
+    if let Some(session) = selector.strip_prefix("session:") {
+        state.ensure_session(session)?;
+        return Ok(real_status_envelope(state, "inspect.session"));
+    }
+    if let Some(view) = selector.strip_prefix("view:") {
+        if view == state.resolved_view_id || view == state.base_resolved_view_id {
+            return Ok(format!("{{\"ok\":true,\"data\":{{\"command\":\"inspect.view\",\"repository_id\":\"{}\",\"ids\":{{\"resolved_view_id\":\"{}\"}},\"view\":{},\"resolved_view\":{}}},\"warnings\":[]}}",
+                json_escape(&state.repository_id),
+                json_escape(view),
+                view_json(&state.view()),
+                resolved_view_record_json(&state.resolved_view()),
+            ));
+        }
+    }
     Err(CliError::new(
         "object_not_found",
         "Sunlight object was not found",
@@ -1281,7 +2891,7 @@ impl StoreIntegrityFixture {
 
 #[derive(Debug)]
 struct ViewResolveOptions {
-    fixture: String,
+    fixture: Option<String>,
     include: Vec<TopicRevisionSelection>,
     base_checkpoint_id: Option<String>,
 }
@@ -1296,7 +2906,7 @@ struct ExecutionRunOptions {
 
 #[derive(Debug)]
 struct CheckpointCreateOptions {
-    fixture: String,
+    fixture: Option<String>,
     view_id: String,
 }
 
@@ -1319,7 +2929,7 @@ struct PolicyExplainOptions {
 
 #[derive(Debug)]
 struct GitExportOptions {
-    fixture: String,
+    fixture: Option<String>,
     checkpoint_id: String,
     git_ref: String,
     write_plan: bool,
@@ -1362,7 +2972,7 @@ struct FixtureGitExport {
 
 #[derive(Debug)]
 struct ProjectMaterializeOptions {
-    fixture: String,
+    fixture: Option<String>,
     view_id: String,
     purpose: ProjectionPurpose,
     strategy: Option<ProjectionStrategy>,
@@ -1671,14 +3281,9 @@ fn parse_project_materialize_options(
         }
     }
 
-    let fixture = fixture.ok_or_else(|| {
-        invalid_request(
-            "usage: sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app",
-        )
-    })?;
     let view_id = view_id.ok_or_else(|| {
         invalid_request(
-            "usage: sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app",
+            "usage: sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export [--fixture basic-app]",
         )
     })?;
 
@@ -1755,14 +3360,9 @@ fn parse_checkpoint_create_options(
         }
     }
 
-    let fixture = fixture.ok_or_else(|| {
-        invalid_request(
-            "usage: sun checkpoint create --view <resolved-view-id> --fixture basic-app",
-        )
-    })?;
     let view_id = view_id.ok_or_else(|| {
         invalid_request(
-            "usage: sun checkpoint create --view <resolved-view-id> --fixture basic-app",
+            "usage: sun checkpoint create --view <resolved-view-id> [--fixture basic-app]",
         )
     })?;
 
@@ -1836,19 +3436,14 @@ fn parse_git_export_options(ctx: &CommandContext) -> Result<GitExportOptions, Cl
         }
     }
 
-    let fixture = fixture.ok_or_else(|| {
-        invalid_request(
-            "usage: sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app",
-        )
-    })?;
     let checkpoint_id = checkpoint_id.ok_or_else(|| {
         invalid_request(
-            "usage: sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app",
+            "usage: sun git export --checkpoint <checkpoint-id> --branch <git-ref> [--fixture basic-app]",
         )
     })?;
     let git_ref = git_ref.ok_or_else(|| {
         invalid_request(
-            "usage: sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app",
+            "usage: sun git export --checkpoint <checkpoint-id> --branch <git-ref> [--fixture basic-app]",
         )
     })?;
     if write_plan && execute_fixture.is_some() {
@@ -2077,13 +3672,7 @@ fn parse_view_resolve_options(ctx: &CommandContext) -> Result<ViewResolveOptions
         }
     }
 
-    let fixture = fixture
-        .ok_or_else(|| invalid_request("usage: sun view resolve requires --fixture basic-app"))?;
-    let include = include.ok_or_else(|| {
-        invalid_request(
-            "usage: sun view resolve requires --include topic:revision[,topic:revision]",
-        )
-    })?;
+    let include = include.unwrap_or_default();
 
     Ok(ViewResolveOptions {
         fixture,
@@ -4251,7 +5840,7 @@ fn unimplemented_command(command: &'static str, message: impl Into<String>) -> C
 struct TopicCreateOptions {
     slug: String,
     display_name: String,
-    fixture: String,
+    fixture: Option<String>,
 }
 
 #[derive(Debug)]
@@ -4259,20 +5848,20 @@ struct SessionStartOptions {
     topic: String,
     view_id: String,
     actor_id: String,
-    fixture: String,
+    fixture: Option<String>,
 }
 
 #[derive(Debug)]
 struct ArtifactCommandOptions {
     session_id: String,
-    fixture: String,
+    fixture: Option<String>,
     operands: Vec<String>,
 }
 
 #[derive(Debug)]
 struct MutationCommandOptions {
     session_id: String,
-    fixture: String,
+    fixture: Option<String>,
     operands: Vec<String>,
     expect_hash: Option<String>,
     patch_file: Option<String>,
@@ -4320,7 +5909,7 @@ fn parse_topic_create_options(ctx: &CommandContext) -> Result<TopicCreateOptions
 
     if operands.len() != 1 {
         return Err(invalid_request(
-            "usage: sun topic create <slug> --display-name <name> --fixture basic-app",
+            "usage: sun topic create <slug> --display-name <name> [--fixture basic-app]",
         ));
     }
 
@@ -4329,9 +5918,7 @@ fn parse_topic_create_options(ctx: &CommandContext) -> Result<TopicCreateOptions
         display_name: display_name.ok_or_else(|| {
             invalid_request("usage: sun topic create requires --display-name <name>")
         })?,
-        fixture: fixture.ok_or_else(|| {
-            invalid_request("usage: sun topic create requires --fixture basic-app")
-        })?,
+        fixture,
     })
 }
 
@@ -4389,9 +5976,7 @@ fn parse_session_start_options(ctx: &CommandContext) -> Result<SessionStartOptio
         actor_id: actor_id.ok_or_else(|| {
             invalid_request("usage: sun session start requires --actor <actor-id>")
         })?,
-        fixture: fixture.ok_or_else(|| {
-            invalid_request("usage: sun session start requires --fixture basic-app")
-        })?,
+        fixture,
     })
 }
 
@@ -4436,10 +6021,6 @@ fn parse_artifact_options(
     let session_id = session_id.ok_or_else(|| {
         invalid_request(format!("usage: sun {command} requires --session <session>"))
     })?;
-    let fixture = fixture.ok_or_else(|| {
-        invalid_request(format!("usage: sun {command} requires --fixture basic-app"))
-    })?;
-
     Ok(ArtifactCommandOptions {
         session_id,
         fixture,
@@ -4449,23 +6030,23 @@ fn parse_artifact_options(
 
 fn artifact_usage(command: &str) -> String {
     match command {
-        "read" => "usage: sun read <path-or-artifact-id> --session <session> --fixture basic-app",
-        "list" => "usage: sun list [path-prefix] --session <session> --fixture basic-app",
-        "search" => "usage: sun search <query> --session <session> --fixture basic-app",
+        "read" => "usage: sun read <path-or-artifact-id> --session <session> [--fixture basic-app]",
+        "list" => "usage: sun list [path-prefix] --session <session> [--fixture basic-app]",
+        "search" => "usage: sun search <query> --session <session> [--fixture basic-app]",
         "patch" => {
-            "usage: sun patch <path> --session <session> --fixture basic-app --expect-hash <hash> --patch-file <file>"
+            "usage: sun patch <path> --session <session> [--fixture basic-app] --expect-hash <hash> --patch-file <file>"
         }
         "write" => {
-            "usage: sun write <path> --session <session> --fixture basic-app --expect-hash <hash-or-new> --content-file <file> --classification <class>"
+            "usage: sun write <path> --session <session> [--fixture basic-app] --expect-hash <hash-or-new> --content-file <file> --classification <class>"
         }
         "move" => {
-            "usage: sun move <from> <to> --session <session> --fixture basic-app --expect-hash <hash>"
+            "usage: sun move <from> <to> --session <session> [--fixture basic-app] --expect-hash <hash>"
         }
         "delete" => {
-            "usage: sun delete <path> --session <session> --fixture basic-app --expect-hash <hash>"
+            "usage: sun delete <path> --session <session> [--fixture basic-app] --expect-hash <hash>"
         }
         "metadata set" => {
-            "usage: sun metadata set <path> --session <session> --fixture basic-app --expect-hash <hash> --classification <class>"
+            "usage: sun metadata set <path> --session <session> [--fixture basic-app] --expect-hash <hash> --classification <class>"
         }
         _ => "usage: sun <artifact-command> --session <session> --fixture basic-app",
     }
@@ -4553,10 +6134,6 @@ fn parse_mutation_options_with_skip(
     let session_id = session_id.ok_or_else(|| {
         invalid_request(format!("usage: sun {command} requires --session <session>"))
     })?;
-    let fixture = fixture.ok_or_else(|| {
-        invalid_request(format!("usage: sun {command} requires --fixture basic-app"))
-    })?;
-
     Ok(MutationCommandOptions {
         session_id,
         fixture,

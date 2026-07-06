@@ -30,7 +30,11 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - Manager setup started: 2026-07-06.
 - Windows checkout status at setup: clean.
 - WSL Codex readiness at setup: passed; Codex CLI, login, app-server, sandbox, Bun, Rust, `rg`, `jq`, and Git identity available.
-- Preferred WSL repo root: `/home/timothycard/code`.
+- WSL working clone: `/home/timothycard/code/Sunlight-2`.
+- WSL clone currently tracks the Windows checkout path as `origin`; use it for delegated work until branch sync is changed deliberately.
+- Critical handoff correction: previous fixture-backed acceptance is not product completion.
+- Current implementation reality: strong fixture prototype, not a real repo-backed source database.
+- Main product gap: remove the hard dependency on `--fixture basic-app` from the normal authoring flow.
 
 ## Workstreams
 
@@ -48,15 +52,15 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 
 | Slice | Thread | Repo/Branch | Status | Objective | Verification |
 | --- | --- | --- | --- | --- | --- |
-| None yet | - | - | Pending setup | Start after scratchpad and heartbeat are in place. | - |
+| real-repo-vertical-slice-1 | WSL Codex CLI | `/home/timothycard/code/Sunlight-2` | Pending launch | Implement the first repo-backed authoring path without `--fixture basic-app`. | Disposable real Git repo can init/read/write/materialize/checkpoint/export. |
 
 ## Delegation Queue
 
-1. Audit the current Rust workspace and map existing code/tests to the v0.3 feature set.
-2. Implement or complete the Phase 0 object model and persistence foundations.
-3. Implement or complete native CLI/API vertical slice operations.
-4. Build resolver conflict tests before broad resolver expansion.
-5. Add projection/execution spike with measured storage/time output.
+1. Replace fixture-backed authoring with real repo-backed init, base checkpoint, artifact records, topics, sessions, and read/list/search.
+2. Add durable repo-backed patch/write/move/delete/metadata operations with topic revisions and session generations.
+3. Make status/inspect show real persisted records.
+4. Make projection, checkpoint, and Git export consume real Sunlight records.
+5. Keep fixture tests only when they directly support removing fixture dependency.
 
 ## Heartbeat Procedure
 
@@ -69,6 +73,6 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 
 ## Open Management Decisions
 
-- Confirm whether the WSL development repo should be a fresh clone under `/home/timothycard/code` or whether this Windows checkout has a remote/branch setup suitable for cloning.
 - Choose the first production-like validation repository once Sunlight can run against itself.
 - Decide the default Git export shape before Phase 4 implementation locks it in.
+- Decide whether to retarget the WSL clone remote from the Windows checkout path to GitHub once slice branch sync requires it.

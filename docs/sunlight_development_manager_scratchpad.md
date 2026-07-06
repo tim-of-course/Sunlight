@@ -53,13 +53,14 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | Slice | Thread | Repo/Branch | Status | Objective | Verification |
 | --- | --- | --- | --- | --- | --- |
 | real-repo-artifact-io | WSL Codex CLI | `/home/timothycard/code/Sunlight-2` -> Windows commit `7bbda1a` | Completed | First no-fixture repo-backed authoring bridge. | Windows `cargo fmt --check`, no-fixture CLI tests, full `cargo test`, and `git diff --check` passed. |
+| repo-backed-core-storage | WSL Codex CLI | `/home/timothycard/code/Sunlight-2-core-storage-local` -> Windows commit `3b05cd7` | Completed | Move repo-backed state into `sunlight-core` and replace TSV with schema JSON. | Windows core repo-state tests, no-fixture CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
 
 ## Delegation Queue
 
-1. Harden repo-backed state: move the no-fixture bridge out of CLI-local TSV helpers toward core durable records, schema-safe serialization, and multiple topics/sessions.
-2. Add repo-backed policy/gitignore-aware ingestion so real production repos do not capture build outputs, caches, secrets, or local-only files by default.
+1. Add repo-backed policy/gitignore-aware ingestion so real production repos do not capture build outputs, caches, secrets, or local-only files by default.
+2. Expand repo-backed state beyond the single active topic/session path.
 3. Expand repo-backed resolver behavior beyond the single active topic/session path.
-4. Make projection, checkpoint, and Git export consume the hardened real Sunlight records.
+4. Make projection, checkpoint, and Git export consume hardened real Sunlight records end-to-end with policy validation.
 5. Keep fixture tests only when they directly support removing fixture dependency.
 
 ## Heartbeat Procedure

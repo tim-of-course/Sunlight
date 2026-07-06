@@ -33,8 +33,8 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - WSL working clone: `/home/timothycard/code/Sunlight-2`.
 - WSL clone currently tracks the Windows checkout path as `origin`; use it for delegated work until branch sync is changed deliberately.
 - Critical handoff correction: previous fixture-backed acceptance is not product completion.
-- Current implementation reality: fixture prototype plus a growing repo-backed authoring path with durable multi-topic/session state and deterministic conflict reporting; still not the full v0.3 product.
-- Main product gap: complete the no-fixture flow across hardened projection, checkpoint, Git export, execution, output promotion, compatibility import, and policy validation.
+- Current implementation reality: fixture prototype plus a growing repo-backed authoring path with durable multi-topic/session state, deterministic conflict reporting, and persisted projection/checkpoint/export snapshots; still not the full v0.3 product.
+- Main product gap: complete the no-fixture flow across execution, output promotion, compatibility import, broader policy validation, and production-like acceptance.
 
 ## Workstreams
 
@@ -58,12 +58,13 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | repo-backed-secret-gates | WSL Codex CLI | `/home/timothycard/code/Sunlight-2-secret-gates-local` -> Windows commit `6d92afd` | Completed | Quarantine likely secrets during ingestion and block secret/local-only checkpoint/export. | Windows core repo-state tests, no-fixture tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
 | repo-backed-multi-session | WSL Codex CLI | `/home/timothycard/code/Sunlight-2-multi-session-local` -> Windows commit `a005aea` | Completed | Persist multiple repo-backed topics and sessions with distinct session generations and topic heads. | Windows core repo-state tests, no-fixture CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
 | repo-backed-resolver | WSL Codex CLI | `/home/timothycard/code/Sunlight-2-resolver-local` -> Windows commit `16b8699` | Completed | Resolve persisted topic heads deterministically, materialize merged views, and report inspectable same-artifact conflicts. | Windows core repo-state tests, no-fixture CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
+| repo-backed-projection-export | WSL Codex CLI | `/home/timothycard/code/Sunlight-2-projection-export-local` -> Windows commit `8041db3` | Completed | Persist projection/checkpoint/export snapshots and export checkpoint bytes after head moves. | Windows core repo-state tests, no-fixture CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
 
 ## Delegation Queue
 
-1. Make projection, checkpoint, and Git export consume hardened real Sunlight records end-to-end with policy validation and durable export/checkpoint metadata.
-2. Add execution/output-promotion support against repo-backed views rather than fixture-only records.
-3. Add compatibility import from real projections back into repo-backed Sunlight operations.
+1. Add execution/output-promotion support against repo-backed views rather than fixture-only records.
+2. Add compatibility import from real projections back into repo-backed Sunlight operations.
+3. Broaden no-fixture policy validation for commit/export/projection records against `.sunlight` policy.
 4. Add a production-like validation repository once Sunlight can run against itself.
 5. Keep fixture tests only when they directly support removing fixture dependency.
 

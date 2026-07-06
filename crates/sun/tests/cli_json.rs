@@ -325,6 +325,109 @@ fn no_fixture_real_repo_artifact_io_vertical_slice() {
 }
 
 #[test]
+fn no_fixture_init_respects_git_ignore_policy() {
+    let repo = TestRepo::new("real-repo-ignore-policy");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    repo.write_file(".gitignore", "target/\n.cache/\n");
+    write_nested_file(
+        repo.path(),
+        "src/lib.rs",
+        "pub fn kept() -> &'static str {\n    \"normal-source-needle\"\n}\n",
+    );
+    write_nested_file(
+        repo.path(),
+        "target/debug/build.log",
+        "ignored-build-needle\n",
+    );
+    write_nested_file(
+        repo.path(),
+        ".cache/sun/local.txt",
+        "ignored-cache-needle\n",
+    );
+    git(repo.path(), &["add", ".gitignore", "src/lib.rs"]);
+    git(repo.path(), &["commit", "-m", "base"]);
+
+    start_native_session(&repo, "ignore-policy");
+
+    let native_state = fs::read_to_string(repo.path().join(".sunlight/records/native-state.json"))
+        .expect("native state should exist");
+    assert!(native_state.contains("\"path\":\"src/lib.rs\""));
+    assert!(!native_state.contains("target/debug/build.log"));
+    assert!(!native_state.contains(".cache/sun/local.txt"));
+    assert!(!native_state.contains("ignored-build-needle"));
+    assert!(!native_state.contains("ignored-cache-needle"));
+
+    let list_src = sun()
+        .arg("list")
+        .arg("src")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun list src should run");
+    assert_success(&list_src);
+    assert!(stdout(&list_src).contains("\"path\":\"src/lib.rs\""));
+
+    let list_target = sun()
+        .arg("list")
+        .arg("target")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun list target should run");
+    assert_success(&list_target);
+    let target_stdout = stdout(&list_target);
+    assert!(!target_stdout.contains("target/debug/build.log"));
+    assert!(!target_stdout.contains("ignored-build-needle"));
+
+    let search_source = sun()
+        .arg("search")
+        .arg("normal-source-needle")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun search source should run");
+    assert_success(&search_source);
+    assert!(stdout(&search_source).contains("\"path\":\"src/lib.rs\""));
+
+    let search_ignored = sun()
+        .arg("search")
+        .arg("ignored-build-needle")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun search ignored should run");
+    assert_success(&search_ignored);
+    let ignored_stdout = stdout(&search_ignored);
+    assert!(!ignored_stdout.contains("target/debug/build.log"));
+    assert!(!ignored_stdout.contains("ignored-build-needle"));
+
+    let search_cache = sun()
+        .arg("search")
+        .arg("ignored-cache-needle")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun search ignored cache should run");
+    assert_success(&search_cache);
+    assert!(!stdout(&search_cache).contains(".cache/sun/local.txt"));
+}
+
+#[test]
 fn no_fixture_move_after_sort_uses_moved_artifact_for_response() {
     let repo = TestRepo::new("real-move-sort-order");
     git(repo.path(), &["init", "-b", "main"]);

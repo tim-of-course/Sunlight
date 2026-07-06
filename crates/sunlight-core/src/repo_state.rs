@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
@@ -265,6 +266,22 @@ pub fn scan_real_repo_files(
     current: &Path,
     entries: &mut Vec<RealArtifactEntry>,
 ) -> Result<(), RepoStateError> {
+    if current == repo_root {
+        if let Some(paths) = git_worktree_file_paths(repo_root)? {
+            for relative in paths {
+                ingest_real_repo_path(repo_root, &relative, entries)?;
+            }
+            return Ok(());
+        }
+    }
+    scan_real_repo_files_fallback(repo_root, current, entries)
+}
+
+fn scan_real_repo_files_fallback(
+    repo_root: &Path,
+    current: &Path,
+    entries: &mut Vec<RealArtifactEntry>,
+) -> Result<(), RepoStateError> {
     let children = fs::read_dir(current)
         .map_err(|error| io_error(current, "failed to scan repository worktree", error))?;
     for child in children {
@@ -281,26 +298,81 @@ pub fn scan_real_repo_files(
             .metadata()
             .map_err(|error| io_error(&path, "failed to inspect worktree path", error))?;
         if metadata.is_dir() {
-            scan_real_repo_files(repo_root, &path, entries)?;
+            scan_real_repo_files_fallback(repo_root, &path, entries)?;
         } else if metadata.is_file() {
-            let bytes = fs::read(&path)
-                .map_err(|error| io_error(&path, "failed to read worktree file", error))?;
             let relative = path
                 .strip_prefix(repo_root)
                 .map_err(|_| invalid_state(repo_root, "failed to normalize worktree path"))?
                 .to_string_lossy()
                 .replace('\\', "/");
-            entries.push(RealArtifactEntry {
-                artifact_id: real_artifact_id_for_path(&relative),
-                path: relative,
-                content_hash: real_content_hash(&bytes),
-                executable: is_executable(&metadata),
-                classification: "source".to_string(),
-                tombstone: false,
-                bytes,
-            });
+            ingest_real_repo_path(repo_root, &relative, entries)?;
         }
     }
+    Ok(())
+}
+
+fn git_worktree_file_paths(repo_root: &Path) -> Result<Option<Vec<String>>, RepoStateError> {
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let mut paths = Vec::new();
+    for raw in output.stdout.split(|byte| *byte == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let relative = String::from_utf8_lossy(raw).replace('\\', "/");
+        if relative == ".git"
+            || relative == ".sunlight"
+            || relative.starts_with(".git/")
+            || relative.starts_with(".sunlight/")
+        {
+            continue;
+        }
+        paths.push(relative);
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(Some(paths))
+}
+
+fn ingest_real_repo_path(
+    repo_root: &Path,
+    relative: &str,
+    entries: &mut Vec<RealArtifactEntry>,
+) -> Result<(), RepoStateError> {
+    let path = repo_root.join(relative);
+    let metadata = fs::metadata(&path)
+        .map_err(|error| io_error(&path, "failed to inspect worktree path", error))?;
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let bytes =
+        fs::read(&path).map_err(|error| io_error(&path, "failed to read worktree file", error))?;
+    entries.push(RealArtifactEntry {
+        artifact_id: real_artifact_id_for_path(relative),
+        path: relative.to_string(),
+        content_hash: real_content_hash(&bytes),
+        executable: is_executable(&metadata),
+        classification: "source".to_string(),
+        tombstone: false,
+        bytes,
+    });
     Ok(())
 }
 
@@ -543,6 +615,7 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn temp_repo(name: &str) -> PathBuf {
         let mut root = std::env::temp_dir();
@@ -553,6 +626,22 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run git {}: {error}", args.join(" ")));
+        assert!(
+            output.status.success(),
+            "git {} failed\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -575,6 +664,59 @@ mod tests {
         assert_eq!(loaded.entries.len(), 2);
         assert!(real_state_path(&repo).is_file());
         assert_eq!(loaded.tree_hash, state.tree_hash);
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn git_ingestion_uses_exclude_standard_ignore_policy() {
+        let repo = temp_repo("git-ignore");
+        git(&repo, &["init", "-b", "main"]);
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join("target/debug")).unwrap();
+        fs::create_dir_all(repo.join(".cache/sun")).unwrap();
+        fs::write(repo.join(".gitignore"), b"target/\n.cache/\n").unwrap();
+        fs::write(repo.join("src/lib.rs"), b"pub fn kept() {}\n").unwrap();
+        fs::write(
+            repo.join("target/debug/build.log"),
+            b"ignored build cache\n",
+        )
+        .unwrap();
+        fs::write(repo.join(".cache/sun/local.txt"), b"ignored local cache\n").unwrap();
+
+        let state = RealRepoState::ingest(&repo, "repo_git_ignore").unwrap();
+        let paths = state
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec![".gitignore", "src/lib.rs"]);
+        assert!(state.entry("src/lib.rs").is_some());
+        assert!(state.entry("target/debug/build.log").is_none());
+        assert!(state.entry(".cache/sun/local.txt").is_none());
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn non_git_ingestion_fallback_still_excludes_sunlight_and_git_dirs() {
+        let repo = temp_repo("fallback");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join(".git/objects")).unwrap();
+        fs::create_dir_all(repo.join(".sunlight/records")).unwrap();
+        fs::write(repo.join("src/lib.rs"), b"pub fn kept() {}\n").unwrap();
+        fs::write(repo.join(".git/config"), b"[core]\n").unwrap();
+        fs::write(repo.join(".sunlight/records/native-state.json"), b"{}\n").unwrap();
+
+        let state = RealRepoState::ingest(&repo, "repo_fallback").unwrap();
+        let paths = state
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["src/lib.rs"]);
 
         fs::remove_dir_all(repo).unwrap();
     }

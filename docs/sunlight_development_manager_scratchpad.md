@@ -54,10 +54,11 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | --- | --- | --- | --- | --- | --- |
 | real-repo-artifact-io | WSL Codex CLI | `/home/timothycard/code/Sunlight-2` -> Windows commit `7bbda1a` | Completed | First no-fixture repo-backed authoring bridge. | Windows `cargo fmt --check`, no-fixture CLI tests, full `cargo test`, and `git diff --check` passed. |
 | repo-backed-core-storage | WSL Codex CLI | `/home/timothycard/code/Sunlight-2-core-storage-local` -> Windows commit `3b05cd7` | Completed | Move repo-backed state into `sunlight-core` and replace TSV with schema JSON. | Windows core repo-state tests, no-fixture CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
+| repo-backed-policy-ingest | WSL Codex CLI | `/home/timothycard/code/Sunlight-2-policy-ingest-local` -> Windows commit `f220730` | Completed | Respect Git ignore policy during repo-backed ingestion. | Windows core repo-state tests, ignore-policy no-fixture test, vertical-slice test, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
 
 ## Delegation Queue
 
-1. Add repo-backed policy/gitignore-aware ingestion so real production repos do not capture build outputs, caches, secrets, or local-only files by default.
+1. Add repo-backed secret detection/classification and export gates; Git ignore support is present but secret handling is not done.
 2. Expand repo-backed state beyond the single active topic/session path.
 3. Expand repo-backed resolver behavior beyond the single active topic/session path.
 4. Make projection, checkpoint, and Git export consume hardened real Sunlight records end-to-end with policy validation.

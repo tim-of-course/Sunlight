@@ -37,6 +37,8 @@ pub struct RealRepoState {
     pub base_entries: Vec<RealArtifactEntry>,
     pub operations: Vec<RealOperationRecord>,
     pub projections: Vec<RealProjectionSnapshot>,
+    pub executions: Vec<RealExecutionSnapshot>,
+    pub promotions: Vec<RealExecutionPromotionSnapshot>,
     pub checkpoints: Vec<RealCheckpointSnapshot>,
     pub export_maps: Vec<RealExportMapSnapshot>,
     pub entries: Vec<RealArtifactEntry>,
@@ -104,6 +106,50 @@ pub struct RealProjectionSnapshot {
     pub created_from_content_tree: String,
     pub materialized_root: Option<String>,
     pub entries: Vec<RealArtifactEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealExecutionSnapshot {
+    pub execution_id: String,
+    pub projection_id: String,
+    pub resolved_view_id: String,
+    pub tree_hash: String,
+    pub command_argv: Vec<String>,
+    pub working_directory: String,
+    pub exit_code: Option<i32>,
+    pub status: String,
+    pub stdout_digest: String,
+    pub stdout_byte_length: u64,
+    pub stderr_digest: String,
+    pub stderr_byte_length: u64,
+    pub outputs: Vec<RealExecutionOutputSnapshot>,
+    pub started_at: String,
+    pub finished_at: String,
+    pub privacy_class: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealExecutionOutputSnapshot {
+    pub path: String,
+    pub classification: String,
+    pub before_hash: Option<String>,
+    pub after_hash: String,
+    pub byte_length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealExecutionPromotionSnapshot {
+    pub execution_id: String,
+    pub projection_id: String,
+    pub output_path: String,
+    pub target_topic_id: String,
+    pub classification: String,
+    pub before_hash: Option<String>,
+    pub after_hash: String,
+    pub operation_transaction_id: String,
+    pub topic_revision_id: String,
+    pub session_generation_id: String,
+    pub authored_context_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +252,8 @@ impl RealRepoState {
             base_entries: entries.clone(),
             operations: Vec::new(),
             projections: Vec::new(),
+            executions: Vec::new(),
+            promotions: Vec::new(),
             checkpoints: Vec::new(),
             export_maps: Vec::new(),
             entries,
@@ -274,6 +322,14 @@ impl RealRepoState {
             .iter()
             .map(|projection| parse_projection_snapshot(repo_root, projection, &path))
             .collect::<Result<Vec<_>, _>>()?;
+        let executions = optional_array(&object, "executions", &path)?
+            .iter()
+            .map(|execution| parse_execution_snapshot(execution, &path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let promotions = optional_array(&object, "promotions", &path)?
+            .iter()
+            .map(|promotion| parse_execution_promotion_snapshot(promotion, &path))
+            .collect::<Result<Vec<_>, _>>()?;
         let checkpoints = optional_array(&object, "checkpoints", &path)?
             .iter()
             .map(|checkpoint| parse_checkpoint_snapshot(repo_root, checkpoint, &path))
@@ -330,6 +386,8 @@ impl RealRepoState {
             base_entries,
             operations,
             projections,
+            executions,
+            promotions,
             checkpoints,
             export_maps,
             entries,
@@ -465,6 +523,24 @@ impl RealRepoState {
                 self.projections
                     .iter()
                     .map(projection_snapshot_json)
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "executions".to_string(),
+            JsonValue::Array(
+                self.executions
+                    .iter()
+                    .map(execution_snapshot_json)
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "promotions".to_string(),
+            JsonValue::Array(
+                self.promotions
+                    .iter()
+                    .map(execution_promotion_snapshot_json)
                     .collect(),
             ),
         );
@@ -1319,6 +1395,91 @@ fn parse_projection_snapshot(
     })
 }
 
+fn parse_execution_snapshot(
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealExecutionSnapshot, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(state_path, "execution must be a JSON object"));
+    };
+    let command_argv = required_array(object, "command_argv", state_path)?
+        .iter()
+        .map(|value| match value {
+            JsonValue::String(arg) => Ok(arg.clone()),
+            _ => Err(invalid_state(
+                state_path,
+                "execution command_argv must be strings",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let outputs = optional_array(object, "outputs", state_path)?
+        .iter()
+        .map(|output| parse_execution_output_snapshot(output, state_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RealExecutionSnapshot {
+        execution_id: required_string(object, "execution_id", state_path)?,
+        projection_id: required_string(object, "projection_id", state_path)?,
+        resolved_view_id: required_string(object, "resolved_view_id", state_path)?,
+        tree_hash: required_string(object, "tree_hash", state_path)?,
+        command_argv,
+        working_directory: required_string(object, "working_directory", state_path)?,
+        exit_code: optional_i32(object, "exit_code", state_path)?,
+        status: required_string(object, "status", state_path)?,
+        stdout_digest: required_string(object, "stdout_digest", state_path)?,
+        stdout_byte_length: required_u64(object, "stdout_byte_length", state_path)?,
+        stderr_digest: required_string(object, "stderr_digest", state_path)?,
+        stderr_byte_length: required_u64(object, "stderr_byte_length", state_path)?,
+        outputs,
+        started_at: required_string(object, "started_at", state_path)?,
+        finished_at: required_string(object, "finished_at", state_path)?,
+        privacy_class: required_string(object, "privacy_class", state_path)?,
+    })
+}
+
+fn parse_execution_output_snapshot(
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealExecutionOutputSnapshot, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(
+            state_path,
+            "execution output must be a JSON object",
+        ));
+    };
+    Ok(RealExecutionOutputSnapshot {
+        path: required_string(object, "path", state_path)?,
+        classification: required_string(object, "classification", state_path)?,
+        before_hash: optional_string(object, "before_hash", state_path)?,
+        after_hash: required_string(object, "after_hash", state_path)?,
+        byte_length: required_u64(object, "byte_length", state_path)?,
+    })
+}
+
+fn parse_execution_promotion_snapshot(
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealExecutionPromotionSnapshot, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(
+            state_path,
+            "execution promotion must be a JSON object",
+        ));
+    };
+    Ok(RealExecutionPromotionSnapshot {
+        execution_id: required_string(object, "execution_id", state_path)?,
+        projection_id: required_string(object, "projection_id", state_path)?,
+        output_path: required_string(object, "output_path", state_path)?,
+        target_topic_id: required_string(object, "target_topic_id", state_path)?,
+        classification: required_string(object, "classification", state_path)?,
+        before_hash: optional_string(object, "before_hash", state_path)?,
+        after_hash: required_string(object, "after_hash", state_path)?,
+        operation_transaction_id: required_string(object, "operation_transaction_id", state_path)?,
+        topic_revision_id: required_string(object, "topic_revision_id", state_path)?,
+        session_generation_id: required_string(object, "session_generation_id", state_path)?,
+        authored_context_id: required_string(object, "authored_context_id", state_path)?,
+    })
+}
+
 fn parse_checkpoint_snapshot(
     repo_root: &Path,
     value: &JsonValue,
@@ -1442,6 +1603,161 @@ fn projection_snapshot_json(projection: &RealProjectionSnapshot) -> JsonValue {
     object.insert(
         "entries".to_string(),
         JsonValue::Array(projection.entries.iter().map(entry_json).collect()),
+    );
+    JsonValue::Object(object)
+}
+
+fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "execution_id".to_string(),
+        JsonValue::String(execution.execution_id.clone()),
+    );
+    object.insert(
+        "projection_id".to_string(),
+        JsonValue::String(execution.projection_id.clone()),
+    );
+    object.insert(
+        "resolved_view_id".to_string(),
+        JsonValue::String(execution.resolved_view_id.clone()),
+    );
+    object.insert(
+        "tree_hash".to_string(),
+        JsonValue::String(execution.tree_hash.clone()),
+    );
+    object.insert(
+        "command_argv".to_string(),
+        JsonValue::Array(
+            execution
+                .command_argv
+                .iter()
+                .map(|arg| JsonValue::String(arg.clone()))
+                .collect(),
+        ),
+    );
+    object.insert(
+        "working_directory".to_string(),
+        JsonValue::String(execution.working_directory.clone()),
+    );
+    object.insert(
+        "exit_code".to_string(),
+        execution
+            .exit_code
+            .map(|code| JsonValue::Number(code.to_string()))
+            .unwrap_or(JsonValue::Null),
+    );
+    object.insert(
+        "status".to_string(),
+        JsonValue::String(execution.status.clone()),
+    );
+    object.insert(
+        "stdout_digest".to_string(),
+        JsonValue::String(execution.stdout_digest.clone()),
+    );
+    object.insert(
+        "stdout_byte_length".to_string(),
+        JsonValue::Number(execution.stdout_byte_length.to_string()),
+    );
+    object.insert(
+        "stderr_digest".to_string(),
+        JsonValue::String(execution.stderr_digest.clone()),
+    );
+    object.insert(
+        "stderr_byte_length".to_string(),
+        JsonValue::Number(execution.stderr_byte_length.to_string()),
+    );
+    object.insert(
+        "outputs".to_string(),
+        JsonValue::Array(
+            execution
+                .outputs
+                .iter()
+                .map(execution_output_snapshot_json)
+                .collect(),
+        ),
+    );
+    object.insert(
+        "started_at".to_string(),
+        JsonValue::String(execution.started_at.clone()),
+    );
+    object.insert(
+        "finished_at".to_string(),
+        JsonValue::String(execution.finished_at.clone()),
+    );
+    object.insert(
+        "privacy_class".to_string(),
+        JsonValue::String(execution.privacy_class.clone()),
+    );
+    JsonValue::Object(object)
+}
+
+fn execution_output_snapshot_json(output: &RealExecutionOutputSnapshot) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert("path".to_string(), JsonValue::String(output.path.clone()));
+    object.insert(
+        "classification".to_string(),
+        JsonValue::String(output.classification.clone()),
+    );
+    object.insert(
+        "before_hash".to_string(),
+        optional_json(&output.before_hash),
+    );
+    object.insert(
+        "after_hash".to_string(),
+        JsonValue::String(output.after_hash.clone()),
+    );
+    object.insert(
+        "byte_length".to_string(),
+        JsonValue::Number(output.byte_length.to_string()),
+    );
+    JsonValue::Object(object)
+}
+
+fn execution_promotion_snapshot_json(promotion: &RealExecutionPromotionSnapshot) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "execution_id".to_string(),
+        JsonValue::String(promotion.execution_id.clone()),
+    );
+    object.insert(
+        "projection_id".to_string(),
+        JsonValue::String(promotion.projection_id.clone()),
+    );
+    object.insert(
+        "output_path".to_string(),
+        JsonValue::String(promotion.output_path.clone()),
+    );
+    object.insert(
+        "target_topic_id".to_string(),
+        JsonValue::String(promotion.target_topic_id.clone()),
+    );
+    object.insert(
+        "classification".to_string(),
+        JsonValue::String(promotion.classification.clone()),
+    );
+    object.insert(
+        "before_hash".to_string(),
+        optional_json(&promotion.before_hash),
+    );
+    object.insert(
+        "after_hash".to_string(),
+        JsonValue::String(promotion.after_hash.clone()),
+    );
+    object.insert(
+        "operation_transaction_id".to_string(),
+        JsonValue::String(promotion.operation_transaction_id.clone()),
+    );
+    object.insert(
+        "topic_revision_id".to_string(),
+        JsonValue::String(promotion.topic_revision_id.clone()),
+    );
+    object.insert(
+        "session_generation_id".to_string(),
+        JsonValue::String(promotion.session_generation_id.clone()),
+    );
+    object.insert(
+        "authored_context_id".to_string(),
+        JsonValue::String(promotion.authored_context_id.clone()),
     );
     JsonValue::Object(object)
 }
@@ -1696,6 +2012,24 @@ fn optional_string(
         _ => Err(invalid_state(
             path,
             format!("field `{field}` must be a string or null"),
+        )),
+    }
+}
+
+fn optional_i32(
+    object: &BTreeMap<String, JsonValue>,
+    field: &'static str,
+    path: &Path,
+) -> Result<Option<i32>, RepoStateError> {
+    match object.get(field) {
+        Some(JsonValue::Null) | None => Ok(None),
+        Some(JsonValue::Number(value)) => value
+            .parse::<i32>()
+            .map(Some)
+            .map_err(|_| invalid_state(path, format!("field `{field}` must be an integer"))),
+        _ => Err(invalid_state(
+            path,
+            format!("field `{field}` must be an integer or null"),
         )),
     }
 }
@@ -2017,6 +2351,8 @@ mod tests {
             base_entries: entries.clone(),
             operations: Vec::new(),
             projections: Vec::new(),
+            executions: Vec::new(),
+            promotions: Vec::new(),
             checkpoints: Vec::new(),
             export_maps: Vec::new(),
             entries,
@@ -2093,6 +2429,8 @@ mod tests {
                 ),
             ],
             projections: Vec::new(),
+            executions: Vec::new(),
+            promotions: Vec::new(),
             checkpoints: Vec::new(),
             export_maps: Vec::new(),
             entries: vec![readme.clone(), lib.clone()],

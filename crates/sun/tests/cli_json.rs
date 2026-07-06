@@ -325,6 +325,230 @@ fn no_fixture_real_repo_artifact_io_vertical_slice() {
 }
 
 #[test]
+fn no_fixture_execution_output_promotion_repo_backed_slice() {
+    let repo = TestRepo::new("real-execution-output");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    repo.write_file("README.md", "# Execution repo\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+
+    let init = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun init should run");
+    assert_success(&init);
+
+    let topic = sun()
+        .arg("topic")
+        .arg("create")
+        .arg("generated-output")
+        .arg("--display-name")
+        .arg("Generated Output")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun topic create should run");
+    assert_success(&topic);
+
+    let session = sun()
+        .arg("session")
+        .arg("start")
+        .arg("--topic")
+        .arg("topic_generated_output")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--actor")
+        .arg("agent-a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun session start should run");
+    assert_success(&session);
+
+    let escaping_cwd = sun()
+        .arg("run")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--cwd")
+        .arg("..")
+        .arg("--json")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg("printf escaped > SHOULD_NOT_EXIST")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run with escaping cwd should run");
+    assert_failure(&escaping_cwd);
+    let escaping_stdout = stdout(&escaping_cwd);
+    assert!(escaping_stdout.contains("\"code\":\"invalid_request\""));
+    assert!(escaping_stdout.contains("execution cwd must stay inside the projection root"));
+    assert!(!repo
+        .path()
+        .join(".sunlight/executions/exec_native_0001.json")
+        .exists());
+    assert!(!repo.path().join("SHOULD_NOT_EXIST").exists());
+
+    let run = sun()
+        .arg("run")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--json")
+        .arg("--")
+        .arg("python")
+        .arg("-c")
+        .arg("from pathlib import Path; Path('generated').mkdir(exist_ok=True); Path('generated/out.txt').write_bytes(b'promoted needle\\n')")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run should run");
+    assert_success(&run);
+    let run_stdout = stdout(&run);
+    assert!(run_stdout.contains("\"command\":\"execution.run\""));
+    assert!(run_stdout.contains("\"output_path\":\"generated/out.txt\""));
+    assert!(
+        run_stdout.contains("\"raw_outputs\":\"local_only\"")
+            || run_stdout.contains("\"execution_id\"")
+    );
+    let execution_id = json_string_field(&run_stdout, "execution_id");
+
+    let status = sun()
+        .arg("status")
+        .arg("--execution")
+        .arg(&execution_id)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status --execution should run");
+    assert_success(&status);
+    let status_stdout = stdout(&status);
+    assert!(status_stdout.contains("\"command\":\"status.execution\""));
+    assert!(status_stdout.contains("\"resolved_view_id\":\"view_base_0001\""));
+    assert!(status_stdout.contains("\"promotion_status\":\"promotion_required\""));
+
+    let inspect = sun()
+        .arg("inspect")
+        .arg(format!("execution:{execution_id}"))
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect execution should run");
+    assert_success(&inspect);
+    assert!(stdout(&inspect).contains("\"source_truth\":\"sunlight_persisted_execution\""));
+
+    let bad_promote = sun()
+        .arg("execution")
+        .arg("promote-output")
+        .arg(&execution_id)
+        .arg("--path")
+        .arg("generated/missing.txt")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--classification")
+        .arg("source_like_delta")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun execution promote-output should run");
+    assert_failure(&bad_promote);
+    assert!(stdout(&bad_promote).contains("\"code\":\"promotion_precondition_failed\""));
+
+    let promote = sun()
+        .arg("execution")
+        .arg("promote-output")
+        .arg(&execution_id)
+        .arg("--path")
+        .arg("generated/out.txt")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--classification")
+        .arg("source_like_delta")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun execution promote-output should run");
+    assert_success(&promote);
+    let promote_stdout = stdout(&promote);
+    assert!(promote_stdout.contains("\"command\":\"execution.promote_output\""));
+    assert!(promote_stdout.contains("\"execution_provenance\""));
+    let promoted_view = json_string_field(&promote_stdout, "resolved_view_id");
+
+    let read = sun()
+        .arg("read")
+        .arg("generated/out.txt")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun read promoted output should run");
+    assert_success(&read);
+    assert!(stdout(&read).contains("promoted needle"));
+
+    let search = sun()
+        .arg("search")
+        .arg("promoted needle")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun search promoted output should run");
+    assert_success(&search);
+    assert!(stdout(&search).contains("\"path\":\"generated/out.txt\""));
+
+    let promoted_status = sun()
+        .arg("status")
+        .arg("--execution")
+        .arg(&execution_id)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status promoted execution should run");
+    assert_success(&promoted_status);
+    assert!(stdout(&promoted_status).contains("\"promotion_status\":\"promoted\""));
+
+    let checkpoint = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg("--view")
+        .arg(&promoted_view)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun checkpoint create should run");
+    assert_success(&checkpoint);
+    let checkpoint_id = json_string_field(&stdout(&checkpoint), "checkpoint_id");
+
+    let export = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg(&checkpoint_id)
+        .arg("--branch")
+        .arg("sunlight/generated-output")
+        .arg("--execute-local")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export should run");
+    assert_success(&export);
+    assert_eq!(
+        git(
+            repo.path(),
+            &["show", "sunlight/generated-output:generated/out.txt"]
+        ),
+        "promoted needle\n"
+    );
+}
+
+#[test]
 fn no_fixture_topics_and_sessions_are_distinct_repo_backed_records() {
     let repo = TestRepo::new("real-multi-topic-session");
     git(repo.path(), &["init", "-b", "main"]);

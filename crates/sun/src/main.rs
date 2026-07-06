@@ -28,6 +28,7 @@ use sunlight_core::compat_import::{
     FIXTURE_COMPAT_IMPORT_OPERATION_ID,
 };
 use sunlight_core::execution::{
+    execution_output_promotion_record_from_ids,
     execution_output_promotion_record_from_mutation_response,
     fixture_execution_output_promotion_record, fixture_failing_execution_from_resolved_view,
     fixture_passing_execution_from_resolved_view, fixture_promotion_candidate_provenance,
@@ -76,6 +77,7 @@ use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue}
 use sunlight_core::repo_state::{
     materialize_real_files, persist_quarantine_report, real_artifact_id_for_path,
     real_content_hash, real_tree_hash, RealArtifactEntry, RealCheckpointSnapshot,
+    RealExecutionOutputSnapshot, RealExecutionPromotionSnapshot, RealExecutionSnapshot,
     RealExportMapSnapshot, RealOperationRecord, RealProjectionSnapshot, RealRepoState,
     RealResolvedRepoView, RealSessionRecord, RealTopicRecord, RepoStateError,
 };
@@ -664,10 +666,13 @@ fn view_resolve(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn execution_run(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_execution_run_options(ctx)?;
-    if options.fixture != "basic-app" {
+    if options.fixture.is_none() {
+        return real_execution_run(ctx, options);
+    }
+    let fixture = options.fixture.clone().unwrap();
+    if fixture != "basic-app" {
         return Err(
-            invalid_request(format!("unknown fixture `{}`", options.fixture))
-                .with_detail("fixture", options.fixture),
+            invalid_request(format!("unknown fixture `{fixture}`")).with_detail("fixture", fixture)
         );
     }
     if options.command_argv.as_slice() != ["cargo", "test"]
@@ -723,10 +728,13 @@ fn execution_run(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn execution_promote_output(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_execution_promote_output_options(ctx)?;
-    if options.fixture != "basic-app" {
+    if options.fixture.is_none() {
+        return real_execution_promote_output(ctx, options);
+    }
+    let fixture = options.fixture.clone().unwrap();
+    if fixture != "basic-app" {
         return Err(
-            invalid_request(format!("unknown fixture `{}`", options.fixture))
-                .with_detail("fixture", options.fixture),
+            invalid_request(format!("unknown fixture `{fixture}`")).with_detail("fixture", fixture)
         );
     }
     if options.execution_id != FIXTURE_PASSING_EXECUTION_ID {
@@ -2140,6 +2148,380 @@ fn real_project_materialize(
     Ok(())
 }
 
+fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Result<(), CliError> {
+    let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    let relative_cwd = real_execution_relative_cwd(&options.cwd)?;
+    let resolved = real_resolve_view_by_id(&state, &options.view_id)?;
+    if !resolved.result.conflict_free() {
+        return Err(CliError::new(
+            "execution_conflicted_view",
+            "cannot execute a conflicted resolved view",
+        )
+        .with_detail("resolved_view_id", resolved.result.resolved_view_id));
+    }
+    let view_state = real_view_state(&state, &resolved);
+    let projection_id = format!(
+        "projection_execution_native_{:04}",
+        state.projections.len() + 1
+    );
+    let execution_id = format!("exec_native_{:04}", state.executions.len() + 1);
+    let projection_root = PathBuf::from(".")
+        .join(".sunlight")
+        .join("projections")
+        .join(&projection_id)
+        .join("root");
+    materialize_real_files(&view_state, &projection_root)?;
+    let execution_cwd = real_execution_cwd_path(&projection_root, &relative_cwd, &options.cwd)?;
+    let manifest_digest =
+        real_projection_manifest_digest(&view_state, &projection_id, ProjectionPurpose::Execution);
+    state.projections.push(RealProjectionSnapshot {
+        projection_id: projection_id.clone(),
+        purpose: "execution".to_string(),
+        resolved_view_id: view_state.resolved_view_id.clone(),
+        tree_hash: view_state.tree_hash.clone(),
+        manifest_digest: manifest_digest.clone(),
+        created_from_content_tree: view_state.tree_hash.clone(),
+        materialized_root: Some(projection_root.display().to_string()),
+        entries: view_state.entries.clone(),
+    });
+
+    let started_at = real_now_id();
+    let command_output = Command::new(&options.command_argv[0])
+        .args(options.command_argv.iter().skip(1))
+        .current_dir(execution_cwd)
+        .output()
+        .map_err(|error| {
+            CliError::new(
+                "execution_command_failed",
+                format!("failed to run command: {error}"),
+            )
+            .with_detail("command", options.command_argv.join(" "))
+        })?;
+    let finished_at = real_now_id();
+    let mut projected_entries = Vec::new();
+    let mut quarantine = Vec::new();
+    sunlight_core::repo_state::scan_real_repo_files_with_quarantine(
+        &projection_root,
+        &projection_root,
+        &mut projected_entries,
+        &mut quarantine,
+    )?;
+    projected_entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let outputs = real_execution_outputs(&view_state.entries, &projected_entries);
+    let status = if command_output.status.success() {
+        "pass"
+    } else {
+        "fail"
+    };
+    let execution = RealExecutionSnapshot {
+        execution_id: execution_id.clone(),
+        projection_id: projection_id.clone(),
+        resolved_view_id: view_state.resolved_view_id.clone(),
+        tree_hash: view_state.tree_hash.clone(),
+        command_argv: options.command_argv,
+        working_directory: options.cwd,
+        exit_code: command_output.status.code(),
+        status: status.to_string(),
+        stdout_digest: real_content_hash(&command_output.stdout),
+        stdout_byte_length: command_output.stdout.len() as u64,
+        stderr_digest: real_content_hash(&command_output.stderr),
+        stderr_byte_length: command_output.stderr.len() as u64,
+        outputs,
+        started_at,
+        finished_at,
+        privacy_class: "policy_gated".to_string(),
+    };
+    state.executions.push(execution.clone());
+    state.save(&PathBuf::from("."))?;
+    persist_real_projection_record(&state, state.projections.last().unwrap())?;
+    state.persist_record(
+        &PathBuf::from("."),
+        "executions",
+        &execution.execution_id,
+        &format!(
+            "{}\n",
+            real_execution_snapshot_record_json(&state, &execution)
+        ),
+    )?;
+    if ctx.json {
+        println!(
+            "{}",
+            real_execution_run_success_envelope(&state, &execution)
+        );
+    } else {
+        println!("{} {}", execution.execution_id, execution.status);
+    }
+    Ok(())
+}
+
+fn real_execution_relative_cwd(cwd: &str) -> Result<PathBuf, CliError> {
+    let display_cwd = if cwd.is_empty() { "." } else { cwd };
+    let requested = PathBuf::from(display_cwd);
+    if requested.is_absolute() {
+        return Err(
+            invalid_request("execution cwd must be relative to the projection root")
+                .with_detail("cwd", display_cwd),
+        );
+    }
+    let mut relative = PathBuf::new();
+    for component in requested.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => relative.push(part),
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(
+                    invalid_request("execution cwd must stay inside the projection root")
+                        .with_detail("cwd", display_cwd),
+                );
+            }
+        }
+    }
+    Ok(relative)
+}
+
+fn real_execution_cwd_path(
+    projection_root: &PathBuf,
+    relative_cwd: &PathBuf,
+    original_cwd: &str,
+) -> Result<PathBuf, CliError> {
+    let root = fs::canonicalize(projection_root).map_err(|error| {
+        invalid_request(format!(
+            "failed to resolve execution projection root: {error}"
+        ))
+    })?;
+    let candidate = fs::canonicalize(projection_root.join(relative_cwd)).map_err(|error| {
+        invalid_request(format!(
+            "execution cwd was not found in the projection: {error}"
+        ))
+        .with_detail(
+            "cwd",
+            if original_cwd.is_empty() {
+                "."
+            } else {
+                original_cwd
+            },
+        )
+    })?;
+    if !candidate.starts_with(&root) {
+        return Err(
+            invalid_request("execution cwd must stay inside the projection root").with_detail(
+                "cwd",
+                if original_cwd.is_empty() {
+                    "."
+                } else {
+                    original_cwd
+                },
+            ),
+        );
+    }
+    if !candidate.is_dir() {
+        return Err(
+            invalid_request("execution cwd is not a directory").with_detail(
+                "cwd",
+                if original_cwd.is_empty() {
+                    "."
+                } else {
+                    original_cwd
+                },
+            ),
+        );
+    }
+    Ok(candidate)
+}
+
+fn real_execution_promote_output(
+    ctx: &CommandContext,
+    options: ExecutionPromoteOutputOptions,
+) -> Result<(), CliError> {
+    let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    let path = options.path.clone().ok_or_else(|| {
+        invalid_request("usage: sun execution promote-output requires --path <path>")
+    })?;
+    let session_id = options.session_id.clone().ok_or_else(|| {
+        invalid_request("usage: sun execution promote-output requires --session <session>")
+    })?;
+    let classification = options.classification.clone().ok_or_else(|| {
+        invalid_request("usage: sun execution promote-output requires --classification <class>")
+    })?;
+    let execution = state
+        .executions
+        .iter()
+        .find(|execution| execution.execution_id == options.execution_id)
+        .cloned()
+        .ok_or_else(|| object_not_found("execution", &options.execution_id))?;
+    let output = execution
+        .outputs
+        .iter()
+        .find(|output| output.path == path)
+        .cloned()
+        .ok_or_else(|| {
+            promotion_error(
+                "promotion_precondition_failed",
+                "execution output path is not a declared promotion candidate",
+                &options.execution_id,
+                Some(&path),
+                Some(&session_id),
+                Some(&classification),
+            )
+        })?;
+    if state.promotions.iter().any(|promotion| {
+        promotion.execution_id == execution.execution_id && promotion.output_path == path
+    }) {
+        return Err(promotion_error(
+            "promotion_precondition_failed",
+            "execution output has already been promoted",
+            &options.execution_id,
+            Some(&path),
+            Some(&session_id),
+            Some(&classification),
+        ));
+    }
+    if classification != output.classification {
+        return Err(promotion_error(
+            "promotion_policy_failed",
+            "execution output promotion classification does not match the candidate",
+            &options.execution_id,
+            Some(&path),
+            Some(&session_id),
+            Some(&classification),
+        ));
+    }
+    if classification == "secret" || classification == "log" || classification == "cache" {
+        return Err(promotion_error(
+            "promotion_policy_failed",
+            "local-only or secret execution outputs cannot be promoted",
+            &options.execution_id,
+            Some(&path),
+            Some(&session_id),
+            Some(&classification),
+        ));
+    }
+    let session = real_session(&state, &session_id)?.clone();
+    let target_topic_id = if let Some(topic) = &options.topic {
+        real_topic(&state, topic)?.topic_id.clone()
+    } else {
+        session.write_topic_id.clone()
+    };
+    if target_topic_id != session.write_topic_id {
+        return Err(CliError::new(
+            "promotion_precondition_failed",
+            "promotion target topic must match the session write topic",
+        )
+        .with_detail("topic_id", target_topic_id)
+        .with_detail("session_id", session_id));
+    }
+    if session.resolved_view_id != execution.resolved_view_id {
+        return Err(promotion_error(
+            "promotion_precondition_failed",
+            "session resolved view is stale for this execution",
+            &options.execution_id,
+            Some(&path),
+            Some(&session_id),
+            Some(&classification),
+        ));
+    }
+    let projection = state
+        .projections
+        .iter()
+        .find(|projection| projection.projection_id == execution.projection_id)
+        .cloned()
+        .ok_or_else(|| object_not_found("projection", &execution.projection_id))?;
+    let root = projection
+        .materialized_root
+        .as_ref()
+        .ok_or_else(|| object_not_found("projection", &execution.projection_id))?;
+    let bytes = fs::read(PathBuf::from(root).join(&path)).map_err(|error| {
+        invalid_request(format!("failed to read execution output: {error}"))
+            .with_detail("path", &path)
+    })?;
+    if !sunlight_core::repo_state::detect_secret_reasons(&path, &bytes).is_empty() {
+        return Err(promotion_error(
+            "promotion_policy_failed",
+            "secret-like execution output cannot be promoted",
+            &options.execution_id,
+            Some(&path),
+            Some(&session_id),
+            Some(&classification),
+        ));
+    }
+    let resolved = state.resolve_session_view(&session);
+    let before = resolved
+        .entries
+        .iter()
+        .find(|entry| entry.path == path && !entry.tombstone)
+        .cloned();
+    if before.as_ref().map(|entry| entry.content_hash.clone()) != output.before_hash {
+        return Err(promotion_error(
+            "promotion_precondition_failed",
+            "execution output no longer matches the session precondition",
+            &options.execution_id,
+            Some(&path),
+            Some(&session_id),
+            Some(&classification),
+        ));
+    }
+    let after = RealArtifactEntry {
+        artifact_id: before
+            .as_ref()
+            .map(|entry| entry.artifact_id.clone())
+            .unwrap_or_else(|| real_artifact_id_for_path(&path)),
+        path: path.clone(),
+        content_hash: real_content_hash(&bytes),
+        executable: false,
+        classification: if classification == "generated_artifact" {
+            "generated".to_string()
+        } else {
+            "source".to_string()
+        },
+        tombstone: false,
+        bytes,
+    };
+    if after.content_hash != output.after_hash {
+        return Err(promotion_error(
+            "promotion_precondition_failed",
+            "execution output bytes changed after the execution record was written",
+            &options.execution_id,
+            Some(&path),
+            Some(&session_id),
+            Some(&classification),
+        ));
+    }
+    let response = real_accept_mutation(
+        &mut state,
+        &session_id,
+        "execution_output_promotion",
+        &path,
+        before,
+        after,
+    )?;
+    let candidate = PromotionCandidateProvenance {
+        execution_id: execution.execution_id.clone(),
+        projection_id: execution.projection_id.clone(),
+        output_path: path.clone(),
+        target_topic_id: session.write_topic_id.clone(),
+        classification: real_output_classification(&classification),
+        before_hash: output.before_hash.clone(),
+        after_hash: output.after_hash.clone(),
+    };
+    let record = execution_output_promotion_record_from_mutation_response(&candidate, &response);
+    state.promotions.push(RealExecutionPromotionSnapshot {
+        execution_id: record.execution_id.clone(),
+        projection_id: record.projection_id.clone(),
+        output_path: record.output_path.clone(),
+        target_topic_id: record.target_topic_id.clone(),
+        classification: record.classification.as_str().to_string(),
+        before_hash: record.before_hash.clone(),
+        after_hash: record.after_hash.clone(),
+        operation_transaction_id: record.operation_transaction_id.clone(),
+        topic_revision_id: record.topic_revision_id.clone(),
+        session_generation_id: record.session_generation_id.clone(),
+        authored_context_id: record.authored_context_id.clone(),
+    });
+    finish_real_promotion(ctx, state, response, record)
+}
+
 fn real_checkpoint_create(
     ctx: &CommandContext,
     options: CheckpointCreateOptions,
@@ -2347,6 +2729,15 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
                 println!("{}", real_export_map_status_envelope(&state, export_map));
                 return Ok(true);
             }
+            "--execution" => {
+                let execution = state
+                    .executions
+                    .iter()
+                    .find(|execution| execution.execution_id == *value)
+                    .ok_or_else(|| object_not_found("execution", value))?;
+                println!("{}", real_execution_status_envelope(&state, execution));
+                return Ok(true);
+            }
             _ => {}
         }
     }
@@ -2404,6 +2795,19 @@ fn real_inspect(ctx: &CommandContext) -> Result<bool, CliError> {
         Some(selector) => selector,
         None => return Ok(false),
     };
+    if let Some(execution_id) = selector.strip_prefix("execution:") {
+        let execution = state
+            .executions
+            .iter()
+            .find(|execution| execution.execution_id == execution_id)
+            .ok_or_else(|| object_not_found("execution", execution_id))?;
+        if ctx.json {
+            println!("{}", real_execution_inspect_envelope(&state, execution));
+        } else {
+            println!("execution {} {}", execution.execution_id, execution.status);
+        }
+        return Ok(true);
+    }
     if ctx.json {
         println!("{}", real_inspect_envelope(&state, selector)?);
     } else {
@@ -2659,6 +3063,104 @@ fn finish_real_mutation(
         );
     }
     Ok(())
+}
+
+fn finish_real_promotion(
+    ctx: &CommandContext,
+    state: RealRepoState,
+    response: MutationResponse,
+    record: ExecutionOutputPromotionRecord,
+) -> Result<(), CliError> {
+    let repo_root = PathBuf::from(".");
+    state.save(&repo_root)?;
+    state.persist_record(
+        &repo_root,
+        "operations",
+        &response.operation.id,
+        &format!("{}\n", operation_json(&response)),
+    )?;
+    state.persist_record(
+        &repo_root,
+        "topics",
+        &response.topic_revision.id,
+        &format!("{}\n", topic_revision_json(&response)),
+    )?;
+    state.persist_record(
+        &repo_root,
+        "views",
+        &state.resolved_view_id,
+        &format!(
+            "{}\n",
+            resolved_view_record_json(&real_resolved_view(&state))
+        ),
+    )?;
+    state.persist_record(
+        &repo_root,
+        "promotions",
+        &record.operation_transaction_id,
+        &format!("{}\n", promotion_record_json(&record)),
+    )?;
+    if ctx.json {
+        let candidate = PromotionCandidateProvenance {
+            execution_id: record.execution_id.clone(),
+            projection_id: record.projection_id.clone(),
+            output_path: record.output_path.clone(),
+            target_topic_id: record.target_topic_id.clone(),
+            classification: record.classification,
+            before_hash: record.before_hash.clone(),
+            after_hash: record.after_hash.clone(),
+        };
+        println!("{}", promotion_success_envelope(&response, &candidate));
+    } else {
+        println!(
+            "promoted {} {}",
+            response.artifact.path, response.artifact.after_hash
+        );
+    }
+    Ok(())
+}
+
+fn real_execution_outputs(
+    before: &[RealArtifactEntry],
+    after: &[RealArtifactEntry],
+) -> Vec<RealExecutionOutputSnapshot> {
+    after
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .filter_map(|entry| {
+            let before_entry = before
+                .iter()
+                .find(|candidate| candidate.path == entry.path && !candidate.tombstone);
+            if before_entry.map(|candidate| candidate.content_hash.as_str())
+                == Some(entry.content_hash.as_str())
+            {
+                return None;
+            }
+            Some(RealExecutionOutputSnapshot {
+                path: entry.path.clone(),
+                classification: if entry.classification == "generated" {
+                    "generated_artifact".to_string()
+                } else {
+                    "source_like_delta".to_string()
+                },
+                before_hash: before_entry.map(|candidate| candidate.content_hash.clone()),
+                after_hash: entry.content_hash.clone(),
+                byte_length: entry.bytes.len() as u64,
+            })
+        })
+        .collect()
+}
+
+fn real_output_classification(value: &str) -> OutputClassification {
+    match value {
+        "generated_artifact" => OutputClassification::GeneratedArtifact,
+        "log" => OutputClassification::Log,
+        "cache" => OutputClassification::Cache,
+        "coverage" => OutputClassification::Coverage,
+        "secret" => OutputClassification::Secret,
+        "ignored" => OutputClassification::Ignored,
+        _ => OutputClassification::SourceLikeDelta,
+    }
 }
 
 fn real_now_id() -> String {
@@ -3075,6 +3577,325 @@ fn real_projection_inspect_envelope(
     )
 }
 
+fn real_execution_record(
+    state: &RealRepoState,
+    execution: &RealExecutionSnapshot,
+) -> ExecutionRecord {
+    ExecutionRecord {
+        id: execution.execution_id.clone(),
+        repository_id: state.repository_id.clone(),
+        resolved_view_id: execution.resolved_view_id.clone(),
+        tree_identity: SingleRepoTree {
+            repository_id: state.repository_id.clone(),
+            tree_hash: execution.tree_hash.clone(),
+        },
+        command: sunlight_core::execution::ExecutionCommand {
+            argv: execution.command_argv.clone(),
+            shell: None,
+        },
+        working_directory: execution.working_directory.clone(),
+        environment_summary: sunlight_core::execution::EnvironmentSummary {
+            id: format!("env_{}", execution.execution_id),
+            os: std::env::consts::OS.to_string(),
+            platform_hint: "local".to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            sunlight_build_id: "sun-cli".to_string(),
+            command_runner_version: "local_process_v1".to_string(),
+            tool_hints: Vec::new(),
+            env_policy: "default_redacted".to_string(),
+            redacted_env_allowlist_digest: "sha256:redacted".to_string(),
+            network_policy: sunlight_core::execution::NetworkPolicy::NotEnforced,
+            sandbox_writable_policy:
+                sunlight_core::execution::WritablePolicy::ReadOnlySourcePrivateOutputs,
+            digest: format!("sha256:{}", execution.execution_id),
+        },
+        projection_id: execution.projection_id.clone(),
+        inputs: sunlight_core::execution::ExecutionInputs {
+            resolved_view_id: execution.resolved_view_id.clone(),
+            tree_hash: execution.tree_hash.clone(),
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+        },
+        outputs: real_execution_output_summaries(execution),
+        promotions: Vec::new(),
+        result: sunlight_core::execution::ExecutionResult {
+            status: if execution.status == "pass" {
+                sunlight_core::execution::ExecutionStatus::Pass
+            } else {
+                sunlight_core::execution::ExecutionStatus::Fail
+            },
+            exit_code: execution.exit_code,
+            timed_out: false,
+        },
+        started_at: execution.started_at.clone(),
+        finished_at: execution.finished_at.clone(),
+        privacy_class: if execution.privacy_class == "local_only" {
+            sunlight_core::records::PrivacyClass::LocalOnly
+        } else {
+            sunlight_core::records::PrivacyClass::PolicyGated
+        },
+    }
+}
+
+fn real_execution_output_summaries(
+    execution: &RealExecutionSnapshot,
+) -> Vec<sunlight_core::execution::OutputSummary> {
+    let mut outputs = vec![
+        sunlight_core::execution::OutputSummary {
+            kind: OutputKind::StdoutSummary,
+            classification: OutputClassification::Log,
+            path: None,
+            digest: execution.stdout_digest.clone(),
+            byte_length: execution.stdout_byte_length,
+            privacy_class: sunlight_core::records::PrivacyClass::LocalOnly,
+        },
+        sunlight_core::execution::OutputSummary {
+            kind: OutputKind::StderrSummary,
+            classification: OutputClassification::Log,
+            path: None,
+            digest: execution.stderr_digest.clone(),
+            byte_length: execution.stderr_byte_length,
+            privacy_class: sunlight_core::records::PrivacyClass::LocalOnly,
+        },
+    ];
+    outputs.extend(execution.outputs.iter().map(|output| {
+        sunlight_core::execution::OutputSummary {
+            kind: OutputKind::FileDelta,
+            classification: real_output_classification(&output.classification),
+            path: Some(output.path.clone()),
+            digest: output.after_hash.clone(),
+            byte_length: output.byte_length,
+            privacy_class: sunlight_core::records::PrivacyClass::PolicyGated,
+        }
+    }));
+    outputs
+}
+
+fn real_execution_candidate(
+    execution: &RealExecutionSnapshot,
+    output: &RealExecutionOutputSnapshot,
+    topic_id: &str,
+) -> PromotionCandidateProvenance {
+    PromotionCandidateProvenance {
+        execution_id: execution.execution_id.clone(),
+        projection_id: execution.projection_id.clone(),
+        output_path: output.path.clone(),
+        target_topic_id: topic_id.to_string(),
+        classification: real_output_classification(&output.classification),
+        before_hash: output.before_hash.clone(),
+        after_hash: output.after_hash.clone(),
+    }
+}
+
+fn real_execution_promotion_record(
+    promotion: &RealExecutionPromotionSnapshot,
+) -> ExecutionOutputPromotionRecord {
+    let candidate = PromotionCandidateProvenance {
+        execution_id: promotion.execution_id.clone(),
+        projection_id: promotion.projection_id.clone(),
+        output_path: promotion.output_path.clone(),
+        target_topic_id: promotion.target_topic_id.clone(),
+        classification: real_output_classification(&promotion.classification),
+        before_hash: promotion.before_hash.clone(),
+        after_hash: promotion.after_hash.clone(),
+    };
+    execution_output_promotion_record_from_ids(
+        &candidate,
+        &promotion.operation_transaction_id,
+        &promotion.topic_revision_id,
+        &promotion.session_generation_id,
+    )
+}
+
+fn real_execution_snapshot_record_json(
+    state: &RealRepoState,
+    execution: &RealExecutionSnapshot,
+) -> String {
+    let record = real_execution_record(state, execution);
+    let output_paths = execution
+        .outputs
+        .iter()
+        .map(|output| {
+            format!(
+                "{{\"path\":\"{}\",\"classification\":\"{}\",\"before_hash\":{},\"after_hash\":\"{}\",\"byte_length\":{}}}",
+                json_escape(&output.path),
+                json_escape(&output.classification),
+                optional_string_json(output.before_hash.as_deref()),
+                json_escape(&output.after_hash),
+                output.byte_length,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{{},\"output_files\":[{}],\"raw_output_policy\":\"local_only\",\"source_truth\":\"sunlight_persisted_execution\"}}",
+        execution_record_json(&record).trim_start_matches('{').trim_end_matches('}'),
+        output_paths,
+    )
+}
+
+fn real_execution_promotion_status(
+    state: &RealRepoState,
+    execution: &RealExecutionSnapshot,
+) -> &'static str {
+    if execution.outputs.is_empty() || execution.status != "pass" {
+        "none"
+    } else if execution.outputs.iter().all(|output| {
+        state.promotions.iter().any(|promotion| {
+            promotion.execution_id == execution.execution_id && promotion.output_path == output.path
+        })
+    }) {
+        "promoted"
+    } else {
+        "promotion_required"
+    }
+}
+
+fn real_execution_promotion_candidates_json(
+    state: &RealRepoState,
+    execution: &RealExecutionSnapshot,
+) -> String {
+    if execution.status != "pass" {
+        return String::new();
+    }
+    let topic_id = state
+        .sessions
+        .last()
+        .map(|session| session.write_topic_id.as_str())
+        .or_else(|| state.topics.last().map(|topic| topic.topic_id.as_str()))
+        .unwrap_or("topic_unknown");
+    execution
+        .outputs
+        .iter()
+        .filter(|output| {
+            !state.promotions.iter().any(|promotion| {
+                promotion.execution_id == execution.execution_id
+                    && promotion.output_path == output.path
+            })
+        })
+        .map(|output| {
+            promotion_candidate_json(&real_execution_candidate(execution, output, topic_id))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn real_execution_promotions_json(
+    state: &RealRepoState,
+    execution: &RealExecutionSnapshot,
+) -> String {
+    state
+        .promotions
+        .iter()
+        .filter(|promotion| promotion.execution_id == execution.execution_id)
+        .map(|promotion| promotion_record_json(&real_execution_promotion_record(promotion)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn real_execution_status_envelope(
+    state: &RealRepoState,
+    execution: &RealExecutionSnapshot,
+) -> String {
+    let record = real_execution_record(state, execution);
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"status.execution\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"execution_id\":\"{}\",\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},",
+            "\"execution_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"result\":{},",
+            "\"output_summary_counts\":{},",
+            "\"promotion_status\":\"{}\",",
+            "\"promotion_candidates\":[{}],",
+            "\"promotions\":[{}],",
+            "\"privacy_semantics\":{{\"execution_record\":\"policy_gated\",\"raw_outputs\":\"local_only\",\"promotion_record\":\"policy_gated\",\"durability\":\"persisted_repo_state\"}}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&state.repository_id),
+        json_escape(&execution.execution_id),
+        json_escape(&execution.projection_id),
+        json_escape(&execution.resolved_view_id),
+        json_escape(&execution.execution_id),
+        json_escape(&execution.projection_id),
+        json_escape(&execution.resolved_view_id),
+        single_repo_tree_json(&record.tree_identity),
+        execution_result_json(&record),
+        output_summary_counts_json(&record),
+        real_execution_promotion_status(state, execution),
+        real_execution_promotion_candidates_json(state, execution),
+        real_execution_promotions_json(state, execution),
+    )
+}
+
+fn real_execution_run_success_envelope(
+    state: &RealRepoState,
+    execution: &RealExecutionSnapshot,
+) -> String {
+    let record = real_execution_record(state, execution);
+    format!(
+        concat!(
+            "{{\"ok\":true,",
+            "\"data\":{{",
+            "\"command\":\"execution.run\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{",
+            "\"execution_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\"",
+            "}},",
+            "\"view\":{{\"resolved_view_id\":\"{}\",\"tree_identity\":{}}},",
+            "\"execution_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"result\":{},",
+            "\"output_summary_counts\":{},",
+            "\"promotion_candidates\":[{}]",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&state.repository_id),
+        json_escape(&execution.execution_id),
+        json_escape(&execution.projection_id),
+        json_escape(&execution.resolved_view_id),
+        json_escape(&execution.resolved_view_id),
+        single_repo_tree_json(&record.tree_identity),
+        json_escape(&execution.execution_id),
+        json_escape(&execution.projection_id),
+        single_repo_tree_json(&record.tree_identity),
+        execution_result_json(&record),
+        output_summary_counts_json(&record),
+        real_execution_promotion_candidates_json(state, execution),
+    )
+}
+
+fn real_execution_inspect_envelope(
+    state: &RealRepoState,
+    execution: &RealExecutionSnapshot,
+) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"inspect.execution\",",
+            "\"repository_id\":\"{}\",",
+            "\"execution\":{},",
+            "\"promotion_status\":\"{}\",",
+            "\"promotion_candidates\":[{}],",
+            "\"promotions\":[{}],",
+            "\"privacy_semantics\":{{\"execution_record\":\"policy_gated\",\"raw_outputs\":\"local_only\",\"promotion_record\":\"policy_gated\",\"durability\":\"persisted_repo_state\"}}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&state.repository_id),
+        real_execution_snapshot_record_json(state, execution),
+        real_execution_promotion_status(state, execution),
+        real_execution_promotion_candidates_json(state, execution),
+        real_execution_promotions_json(state, execution),
+    )
+}
+
 fn real_checkpoint_snapshot_json(
     state: &RealRepoState,
     checkpoint: &RealCheckpointSnapshot,
@@ -3457,9 +4278,10 @@ struct ViewResolveOptions {
 
 #[derive(Debug)]
 struct ExecutionRunOptions {
-    fixture: String,
+    fixture: Option<String>,
     view_id: String,
     command_argv: Vec<String>,
+    cwd: String,
     integrity_fixture: Option<StoreIntegrityFixture>,
 }
 
@@ -4273,6 +5095,7 @@ fn parse_view_include(value: &str) -> Result<Vec<TopicRevisionSelection>, CliErr
 fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptions, CliError> {
     let mut fixture = None;
     let mut view_id = None;
+    let mut cwd = ".".to_string();
     let mut integrity_fixture = None;
     let mut command_argv = Vec::new();
     let mut args = ctx.args.iter().skip(1);
@@ -4295,16 +5118,17 @@ fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptio
                 let value = args
                     .next()
                     .ok_or_else(|| invalid_request("usage: sun run --cwd <repo-relative-path>"))?;
-                if value != "." {
+                if fixture.is_some() && value != "." {
                     return Err(invalid_request("fixture execution supports only --cwd .")
                         .with_detail("cwd", value.clone()));
                 }
+                cwd = value.clone();
             }
             "--timeout" => {
                 let value = args
                     .next()
                     .ok_or_else(|| invalid_request("usage: sun run --timeout <duration>"))?;
-                if value != "fixture" {
+                if fixture.is_some() && value != "fixture" {
                     return Err(invalid_request(
                         "fixture execution accepts only --timeout fixture",
                     )
@@ -4336,13 +5160,11 @@ fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptio
         }
     }
 
-    let fixture =
-        fixture.ok_or_else(|| invalid_request("usage: sun run requires --fixture basic-app"))?;
     let view_id =
         view_id.ok_or_else(|| invalid_request("usage: sun run requires --view <view>"))?;
     if command_argv.is_empty() {
         return Err(invalid_request(
-            "usage: sun run --view <view> --fixture basic-app -- <command> [args...]",
+            "usage: sun run --view <view> [--fixture basic-app] -- <command> [args...]",
         ));
     }
 
@@ -4350,6 +5172,7 @@ fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptio
         fixture,
         view_id,
         command_argv,
+        cwd,
         integrity_fixture,
     })
 }
@@ -4362,6 +5185,7 @@ fn parse_execution_promote_output_options(
     let mut path = None;
     let mut session_id = None;
     let mut classification = None;
+    let mut topic = None;
     let mut args = ctx.args.iter().skip(2);
 
     while let Some(arg) = args.next() {
@@ -4400,13 +5224,14 @@ fn parse_execution_promote_output_options(
                 let value = args.next().ok_or_else(|| {
                     invalid_request("usage: sun execution promote-output --topic <topic>")
                 })?;
-                if value != FIXTURE_WRITE_TOPIC_ID {
+                if fixture.is_some() && value != FIXTURE_WRITE_TOPIC_ID {
                     return Err(CliError::new(
                         "promotion_topic_not_found",
                         "promotion target topic was not found",
                     )
                     .with_detail("topic_id", value.clone()));
                 }
+                topic = Some(value.clone());
             }
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
@@ -4429,9 +5254,6 @@ fn parse_execution_promote_output_options(
             "usage: sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> --fixture basic-app",
         )
     })?;
-    let fixture = fixture.ok_or_else(|| {
-        invalid_request("usage: sun execution promote-output requires --fixture basic-app")
-    })?;
 
     Ok(ExecutionPromoteOutputOptions {
         execution_id,
@@ -4439,6 +5261,7 @@ fn parse_execution_promote_output_options(
         path,
         session_id,
         classification,
+        topic,
     })
 }
 
@@ -6431,10 +7254,11 @@ struct MutationCommandOptions {
 #[derive(Debug)]
 struct ExecutionPromoteOutputOptions {
     execution_id: String,
-    fixture: String,
+    fixture: Option<String>,
     path: Option<String>,
     session_id: Option<String>,
     classification: Option<String>,
+    topic: Option<String>,
 }
 
 fn parse_topic_create_options(ctx: &CommandContext) -> Result<TopicCreateOptions, CliError> {

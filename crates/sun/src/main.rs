@@ -74,8 +74,9 @@ use sunlight_core::projection::{
 };
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repo_state::{
-    materialize_real_files, real_artifact_id_for_path, real_content_hash, real_tree_hash,
-    write_real_files_overwrite, RealArtifactEntry, RealRepoState, RepoStateError,
+    materialize_real_files, persist_quarantine_report, real_artifact_id_for_path,
+    real_content_hash, real_tree_hash, write_real_files_overwrite, RealArtifactEntry,
+    RealRepoState, RepoStateError,
 };
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
@@ -253,6 +254,7 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
     })?;
     let ingest = RealRepoState::ingest(&report.repo_root, &report.repository_id)?;
     ingest.save(&report.repo_root)?;
+    persist_quarantine_report(&report.repo_root, &ingest.quarantine)?;
     ingest.persist_record(
         &report.repo_root,
         "checkpoints",
@@ -288,6 +290,7 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
                 report.created_config,
                 report.created_gitignore,
                 report.created_directories.len(),
+                ingest.quarantine.len(),
             )
         );
     } else {
@@ -298,6 +301,9 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
         println!("created_config = {}", report.created_config);
         println!("created_gitignore = {}", report.created_gitignore);
         println!("created_directories = {}", report.created_directories.len());
+        if !ingest.quarantine.is_empty() {
+            println!("quarantined_secrets = {}", ingest.quarantine.len());
+        }
     }
 
     Ok(())
@@ -1848,6 +1854,7 @@ fn real_checkpoint_create(
     if options.view_id != state.resolved_view_id && options.view_id != state.base_resolved_view_id {
         return Err(object_not_found("resolved_view", &options.view_id));
     }
+    reject_real_export_blocked_entries(&state)?;
     let checkpoint = real_checkpoint(&state);
     state.persist_record(
         &PathBuf::from("."),
@@ -1870,6 +1877,7 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
     if checkpoint.id != options.checkpoint_id {
         return Err(object_not_found("checkpoint", &options.checkpoint_id));
     }
+    reject_real_export_blocked_entries(&state)?;
     if options.write_plan {
         let plan_json = format!(
             "{{\"ok\":true,\"data\":{{\"command\":\"git.export.plan\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\"}},\"git_ref\":\"{}\",\"content_files\":{}}},\"warnings\":[]}}",
@@ -1942,6 +1950,40 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
         println!("{} {}", response.checkpoint_id, response.git_ref);
     }
     Ok(())
+}
+
+fn reject_real_export_blocked_entries(state: &RealRepoState) -> Result<(), CliError> {
+    let blocked = state
+        .entries
+        .iter()
+        .filter(|entry| {
+            !entry.tombstone
+                && matches!(
+                    entry.classification.as_str(),
+                    "secret" | "local_only" | "local-only"
+                )
+        })
+        .collect::<Vec<_>>();
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    let paths = blocked
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let classifications = blocked
+        .iter()
+        .map(|entry| entry.classification.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    Err(CliError::new(
+        "export_policy_failed",
+        "state contains secret or local-only artifacts and cannot be checkpointed or exported",
+    )
+    .with_detail("blocked_count", blocked.len().to_string())
+    .with_detail("blocked_paths", paths)
+    .with_detail("blocked_classifications", classifications))
 }
 
 fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
@@ -2464,8 +2506,9 @@ fn real_projection_materialized_envelope(
 }
 
 fn real_status_envelope(state: &RealRepoState, command: &str) -> String {
+    let warnings = real_quarantine_warnings_json(state);
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\"}},\"topic\":{{\"topic_id\":{},\"head_revision_id\":{}}},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\"}}}},\"warnings\":[]}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"quarantined_secret_count\":{},\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"}},\"topic\":{{\"topic_id\":{},\"head_revision_id\":{}}},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\"}}}},\"warnings\":{}}}",
         command,
         json_escape(&state.repository_id),
         json_escape(&state.repository_id),
@@ -2476,10 +2519,22 @@ fn real_status_envelope(state: &RealRepoState, command: &str) -> String {
         state.entries.iter().filter(|entry| !entry.tombstone).count(),
         json_escape(&state.tree_hash),
         json_escape(&state.base_checkpoint_id),
+        state.quarantine.len(),
         optional_string_json(state.topic_id.as_deref()),
         optional_string_json(state.head_revision_id.as_deref()),
         optional_string_json(state.session_id.as_deref()),
         json_escape(&real_view(&state).session_generation_id),
+        warnings,
+    )
+}
+
+fn real_quarantine_warnings_json(state: &RealRepoState) -> String {
+    if state.quarantine.is_empty() {
+        return "[]".to_string();
+    }
+    format!(
+        "[{{\"code\":\"ingest_secrets_quarantined\",\"message\":\"repo ingestion skipped likely secret files\",\"quarantined_count\":{},\"report\":\"local://.sunlight/quarantine/ingest-report.json\"}}]",
+        state.quarantine.len()
     )
 }
 
@@ -6743,7 +6798,16 @@ fn init_success_envelope(
     created_config: bool,
     created_gitignore: bool,
     created_directories: usize,
+    quarantined_count: usize,
 ) -> String {
+    let warnings = if quarantined_count == 0 {
+        "[]".to_string()
+    } else {
+        format!(
+            "[{{\"code\":\"ingest_secrets_quarantined\",\"message\":\"repo ingestion skipped likely secret files\",\"quarantined_count\":{},\"report\":\"local://.sunlight/quarantine/ingest-report.json\"}}]",
+            quarantined_count
+        )
+    };
     format!(
         concat!(
             "{{\"ok\":true,",
@@ -6764,10 +6828,12 @@ fn init_success_envelope(
             "\"sunlight_dir\":\"{}\",",
             "\"created_config\":{},",
             "\"created_gitignore\":{},",
-            "\"created_directories\":{}",
+            "\"created_directories\":{},",
+            "\"quarantined_secret_count\":{},",
+            "\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"",
             "}}",
             "}},",
-            "\"warnings\":[]",
+            "\"warnings\":{}",
             "}}"
         ),
         json_escape(repository_id),
@@ -6778,6 +6844,8 @@ fn init_success_envelope(
         created_config,
         created_gitignore,
         created_directories,
+        quarantined_count,
+        warnings,
     )
 }
 

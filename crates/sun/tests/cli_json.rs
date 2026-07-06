@@ -428,6 +428,233 @@ fn no_fixture_init_respects_git_ignore_policy() {
 }
 
 #[test]
+fn no_fixture_init_quarantines_tracked_secret_without_persisting_or_searching_bytes() {
+    let repo = TestRepo::new("real-secret-quarantine");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    write_nested_file(repo.path(), "src/lib.rs", "pub fn kept() {}\n");
+    repo.write_file(
+        ".env",
+        "API_KEY=tracked-secret-value-that-must-not-persist\n",
+    );
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+
+    start_native_session(&repo, "secret-quarantine");
+
+    let native_state = fs::read_to_string(repo.path().join(".sunlight/records/native-state.json"))
+        .expect("native state should exist");
+    assert!(native_state.contains("\"path\":\".env\""));
+    assert!(native_state.contains("\"classification\":\"secret\""));
+    assert!(!native_state.contains("tracked-secret-value-that-must-not-persist"));
+    let blob_root = repo.path().join(".sunlight/objects/blobs/sha256");
+    for blob in fs::read_dir(blob_root).expect("blob directory should exist") {
+        let blob = blob.expect("blob entry should be readable");
+        let bytes = fs::read(blob.path()).expect("blob should be readable");
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("tracked-secret-value-that-must-not-persist")
+        );
+    }
+
+    let report = fs::read_to_string(repo.path().join(".sunlight/quarantine/ingest-report.json"))
+        .expect("quarantine report should exist");
+    assert!(report.contains("\"record_type\":\"ingest_quarantine_report\""));
+    assert!(report.contains("\"quarantined_count\":1"));
+    assert!(report.contains("\"path\":\".env\""));
+    assert!(report.contains("\"reason_codes\":[\"secret_path\",\"secret_token\"]"));
+    assert!(!report.contains("tracked-secret-value-that-must-not-persist"));
+
+    let status = sun()
+        .arg("status")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status should run");
+    assert_success(&status);
+    let status_stdout = stdout(&status);
+    assert!(status_stdout.contains("\"quarantined_secret_count\":1"));
+    assert!(status_stdout.contains("\"code\":\"ingest_secrets_quarantined\""));
+
+    let list_root = sun()
+        .arg("list")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun list should run");
+    assert_success(&list_root);
+    let list_stdout = stdout(&list_root);
+    assert!(list_stdout.contains("\"path\":\"src/lib.rs\""));
+    assert!(!list_stdout.contains("\"path\":\".env\""));
+
+    let read_secret = sun()
+        .arg("read")
+        .arg(".env")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun read secret should run");
+    assert_failure(&read_secret);
+    let read_stdout = stdout(&read_secret);
+    assert!(read_stdout.contains("\"code\":\"path_not_found\""));
+    assert!(read_stdout.contains("\"path\":\".env\""));
+    assert!(!read_stdout.contains("tracked-secret-value-that-must-not-persist"));
+
+    let search_secret = sun()
+        .arg("search")
+        .arg("tracked-secret-value-that-must-not-persist")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun search secret should run");
+    assert_success(&search_secret);
+    let search_stdout = stdout(&search_secret);
+    assert!(!search_stdout.contains(".env"));
+    assert!(!search_stdout.contains("tracked-secret-value-that-must-not-persist"));
+}
+
+#[test]
+fn no_fixture_git_export_rejects_secret_classified_artifact() {
+    let repo = TestRepo::new("real-secret-export-gate");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    repo.write_file("README.md", "# public\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+    start_native_session(&repo, "secret-export");
+
+    let checkpoint = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun checkpoint create should run");
+    assert_success(&checkpoint);
+    let checkpoint_id = json_string_field(&stdout(&checkpoint), "checkpoint_id");
+
+    let read = sun()
+        .arg("read")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun read should run");
+    assert_success(&read);
+    let content_hash = json_string_field(&stdout(&read), "content_hash");
+
+    let metadata = sun()
+        .arg("metadata")
+        .arg("set")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--expect-hash")
+        .arg(&content_hash)
+        .arg("--classification")
+        .arg("secret")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun metadata set should run");
+    assert_success(&metadata);
+
+    let export = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg(&checkpoint_id)
+        .arg("--branch")
+        .arg("sunlight/secret-export")
+        .arg("--execute-local")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export should run");
+    assert_failure(&export);
+    let export_stdout = stdout(&export);
+    assert!(export_stdout.contains("\"code\":\"export_policy_failed\""));
+    assert!(export_stdout.contains("\"blocked_paths\":\"README.md\""));
+    assert!(export_stdout.contains("\"blocked_classifications\":\"secret\""));
+}
+
+#[test]
+fn no_fixture_checkpoint_rejects_local_only_classified_artifact() {
+    let repo = TestRepo::new("real-local-only-checkpoint-gate");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    repo.write_file("README.md", "# public\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+    start_native_session(&repo, "local-only-checkpoint");
+
+    let read = sun()
+        .arg("read")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun read should run");
+    assert_success(&read);
+    let content_hash = json_string_field(&stdout(&read), "content_hash");
+
+    let metadata = sun()
+        .arg("metadata")
+        .arg("set")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--expect-hash")
+        .arg(&content_hash)
+        .arg("--classification")
+        .arg("local-only")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun metadata set should run");
+    assert_success(&metadata);
+    let resolved_view = json_string_field(&stdout(&metadata), "resolved_view_id");
+
+    let checkpoint = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg("--view")
+        .arg(&resolved_view)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun checkpoint create should run");
+    assert_failure(&checkpoint);
+    let checkpoint_stdout = stdout(&checkpoint);
+    assert!(checkpoint_stdout.contains("\"code\":\"export_policy_failed\""));
+    assert!(checkpoint_stdout.contains("\"blocked_paths\":\"README.md\""));
+    assert!(checkpoint_stdout.contains("\"blocked_classifications\":\"local-only\""));
+}
+
+#[test]
 fn no_fixture_move_after_sort_uses_moved_artifact_for_response() {
     let repo = TestRepo::new("real-move-sort-order");
     git(repo.path(), &["init", "-b", "main"]);

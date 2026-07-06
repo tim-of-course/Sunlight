@@ -27,6 +27,7 @@ pub struct RealRepoState {
     pub revision_number: u64,
     pub head_revision_id: Option<String>,
     pub entries: Vec<RealArtifactEntry>,
+    pub quarantine: Vec<RealQuarantineEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +39,15 @@ pub struct RealArtifactEntry {
     pub classification: String,
     pub tombstone: bool,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealQuarantineEntry {
+    pub path: String,
+    pub reason_codes: Vec<String>,
+    pub classification: String,
+    pub content_hash: String,
+    pub byte_length: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +92,8 @@ impl From<RecordError> for RepoStateError {
 impl RealRepoState {
     pub fn ingest(repo_root: &Path, repository_id: &str) -> Result<Self, RepoStateError> {
         let mut entries = Vec::new();
-        scan_real_repo_files(repo_root, repo_root, &mut entries)?;
+        let mut quarantine = Vec::new();
+        scan_real_repo_files_with_quarantine(repo_root, repo_root, &mut entries, &mut quarantine)?;
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         let tree_hash = real_tree_hash(&entries);
         let state = Self {
@@ -100,6 +111,7 @@ impl RealRepoState {
             revision_number: 0,
             head_revision_id: None,
             entries,
+            quarantine,
         };
         state.persist_blobs(repo_root)?;
         Ok(state)
@@ -129,6 +141,10 @@ impl RealRepoState {
             .iter()
             .map(|entry| parse_entry(repo_root, entry, &path))
             .collect::<Result<Vec<_>, _>>()?;
+        let quarantine = optional_array(&object, "quarantine", &path)?
+            .iter()
+            .map(|entry| parse_quarantine_entry(entry, &path))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut state = Self {
             repository_id: required_string(&object, "repository_id", &path)?,
             base_checkpoint_id: required_string(&object, "base_checkpoint_id", &path)?,
@@ -144,6 +160,7 @@ impl RealRepoState {
             revision_number: required_u64(&object, "revision_number", &path)?,
             head_revision_id: optional_string(&object, "head_revision_id", &path)?,
             entries,
+            quarantine,
         };
         state
             .entries
@@ -251,6 +268,10 @@ impl RealRepoState {
             "entries".to_string(),
             JsonValue::Array(self.entries.iter().map(entry_json).collect()),
         );
+        object.insert(
+            "quarantine".to_string(),
+            JsonValue::Array(self.quarantine.iter().map(quarantine_json).collect()),
+        );
         JsonValue::Object(object)
     }
 
@@ -266,21 +287,32 @@ pub fn scan_real_repo_files(
     current: &Path,
     entries: &mut Vec<RealArtifactEntry>,
 ) -> Result<(), RepoStateError> {
+    let mut quarantine = Vec::new();
+    scan_real_repo_files_with_quarantine(repo_root, current, entries, &mut quarantine)
+}
+
+pub fn scan_real_repo_files_with_quarantine(
+    repo_root: &Path,
+    current: &Path,
+    entries: &mut Vec<RealArtifactEntry>,
+    quarantine: &mut Vec<RealQuarantineEntry>,
+) -> Result<(), RepoStateError> {
     if current == repo_root {
         if let Some(paths) = git_worktree_file_paths(repo_root)? {
             for relative in paths {
-                ingest_real_repo_path(repo_root, &relative, entries)?;
+                ingest_real_repo_path(repo_root, &relative, entries, quarantine)?;
             }
             return Ok(());
         }
     }
-    scan_real_repo_files_fallback(repo_root, current, entries)
+    scan_real_repo_files_fallback(repo_root, current, entries, quarantine)
 }
 
 fn scan_real_repo_files_fallback(
     repo_root: &Path,
     current: &Path,
     entries: &mut Vec<RealArtifactEntry>,
+    quarantine: &mut Vec<RealQuarantineEntry>,
 ) -> Result<(), RepoStateError> {
     let children = fs::read_dir(current)
         .map_err(|error| io_error(current, "failed to scan repository worktree", error))?;
@@ -298,14 +330,14 @@ fn scan_real_repo_files_fallback(
             .metadata()
             .map_err(|error| io_error(&path, "failed to inspect worktree path", error))?;
         if metadata.is_dir() {
-            scan_real_repo_files_fallback(repo_root, &path, entries)?;
+            scan_real_repo_files_fallback(repo_root, &path, entries, quarantine)?;
         } else if metadata.is_file() {
             let relative = path
                 .strip_prefix(repo_root)
                 .map_err(|_| invalid_state(repo_root, "failed to normalize worktree path"))?
                 .to_string_lossy()
                 .replace('\\', "/");
-            ingest_real_repo_path(repo_root, &relative, entries)?;
+            ingest_real_repo_path(repo_root, &relative, entries, quarantine)?;
         }
     }
     Ok(())
@@ -355,6 +387,7 @@ fn ingest_real_repo_path(
     repo_root: &Path,
     relative: &str,
     entries: &mut Vec<RealArtifactEntry>,
+    quarantine: &mut Vec<RealQuarantineEntry>,
 ) -> Result<(), RepoStateError> {
     let path = repo_root.join(relative);
     let metadata = fs::metadata(&path)
@@ -364,6 +397,17 @@ fn ingest_real_repo_path(
     }
     let bytes =
         fs::read(&path).map_err(|error| io_error(&path, "failed to read worktree file", error))?;
+    let secret_reasons = detect_secret_reasons(relative, &bytes);
+    if !secret_reasons.is_empty() {
+        quarantine.push(RealQuarantineEntry {
+            path: relative.to_string(),
+            reason_codes: secret_reasons,
+            classification: "secret".to_string(),
+            content_hash: real_content_hash(&bytes),
+            byte_length: bytes.len(),
+        });
+        return Ok(());
+    }
     entries.push(RealArtifactEntry {
         artifact_id: real_artifact_id_for_path(relative),
         path: relative.to_string(),
@@ -374,6 +418,90 @@ fn ingest_real_repo_path(
         bytes,
     });
     Ok(())
+}
+
+pub fn detect_secret_reasons(path: &str, bytes: &[u8]) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
+    let file_name = normalized_path.rsplit('/').next().unwrap_or("");
+    let path_secret = file_name == ".env"
+        || file_name.starts_with(".env.")
+        || normalized_path.ends_with("/.env")
+        || normalized_path.contains("/.env.")
+        || file_name.ends_with(".pem")
+        || file_name.ends_with(".key")
+        || file_name == "id_rsa"
+        || file_name == "id_dsa"
+        || file_name == "id_ecdsa"
+        || file_name == "id_ed25519"
+        || normalized_path.contains("secret")
+        || normalized_path.contains("secrets")
+        || normalized_path.contains("credentials");
+    if path_secret {
+        reasons.push("secret_path".to_string());
+    }
+
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        let lowered = text.to_ascii_lowercase();
+        let token_secret = [
+            "api_key",
+            "apikey",
+            "access_token",
+            "auth_token",
+            "secret_key",
+            "client_secret",
+            "private_key",
+            "password",
+            "-----begin private key-----",
+            "-----begin rsa private key-----",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle));
+        if token_secret {
+            reasons.push("secret_token".to_string());
+        }
+    }
+    reasons.sort();
+    reasons.dedup();
+    reasons
+}
+
+pub fn persist_quarantine_report(
+    repo_root: &Path,
+    quarantine: &[RealQuarantineEntry],
+) -> Result<(), RepoStateError> {
+    let path = repo_root
+        .join(".sunlight")
+        .join("quarantine")
+        .join("ingest-report.json");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| io_error(parent, "failed to create quarantine directory", error))?;
+    }
+    let mut object = BTreeMap::new();
+    object.insert(
+        "record_type".to_string(),
+        JsonValue::String("ingest_quarantine_report".to_string()),
+    );
+    object.insert(
+        "privacy_class".to_string(),
+        JsonValue::String("local_only".to_string()),
+    );
+    object.insert(
+        "classification".to_string(),
+        JsonValue::String("secret".to_string()),
+    );
+    object.insert(
+        "quarantined_count".to_string(),
+        JsonValue::Number(quarantine.len().to_string()),
+    );
+    object.insert(
+        "entries".to_string(),
+        JsonValue::Array(quarantine.iter().map(quarantine_json).collect()),
+    );
+    let body = canonical_json_bytes(&JsonValue::Object(object))?;
+    fs::write(&path, body)
+        .map_err(|error| io_error(&path, "failed to write quarantine report", error))
 }
 
 pub fn real_state_path(repo_root: &Path) -> PathBuf {
@@ -487,6 +615,35 @@ fn parse_entry(
     })
 }
 
+fn parse_quarantine_entry(
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealQuarantineEntry, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(
+            state_path,
+            "quarantine entry must be a JSON object",
+        ));
+    };
+    let reason_codes = required_array(object, "reason_codes", state_path)?
+        .iter()
+        .map(|value| match value {
+            JsonValue::String(reason) => Ok(reason.clone()),
+            _ => Err(invalid_state(
+                state_path,
+                "quarantine reason_codes must be strings",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RealQuarantineEntry {
+        path: required_string(object, "path", state_path)?,
+        reason_codes,
+        classification: required_string(object, "classification", state_path)?,
+        content_hash: required_string(object, "content_hash", state_path)?,
+        byte_length: required_u64(object, "byte_length", state_path)? as usize,
+    })
+}
+
 fn entry_json(entry: &RealArtifactEntry) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert("path".to_string(), JsonValue::String(entry.path.clone()));
@@ -504,6 +661,34 @@ fn entry_json(entry: &RealArtifactEntry) -> JsonValue {
         JsonValue::String(entry.classification.clone()),
     );
     object.insert("tombstone".to_string(), JsonValue::Bool(entry.tombstone));
+    JsonValue::Object(object)
+}
+
+fn quarantine_json(entry: &RealQuarantineEntry) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert("path".to_string(), JsonValue::String(entry.path.clone()));
+    object.insert(
+        "reason_codes".to_string(),
+        JsonValue::Array(
+            entry
+                .reason_codes
+                .iter()
+                .map(|reason| JsonValue::String(reason.clone()))
+                .collect(),
+        ),
+    );
+    object.insert(
+        "classification".to_string(),
+        JsonValue::String(entry.classification.clone()),
+    );
+    object.insert(
+        "content_hash".to_string(),
+        JsonValue::String(entry.content_hash.clone()),
+    );
+    object.insert(
+        "byte_length".to_string(),
+        JsonValue::Number(entry.byte_length.to_string()),
+    );
     JsonValue::Object(object)
 }
 
@@ -580,6 +765,21 @@ fn required_array<'a>(
 ) -> Result<&'a [JsonValue], RepoStateError> {
     match object.get(field) {
         Some(JsonValue::Array(values)) => Ok(values),
+        _ => Err(invalid_state(
+            path,
+            format!("field `{field}` must be an array"),
+        )),
+    }
+}
+
+fn optional_array<'a>(
+    object: &'a BTreeMap<String, JsonValue>,
+    field: &'static str,
+    path: &Path,
+) -> Result<&'a [JsonValue], RepoStateError> {
+    match object.get(field) {
+        Some(JsonValue::Array(values)) => Ok(values),
+        None => Ok(&[]),
         _ => Err(invalid_state(
             path,
             format!("field `{field}` must be an array"),
@@ -700,6 +900,73 @@ mod tests {
     }
 
     #[test]
+    fn ingest_quarantines_secret_path_without_persisting_secret_bytes() {
+        let repo = temp_repo("secret-path");
+        git(&repo, &["init", "-b", "main"]);
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/lib.rs"), b"pub fn kept() {}\n").unwrap();
+        fs::write(
+            repo.join(".env"),
+            b"API_KEY=super-secret-value-that-must-not-persist\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "src/lib.rs", ".env"]);
+
+        let state = RealRepoState::ingest(&repo, "repo_secret_path").unwrap();
+        state.save(&repo).unwrap();
+        persist_quarantine_report(&repo, &state.quarantine).unwrap();
+
+        assert_eq!(state.entries.len(), 1);
+        assert!(state.entry("src/lib.rs").is_some());
+        assert!(state.entry(".env").is_none());
+        assert_eq!(state.quarantine.len(), 1);
+        assert_eq!(state.quarantine[0].path, ".env");
+        assert!(state.quarantine[0]
+            .reason_codes
+            .contains(&"secret_path".to_string()));
+        assert!(state.quarantine[0]
+            .reason_codes
+            .contains(&"secret_token".to_string()));
+
+        let state_json = fs::read_to_string(real_state_path(&repo)).unwrap();
+        assert!(state_json.contains("\"path\":\".env\""));
+        assert!(!state_json.contains("super-secret-value-that-must-not-persist"));
+        assert!(!real_blob_path(&repo, &state.quarantine[0].content_hash).exists());
+
+        let report =
+            fs::read_to_string(repo.join(".sunlight/quarantine/ingest-report.json")).unwrap();
+        assert!(report.contains("\"record_type\":\"ingest_quarantine_report\""));
+        assert!(report.contains("\"path\":\".env\""));
+        assert!(report.contains("\"quarantined_count\":1"));
+        assert!(!report.contains("super-secret-value-that-must-not-persist"));
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn ingest_quarantines_secret_token_in_unignored_source_like_path() {
+        let repo = temp_repo("secret-token");
+        fs::create_dir_all(repo.join("config")).unwrap();
+        fs::write(
+            repo.join("config/app.toml"),
+            b"client_secret = \"abc123\"\n",
+        )
+        .unwrap();
+        fs::write(repo.join("README.md"), b"# public\n").unwrap();
+
+        let state = RealRepoState::ingest(&repo, "repo_secret_token").unwrap();
+
+        assert_eq!(state.entries.len(), 1);
+        assert!(state.entry("README.md").is_some());
+        assert!(state.entry("config/app.toml").is_none());
+        assert_eq!(state.quarantine.len(), 1);
+        assert_eq!(state.quarantine[0].path, "config/app.toml");
+        assert_eq!(state.quarantine[0].reason_codes, vec!["secret_token"]);
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
     fn non_git_ingestion_fallback_still_excludes_sunlight_and_git_dirs() {
         let repo = temp_repo("fallback");
         fs::create_dir_all(repo.join("src")).unwrap();
@@ -750,6 +1017,7 @@ mod tests {
             revision_number: 0,
             head_revision_id: None,
             entries,
+            quarantine: Vec::new(),
         };
         state.save(&repo).unwrap();
         let state_bytes = fs::read(real_state_path(&repo)).unwrap();

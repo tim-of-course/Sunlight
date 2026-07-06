@@ -26,8 +26,31 @@ pub struct RealRepoState {
     pub generation_number: u64,
     pub revision_number: u64,
     pub head_revision_id: Option<String>,
+    pub topics: Vec<RealTopicRecord>,
+    pub sessions: Vec<RealSessionRecord>,
     pub entries: Vec<RealArtifactEntry>,
     pub quarantine: Vec<RealQuarantineEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealTopicRecord {
+    pub topic_id: String,
+    pub slug: String,
+    pub display_name: String,
+    pub owner_actor_id: String,
+    pub base_checkpoint_id: String,
+    pub head_revision_id: Option<String>,
+    pub revision_number: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealSessionRecord {
+    pub session_id: String,
+    pub actor_id: String,
+    pub write_topic_id: String,
+    pub resolved_view_id: String,
+    pub session_generation_id: String,
+    pub generation_number: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +133,8 @@ impl RealRepoState {
             generation_number: 0,
             revision_number: 0,
             head_revision_id: None,
+            topics: Vec::new(),
+            sessions: Vec::new(),
             entries,
             quarantine,
         };
@@ -145,23 +170,71 @@ impl RealRepoState {
             .iter()
             .map(|entry| parse_quarantine_entry(entry, &path))
             .collect::<Result<Vec<_>, _>>()?;
+        let topic_id = optional_string(&object, "topic_id", &path)?;
+        let topic_slug = optional_string(&object, "topic_slug", &path)?;
+        let topic_display_name = optional_string(&object, "topic_display_name", &path)?;
+        let session_id = optional_string(&object, "session_id", &path)?;
+        let actor_id = optional_string(&object, "actor_id", &path)?;
+        let generation_number = required_u64(&object, "generation_number", &path)?;
+        let revision_number = required_u64(&object, "revision_number", &path)?;
+        let head_revision_id = optional_string(&object, "head_revision_id", &path)?;
+        let mut topics = optional_array(&object, "topics", &path)?
+            .iter()
+            .map(|topic| parse_topic(topic, &path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut sessions = optional_array(&object, "sessions", &path)?
+            .iter()
+            .map(|session| parse_session(session, &path))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if topics.is_empty() {
+            if let Some(legacy_topic_id) = topic_id.clone() {
+                topics.push(RealTopicRecord {
+                    topic_id: legacy_topic_id,
+                    slug: topic_slug.clone().unwrap_or_default(),
+                    display_name: topic_display_name.clone().unwrap_or_default(),
+                    owner_actor_id: actor_id.clone().unwrap_or_else(|| "local".to_string()),
+                    base_checkpoint_id: required_string(&object, "base_checkpoint_id", &path)?,
+                    head_revision_id: head_revision_id.clone(),
+                    revision_number,
+                });
+            }
+        }
+        if sessions.is_empty() {
+            if let (Some(legacy_session_id), Some(legacy_topic_id)) =
+                (session_id.clone(), topic_id.clone())
+            {
+                sessions.push(RealSessionRecord {
+                    session_id: legacy_session_id,
+                    actor_id: actor_id.clone().unwrap_or_else(|| "local".to_string()),
+                    write_topic_id: legacy_topic_id,
+                    resolved_view_id: required_string(&object, "resolved_view_id", &path)?,
+                    session_generation_id: format!("gen_native_{:04}", generation_number.max(1)),
+                    generation_number,
+                });
+            }
+        }
+
         let mut state = Self {
             repository_id: required_string(&object, "repository_id", &path)?,
             base_checkpoint_id: required_string(&object, "base_checkpoint_id", &path)?,
             base_resolved_view_id: required_string(&object, "base_resolved_view_id", &path)?,
             resolved_view_id: required_string(&object, "resolved_view_id", &path)?,
             tree_hash: required_string(&object, "tree_hash", &path)?,
-            topic_id: optional_string(&object, "topic_id", &path)?,
-            topic_slug: optional_string(&object, "topic_slug", &path)?,
-            topic_display_name: optional_string(&object, "topic_display_name", &path)?,
-            session_id: optional_string(&object, "session_id", &path)?,
-            actor_id: optional_string(&object, "actor_id", &path)?,
-            generation_number: required_u64(&object, "generation_number", &path)?,
-            revision_number: required_u64(&object, "revision_number", &path)?,
-            head_revision_id: optional_string(&object, "head_revision_id", &path)?,
+            topic_id,
+            topic_slug,
+            topic_display_name,
+            session_id,
+            actor_id,
+            generation_number,
+            revision_number,
+            head_revision_id,
+            topics,
+            sessions,
             entries,
             quarantine,
         };
+        state.sync_compat_fields();
         state
             .entries
             .sort_by(|left, right| left.path.cmp(&right.path));
@@ -265,6 +338,14 @@ impl RealRepoState {
             optional_json(&self.head_revision_id),
         );
         object.insert(
+            "topics".to_string(),
+            JsonValue::Array(self.topics.iter().map(topic_json).collect()),
+        );
+        object.insert(
+            "sessions".to_string(),
+            JsonValue::Array(self.sessions.iter().map(session_json).collect()),
+        );
+        object.insert(
             "entries".to_string(),
             JsonValue::Array(self.entries.iter().map(entry_json).collect()),
         );
@@ -279,6 +360,57 @@ impl RealRepoState {
         self.entries
             .iter()
             .find(|entry| entry.path == path && !entry.tombstone)
+    }
+
+    pub fn sync_compat_fields(&mut self) {
+        if let Some(topic) = self.topics.last() {
+            self.topic_id = Some(topic.topic_id.clone());
+            self.topic_slug = Some(topic.slug.clone());
+            self.topic_display_name = Some(topic.display_name.clone());
+            self.head_revision_id = topic.head_revision_id.clone();
+            self.revision_number = self
+                .topics
+                .iter()
+                .map(|topic| topic.revision_number)
+                .max()
+                .unwrap_or(0)
+                .max(self.revision_number);
+        }
+        if let Some(session) = self.sessions.last() {
+            self.session_id = Some(session.session_id.clone());
+            self.actor_id = Some(session.actor_id.clone());
+            self.generation_number = self
+                .sessions
+                .iter()
+                .map(|session| session.generation_number)
+                .max()
+                .unwrap_or(0)
+                .max(self.generation_number);
+        }
+    }
+
+    pub fn topic_by_id_or_slug(&self, value: &str) -> Option<&RealTopicRecord> {
+        self.topics
+            .iter()
+            .find(|topic| topic.topic_id == value || topic.slug == value)
+    }
+
+    pub fn topic_by_id_or_slug_mut(&mut self, value: &str) -> Option<&mut RealTopicRecord> {
+        self.topics
+            .iter_mut()
+            .find(|topic| topic.topic_id == value || topic.slug == value)
+    }
+
+    pub fn session_by_id(&self, session_id: &str) -> Option<&RealSessionRecord> {
+        self.sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+    }
+
+    pub fn session_by_id_mut(&mut self, session_id: &str) -> Option<&mut RealSessionRecord> {
+        self.sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
     }
 }
 
@@ -644,6 +776,38 @@ fn parse_quarantine_entry(
     })
 }
 
+fn parse_topic(value: &JsonValue, state_path: &Path) -> Result<RealTopicRecord, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(state_path, "topic must be a JSON object"));
+    };
+    Ok(RealTopicRecord {
+        topic_id: required_string(object, "topic_id", state_path)?,
+        slug: required_string(object, "slug", state_path)?,
+        display_name: required_string(object, "display_name", state_path)?,
+        owner_actor_id: required_string(object, "owner_actor_id", state_path)?,
+        base_checkpoint_id: required_string(object, "base_checkpoint_id", state_path)?,
+        head_revision_id: optional_string(object, "head_revision_id", state_path)?,
+        revision_number: required_u64(object, "revision_number", state_path)?,
+    })
+}
+
+fn parse_session(
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealSessionRecord, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(state_path, "session must be a JSON object"));
+    };
+    Ok(RealSessionRecord {
+        session_id: required_string(object, "session_id", state_path)?,
+        actor_id: required_string(object, "actor_id", state_path)?,
+        write_topic_id: required_string(object, "write_topic_id", state_path)?,
+        resolved_view_id: required_string(object, "resolved_view_id", state_path)?,
+        session_generation_id: required_string(object, "session_generation_id", state_path)?,
+        generation_number: required_u64(object, "generation_number", state_path)?,
+    })
+}
+
 fn entry_json(entry: &RealArtifactEntry) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert("path".to_string(), JsonValue::String(entry.path.clone()));
@@ -661,6 +825,65 @@ fn entry_json(entry: &RealArtifactEntry) -> JsonValue {
         JsonValue::String(entry.classification.clone()),
     );
     object.insert("tombstone".to_string(), JsonValue::Bool(entry.tombstone));
+    JsonValue::Object(object)
+}
+
+fn topic_json(topic: &RealTopicRecord) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "topic_id".to_string(),
+        JsonValue::String(topic.topic_id.clone()),
+    );
+    object.insert("slug".to_string(), JsonValue::String(topic.slug.clone()));
+    object.insert(
+        "display_name".to_string(),
+        JsonValue::String(topic.display_name.clone()),
+    );
+    object.insert(
+        "owner_actor_id".to_string(),
+        JsonValue::String(topic.owner_actor_id.clone()),
+    );
+    object.insert(
+        "base_checkpoint_id".to_string(),
+        JsonValue::String(topic.base_checkpoint_id.clone()),
+    );
+    object.insert(
+        "head_revision_id".to_string(),
+        optional_json(&topic.head_revision_id),
+    );
+    object.insert(
+        "revision_number".to_string(),
+        JsonValue::Number(topic.revision_number.to_string()),
+    );
+    JsonValue::Object(object)
+}
+
+fn session_json(session: &RealSessionRecord) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "session_id".to_string(),
+        JsonValue::String(session.session_id.clone()),
+    );
+    object.insert(
+        "actor_id".to_string(),
+        JsonValue::String(session.actor_id.clone()),
+    );
+    object.insert(
+        "write_topic_id".to_string(),
+        JsonValue::String(session.write_topic_id.clone()),
+    );
+    object.insert(
+        "resolved_view_id".to_string(),
+        JsonValue::String(session.resolved_view_id.clone()),
+    );
+    object.insert(
+        "session_generation_id".to_string(),
+        JsonValue::String(session.session_generation_id.clone()),
+    );
+    object.insert(
+        "generation_number".to_string(),
+        JsonValue::Number(session.generation_number.to_string()),
+    );
     JsonValue::Object(object)
 }
 
@@ -1016,6 +1239,8 @@ mod tests {
             generation_number: 0,
             revision_number: 0,
             head_revision_id: None,
+            topics: Vec::new(),
+            sessions: Vec::new(),
             entries,
             quarantine: Vec::new(),
         };

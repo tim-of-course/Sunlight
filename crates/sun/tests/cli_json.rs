@@ -325,6 +325,200 @@ fn no_fixture_real_repo_artifact_io_vertical_slice() {
 }
 
 #[test]
+fn no_fixture_topics_and_sessions_are_distinct_repo_backed_records() {
+    let repo = TestRepo::new("real-multi-topic-session");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    repo.write_file("README.md", "# Multi\n\nalpha\n");
+    write_nested_file(
+        repo.path(),
+        "src/lib.rs",
+        "pub fn value() -> u32 {\n    1\n}\n",
+    );
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+
+    let init = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun init should run");
+    assert_success(&init);
+
+    for (slug, display) in [("alpha-topic", "Alpha Topic"), ("beta-topic", "Beta Topic")] {
+        let topic = sun()
+            .arg("topic")
+            .arg("create")
+            .arg(slug)
+            .arg("--display-name")
+            .arg(display)
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .expect("sun topic create should run");
+        assert_success(&topic);
+        assert!(stdout(&topic).contains(&format!("\"slug\":\"{slug}\"")));
+    }
+
+    let duplicate = sun()
+        .arg("topic")
+        .arg("create")
+        .arg("alpha-topic")
+        .arg("--display-name")
+        .arg("Duplicate Alpha")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("duplicate topic create should run");
+    assert_failure(&duplicate);
+    assert!(stdout(&duplicate).contains("\"code\":\"topic_conflict\""));
+
+    let alpha_session = sun()
+        .arg("session")
+        .arg("start")
+        .arg("--topic")
+        .arg("alpha-topic")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--actor")
+        .arg("agent-a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("alpha session start should run");
+    assert_success(&alpha_session);
+    let alpha_stdout = stdout(&alpha_session);
+    assert!(alpha_stdout.contains("\"session_id\":\"session_agent_a\""));
+    assert!(alpha_stdout.contains("\"write_topic_id\":\"topic_alpha_topic\""));
+
+    let beta_session = sun()
+        .arg("session")
+        .arg("start")
+        .arg("--topic")
+        .arg("topic_beta_topic")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--actor")
+        .arg("agent-b")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("beta session start should run");
+    assert_success(&beta_session);
+    let beta_stdout = stdout(&beta_session);
+    assert!(beta_stdout.contains("\"session_id\":\"session_agent_b\""));
+    assert!(beta_stdout.contains("\"write_topic_id\":\"topic_beta_topic\""));
+
+    let alpha_read = sun()
+        .arg("read")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("alpha read should run");
+    assert_success(&alpha_read);
+    let readme_hash = json_string_field(&stdout(&alpha_read), "content_hash");
+    let alpha_content = repo.write_file("alpha-readme.md", "# Multi\n\nalpha updated\n");
+    let alpha_write = sun()
+        .arg("write")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--expect-hash")
+        .arg(&readme_hash)
+        .arg("--content-file")
+        .arg(&alpha_content)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("alpha write should run");
+    assert_success(&alpha_write);
+    let alpha_write_stdout = stdout(&alpha_write);
+    assert!(alpha_write_stdout.contains("\"topic_id\":\"topic_alpha_topic\""));
+    assert!(alpha_write_stdout.contains("\"topic_revision_id\":\"rev_alpha_topic_0001\""));
+    assert!(alpha_write_stdout.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
+
+    let beta_read = sun()
+        .arg("read")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_b")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("beta read should run");
+    assert_success(&beta_read);
+    let lib_hash = json_string_field(&stdout(&beta_read), "content_hash");
+    let beta_content = repo.write_file("beta-lib.rs", "pub fn value() -> u32 {\n    2\n}\n");
+    let beta_write = sun()
+        .arg("write")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_b")
+        .arg("--expect-hash")
+        .arg(&lib_hash)
+        .arg("--content-file")
+        .arg(&beta_content)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("beta write should run");
+    assert_success(&beta_write);
+    let beta_write_stdout = stdout(&beta_write);
+    assert!(beta_write_stdout.contains("\"topic_id\":\"topic_beta_topic\""));
+    assert!(beta_write_stdout.contains("\"topic_revision_id\":\"rev_beta_topic_0001\""));
+    assert!(beta_write_stdout.contains("\"session_generation_id\":\"gen_agent_b_0002\""));
+
+    let alpha_status = sun()
+        .arg("status")
+        .arg("--topic")
+        .arg("alpha-topic")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("alpha status should run");
+    assert_success(&alpha_status);
+    let alpha_status_stdout = stdout(&alpha_status);
+    assert!(alpha_status_stdout.contains("\"topic_id\":\"topic_alpha_topic\""));
+    assert!(alpha_status_stdout.contains("\"head_revision_id\":\"rev_alpha_topic_0001\""));
+    assert!(!alpha_status_stdout.contains("\"topic_id\":\"topic_beta_topic\""));
+
+    let beta_status = sun()
+        .arg("status")
+        .arg("--session")
+        .arg("session_agent_b")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("beta session status should run");
+    assert_success(&beta_status);
+    let beta_status_stdout = stdout(&beta_status);
+    assert!(beta_status_stdout.contains("\"session_id\":\"session_agent_b\""));
+    assert!(beta_status_stdout.contains("\"topic_id\":\"topic_beta_topic\""));
+    assert!(beta_status_stdout.contains("\"session_generation_id\":\"gen_agent_b_0002\""));
+
+    let state_json = fs::read_to_string(repo.path().join(".sunlight/records/native-state.json"))
+        .expect("native state should exist");
+    assert!(state_json.contains("\"topics\":["));
+    assert!(state_json.contains("\"sessions\":["));
+    assert!(state_json.contains("\"topic_id\":\"topic_alpha_topic\""));
+    assert!(state_json.contains("\"topic_id\":\"topic_beta_topic\""));
+    assert!(state_json.contains("\"session_id\":\"session_agent_a\""));
+    assert!(state_json.contains("\"session_id\":\"session_agent_b\""));
+}
+
+#[test]
 fn no_fixture_init_respects_git_ignore_policy() {
     let repo = TestRepo::new("real-repo-ignore-policy");
     git(repo.path(), &["init", "-b", "main"]);

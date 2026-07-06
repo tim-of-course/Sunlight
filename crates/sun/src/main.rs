@@ -76,7 +76,8 @@ use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue}
 use sunlight_core::repo_state::{
     materialize_real_files, persist_quarantine_report, real_artifact_id_for_path,
     real_content_hash, real_tree_hash, write_real_files_overwrite, RealArtifactEntry,
-    RealRepoState, RealSessionRecord, RealTopicRecord, RepoStateError,
+    RealOperationRecord, RealRepoState, RealResolvedRepoView, RealSessionRecord, RealTopicRecord,
+    RepoStateError,
 };
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
@@ -1379,22 +1380,105 @@ fn real_view(state: &RealRepoState) -> SessionView {
 }
 
 fn real_session_view(state: &RealRepoState, session: &RealSessionRecord) -> SessionView {
+    let resolved = state.resolve_session_view(session);
+    real_resolved_session_view(state, session, &resolved)
+}
+
+fn real_resolved_session_view(
+    state: &RealRepoState,
+    session: &RealSessionRecord,
+    resolved: &RealResolvedRepoView,
+) -> SessionView {
+    let tree_identity = resolved
+        .result
+        .tree_identity
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| SingleRepoTree {
+            repository_id: state.repository_id.clone(),
+            tree_hash: real_tree_hash(&resolved.entries),
+        });
     SessionView {
-        resolved_view_id: session.resolved_view_id.clone(),
+        resolved_view_id: resolved.result.resolved_view_id.clone(),
         session_generation_id: session.session_generation_id.clone(),
         tree_identity: TreeIdentityView {
             kind: "SingleRepoTree".to_string(),
-            repository_id: state.repository_id.clone(),
-            tree_hash: state.tree_hash.clone(),
+            repository_id: tree_identity.repository_id,
+            tree_hash: tree_identity.tree_hash,
         },
     }
 }
 
 fn real_resolved_view(state: &RealRepoState) -> ResolvedViewResult {
-    let tree_entries = state
-        .entries
+    state.resolve_head_view().result
+}
+
+fn real_resolve_view_by_id(
+    state: &RealRepoState,
+    view_id: &str,
+) -> Result<RealResolvedRepoView, CliError> {
+    if view_id == state.base_resolved_view_id {
+        return Ok(real_base_resolved_repo_view(state));
+    }
+
+    let head = state.resolve_head_view();
+    if view_id == head.result.resolved_view_id || view_id == state.resolved_view_id {
+        return Ok(head);
+    }
+
+    for session in &state.sessions {
+        if view_id == session.resolved_view_id {
+            return Ok(state.resolve_session_view(session));
+        }
+    }
+
+    Err(object_not_found("resolved_view", view_id))
+}
+
+fn real_resolve_checkpoint_view(
+    state: &RealRepoState,
+    checkpoint_id: &str,
+) -> Result<RealResolvedRepoView, CliError> {
+    let mut candidates = vec![state.resolve_head_view()];
+    candidates.extend(
+        state
+            .sessions
+            .iter()
+            .map(|session| state.resolve_session_view(session)),
+    );
+    candidates.push(real_base_resolved_repo_view(state));
+    for resolved in candidates {
+        let view_state = real_view_state(state, &resolved);
+        let checkpoint = real_checkpoint(&view_state);
+        if checkpoint.id == checkpoint_id {
+            return Ok(resolved);
+        }
+    }
+    Err(object_not_found("checkpoint", checkpoint_id))
+}
+
+fn real_view_state(state: &RealRepoState, resolved: &RealResolvedRepoView) -> RealRepoState {
+    let mut view_state = state.clone();
+    view_state.entries = resolved.entries.clone();
+    view_state.resolved_view_id = resolved.result.resolved_view_id.clone();
+    if let Some(tree) = &resolved.result.tree_identity {
+        view_state.tree_hash = tree.tree_hash.clone();
+    } else {
+        view_state.tree_hash = real_tree_hash(&resolved.entries);
+    }
+    view_state
+}
+
+fn real_base_resolved_repo_view(state: &RealRepoState) -> RealResolvedRepoView {
+    let entries = state
+        .base_entries
         .iter()
         .filter(|entry| !entry.tombstone)
+        .cloned()
+        .collect::<Vec<_>>();
+    let tree_hash = real_tree_hash(&entries);
+    let tree_entries = entries
+        .iter()
         .map(|entry| {
             (
                 entry.path.clone(),
@@ -1406,47 +1490,47 @@ fn real_resolved_view(state: &RealRepoState) -> ResolvedViewResult {
             )
         })
         .collect();
-    let topic_frontier = state
-        .topics
-        .iter()
-        .filter_map(|topic| {
-            topic
-                .head_revision_id
-                .as_ref()
-                .map(|revision| (topic.topic_id.clone(), revision.clone()))
-        })
-        .collect();
-    ResolvedViewResult {
-        resolved_view_id: state.resolved_view_id.clone(),
-        repository_id: state.repository_id.clone(),
-        base_checkpoint_ids: vec![state.base_checkpoint_id.clone()],
-        topic_frontier,
-        dependency_closure: DependencyClosure {
-            revision_ids: Vec::new(),
-        },
-        operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
-        path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
-        resolver_order: DeterministicResolverOrder {
-            operation_ids: Vec::new(),
-        },
-        tree_identity: Some(SingleRepoTree {
+    RealResolvedRepoView {
+        result: ResolvedViewResult {
+            resolved_view_id: state.base_resolved_view_id.clone(),
             repository_id: state.repository_id.clone(),
-            tree_hash: state.tree_hash.clone(),
-        }),
-        records: Vec::new(),
-        tree_entries,
+            base_checkpoint_ids: vec![state.base_checkpoint_id.clone()],
+            topic_frontier: BTreeMap::new(),
+            dependency_closure: DependencyClosure {
+                revision_ids: Vec::new(),
+            },
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            resolver_order: DeterministicResolverOrder {
+                operation_ids: Vec::new(),
+            },
+            tree_identity: Some(SingleRepoTree {
+                repository_id: state.repository_id.clone(),
+                tree_hash,
+            }),
+            records: Vec::new(),
+            tree_entries,
+        },
+        entries,
     }
 }
 
-fn real_entry<'a>(state: &'a RealRepoState, path: &str) -> Result<&'a RealArtifactEntry, CliError> {
-    state.entry(path).ok_or_else(|| {
-        CliError::new("path_not_found", format!("path `{path}` was not found"))
-            .with_detail("path", path)
-            .with_detail(
-                "session_generation_id",
-                real_view(state).session_generation_id,
-            )
-    })
+fn real_entry<'a>(
+    state: &RealRepoState,
+    entries: &'a [RealArtifactEntry],
+    path: &str,
+) -> Result<&'a RealArtifactEntry, CliError> {
+    entries
+        .iter()
+        .find(|entry| entry.path == path && !entry.tombstone)
+        .ok_or_else(|| {
+            CliError::new("path_not_found", format!("path `{path}` was not found"))
+                .with_detail("path", path)
+                .with_detail(
+                    "session_generation_id",
+                    real_view(state).session_generation_id,
+                )
+        })
 }
 
 fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Result<(), CliError> {
@@ -1573,14 +1657,15 @@ fn real_artifact_read(
 ) -> Result<(), CliError> {
     let state = RealRepoState::load(&PathBuf::from("."))?;
     let session = real_session(&state, &options.session_id)?;
-    let entry = real_entry(&state, &options.operands[0])?;
+    let resolved = state.resolve_session_view(session);
+    let entry = real_entry(&state, &resolved.entries, &options.operands[0])?;
     let bytes = std::str::from_utf8(&entry.bytes)
         .map_err(|_| CliError::new("invalid_content_encoding", "path is not UTF-8 text"))?;
     let response = ReadResponse {
         command: "artifact.read",
         repository_id: state.repository_id.clone(),
         session_id: options.session_id,
-        view: real_session_view(&state, session),
+        view: real_resolved_session_view(&state, session, &resolved),
         artifact: real_artifact_view(entry),
         content: sunlight_core::artifacts::ContentView {
             encoding: "utf-8".to_string(),
@@ -1601,13 +1686,14 @@ fn real_artifact_list(
 ) -> Result<(), CliError> {
     let state = RealRepoState::load(&PathBuf::from("."))?;
     let session = real_session(&state, &options.session_id)?;
+    let resolved = state.resolve_session_view(session);
     let prefix = options.operands.first().map(String::as_str).unwrap_or("");
     let response = ListResponse {
         command: "artifact.list",
         repository_id: state.repository_id.clone(),
         session_id: options.session_id,
-        view: real_session_view(&state, session),
-        artifacts: state
+        view: real_resolved_session_view(&state, session, &resolved),
+        artifacts: resolved
             .entries
             .iter()
             .filter(|entry| {
@@ -1635,9 +1721,10 @@ fn real_artifact_search(
 ) -> Result<(), CliError> {
     let state = RealRepoState::load(&PathBuf::from("."))?;
     let session = real_session(&state, &options.session_id)?;
+    let resolved = state.resolve_session_view(session);
     let query = &options.operands[0];
     let mut matches = Vec::new();
-    for entry in state.entries.iter().filter(|entry| !entry.tombstone) {
+    for entry in resolved.entries.iter().filter(|entry| !entry.tombstone) {
         if let Ok(text) = std::str::from_utf8(&entry.bytes) {
             for (line_index, line) in text.lines().enumerate() {
                 if line.contains(query) {
@@ -1656,7 +1743,7 @@ fn real_artifact_search(
         command: "artifact.search",
         repository_id: state.repository_id.clone(),
         session_id: options.session_id,
-        view: real_session_view(&state, session),
+        view: real_resolved_session_view(&state, session, &resolved),
         matches,
     };
     if ctx.json {
@@ -1675,9 +1762,10 @@ fn real_artifact_patch(
     patch: String,
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    let session = real_session(&state, &options.session_id)?.clone();
+    let resolved = state.resolve_session_view(&session);
     let path = options.operands[0].clone();
-    let index = real_entry_index(&state, &path)?;
-    let before = state.entries[index].clone();
+    let before = real_entry(&state, &resolved.entries, &path)?.clone();
     if before.content_hash != options.expect_hash.as_deref().unwrap_or("") {
         return Err(real_precondition_error(
             &state,
@@ -1688,15 +1776,16 @@ fn real_artifact_patch(
     let before_text = std::str::from_utf8(&before.bytes)
         .map_err(|_| CliError::new("invalid_content_encoding", "path is not UTF-8 text"))?;
     let (after_text, _) = apply_real_patch(before_text, &patch)?;
-    state.entries[index].bytes = after_text.into_bytes();
-    state.entries[index].content_hash = real_content_hash(&state.entries[index].bytes);
+    let mut after = before.clone();
+    after.bytes = after_text.into_bytes();
+    after.content_hash = real_content_hash(&after.bytes);
     let response = real_accept_mutation(
         &mut state,
         &options.session_id,
         "patch",
         &path,
         Some(before),
-        index,
+        after,
     )?;
     finish_real_mutation(ctx, state, response)
 }
@@ -1708,13 +1797,15 @@ fn real_artifact_write(
     expected_hash: ExpectedHash,
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&PathBuf::from("."))?;
-    real_session(&state, &options.session_id)?;
+    let session = real_session(&state, &options.session_id)?.clone();
+    let resolved = state.resolve_session_view(&session);
     let path = options.operands[0].clone();
-    let existing = state
+    let existing = resolved
         .entries
         .iter()
-        .position(|entry| entry.path == path && !entry.tombstone);
-    let before = existing.map(|index| state.entries[index].clone());
+        .find(|entry| entry.path == path && !entry.tombstone)
+        .cloned();
+    let before = existing;
     match (&expected_hash, &before) {
         (ExpectedHash::New, Some(entry)) => {
             return Err(real_precondition_error(&state, entry, "new"))
@@ -1737,16 +1828,16 @@ fn real_artifact_write(
         }
         _ => {}
     }
-    let index = if let Some(index) = existing {
-        state.entries[index].bytes = content;
-        state.entries[index].content_hash = real_content_hash(&state.entries[index].bytes);
-        state.entries[index].classification = options
+    let after = if let Some(mut entry) = before.clone() {
+        entry.bytes = content;
+        entry.content_hash = real_content_hash(&entry.bytes);
+        entry.classification = options
             .classification
             .clone()
             .unwrap_or_else(|| "source".to_string());
-        index
+        entry
     } else {
-        state.entries.push(RealArtifactEntry {
+        RealArtifactEntry {
             artifact_id: real_artifact_id_for_path(&path),
             path: path.clone(),
             content_hash: real_content_hash(&content),
@@ -1757,8 +1848,7 @@ fn real_artifact_write(
                 .unwrap_or_else(|| "source".to_string()),
             tombstone: false,
             bytes: content,
-        });
-        state.entries.len() - 1
+        }
     };
     let response = real_accept_mutation(
         &mut state,
@@ -1766,7 +1856,7 @@ fn real_artifact_write(
         "write",
         &path,
         before,
-        index,
+        after,
     )?;
     finish_real_mutation(ctx, state, response)
 }
@@ -1777,24 +1867,23 @@ fn real_artifact_move(
     expected: String,
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    let session = real_session(&state, &options.session_id)?.clone();
+    let resolved = state.resolve_session_view(&session);
     let source = options.operands[0].clone();
     let target = options.operands[1].clone();
-    let index = real_entry_index(&state, &source)?;
-    let before = state.entries[index].clone();
+    let before = real_entry(&state, &resolved.entries, &source)?.clone();
     if before.content_hash != expected {
         return Err(real_precondition_error(&state, &before, &expected));
     }
-    state.entries[index].path = target.clone();
-    let mut tombstone = before.clone();
-    tombstone.tombstone = true;
-    state.entries.push(tombstone);
+    let mut after = before.clone();
+    after.path = target.clone();
     let response = real_accept_mutation(
         &mut state,
         &options.session_id,
         "move",
         &target,
         Some(before),
-        index,
+        after,
     )?;
     finish_real_mutation(ctx, state, response)
 }
@@ -1805,20 +1894,22 @@ fn real_artifact_delete(
     expected: String,
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    let session = real_session(&state, &options.session_id)?.clone();
+    let resolved = state.resolve_session_view(&session);
     let path = options.operands[0].clone();
-    let index = real_entry_index(&state, &path)?;
-    let before = state.entries[index].clone();
+    let before = real_entry(&state, &resolved.entries, &path)?.clone();
     if before.content_hash != expected {
         return Err(real_precondition_error(&state, &before, &expected));
     }
-    state.entries[index].tombstone = true;
+    let mut after = before.clone();
+    after.tombstone = true;
     let response = real_accept_mutation(
         &mut state,
         &options.session_id,
         "delete",
         &path,
         Some(before),
-        index,
+        after,
     )?;
     finish_real_mutation(ctx, state, response)
 }
@@ -1830,20 +1921,22 @@ fn real_artifact_metadata_set(
     classification: String,
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    let session = real_session(&state, &options.session_id)?.clone();
+    let resolved = state.resolve_session_view(&session);
     let path = options.operands[0].clone();
-    let index = real_entry_index(&state, &path)?;
-    let before = state.entries[index].clone();
+    let before = real_entry(&state, &resolved.entries, &path)?.clone();
     if before.content_hash != expected {
         return Err(real_precondition_error(&state, &before, &expected));
     }
-    state.entries[index].classification = classification;
+    let mut after = before.clone();
+    after.classification = classification;
     let response = real_accept_mutation(
         &mut state,
         &options.session_id,
         "metadata_set",
         &path,
         Some(before),
-        index,
+        after,
     )?;
     finish_real_mutation(ctx, state, response)
 }
@@ -1855,11 +1948,56 @@ fn real_view_resolve(ctx: &CommandContext, options: ViewResolveOptions) -> Resul
             return Err(object_not_found("checkpoint", base));
         }
     }
-    let view = real_resolved_view(&state);
+    let frontier = if options.include.is_empty() {
+        Vec::new()
+    } else {
+        options
+            .include
+            .iter()
+            .map(|selection| {
+                let topic = real_topic(&state, &selection.topic_id)?;
+                if !state.operations.iter().any(|operation| {
+                    operation.topic_id == topic.topic_id
+                        && operation.topic_revision_id == selection.revision_id
+                }) {
+                    return Err(object_not_found("topic_revision", &selection.revision_id));
+                }
+                Ok(TopicRevisionSelection {
+                    topic_id: topic.topic_id.clone(),
+                    revision_id: selection.revision_id.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, CliError>>()?
+    };
+    let resolved = if frontier.is_empty() {
+        state.resolve_head_view()
+    } else {
+        state.resolve_view(frontier)
+    };
+    let view = resolved.result;
+    state.persist_record(
+        &PathBuf::from("."),
+        "views",
+        &view.resolved_view_id,
+        &format!("{}\n", resolved_view_record_json(&view)),
+    )?;
+    for record in &view.records {
+        state.persist_record(
+            &PathBuf::from("."),
+            "conflicts",
+            &record.id,
+            &format!("{}\n", resolver_record_json(record)),
+        )?;
+    }
     if ctx.json {
         println!("{}", view_resolve_success_envelope(&view));
     } else {
-        println!("{} {}", view.resolved_view_id, state.tree_hash);
+        let tree_hash = view
+            .tree_identity
+            .as_ref()
+            .map(|tree| tree.tree_hash.as_str())
+            .unwrap_or("conflicted");
+        println!("{} {}", view.resolved_view_id, tree_hash);
     }
     Ok(())
 }
@@ -1869,21 +2007,27 @@ fn real_project_materialize(
     options: ProjectMaterializeOptions,
 ) -> Result<(), CliError> {
     let state = RealRepoState::load(&PathBuf::from("."))?;
-    if options.view_id != state.resolved_view_id && options.view_id != state.base_resolved_view_id {
-        return Err(object_not_found("resolved_view", &options.view_id));
+    let resolved = real_resolve_view_by_id(&state, &options.view_id)?;
+    if !resolved.result.conflict_free() {
+        return Err(CliError::new(
+            "conflicted_view",
+            "cannot materialize a conflicted resolved view",
+        )
+        .with_detail("resolved_view_id", resolved.result.resolved_view_id));
     }
     let projection_id = format!(
         "projection_{}_native_{:04}",
         options.purpose.as_str(),
         state.generation_number.max(1)
     );
+    let view_state = real_view_state(&state, &resolved);
     if let Some(root) = options.projection_root {
-        materialize_real_files(&state, &root)?;
+        materialize_real_files(&view_state, &root)?;
         if ctx.json {
             println!(
                 "{}",
                 real_projection_materialized_envelope(
-                    &state,
+                    &view_state,
                     &projection_id,
                     options.purpose,
                     &root
@@ -1895,7 +2039,7 @@ fn real_project_materialize(
     } else if ctx.json {
         println!(
             "{}",
-            real_projection_plan_envelope(&state, &projection_id, options.purpose)
+            real_projection_plan_envelope(&view_state, &projection_id, options.purpose)
         );
     } else {
         println!("{} .sunlight/projections/{}", projection_id, projection_id);
@@ -1908,11 +2052,17 @@ fn real_checkpoint_create(
     options: CheckpointCreateOptions,
 ) -> Result<(), CliError> {
     let state = RealRepoState::load(&PathBuf::from("."))?;
-    if options.view_id != state.resolved_view_id && options.view_id != state.base_resolved_view_id {
-        return Err(object_not_found("resolved_view", &options.view_id));
+    let resolved = real_resolve_view_by_id(&state, &options.view_id)?;
+    if !resolved.result.conflict_free() {
+        return Err(CliError::new(
+            "conflicted_view",
+            "cannot checkpoint a conflicted resolved view",
+        )
+        .with_detail("resolved_view_id", resolved.result.resolved_view_id));
     }
-    reject_real_export_blocked_entries(&state)?;
-    let checkpoint = real_checkpoint(&state);
+    let view_state = real_view_state(&state, &resolved);
+    reject_real_export_blocked_entries(&view_state)?;
+    let checkpoint = real_checkpoint(&view_state);
     state.persist_record(
         &PathBuf::from("."),
         "checkpoints",
@@ -1930,24 +2080,30 @@ fn real_checkpoint_create(
 fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<(), CliError> {
     let repo_root = options.repo.clone().unwrap_or_else(|| PathBuf::from("."));
     let state = RealRepoState::load(&repo_root)?;
-    let checkpoint = real_checkpoint(&state);
-    if checkpoint.id != options.checkpoint_id {
-        return Err(object_not_found("checkpoint", &options.checkpoint_id));
+    let resolved = real_resolve_checkpoint_view(&state, &options.checkpoint_id)?;
+    if !resolved.result.conflict_free() {
+        return Err(CliError::new(
+            "conflicted_view",
+            "cannot export a conflicted resolved view",
+        )
+        .with_detail("resolved_view_id", resolved.result.resolved_view_id));
     }
-    reject_real_export_blocked_entries(&state)?;
+    let view_state = real_view_state(&state, &resolved);
+    let checkpoint = real_checkpoint(&view_state);
+    reject_real_export_blocked_entries(&view_state)?;
     if options.write_plan {
         let plan_json = format!(
             "{{\"ok\":true,\"data\":{{\"command\":\"git.export.plan\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\"}},\"git_ref\":\"{}\",\"content_files\":{}}},\"warnings\":[]}}",
             json_escape(&state.repository_id),
             json_escape(&checkpoint.id),
             json_escape(&options.git_ref),
-            state.entries.iter().filter(|entry| !entry.tombstone).count(),
+            view_state.entries.iter().filter(|entry| !entry.tombstone).count(),
         );
         println!("{plan_json}");
         return Ok(());
     }
     if options.execute_local {
-        write_real_files_overwrite(&state, &repo_root)?;
+        write_real_files_overwrite(&view_state, &repo_root)?;
         run_git_capture(&repo_root, &["add", "-A"]).map_err(invalid_request)?;
         let commit_message = format!("Sunlight export {}", checkpoint.id);
         let commit = Command::new("git")
@@ -2116,7 +2272,7 @@ fn real_accept_mutation(
     mutation: &str,
     path: &str,
     before: Option<RealArtifactEntry>,
-    index: usize,
+    after: RealArtifactEntry,
 ) -> Result<MutationResponse, CliError> {
     let session = real_session(state, session_id)?.clone();
     let topic = state
@@ -2137,21 +2293,10 @@ fn real_accept_mutation(
     let mutated_artifact_id = before
         .as_ref()
         .map(|entry| entry.artifact_id.clone())
-        .or_else(|| {
-            state
-                .entries
-                .get(index)
-                .map(|entry| entry.artifact_id.clone())
-        })
-        .ok_or_else(|| CliError::new("path_not_found", "mutated artifact was not found"))?;
+        .unwrap_or_else(|| after.artifact_id.clone());
     state.revision_number += 1;
     let next_topic_revision_number = topic.revision_number + 1;
     let next_session_generation_number = session.generation_number + 1;
-    state
-        .entries
-        .sort_by(|left, right| left.path.cmp(&right.path));
-    state.tree_hash = real_tree_hash(&state.entries);
-    state.resolved_view_id = format!("view_native_{:04}", state.revision_number);
     let operation_id = format!("op_native_{:04}", state.revision_number);
     let revision_id = format!(
         "rev_{}_{:04}",
@@ -2171,29 +2316,54 @@ fn real_accept_mutation(
         topic.head_revision_id = Some(revision_id.clone());
         topic.revision_number = next_topic_revision_number;
     }
-    let resolved_view_id = state.resolved_view_id.clone();
+    let before_hash = before.as_ref().map(|entry| entry.content_hash.clone());
+    let after_hash = after.content_hash.clone();
+    let authored_context_id = format!("ctx_native_{:04}", state.revision_number - 1);
+    state.operations.push(RealOperationRecord {
+        operation_transaction_id: operation_id.clone(),
+        topic_id: topic_id.clone(),
+        topic_revision_id: revision_id.clone(),
+        session_id: session_id.to_string(),
+        artifact_id: mutated_artifact_id.clone(),
+        path: after.path.clone(),
+        mutation: mutation.to_string(),
+        base_content_hash: before_hash.clone(),
+        result_content_hash: after_hash.clone(),
+        authored_context_id: authored_context_id.clone(),
+        dependency_revision_ids: Vec::new(),
+        classification: after.classification.clone(),
+        executable: after.executable,
+        tombstone: after.tombstone,
+        bytes: after.bytes.clone(),
+    });
+    let session_after = state
+        .sessions
+        .iter()
+        .find(|candidate| candidate.session_id == session_id)
+        .cloned()
+        .unwrap_or(session.clone());
+    let mut session_resolved = state.resolve_session_view(&session_after);
+    let resolved_view_id = session_resolved.result.resolved_view_id.clone();
+    let tree_hash = session_resolved
+        .result
+        .tree_identity
+        .as_ref()
+        .map(|tree| tree.tree_hash.clone())
+        .unwrap_or_else(|| real_tree_hash(&session_resolved.entries));
+    state.resolved_view_id = resolved_view_id.clone();
+    state.tree_hash = tree_hash;
+    state.entries = session_resolved.entries.clone();
     if let Some(session) = state.session_by_id_mut(session_id) {
-        session.resolved_view_id = resolved_view_id;
+        session.resolved_view_id = resolved_view_id.clone();
         session.session_generation_id = session_generation_id.clone();
         session.generation_number = next_session_generation_number;
     }
     state.sync_compat_fields();
-    let after = state
-        .entries
-        .iter()
-        .find(|entry| {
-            entry.artifact_id == mutated_artifact_id && (mutation == "delete" || !entry.tombstone)
-        })
-        .cloned()
-        .ok_or_else(|| {
-            CliError::new(
-                "path_not_found",
-                "mutated artifact was not found after mutation",
-            )
-        })?;
-    let tree_identity = real_view(&state).tree_identity;
-    let before_hash = before.as_ref().map(|entry| entry.content_hash.clone());
-    let after_hash = after.content_hash.clone();
+    let response_after = after.clone();
+    session_resolved = state.resolve_session_view(real_session(state, session_id)?);
+    let tree_identity =
+        real_resolved_session_view(state, real_session(state, session_id)?, &session_resolved)
+            .tree_identity;
     let kind = match mutation {
         "patch" => MutationKind::Patch,
         "move" => MutationKind::Move,
@@ -2220,7 +2390,7 @@ fn real_accept_mutation(
         session_id: session_id.to_string(),
         session_generation_id: prior_view.session_generation_id.clone(),
         actor_id: session.actor_id.clone(),
-        authored_context_id: format!("ctx_native_{:04}", state.revision_number - 1),
+        authored_context_id,
         preconditions: sunlight_core::artifacts::MutationPreconditions {
             resolved_view_id: prior_view.resolved_view_id.clone(),
             session_generation_id: prior_view.session_generation_id.clone(),
@@ -2292,13 +2462,13 @@ fn real_accept_mutation(
             tree_identity: tree_identity.clone(),
         },
         artifact: MutationArtifactView {
-            artifact_id: after.artifact_id,
-            path: after.path,
+            artifact_id: response_after.artifact_id,
+            path: response_after.path,
             kind: ArtifactKind::File,
             before_hash,
             after_hash,
-            classification: after.classification,
-            executable: after.executable,
+            classification: response_after.classification,
+            executable: response_after.executable,
         },
         operation,
         topic_revision,
@@ -2364,21 +2534,6 @@ fn real_artifact_view(entry: &RealArtifactEntry) -> SessionVisibleArtifactView {
         executable: entry.executable,
         tombstone: entry.tombstone,
     }
-}
-
-fn real_entry_index(state: &RealRepoState, path: &str) -> Result<usize, CliError> {
-    state
-        .entries
-        .iter()
-        .position(|entry| entry.path == path && !entry.tombstone)
-        .ok_or_else(|| {
-            CliError::new("path_not_found", format!("path `{path}` was not found"))
-                .with_detail("path", path)
-                .with_detail(
-                    "session_generation_id",
-                    real_view(&state).session_generation_id,
-                )
-        })
 }
 
 fn real_precondition_error(
@@ -2651,12 +2806,13 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
         .strip_prefix("artifact:")
         .or_else(|| selector.strip_prefix("path:"))
     {
-        let entry = real_entry(&state, path)?;
+        let resolved = state.resolve_head_view();
+        let entry = real_entry(state, &resolved.entries, path)?;
         return Ok(format!(
             "{{\"ok\":true,\"data\":{{\"command\":\"inspect.artifact\",\"repository_id\":\"{}\",\"ids\":{{\"artifact_id\":\"{}\"}},\"view\":{},\"artifact\":{}}},\"warnings\":[]}}",
             json_escape(&state.repository_id),
             json_escape(&entry.artifact_id),
-            view_json(&real_view(&state)),
+            view_resolve_view_json(&resolved.result),
             artifact_json(&real_artifact_view(entry)),
         ));
     }
@@ -2695,12 +2851,33 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
         ));
     }
     if let Some(view) = selector.strip_prefix("view:") {
-        if view == state.resolved_view_id || view == state.base_resolved_view_id {
+        let resolved = state.resolve_head_view();
+        if view == resolved.result.resolved_view_id
+            || view == state.resolved_view_id
+            || view == state.base_resolved_view_id
+        {
             return Ok(format!("{{\"ok\":true,\"data\":{{\"command\":\"inspect.view\",\"repository_id\":\"{}\",\"ids\":{{\"resolved_view_id\":\"{}\"}},\"view\":{},\"resolved_view\":{}}},\"warnings\":[]}}",
                 json_escape(&state.repository_id),
                 json_escape(view),
-                view_json(&real_view(&state)),
-                resolved_view_record_json(&real_resolved_view(&state)),
+                view_resolve_view_json(&resolved.result),
+                resolved_view_record_json(&resolved.result),
+            ));
+        }
+    }
+    if let Some(conflict) = selector.strip_prefix("conflict:") {
+        let resolved = state.resolve_head_view();
+        if let Some(record) = resolved
+            .result
+            .records
+            .iter()
+            .find(|record| record.id == conflict)
+        {
+            return Ok(format!(
+                "{{\"ok\":true,\"data\":{{\"command\":\"inspect.conflict\",\"repository_id\":\"{}\",\"ids\":{{\"conflict_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"conflict\":{}}},\"warnings\":[]}}",
+                json_escape(&state.repository_id),
+                json_escape(&record.id),
+                json_escape(&record.resolved_view_id),
+                resolver_record_json(record),
             ));
         }
     }

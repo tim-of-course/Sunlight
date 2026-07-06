@@ -7,7 +7,13 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
+use crate::artifacts::{FILE_OPERATION_SEMANTICS_VERSION, POSIX_CASE_SENSITIVE_PATH_POLICY_ID};
 use crate::records::{canonical_json_bytes, parse_json_record, JsonValue, RecordError};
+use crate::resolver::{
+    resolve_fixture_view, DeterministicResolverOrder, OperationRef, PathRef, ResolvedViewResult,
+    ResolverConflictOrStalenessRecord, ResolverInputFrontier, ResolverMutationKind,
+    ResolverRecordKind, SingleRepoTree, TopicRevisionRef, TopicRevisionSelection, TreeEntryState,
+};
 
 pub const REPO_STATE_SCHEMA_VERSION: u32 = 1;
 
@@ -28,6 +34,8 @@ pub struct RealRepoState {
     pub head_revision_id: Option<String>,
     pub topics: Vec<RealTopicRecord>,
     pub sessions: Vec<RealSessionRecord>,
+    pub base_entries: Vec<RealArtifactEntry>,
+    pub operations: Vec<RealOperationRecord>,
     pub entries: Vec<RealArtifactEntry>,
     pub quarantine: Vec<RealQuarantineEntry>,
 }
@@ -62,6 +70,31 @@ pub struct RealArtifactEntry {
     pub classification: String,
     pub tombstone: bool,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealOperationRecord {
+    pub operation_transaction_id: String,
+    pub topic_id: String,
+    pub topic_revision_id: String,
+    pub session_id: String,
+    pub artifact_id: String,
+    pub path: String,
+    pub mutation: String,
+    pub base_content_hash: Option<String>,
+    pub result_content_hash: String,
+    pub authored_context_id: String,
+    pub dependency_revision_ids: Vec<String>,
+    pub classification: String,
+    pub executable: bool,
+    pub tombstone: bool,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealResolvedRepoView {
+    pub result: ResolvedViewResult,
+    pub entries: Vec<RealArtifactEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +168,8 @@ impl RealRepoState {
             head_revision_id: None,
             topics: Vec::new(),
             sessions: Vec::new(),
+            base_entries: entries.clone(),
+            operations: Vec::new(),
             entries,
             quarantine,
         };
@@ -186,6 +221,17 @@ impl RealRepoState {
             .iter()
             .map(|session| parse_session(session, &path))
             .collect::<Result<Vec<_>, _>>()?;
+        let base_entries = match optional_array_field(&object, "base_entries") {
+            Some(values) => values
+                .iter()
+                .map(|entry| parse_entry(repo_root, entry, &path))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => entries.clone(),
+        };
+        let operations = optional_array(&object, "operations", &path)?
+            .iter()
+            .map(|operation| parse_operation(repo_root, operation, &path))
+            .collect::<Result<Vec<_>, _>>()?;
 
         if topics.is_empty() {
             if let Some(legacy_topic_id) = topic_id.clone() {
@@ -231,6 +277,8 @@ impl RealRepoState {
             head_revision_id,
             topics,
             sessions,
+            base_entries,
+            operations,
             entries,
             quarantine,
         };
@@ -254,16 +302,11 @@ impl RealRepoState {
     }
 
     pub fn persist_blobs(&self, repo_root: &Path) -> Result<(), RepoStateError> {
-        for entry in &self.entries {
-            let path = real_blob_path(repo_root, &entry.content_hash);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| io_error(parent, "failed to create blob directory", error))?;
-            }
-            if !path.exists() {
-                fs::write(&path, &entry.bytes)
-                    .map_err(|error| io_error(&path, "failed to write content blob", error))?;
-            }
+        for entry in self.entries.iter().chain(self.base_entries.iter()) {
+            persist_blob(repo_root, &entry.content_hash, &entry.bytes)?;
+        }
+        for operation in &self.operations {
+            persist_blob(repo_root, &operation.result_content_hash, &operation.bytes)?;
         }
         Ok(())
     }
@@ -346,6 +389,14 @@ impl RealRepoState {
             JsonValue::Array(self.sessions.iter().map(session_json).collect()),
         );
         object.insert(
+            "base_entries".to_string(),
+            JsonValue::Array(self.base_entries.iter().map(entry_json).collect()),
+        );
+        object.insert(
+            "operations".to_string(),
+            JsonValue::Array(self.operations.iter().map(operation_json).collect()),
+        );
+        object.insert(
             "entries".to_string(),
             JsonValue::Array(self.entries.iter().map(entry_json).collect()),
         );
@@ -411,6 +462,294 @@ impl RealRepoState {
         self.sessions
             .iter_mut()
             .find(|session| session.session_id == session_id)
+    }
+
+    pub fn resolve_head_view(&self) -> RealResolvedRepoView {
+        let frontier = self
+            .topics
+            .iter()
+            .filter_map(|topic| {
+                topic
+                    .head_revision_id
+                    .as_ref()
+                    .map(|revision| TopicRevisionSelection {
+                        topic_id: topic.topic_id.clone(),
+                        revision_id: revision.clone(),
+                    })
+            })
+            .collect();
+        self.resolve_view(frontier)
+    }
+
+    pub fn resolve_session_view(&self, session: &RealSessionRecord) -> RealResolvedRepoView {
+        let frontier = self
+            .topics
+            .iter()
+            .filter(|topic| topic.topic_id == session.write_topic_id)
+            .filter_map(|topic| {
+                topic
+                    .head_revision_id
+                    .as_ref()
+                    .map(|revision| TopicRevisionSelection {
+                        topic_id: topic.topic_id.clone(),
+                        revision_id: revision.clone(),
+                    })
+            })
+            .collect();
+        self.resolve_view(frontier)
+    }
+
+    pub fn resolve_view(&self, frontier: Vec<TopicRevisionSelection>) -> RealResolvedRepoView {
+        resolve_real_repo_view(self, frontier)
+    }
+}
+
+pub fn resolve_real_repo_view(
+    state: &RealRepoState,
+    frontier: Vec<TopicRevisionSelection>,
+) -> RealResolvedRepoView {
+    let input = ResolverInputFrontier {
+        repository_id: state.repository_id.clone(),
+        base_checkpoint_ids: vec![state.base_checkpoint_id.clone()],
+        topic_frontier: frontier,
+        operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+        path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+    };
+    let base_tree_entries = state
+        .base_entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .map(|entry| TreeEntryState {
+            artifact_id: entry.artifact_id.clone(),
+            path: entry.path.clone(),
+            content_hash: entry.content_hash.clone(),
+        })
+        .collect::<Vec<_>>();
+    let revision_refs = state
+        .operations
+        .iter()
+        .map(real_operation_revision_ref)
+        .collect::<Vec<_>>();
+    let mut result = resolve_fixture_view(input, base_tree_entries, revision_refs);
+    if result.records.is_empty() {
+        result.resolver_order = DeterministicResolverOrder {
+            operation_ids: expanded_operation_order(state, &result.topic_frontier),
+        };
+        result.dependency_closure.revision_ids = result
+            .resolver_order
+            .operation_ids
+            .iter()
+            .filter_map(|operation_id| {
+                state
+                    .operations
+                    .iter()
+                    .find(|operation| operation.operation_transaction_id == *operation_id)
+                    .map(|operation| operation.topic_revision_id.clone())
+            })
+            .collect();
+        result
+            .records
+            .extend(expanded_same_artifact_conflicts(state, &result));
+    }
+    let entries = if result.records.is_empty() {
+        materialize_real_resolved_entries(state, &result.resolver_order)
+    } else {
+        state
+            .base_entries
+            .iter()
+            .filter(|entry| !entry.tombstone)
+            .cloned()
+            .collect()
+    };
+    if result.records.is_empty() {
+        result.tree_entries = entries
+            .iter()
+            .filter(|entry| !entry.tombstone)
+            .map(|entry| {
+                (
+                    entry.path.clone(),
+                    TreeEntryState {
+                        artifact_id: entry.artifact_id.clone(),
+                        path: entry.path.clone(),
+                        content_hash: entry.content_hash.clone(),
+                    },
+                )
+            })
+            .collect();
+        result.tree_identity = Some(SingleRepoTree {
+            repository_id: state.repository_id.clone(),
+            tree_hash: real_tree_hash(&entries),
+        });
+    }
+    RealResolvedRepoView { result, entries }
+}
+
+fn expanded_operation_order(
+    state: &RealRepoState,
+    frontier: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut operation_ids = Vec::new();
+    for (topic_id, head_revision_id) in frontier {
+        for operation in state
+            .operations
+            .iter()
+            .filter(|operation| operation.topic_id == *topic_id)
+        {
+            operation_ids.push(operation.operation_transaction_id.clone());
+            if operation.topic_revision_id == *head_revision_id {
+                break;
+            }
+        }
+    }
+    operation_ids
+}
+
+fn expanded_same_artifact_conflicts(
+    state: &RealRepoState,
+    result: &ResolvedViewResult,
+) -> Vec<ResolverConflictOrStalenessRecord> {
+    let mut latest_by_topic_artifact = BTreeMap::<(String, String), &RealOperationRecord>::new();
+    for operation_id in &result.resolver_order.operation_ids {
+        let Some(operation) = state
+            .operations
+            .iter()
+            .find(|candidate| candidate.operation_transaction_id == *operation_id)
+        else {
+            continue;
+        };
+        latest_by_topic_artifact.insert(
+            (operation.topic_id.clone(), operation.artifact_id.clone()),
+            operation,
+        );
+    }
+
+    let mut by_artifact = BTreeMap::<String, Vec<&RealOperationRecord>>::new();
+    for ((_topic_id, artifact_id), operation) in latest_by_topic_artifact {
+        by_artifact.entry(artifact_id).or_default().push(operation);
+    }
+
+    by_artifact
+        .into_iter()
+        .filter_map(|(artifact_id, operations)| {
+            if operations.len() <= 1 {
+                return None;
+            }
+            let candidate_hashes = operations
+                .iter()
+                .map(|operation| operation.result_content_hash.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            if candidate_hashes.len() <= 1 {
+                return None;
+            }
+            let paths = operations
+                .iter()
+                .map(|operation| operation.path.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut candidate_refs = BTreeMap::new();
+            candidate_refs.insert(
+                "base_content_hashes".to_string(),
+                operations
+                    .iter()
+                    .filter_map(|operation| operation.base_content_hash.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+            );
+            candidate_refs.insert(
+                "candidate_hashes".to_string(),
+                candidate_hashes.into_iter().collect(),
+            );
+            candidate_refs.insert(
+                "operation_semantics_version".to_string(),
+                vec![FILE_OPERATION_SEMANTICS_VERSION.to_string()],
+            );
+            candidate_refs.insert(
+                "path_policy_id".to_string(),
+                vec![POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string()],
+            );
+            Some(ResolverConflictOrStalenessRecord {
+                id: format!("conflict_{}_0001", artifact_id.replace("artifact_", "")),
+                kind: ResolverRecordKind::SameArtifactConflict,
+                resolved_view_id: result.resolved_view_id.clone(),
+                artifact_ids: vec![artifact_id],
+                path_refs: paths
+                    .into_iter()
+                    .map(|path| PathRef {
+                        path,
+                        path_state: "active".to_string(),
+                    })
+                    .collect(),
+                operation_ids: operations
+                    .iter()
+                    .map(|operation| operation.operation_transaction_id.clone())
+                    .collect(),
+                authored_context_ids: operations
+                    .iter()
+                    .map(|operation| operation.authored_context_id.clone())
+                    .collect(),
+                policy_reason:
+                    "same artifact operations are not proven commutative under file_ops_v1"
+                        .to_string(),
+                candidate_refs,
+                resolution_operation_id: None,
+            })
+        })
+        .collect()
+}
+
+fn materialize_real_resolved_entries(
+    state: &RealRepoState,
+    order: &DeterministicResolverOrder,
+) -> Vec<RealArtifactEntry> {
+    let mut entries = state
+        .base_entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .cloned()
+        .collect::<Vec<_>>();
+    for operation_id in &order.operation_ids {
+        let Some(operation) = state
+            .operations
+            .iter()
+            .find(|candidate| candidate.operation_transaction_id == *operation_id)
+        else {
+            continue;
+        };
+        entries.retain(|entry| entry.artifact_id != operation.artifact_id);
+        entries.push(RealArtifactEntry {
+            path: operation.path.clone(),
+            artifact_id: operation.artifact_id.clone(),
+            content_hash: operation.result_content_hash.clone(),
+            executable: operation.executable,
+            classification: operation.classification.clone(),
+            tombstone: operation.tombstone,
+            bytes: operation.bytes.clone(),
+        });
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    entries
+}
+
+fn real_operation_revision_ref(operation: &RealOperationRecord) -> TopicRevisionRef {
+    TopicRevisionRef {
+        topic_id: operation.topic_id.clone(),
+        revision_id: operation.topic_revision_id.clone(),
+        operation: OperationRef {
+            operation_transaction_id: operation.operation_transaction_id.clone(),
+            topic_id: operation.topic_id.clone(),
+            topic_revision_id: operation.topic_revision_id.clone(),
+            artifact_id: operation.artifact_id.clone(),
+            path: operation.path.clone(),
+            mutation: if operation.base_content_hash.is_some() {
+                ResolverMutationKind::Patch
+            } else {
+                ResolverMutationKind::Write
+            },
+            base_content_hash: operation.base_content_hash.clone(),
+            result_content_hash: operation.result_content_hash.clone(),
+            authored_context_id: operation.authored_context_id.clone(),
+        },
+        dependency_revision_ids: operation.dependency_revision_ids.clone(),
     }
 }
 
@@ -657,6 +996,19 @@ pub fn read_real_blob(repo_root: &Path, content_hash: &str) -> Result<Vec<u8>, R
     fs::read(&path).map_err(|error| io_error(&path, "failed to read content blob", error))
 }
 
+fn persist_blob(repo_root: &Path, content_hash: &str, bytes: &[u8]) -> Result<(), RepoStateError> {
+    let path = real_blob_path(repo_root, content_hash);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| io_error(parent, "failed to create blob directory", error))?;
+    }
+    if !path.exists() {
+        fs::write(&path, bytes)
+            .map_err(|error| io_error(&path, "failed to write content blob", error))?;
+    }
+    Ok(())
+}
+
 pub fn real_content_hash(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
@@ -808,6 +1160,44 @@ fn parse_session(
     })
 }
 
+fn parse_operation(
+    repo_root: &Path,
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealOperationRecord, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(state_path, "operation must be a JSON object"));
+    };
+    let result_content_hash = required_string(object, "result_content_hash", state_path)?;
+    let dependency_revision_ids = optional_array(object, "dependency_revision_ids", state_path)?
+        .iter()
+        .map(|value| match value {
+            JsonValue::String(revision) => Ok(revision.clone()),
+            _ => Err(invalid_state(
+                state_path,
+                "operation dependency_revision_ids must be strings",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RealOperationRecord {
+        operation_transaction_id: required_string(object, "operation_transaction_id", state_path)?,
+        topic_id: required_string(object, "topic_id", state_path)?,
+        topic_revision_id: required_string(object, "topic_revision_id", state_path)?,
+        session_id: required_string(object, "session_id", state_path)?,
+        artifact_id: required_string(object, "artifact_id", state_path)?,
+        path: required_string(object, "path", state_path)?,
+        mutation: required_string(object, "mutation", state_path)?,
+        base_content_hash: optional_string(object, "base_content_hash", state_path)?,
+        bytes: read_real_blob(repo_root, &result_content_hash)?,
+        result_content_hash,
+        authored_context_id: required_string(object, "authored_context_id", state_path)?,
+        dependency_revision_ids,
+        classification: required_string(object, "classification", state_path)?,
+        executable: required_bool(object, "executable", state_path)?,
+        tombstone: required_bool(object, "tombstone", state_path)?,
+    })
+}
+
 fn entry_json(entry: &RealArtifactEntry) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert("path".to_string(), JsonValue::String(entry.path.clone()));
@@ -825,6 +1215,73 @@ fn entry_json(entry: &RealArtifactEntry) -> JsonValue {
         JsonValue::String(entry.classification.clone()),
     );
     object.insert("tombstone".to_string(), JsonValue::Bool(entry.tombstone));
+    JsonValue::Object(object)
+}
+
+fn operation_json(operation: &RealOperationRecord) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "operation_transaction_id".to_string(),
+        JsonValue::String(operation.operation_transaction_id.clone()),
+    );
+    object.insert(
+        "topic_id".to_string(),
+        JsonValue::String(operation.topic_id.clone()),
+    );
+    object.insert(
+        "topic_revision_id".to_string(),
+        JsonValue::String(operation.topic_revision_id.clone()),
+    );
+    object.insert(
+        "session_id".to_string(),
+        JsonValue::String(operation.session_id.clone()),
+    );
+    object.insert(
+        "artifact_id".to_string(),
+        JsonValue::String(operation.artifact_id.clone()),
+    );
+    object.insert(
+        "path".to_string(),
+        JsonValue::String(operation.path.clone()),
+    );
+    object.insert(
+        "mutation".to_string(),
+        JsonValue::String(operation.mutation.clone()),
+    );
+    object.insert(
+        "base_content_hash".to_string(),
+        optional_json(&operation.base_content_hash),
+    );
+    object.insert(
+        "result_content_hash".to_string(),
+        JsonValue::String(operation.result_content_hash.clone()),
+    );
+    object.insert(
+        "authored_context_id".to_string(),
+        JsonValue::String(operation.authored_context_id.clone()),
+    );
+    object.insert(
+        "dependency_revision_ids".to_string(),
+        JsonValue::Array(
+            operation
+                .dependency_revision_ids
+                .iter()
+                .map(|revision| JsonValue::String(revision.clone()))
+                .collect(),
+        ),
+    );
+    object.insert(
+        "classification".to_string(),
+        JsonValue::String(operation.classification.clone()),
+    );
+    object.insert(
+        "executable".to_string(),
+        JsonValue::Bool(operation.executable),
+    );
+    object.insert(
+        "tombstone".to_string(),
+        JsonValue::Bool(operation.tombstone),
+    );
     JsonValue::Object(object)
 }
 
@@ -1007,6 +1464,16 @@ fn optional_array<'a>(
             path,
             format!("field `{field}` must be an array"),
         )),
+    }
+}
+
+fn optional_array_field<'a>(
+    object: &'a BTreeMap<String, JsonValue>,
+    field: &'static str,
+) -> Option<&'a [JsonValue]> {
+    match object.get(field) {
+        Some(JsonValue::Array(values)) => Some(values),
+        _ => None,
     }
 }
 
@@ -1241,6 +1708,8 @@ mod tests {
             head_revision_id: None,
             topics: Vec::new(),
             sessions: Vec::new(),
+            base_entries: entries.clone(),
+            operations: Vec::new(),
             entries,
             quarantine: Vec::new(),
         };
@@ -1256,5 +1725,157 @@ mod tests {
         assert_eq!(loaded.entries[0].bytes, b"fn main() {}\n");
 
         fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn repo_state_resolves_independent_heads_and_reports_same_artifact_conflict() {
+        let readme = artifact_entry("README.md", b"# Base\n");
+        let lib = artifact_entry("src/lib.rs", b"pub fn value() -> u32 { 1 }\n");
+        let mut state = RealRepoState {
+            repository_id: "repo_resolve".to_string(),
+            base_checkpoint_id: "checkpoint_base_0001".to_string(),
+            base_resolved_view_id: "view_base_0001".to_string(),
+            resolved_view_id: "view_base_0001".to_string(),
+            tree_hash: real_tree_hash(&[readme.clone(), lib.clone()]),
+            topic_id: None,
+            topic_slug: None,
+            topic_display_name: None,
+            session_id: None,
+            actor_id: None,
+            generation_number: 0,
+            revision_number: 0,
+            head_revision_id: None,
+            topics: vec![
+                RealTopicRecord {
+                    topic_id: "topic_docs".to_string(),
+                    slug: "docs".to_string(),
+                    display_name: "Docs".to_string(),
+                    owner_actor_id: "agent-a".to_string(),
+                    base_checkpoint_id: "checkpoint_base_0001".to_string(),
+                    head_revision_id: Some("rev_docs_0001".to_string()),
+                    revision_number: 1,
+                },
+                RealTopicRecord {
+                    topic_id: "topic_code".to_string(),
+                    slug: "code".to_string(),
+                    display_name: "Code".to_string(),
+                    owner_actor_id: "agent-b".to_string(),
+                    base_checkpoint_id: "checkpoint_base_0001".to_string(),
+                    head_revision_id: Some("rev_code_0001".to_string()),
+                    revision_number: 1,
+                },
+            ],
+            sessions: Vec::new(),
+            base_entries: vec![readme.clone(), lib.clone()],
+            operations: vec![
+                operation(
+                    "op_docs_0001",
+                    "topic_docs",
+                    "rev_docs_0001",
+                    &readme,
+                    b"# Base\n\nDocs\n",
+                ),
+                operation(
+                    "op_code_0001",
+                    "topic_code",
+                    "rev_code_0001",
+                    &lib,
+                    b"pub fn value() -> u32 { 2 }\n",
+                ),
+            ],
+            entries: vec![readme.clone(), lib.clone()],
+            quarantine: Vec::new(),
+        };
+
+        let merged = state.resolve_head_view();
+        assert!(merged.result.conflict_free());
+        assert_eq!(
+            merged.result.resolver_order.operation_ids,
+            vec!["op_code_0001", "op_docs_0001"]
+        );
+        assert_eq!(
+            merged
+                .entries
+                .iter()
+                .find(|entry| entry.path == "README.md")
+                .unwrap()
+                .bytes,
+            b"# Base\n\nDocs\n"
+        );
+        assert_eq!(
+            merged
+                .entries
+                .iter()
+                .find(|entry| entry.path == "src/lib.rs")
+                .unwrap()
+                .bytes,
+            b"pub fn value() -> u32 { 2 }\n"
+        );
+
+        state.topics.push(RealTopicRecord {
+            topic_id: "topic_alt_code".to_string(),
+            slug: "alt-code".to_string(),
+            display_name: "Alt Code".to_string(),
+            owner_actor_id: "agent-c".to_string(),
+            base_checkpoint_id: "checkpoint_base_0001".to_string(),
+            head_revision_id: Some("rev_alt_code_0001".to_string()),
+            revision_number: 1,
+        });
+        state.operations.push(operation(
+            "op_alt_code_0001",
+            "topic_alt_code",
+            "rev_alt_code_0001",
+            &lib,
+            b"pub fn value() -> u32 { 3 }\n",
+        ));
+
+        let conflicted = state.resolve_head_view();
+        assert!(!conflicted.result.conflict_free());
+        let conflict = conflicted.result.conflicts().next().unwrap();
+        assert_eq!(conflict.id, "conflict_src_lib_rs_0001");
+        assert_eq!(conflict.kind.as_str(), "same_artifact_conflict");
+        assert_eq!(
+            conflict.operation_ids,
+            vec!["op_alt_code_0001", "op_code_0001"]
+        );
+        assert_eq!(conflict.path_refs[0].path, "src/lib.rs");
+    }
+
+    fn artifact_entry(path: &str, bytes: &[u8]) -> RealArtifactEntry {
+        RealArtifactEntry {
+            path: path.to_string(),
+            artifact_id: real_artifact_id_for_path(path),
+            content_hash: real_content_hash(bytes),
+            executable: false,
+            classification: "source".to_string(),
+            tombstone: false,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn operation(
+        operation_id: &str,
+        topic_id: &str,
+        revision_id: &str,
+        before: &RealArtifactEntry,
+        after_bytes: &[u8],
+    ) -> RealOperationRecord {
+        RealOperationRecord {
+            operation_transaction_id: operation_id.to_string(),
+            topic_id: topic_id.to_string(),
+            topic_revision_id: revision_id.to_string(),
+            session_id: format!("session_{topic_id}"),
+            artifact_id: before.artifact_id.clone(),
+            path: before.path.clone(),
+            mutation: "write".to_string(),
+            base_content_hash: Some(before.content_hash.clone()),
+            result_content_hash: real_content_hash(after_bytes),
+            authored_context_id: "ctx_base".to_string(),
+            dependency_revision_ids: Vec::new(),
+            classification: before.classification.clone(),
+            executable: before.executable,
+            tombstone: false,
+            bytes: after_bytes.to_vec(),
+        }
     }
 }

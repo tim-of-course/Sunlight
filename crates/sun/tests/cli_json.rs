@@ -519,6 +519,292 @@ fn no_fixture_topics_and_sessions_are_distinct_repo_backed_records() {
 }
 
 #[test]
+fn no_fixture_repo_backed_resolver_merges_independent_topics_and_reports_conflicts() {
+    let repo = TestRepo::new("real-resolver-topics");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    repo.write_file("README.md", "# Resolver\n\nbase\n");
+    write_nested_file(
+        repo.path(),
+        "src/lib.rs",
+        "pub fn value() -> u32 {\n    1\n}\n",
+    );
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+
+    let init = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun init should run");
+    assert_success(&init);
+
+    for (slug, display) in [
+        ("docs-topic", "Docs Topic"),
+        ("code-topic", "Code Topic"),
+        ("alt-code-topic", "Alt Code Topic"),
+    ] {
+        let topic = sun()
+            .arg("topic")
+            .arg("create")
+            .arg(slug)
+            .arg("--display-name")
+            .arg(display)
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .expect("sun topic create should run");
+        assert_success(&topic);
+    }
+
+    for (topic, actor) in [
+        ("docs-topic", "agent-docs"),
+        ("code-topic", "agent-code"),
+        ("alt-code-topic", "agent-alt"),
+    ] {
+        let session = sun()
+            .arg("session")
+            .arg("start")
+            .arg("--topic")
+            .arg(topic)
+            .arg("--view")
+            .arg("view_base_0001")
+            .arg("--actor")
+            .arg(actor)
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .expect("sun session start should run");
+        assert_success(&session);
+    }
+
+    let docs_read = sun()
+        .arg("read")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_docs")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("docs read should run");
+    assert_success(&docs_read);
+    let readme_hash = json_string_field(&stdout(&docs_read), "content_hash");
+    let docs_content = repo.write_file("docs-readme.md", "# Resolver\n\nbase\ndocs\n");
+    let docs_write = sun()
+        .arg("write")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_docs")
+        .arg("--expect-hash")
+        .arg(&readme_hash)
+        .arg("--content-file")
+        .arg(&docs_content)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("docs write should run");
+    assert_success(&docs_write);
+
+    let code_read = sun()
+        .arg("read")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_code")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("code read should run");
+    assert_success(&code_read);
+    let lib_hash = json_string_field(&stdout(&code_read), "content_hash");
+    assert!(stdout(&code_read).contains("    1"));
+    let code_content = repo.write_file("code-lib.rs", "pub fn value() -> u32 {\n    2\n}\n");
+    let code_write = sun()
+        .arg("write")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_code")
+        .arg("--expect-hash")
+        .arg(&lib_hash)
+        .arg("--content-file")
+        .arg(&code_content)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("code write should run");
+    assert_success(&code_write);
+
+    let resolved = sun()
+        .arg("view")
+        .arg("resolve")
+        .arg("--base")
+        .arg("checkpoint_base_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun view resolve should run");
+    assert_success(&resolved);
+    let resolved_stdout = stdout(&resolved);
+    assert!(resolved_stdout.contains("\"conflict_ids\":[]"));
+    assert!(resolved_stdout.contains("\"topic_docs_topic\":\"rev_docs_topic_0001\""));
+    assert!(resolved_stdout.contains("\"topic_code_topic\":\"rev_code_topic_0001\""));
+    let resolved_view = json_string_field(&resolved_stdout, "resolved_view_id");
+
+    let projection_root = repo.path().join("resolved-projection");
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&resolved_view)
+        .arg("--purpose")
+        .arg("inspection")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+    assert_eq!(
+        fs::read_to_string(projection_root.join("README.md")).unwrap(),
+        "# Resolver\n\nbase\ndocs\n"
+    );
+    assert_eq!(
+        fs::read_to_string(projection_root.join("src/lib.rs")).unwrap(),
+        "pub fn value() -> u32 {\n    2\n}\n"
+    );
+
+    let docs_search = sun()
+        .arg("search")
+        .arg("docs")
+        .arg("--session")
+        .arg("session_agent_docs")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("docs search should run");
+    assert_success(&docs_search);
+    assert!(stdout(&docs_search).contains("\"path\":\"README.md\""));
+
+    let alt_read = sun()
+        .arg("read")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_alt")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("alt read should run");
+    assert_success(&alt_read);
+    let alt_hash = json_string_field(&stdout(&alt_read), "content_hash");
+    assert_eq!(alt_hash, lib_hash);
+    let alt_content = repo.write_file("alt-lib.rs", "pub fn value() -> u32 {\n    3\n}\n");
+    let alt_write = sun()
+        .arg("write")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_alt")
+        .arg("--expect-hash")
+        .arg(&alt_hash)
+        .arg("--content-file")
+        .arg(&alt_content)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("alt write should run");
+    assert_success(&alt_write);
+
+    let conflicted = sun()
+        .arg("view")
+        .arg("resolve")
+        .arg("--base")
+        .arg("checkpoint_base_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun view resolve should run");
+    assert_success(&conflicted);
+    let conflicted_stdout = stdout(&conflicted);
+    assert!(conflicted_stdout.contains("\"tree_identity\":null"));
+    assert!(conflicted_stdout.contains("\"conflict_ids\":[\"conflict_src_lib_rs_0001\"]"));
+    assert!(conflicted_stdout.contains("\"kind\":\"same_artifact_conflict\""));
+    assert!(
+        conflicted_stdout.contains("\"operation_ids\":[\"op_native_0002\",\"op_native_0003\"]")
+            || conflicted_stdout
+                .contains("\"operation_ids\":[\"op_native_0003\",\"op_native_0002\"]")
+    );
+
+    let base_projection_root = repo.path().join("base-projection-after-conflict");
+    let base_materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--purpose")
+        .arg("inspection")
+        .arg("--projection-root")
+        .arg(&base_projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize base should run");
+    assert_success(&base_materialize);
+    assert_eq!(
+        fs::read_to_string(base_projection_root.join("README.md")).unwrap(),
+        "# Resolver\n\nbase\n"
+    );
+    assert_eq!(
+        fs::read_to_string(base_projection_root.join("src/lib.rs")).unwrap(),
+        "pub fn value() -> u32 {\n    1\n}\n"
+    );
+
+    let unknown_revision = sun()
+        .arg("view")
+        .arg("resolve")
+        .arg("--base")
+        .arg("checkpoint_base_0001")
+        .arg("--include")
+        .arg("topic_code_topic:rev_code_topic_9999")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun view resolve should run");
+    assert_failure(&unknown_revision);
+    let unknown_revision_stdout = stdout(&unknown_revision);
+    assert!(unknown_revision_stdout.contains("\"code\":\"object_not_found\""));
+    assert!(unknown_revision_stdout.contains("\"object_type\":\"topic_revision\""));
+    assert!(unknown_revision_stdout.contains("\"selector\":\"rev_code_topic_9999\""));
+
+    let inspect = sun()
+        .arg("inspect")
+        .arg("conflict:conflict_src_lib_rs_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect conflict should run");
+    assert_success(&inspect);
+    let inspect_stdout = stdout(&inspect);
+    assert!(inspect_stdout.contains("\"command\":\"inspect.conflict\""));
+    assert!(inspect_stdout.contains("\"conflict_id\":\"conflict_src_lib_rs_0001\""));
+    assert!(inspect_stdout.contains("\"path\":\"src/lib.rs\""));
+
+    let conflict_record = repo
+        .path()
+        .join(".sunlight/conflicts/conflict_src_lib_rs_0001.json");
+    assert!(conflict_record.is_file());
+}
+
+#[test]
 fn no_fixture_init_respects_git_ignore_policy() {
     let repo = TestRepo::new("real-repo-ignore-policy");
     git(repo.path(), &["init", "-b", "main"]);

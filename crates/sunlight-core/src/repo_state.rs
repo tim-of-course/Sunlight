@@ -36,6 +36,9 @@ pub struct RealRepoState {
     pub sessions: Vec<RealSessionRecord>,
     pub base_entries: Vec<RealArtifactEntry>,
     pub operations: Vec<RealOperationRecord>,
+    pub projections: Vec<RealProjectionSnapshot>,
+    pub checkpoints: Vec<RealCheckpointSnapshot>,
+    pub export_maps: Vec<RealExportMapSnapshot>,
     pub entries: Vec<RealArtifactEntry>,
     pub quarantine: Vec<RealQuarantineEntry>,
 }
@@ -89,6 +92,38 @@ pub struct RealOperationRecord {
     pub executable: bool,
     pub tombstone: bool,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealProjectionSnapshot {
+    pub projection_id: String,
+    pub purpose: String,
+    pub resolved_view_id: String,
+    pub tree_hash: String,
+    pub manifest_digest: String,
+    pub created_from_content_tree: String,
+    pub materialized_root: Option<String>,
+    pub entries: Vec<RealArtifactEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealCheckpointSnapshot {
+    pub checkpoint_id: String,
+    pub resolved_view_id: String,
+    pub tree_hash: String,
+    pub topic_frontier: Vec<(String, String)>,
+    pub created_at: String,
+    pub entries: Vec<RealArtifactEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealExportMapSnapshot {
+    pub export_map_id: String,
+    pub checkpoint_id: String,
+    pub tree_hash: String,
+    pub git_ref: String,
+    pub git_commit_ids: Vec<String>,
+    pub exported_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +205,9 @@ impl RealRepoState {
             sessions: Vec::new(),
             base_entries: entries.clone(),
             operations: Vec::new(),
+            projections: Vec::new(),
+            checkpoints: Vec::new(),
+            export_maps: Vec::new(),
             entries,
             quarantine,
         };
@@ -232,6 +270,18 @@ impl RealRepoState {
             .iter()
             .map(|operation| parse_operation(repo_root, operation, &path))
             .collect::<Result<Vec<_>, _>>()?;
+        let projections = optional_array(&object, "projections", &path)?
+            .iter()
+            .map(|projection| parse_projection_snapshot(repo_root, projection, &path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let checkpoints = optional_array(&object, "checkpoints", &path)?
+            .iter()
+            .map(|checkpoint| parse_checkpoint_snapshot(repo_root, checkpoint, &path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let export_maps = optional_array(&object, "export_maps", &path)?
+            .iter()
+            .map(|export_map| parse_export_map_snapshot(export_map, &path))
+            .collect::<Result<Vec<_>, _>>()?;
 
         if topics.is_empty() {
             if let Some(legacy_topic_id) = topic_id.clone() {
@@ -279,6 +329,9 @@ impl RealRepoState {
             sessions,
             base_entries,
             operations,
+            projections,
+            checkpoints,
+            export_maps,
             entries,
             quarantine,
         };
@@ -307,6 +360,16 @@ impl RealRepoState {
         }
         for operation in &self.operations {
             persist_blob(repo_root, &operation.result_content_hash, &operation.bytes)?;
+        }
+        for projection in &self.projections {
+            for entry in &projection.entries {
+                persist_blob(repo_root, &entry.content_hash, &entry.bytes)?;
+            }
+        }
+        for checkpoint in &self.checkpoints {
+            for entry in &checkpoint.entries {
+                persist_blob(repo_root, &entry.content_hash, &entry.bytes)?;
+            }
         }
         Ok(())
     }
@@ -395,6 +458,33 @@ impl RealRepoState {
         object.insert(
             "operations".to_string(),
             JsonValue::Array(self.operations.iter().map(operation_json).collect()),
+        );
+        object.insert(
+            "projections".to_string(),
+            JsonValue::Array(
+                self.projections
+                    .iter()
+                    .map(projection_snapshot_json)
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "checkpoints".to_string(),
+            JsonValue::Array(
+                self.checkpoints
+                    .iter()
+                    .map(checkpoint_snapshot_json)
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "export_maps".to_string(),
+            JsonValue::Array(
+                self.export_maps
+                    .iter()
+                    .map(export_map_snapshot_json)
+                    .collect(),
+            ),
         );
         object.insert(
             "entries".to_string(),
@@ -1198,6 +1288,107 @@ fn parse_operation(
     })
 }
 
+fn parse_projection_snapshot(
+    repo_root: &Path,
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealProjectionSnapshot, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(
+            state_path,
+            "projection must be a JSON object",
+        ));
+    };
+    let entries = required_array(object, "entries", state_path)?
+        .iter()
+        .map(|entry| parse_entry(repo_root, entry, state_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RealProjectionSnapshot {
+        projection_id: required_string(object, "projection_id", state_path)?,
+        purpose: required_string(object, "purpose", state_path)?,
+        resolved_view_id: required_string(object, "resolved_view_id", state_path)?,
+        tree_hash: required_string(object, "tree_hash", state_path)?,
+        manifest_digest: required_string(object, "manifest_digest", state_path)?,
+        created_from_content_tree: required_string(
+            object,
+            "created_from_content_tree",
+            state_path,
+        )?,
+        materialized_root: optional_string(object, "materialized_root", state_path)?,
+        entries,
+    })
+}
+
+fn parse_checkpoint_snapshot(
+    repo_root: &Path,
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealCheckpointSnapshot, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(
+            state_path,
+            "checkpoint must be a JSON object",
+        ));
+    };
+    let entries = required_array(object, "entries", state_path)?
+        .iter()
+        .map(|entry| parse_entry(repo_root, entry, state_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let topic_frontier = optional_array(object, "topic_frontier", state_path)?
+        .iter()
+        .map(|value| {
+            let JsonValue::Object(object) = value else {
+                return Err(invalid_state(
+                    state_path,
+                    "checkpoint topic_frontier entries must be objects",
+                ));
+            };
+            Ok((
+                required_string(object, "topic_id", state_path)?,
+                required_string(object, "topic_revision_id", state_path)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RealCheckpointSnapshot {
+        checkpoint_id: required_string(object, "checkpoint_id", state_path)?,
+        resolved_view_id: required_string(object, "resolved_view_id", state_path)?,
+        tree_hash: required_string(object, "tree_hash", state_path)?,
+        topic_frontier,
+        created_at: required_string(object, "created_at", state_path)?,
+        entries,
+    })
+}
+
+fn parse_export_map_snapshot(
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealExportMapSnapshot, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(
+            state_path,
+            "export_map must be a JSON object",
+        ));
+    };
+    let git_commit_ids = optional_array(object, "git_commit_ids", state_path)?
+        .iter()
+        .map(|value| match value {
+            JsonValue::String(commit_id) => Ok(commit_id.clone()),
+            _ => Err(invalid_state(
+                state_path,
+                "export_map git_commit_ids must be strings",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RealExportMapSnapshot {
+        export_map_id: required_string(object, "export_map_id", state_path)?,
+        checkpoint_id: required_string(object, "checkpoint_id", state_path)?,
+        tree_hash: required_string(object, "tree_hash", state_path)?,
+        git_ref: required_string(object, "git_ref", state_path)?,
+        git_commit_ids,
+        exported_at: required_string(object, "exported_at", state_path)?,
+    })
+}
+
 fn entry_json(entry: &RealArtifactEntry) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert("path".to_string(), JsonValue::String(entry.path.clone()));
@@ -1215,6 +1406,121 @@ fn entry_json(entry: &RealArtifactEntry) -> JsonValue {
         JsonValue::String(entry.classification.clone()),
     );
     object.insert("tombstone".to_string(), JsonValue::Bool(entry.tombstone));
+    JsonValue::Object(object)
+}
+
+fn projection_snapshot_json(projection: &RealProjectionSnapshot) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "projection_id".to_string(),
+        JsonValue::String(projection.projection_id.clone()),
+    );
+    object.insert(
+        "purpose".to_string(),
+        JsonValue::String(projection.purpose.clone()),
+    );
+    object.insert(
+        "resolved_view_id".to_string(),
+        JsonValue::String(projection.resolved_view_id.clone()),
+    );
+    object.insert(
+        "tree_hash".to_string(),
+        JsonValue::String(projection.tree_hash.clone()),
+    );
+    object.insert(
+        "manifest_digest".to_string(),
+        JsonValue::String(projection.manifest_digest.clone()),
+    );
+    object.insert(
+        "created_from_content_tree".to_string(),
+        JsonValue::String(projection.created_from_content_tree.clone()),
+    );
+    object.insert(
+        "materialized_root".to_string(),
+        optional_json(&projection.materialized_root),
+    );
+    object.insert(
+        "entries".to_string(),
+        JsonValue::Array(projection.entries.iter().map(entry_json).collect()),
+    );
+    JsonValue::Object(object)
+}
+
+fn checkpoint_snapshot_json(checkpoint: &RealCheckpointSnapshot) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "checkpoint_id".to_string(),
+        JsonValue::String(checkpoint.checkpoint_id.clone()),
+    );
+    object.insert(
+        "resolved_view_id".to_string(),
+        JsonValue::String(checkpoint.resolved_view_id.clone()),
+    );
+    object.insert(
+        "tree_hash".to_string(),
+        JsonValue::String(checkpoint.tree_hash.clone()),
+    );
+    object.insert(
+        "topic_frontier".to_string(),
+        JsonValue::Array(
+            checkpoint
+                .topic_frontier
+                .iter()
+                .map(|(topic_id, topic_revision_id)| {
+                    let mut object = BTreeMap::new();
+                    object.insert("topic_id".to_string(), JsonValue::String(topic_id.clone()));
+                    object.insert(
+                        "topic_revision_id".to_string(),
+                        JsonValue::String(topic_revision_id.clone()),
+                    );
+                    JsonValue::Object(object)
+                })
+                .collect(),
+        ),
+    );
+    object.insert(
+        "created_at".to_string(),
+        JsonValue::String(checkpoint.created_at.clone()),
+    );
+    object.insert(
+        "entries".to_string(),
+        JsonValue::Array(checkpoint.entries.iter().map(entry_json).collect()),
+    );
+    JsonValue::Object(object)
+}
+
+fn export_map_snapshot_json(export_map: &RealExportMapSnapshot) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "export_map_id".to_string(),
+        JsonValue::String(export_map.export_map_id.clone()),
+    );
+    object.insert(
+        "checkpoint_id".to_string(),
+        JsonValue::String(export_map.checkpoint_id.clone()),
+    );
+    object.insert(
+        "tree_hash".to_string(),
+        JsonValue::String(export_map.tree_hash.clone()),
+    );
+    object.insert(
+        "git_ref".to_string(),
+        JsonValue::String(export_map.git_ref.clone()),
+    );
+    object.insert(
+        "git_commit_ids".to_string(),
+        JsonValue::Array(
+            export_map
+                .git_commit_ids
+                .iter()
+                .map(|commit_id| JsonValue::String(commit_id.clone()))
+                .collect(),
+        ),
+    );
+    object.insert(
+        "exported_at".to_string(),
+        JsonValue::String(export_map.exported_at.clone()),
+    );
     JsonValue::Object(object)
 }
 
@@ -1710,6 +2016,9 @@ mod tests {
             sessions: Vec::new(),
             base_entries: entries.clone(),
             operations: Vec::new(),
+            projections: Vec::new(),
+            checkpoints: Vec::new(),
+            export_maps: Vec::new(),
             entries,
             quarantine: Vec::new(),
         };
@@ -1783,6 +2092,9 @@ mod tests {
                     b"pub fn value() -> u32 { 2 }\n",
                 ),
             ],
+            projections: Vec::new(),
+            checkpoints: Vec::new(),
+            export_maps: Vec::new(),
             entries: vec![readme.clone(), lib.clone()],
             quarantine: Vec::new(),
         };

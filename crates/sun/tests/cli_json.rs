@@ -479,6 +479,31 @@ fn no_fixture_topics_and_sessions_are_distinct_repo_backed_records() {
     assert!(beta_write_stdout.contains("\"topic_id\":\"topic_beta_topic\""));
     assert!(beta_write_stdout.contains("\"topic_revision_id\":\"rev_beta_topic_0001\""));
     assert!(beta_write_stdout.contains("\"session_generation_id\":\"gen_agent_b_0002\""));
+    let beta_session_view = json_string_field(&beta_write_stdout, "resolved_view_id");
+
+    let beta_projection_root = repo.path().join("beta-session-projection");
+    let beta_materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&beta_session_view)
+        .arg("--purpose")
+        .arg("inspection")
+        .arg("--projection-root")
+        .arg(&beta_projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("beta session materialize should run");
+    assert_success(&beta_materialize);
+    assert_eq!(
+        fs::read_to_string(beta_projection_root.join("README.md")).unwrap(),
+        "# Multi\n\nalpha\n"
+    );
+    assert_eq!(
+        fs::read_to_string(beta_projection_root.join("src/lib.rs")).unwrap(),
+        "pub fn value() -> u32 {\n    2\n}\n"
+    );
 
     let alpha_status = sun()
         .arg("status")
@@ -805,6 +830,279 @@ fn no_fixture_repo_backed_resolver_merges_independent_topics_and_reports_conflic
 }
 
 #[test]
+fn no_fixture_checkpoint_export_uses_persisted_snapshot_after_head_moves() {
+    let repo = TestRepo::new("real-checkpoint-export-snapshot");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    repo.write_file("README.md", "# Snapshot\n\nbase\n");
+    write_nested_file(
+        repo.path(),
+        "src/lib.rs",
+        "pub fn value() -> u32 {\n    1\n}\n",
+    );
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+
+    let init = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun init should run");
+    assert_success(&init);
+
+    for (slug, display, actor) in [
+        ("snapshot-docs", "Snapshot Docs", "agent-docs"),
+        ("snapshot-code", "Snapshot Code", "agent-code"),
+    ] {
+        let topic = sun()
+            .arg("topic")
+            .arg("create")
+            .arg(slug)
+            .arg("--display-name")
+            .arg(display)
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .expect("sun topic create should run");
+        assert_success(&topic);
+        let session = sun()
+            .arg("session")
+            .arg("start")
+            .arg("--topic")
+            .arg(slug)
+            .arg("--view")
+            .arg("view_base_0001")
+            .arg("--actor")
+            .arg(actor)
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .expect("sun session start should run");
+        assert_success(&session);
+    }
+
+    let readme = sun()
+        .arg("read")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_docs")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("docs read should run");
+    assert_success(&readme);
+    let readme_hash = json_string_field(&stdout(&readme), "content_hash");
+    let docs_content = repo.write_file("docs-snapshot.md", "# Snapshot\n\nbase\ndocs v1\n");
+    let docs_write = sun()
+        .arg("write")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_docs")
+        .arg("--expect-hash")
+        .arg(&readme_hash)
+        .arg("--content-file")
+        .arg(&docs_content)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("docs write should run");
+    assert_success(&docs_write);
+
+    let lib = sun()
+        .arg("read")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_code")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("code read should run");
+    assert_success(&lib);
+    let lib_hash = json_string_field(&stdout(&lib), "content_hash");
+    let code_v2 = repo.write_file("code-v2.rs", "pub fn value() -> u32 {\n    2\n}\n");
+    let code_write = sun()
+        .arg("write")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_code")
+        .arg("--expect-hash")
+        .arg(&lib_hash)
+        .arg("--content-file")
+        .arg(&code_v2)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("code write should run");
+    assert_success(&code_write);
+
+    let resolved = sun()
+        .arg("view")
+        .arg("resolve")
+        .arg("--base")
+        .arg("checkpoint_base_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun view resolve should run");
+    assert_success(&resolved);
+    let resolved_stdout = stdout(&resolved);
+    assert!(resolved_stdout.contains("\"conflict_ids\":[]"));
+    let resolved_view = json_string_field(&resolved_stdout, "resolved_view_id");
+
+    let projection_root = repo.path().join("snapshot-projection");
+    let materialize = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg(&resolved_view)
+        .arg("--purpose")
+        .arg("inspection")
+        .arg("--projection-root")
+        .arg(&projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&materialize);
+    let projection_stdout = stdout(&materialize);
+    let projection_id = json_string_field(&projection_stdout, "projection_id");
+    assert!(projection_stdout.contains("\"source\":\"resolved_content_tree\""));
+    assert_eq!(
+        fs::read_to_string(projection_root.join("src/lib.rs")).unwrap(),
+        "pub fn value() -> u32 {\n    2\n}\n"
+    );
+
+    let projection_status = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg(&projection_id)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+    assert_success(&projection_status);
+    assert!(stdout(&projection_status)
+        .contains("\"source_truth\":\"sunlight_persisted_resolved_view\""));
+    assert!(stdout(&projection_status).contains("\"manifest_digest\":\"sha256:"));
+
+    let checkpoint = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg("--view")
+        .arg(&resolved_view)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun checkpoint create should run");
+    assert_success(&checkpoint);
+    let checkpoint_id = json_string_field(&stdout(&checkpoint), "checkpoint_id");
+
+    let checkpoint_inspect = sun()
+        .arg("inspect")
+        .arg(format!("checkpoint:{checkpoint_id}"))
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect checkpoint should run");
+    assert_success(&checkpoint_inspect);
+    assert!(
+        stdout(&checkpoint_inspect).contains("\"source_truth\":\"sunlight_persisted_checkpoint\"")
+    );
+    assert!(stdout(&checkpoint_inspect).contains("\"path\":\"src/lib.rs\""));
+
+    let lib_after_checkpoint = sun()
+        .arg("read")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_code")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("code read after checkpoint should run");
+    assert_success(&lib_after_checkpoint);
+    let lib_v2_hash = json_string_field(&stdout(&lib_after_checkpoint), "content_hash");
+    let code_v3 = repo.write_file("code-v3.rs", "pub fn value() -> u32 {\n    3\n}\n");
+    let code_move_head = sun()
+        .arg("write")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_code")
+        .arg("--expect-hash")
+        .arg(&lib_v2_hash)
+        .arg("--content-file")
+        .arg(&code_v3)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("code v3 write should run");
+    assert_success(&code_move_head);
+    let moved_head_read = sun()
+        .arg("read")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_code")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("code moved head read should run");
+    assert_success(&moved_head_read);
+    assert!(stdout(&moved_head_read).contains("    3"));
+
+    let export = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg(&checkpoint_id)
+        .arg("--branch")
+        .arg("sunlight/snapshot-export")
+        .arg("--execute-local")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export should run");
+    assert_success(&export);
+    let export_map_id = format!("export_map_{checkpoint_id}");
+    assert!(stdout(&export).contains("\"lifecycle_state\":\"exported\""));
+    assert_eq!(
+        git(
+            repo.path(),
+            &["show", "sunlight/snapshot-export:src/lib.rs"]
+        ),
+        "pub fn value() -> u32 {\n    2\n}\n"
+    );
+    assert_ne!(
+        git(
+            repo.path(),
+            &["show", "sunlight/snapshot-export:src/lib.rs"]
+        ),
+        "pub fn value() -> u32 {\n    3\n}\n"
+    );
+
+    let export_status = sun()
+        .arg("status")
+        .arg("--export")
+        .arg(&export_map_id)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status export should run");
+    assert_success(&export_status);
+    assert!(stdout(&export_status).contains("\"source_truth\":\"sunlight_persisted_checkpoint\""));
+    assert!(stdout(&export_status).contains(&format!("\"checkpoint_id\":\"{checkpoint_id}\"")));
+}
+
+#[test]
 fn no_fixture_init_respects_git_ignore_policy() {
     let repo = TestRepo::new("real-repo-ignore-policy");
     git(repo.path(), &["init", "-b", "main"]);
@@ -1003,7 +1301,7 @@ fn no_fixture_init_quarantines_tracked_secret_without_persisting_or_searching_by
 }
 
 #[test]
-fn no_fixture_git_export_rejects_secret_classified_artifact() {
+fn no_fixture_git_export_uses_persisted_checkpoint_when_current_head_is_secret_classified() {
     let repo = TestRepo::new("real-secret-export-gate");
     git(repo.path(), &["init", "-b", "main"]);
     git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
@@ -1068,11 +1366,13 @@ fn no_fixture_git_export_rejects_secret_classified_artifact() {
         .current_dir(repo.path())
         .output()
         .expect("sun git export should run");
-    assert_failure(&export);
+    assert_success(&export);
     let export_stdout = stdout(&export);
-    assert!(export_stdout.contains("\"code\":\"export_policy_failed\""));
-    assert!(export_stdout.contains("\"blocked_paths\":\"README.md\""));
-    assert!(export_stdout.contains("\"blocked_classifications\":\"secret\""));
+    assert!(export_stdout.contains("\"lifecycle_state\":\"exported\""));
+    assert_eq!(
+        git(repo.path(), &["show", "sunlight/secret-export:README.md"]),
+        "# public\n"
+    );
 }
 
 #[test]

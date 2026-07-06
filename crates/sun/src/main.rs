@@ -75,9 +75,9 @@ use sunlight_core::projection::{
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repo_state::{
     materialize_real_files, persist_quarantine_report, real_artifact_id_for_path,
-    real_content_hash, real_tree_hash, write_real_files_overwrite, RealArtifactEntry,
-    RealOperationRecord, RealRepoState, RealResolvedRepoView, RealSessionRecord, RealTopicRecord,
-    RepoStateError,
+    real_content_hash, real_tree_hash, RealArtifactEntry, RealCheckpointSnapshot,
+    RealExportMapSnapshot, RealOperationRecord, RealProjectionSnapshot, RealRepoState,
+    RealResolvedRepoView, RealSessionRecord, RealTopicRecord, RepoStateError,
 };
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
@@ -1422,7 +1422,7 @@ fn real_resolve_view_by_id(
     }
 
     let head = state.resolve_head_view();
-    if view_id == head.result.resolved_view_id || view_id == state.resolved_view_id {
+    if view_id == head.result.resolved_view_id {
         return Ok(head);
     }
 
@@ -1432,6 +1432,10 @@ fn real_resolve_view_by_id(
         }
     }
 
+    if view_id == state.resolved_view_id {
+        return Ok(head);
+    }
+
     Err(object_not_found("resolved_view", view_id))
 }
 
@@ -1439,6 +1443,14 @@ fn real_resolve_checkpoint_view(
     state: &RealRepoState,
     checkpoint_id: &str,
 ) -> Result<RealResolvedRepoView, CliError> {
+    if let Some(snapshot) = state
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
+    {
+        return Ok(real_checkpoint_snapshot_resolved_view(state, snapshot));
+    }
+
     let mut candidates = vec![state.resolve_head_view()];
     candidates.extend(
         state
@@ -1461,12 +1473,63 @@ fn real_view_state(state: &RealRepoState, resolved: &RealResolvedRepoView) -> Re
     let mut view_state = state.clone();
     view_state.entries = resolved.entries.clone();
     view_state.resolved_view_id = resolved.result.resolved_view_id.clone();
+    for topic in &mut view_state.topics {
+        topic.head_revision_id = resolved.result.topic_frontier.get(&topic.topic_id).cloned();
+    }
     if let Some(tree) = &resolved.result.tree_identity {
         view_state.tree_hash = tree.tree_hash.clone();
     } else {
         view_state.tree_hash = real_tree_hash(&resolved.entries);
     }
     view_state
+}
+
+fn real_checkpoint_snapshot_resolved_view(
+    state: &RealRepoState,
+    snapshot: &RealCheckpointSnapshot,
+) -> RealResolvedRepoView {
+    let tree_entries = snapshot
+        .entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .map(|entry| {
+            (
+                entry.path.clone(),
+                TreeEntryState {
+                    artifact_id: entry.artifact_id.clone(),
+                    path: entry.path.clone(),
+                    content_hash: entry.content_hash.clone(),
+                },
+            )
+        })
+        .collect();
+    RealResolvedRepoView {
+        result: ResolvedViewResult {
+            resolved_view_id: snapshot.resolved_view_id.clone(),
+            repository_id: state.repository_id.clone(),
+            base_checkpoint_ids: vec![state.base_checkpoint_id.clone()],
+            topic_frontier: snapshot.topic_frontier.iter().cloned().collect(),
+            dependency_closure: DependencyClosure {
+                revision_ids: snapshot
+                    .topic_frontier
+                    .iter()
+                    .map(|(_topic_id, revision_id)| revision_id.clone())
+                    .collect(),
+            },
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            resolver_order: DeterministicResolverOrder {
+                operation_ids: Vec::new(),
+            },
+            tree_identity: Some(SingleRepoTree {
+                repository_id: state.repository_id.clone(),
+                tree_hash: snapshot.tree_hash.clone(),
+            }),
+            records: Vec::new(),
+            tree_entries,
+        },
+        entries: snapshot.entries.clone(),
+    }
 }
 
 fn real_base_resolved_repo_view(state: &RealRepoState) -> RealResolvedRepoView {
@@ -2006,7 +2069,7 @@ fn real_project_materialize(
     ctx: &CommandContext,
     options: ProjectMaterializeOptions,
 ) -> Result<(), CliError> {
-    let state = RealRepoState::load(&PathBuf::from("."))?;
+    let mut state = RealRepoState::load(&PathBuf::from("."))?;
     let resolved = real_resolve_view_by_id(&state, &options.view_id)?;
     if !resolved.result.conflict_free() {
         return Err(CliError::new(
@@ -2018,11 +2081,29 @@ fn real_project_materialize(
     let projection_id = format!(
         "projection_{}_native_{:04}",
         options.purpose.as_str(),
-        state.generation_number.max(1)
+        state.projections.len() + 1
     );
     let view_state = real_view_state(&state, &resolved);
+    let manifest_digest =
+        real_projection_manifest_digest(&view_state, &projection_id, options.purpose);
+    let root_string = options
+        .projection_root
+        .as_ref()
+        .map(|root| root.display().to_string());
     if let Some(root) = options.projection_root {
         materialize_real_files(&view_state, &root)?;
+        state.projections.push(RealProjectionSnapshot {
+            projection_id: projection_id.clone(),
+            purpose: options.purpose.as_str().to_string(),
+            resolved_view_id: view_state.resolved_view_id.clone(),
+            tree_hash: view_state.tree_hash.clone(),
+            manifest_digest: manifest_digest.clone(),
+            created_from_content_tree: view_state.tree_hash.clone(),
+            materialized_root: root_string,
+            entries: view_state.entries.clone(),
+        });
+        state.save(&PathBuf::from("."))?;
+        persist_real_projection_record(&state, state.projections.last().unwrap())?;
         if ctx.json {
             println!(
                 "{}",
@@ -2037,6 +2118,18 @@ fn real_project_materialize(
             println!("{} {}", projection_id, root.display());
         }
     } else if ctx.json {
+        state.projections.push(RealProjectionSnapshot {
+            projection_id: projection_id.clone(),
+            purpose: options.purpose.as_str().to_string(),
+            resolved_view_id: view_state.resolved_view_id.clone(),
+            tree_hash: view_state.tree_hash.clone(),
+            manifest_digest,
+            created_from_content_tree: view_state.tree_hash.clone(),
+            materialized_root: None,
+            entries: view_state.entries.clone(),
+        });
+        state.save(&PathBuf::from("."))?;
+        persist_real_projection_record(&state, state.projections.last().unwrap())?;
         println!(
             "{}",
             real_projection_plan_envelope(&view_state, &projection_id, options.purpose)
@@ -2051,7 +2144,7 @@ fn real_checkpoint_create(
     ctx: &CommandContext,
     options: CheckpointCreateOptions,
 ) -> Result<(), CliError> {
-    let state = RealRepoState::load(&PathBuf::from("."))?;
+    let mut state = RealRepoState::load(&PathBuf::from("."))?;
     let resolved = real_resolve_view_by_id(&state, &options.view_id)?;
     if !resolved.result.conflict_free() {
         return Err(CliError::new(
@@ -2063,6 +2156,25 @@ fn real_checkpoint_create(
     let view_state = real_view_state(&state, &resolved);
     reject_real_export_blocked_entries(&view_state)?;
     let checkpoint = real_checkpoint(&view_state);
+    if !state
+        .checkpoints
+        .iter()
+        .any(|snapshot| snapshot.checkpoint_id == checkpoint.id)
+    {
+        state.checkpoints.push(RealCheckpointSnapshot {
+            checkpoint_id: checkpoint.id.clone(),
+            resolved_view_id: checkpoint.resolved_view_id.clone(),
+            tree_hash: checkpoint.tree_identity.tree_hash.clone(),
+            topic_frontier: checkpoint
+                .topic_frontier
+                .iter()
+                .map(|entry| (entry.topic_id.clone(), entry.topic_revision_id.clone()))
+                .collect(),
+            created_at: checkpoint.created_at.clone(),
+            entries: view_state.entries.clone(),
+        });
+    }
+    state.save(&PathBuf::from("."))?;
     state.persist_record(
         &PathBuf::from("."),
         "checkpoints",
@@ -2079,7 +2191,7 @@ fn real_checkpoint_create(
 
 fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<(), CliError> {
     let repo_root = options.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-    let state = RealRepoState::load(&repo_root)?;
+    let mut state = RealRepoState::load(&repo_root)?;
     let resolved = real_resolve_checkpoint_view(&state, &options.checkpoint_id)?;
     if !resolved.result.conflict_free() {
         return Err(CliError::new(
@@ -2103,41 +2215,43 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
         return Ok(());
     }
     if options.execute_local {
-        write_real_files_overwrite(&view_state, &repo_root)?;
-        run_git_capture(&repo_root, &["add", "-A"]).map_err(invalid_request)?;
-        let commit_message = format!("Sunlight export {}", checkpoint.id);
-        let commit = Command::new("git")
-            .arg("-C")
-            .arg(&repo_root)
-            .args(["commit", "-m", &commit_message])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| invalid_request(format!("failed to start git commit: {error}")))?;
-        if !commit.status.success() {
-            let stderr = String::from_utf8_lossy(&commit.stderr);
-            if !stderr.contains("nothing to commit") {
-                return Err(invalid_request(format!(
-                    "git commit failed: {}",
-                    stderr.trim()
-                )));
-            }
-        }
-        run_git_capture(&repo_root, &["branch", "-f", &options.git_ref])
-            .map_err(invalid_request)?;
-        let commit_id =
-            run_git_capture(&repo_root, &["rev-parse", "HEAD"]).map_err(invalid_request)?;
+        let content_files = real_git_export_content_files(&view_state);
+        let tree_hash = checkpoint.tree_identity.tree_hash.clone();
+        let input = real_git_export_writer_input(&repo_root, &options, checkpoint.clone())?;
+        let mut store = InMemoryGitExportMapStore::default();
+        let result = execute_local_git_export_writer(input, content_files, &mut store)
+            .map_err(git_export_planning_error)?;
+        let commit_id = result.created_commit_id.clone().ok_or_else(|| {
+            invalid_request(
+                result
+                    .error
+                    .as_ref()
+                    .map(|error| error.message.clone())
+                    .unwrap_or_else(|| "git export did not create a commit".to_string()),
+            )
+        })?;
         let export_id = format!("export_map_{}", checkpoint.id);
+        state.export_maps.push(RealExportMapSnapshot {
+            export_map_id: export_id.clone(),
+            checkpoint_id: checkpoint.id.clone(),
+            tree_hash,
+            git_ref: options.git_ref.clone(),
+            git_commit_ids: vec![commit_id.clone()],
+            exported_at: real_now_id(),
+        });
+        state.save(&repo_root)?;
         state.persist_record(
             &repo_root,
             "export-map",
             &export_id,
             &format!(
-                "{{\"record_type\":\"git_export_map\",\"id\":\"{}\",\"repository_id\":\"{}\",\"checkpoint_id\":\"{}\",\"git_ref\":\"{}\",\"git_commit_ids\":[\"{}\"]}}\n",
+                "{{\"record_type\":\"git_export_map\",\"id\":\"{}\",\"repository_id\":\"{}\",\"checkpoint_id\":\"{}\",\"tree_hash\":\"{}\",\"git_ref\":\"{}\",\"git_commit_ids\":[\"{}\"]}}\n",
                 json_escape(&export_id),
                 json_escape(&state.repository_id),
                 json_escape(&checkpoint.id),
+                json_escape(&checkpoint.tree_identity.tree_hash),
                 json_escape(&options.git_ref),
-                json_escape(commit_id.trim()),
+                json_escape(&commit_id),
             ),
         )?;
         if ctx.json {
@@ -2148,7 +2262,7 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
                 json_escape(&export_id),
                 json_escape(&checkpoint.id),
                 json_escape(&options.git_ref),
-                json_escape(commit_id.trim()),
+                json_escape(&commit_id),
             );
         } else {
             println!("{} exported", checkpoint.id);
@@ -2204,6 +2318,38 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
         Ok(state) => state,
         Err(_) => return Ok(false),
     };
+    if let [_, flag, value] = ctx.args.as_slice() {
+        match flag.as_str() {
+            "--projection" => {
+                let projection = state
+                    .projections
+                    .iter()
+                    .find(|projection| projection.projection_id == *value)
+                    .ok_or_else(|| object_not_found("projection", value))?;
+                println!("{}", real_projection_status_envelope(&state, projection));
+                return Ok(true);
+            }
+            "--checkpoint" => {
+                let checkpoint = state
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.checkpoint_id == *value)
+                    .ok_or_else(|| object_not_found("checkpoint", value))?;
+                println!("{}", real_checkpoint_status_envelope(&state, checkpoint));
+                return Ok(true);
+            }
+            "--export" | "--export-map" => {
+                let export_map = state
+                    .export_maps
+                    .iter()
+                    .find(|export_map| export_map.export_map_id == *value)
+                    .ok_or_else(|| object_not_found("export_map", value))?;
+                println!("{}", real_export_map_status_envelope(&state, export_map));
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
     let mut selected_topic = None;
     let mut selected_session = None;
     let command = match ctx.args.as_slice() {
@@ -2651,6 +2797,111 @@ fn real_checkpoint(state: &RealRepoState) -> CheckpointRecord {
     }
 }
 
+fn real_projection_manifest_digest(
+    state: &RealRepoState,
+    projection_id: &str,
+    purpose: ProjectionPurpose,
+) -> String {
+    let payload = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        projection_id,
+        purpose.as_str(),
+        state.repository_id,
+        state.resolved_view_id,
+        state.tree_hash
+    );
+    real_content_hash(payload.as_bytes())
+}
+
+fn persist_real_projection_record(
+    state: &RealRepoState,
+    projection: &RealProjectionSnapshot,
+) -> Result<(), CliError> {
+    state
+        .persist_record(
+            &PathBuf::from("."),
+            "projections",
+            &projection.projection_id,
+            &format!("{}\n", real_projection_snapshot_json(state, projection)),
+        )
+        .map_err(CliError::from)
+}
+
+fn real_git_export_content_files(state: &RealRepoState) -> Vec<GitExportContentFile> {
+    state
+        .entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .map(|entry| GitExportContentFile {
+            path: entry.path.clone(),
+            bytes: entry.bytes.clone(),
+            executable: entry.executable,
+        })
+        .collect()
+}
+
+fn real_git_export_writer_input(
+    repo_root: &PathBuf,
+    options: &GitExportOptions,
+    checkpoint: CheckpointRecord,
+) -> Result<GitExportWriterInput, CliError> {
+    let repo_root = fs::canonicalize(repo_root).map_err(|error| {
+        invalid_request(format!(
+            "failed to resolve local Git repository path `{}`: {error}",
+            repo_root.display()
+        ))
+    })?;
+    let repo_root_string = repo_root.display().to_string();
+    let base_commit_id = run_git_capture(&repo_root, &["rev-parse", "--verify", "HEAD^{commit}"])
+        .map_err(|message| {
+            invalid_request(format!(
+                "sun git export --execute-local requires a local Git repository with HEAD: {message}"
+            ))
+        })?
+        .trim()
+        .to_string();
+    let target_ref = if options.git_ref.starts_with("refs/") {
+        options.git_ref.clone()
+    } else {
+        format!("refs/heads/{}", options.git_ref)
+    };
+    let target_ref_commit_id = run_git_capture(&repo_root, &["rev-parse", "--verify", &target_ref])
+        .ok()
+        .map(|commit_id| commit_id.trim().to_string())
+        .filter(|commit_id| !commit_id.is_empty());
+    let refs = target_ref_commit_id
+        .map(|commit_id| GitRefState {
+            git_ref: target_ref.clone(),
+            commit_id,
+        })
+        .into_iter()
+        .collect();
+    let mut request = GitExportRequest::from_checkpoint(&checkpoint);
+    request.git_ref = target_ref.clone();
+    let mut validation_report = sunlight_core::git_export::validate_git_export_request(&request);
+    validation_report.git_ref = target_ref.clone();
+    Ok(GitExportWriterInput {
+        base_checkpoint_ids: vec!["checkpoint_base_0001".to_string()],
+        imported_base_commits: vec![ImportedBaseGitCommit {
+            checkpoint_id: "checkpoint_base_0001".to_string(),
+            git_commit_id: base_commit_id.clone(),
+        }],
+        prior_export_maps: Vec::new(),
+        planned_commit_id: "planned_commit_id_replaced_by_real_git".to_string(),
+        export_map_id: format!("export_map_{}", checkpoint.id),
+        exported_at: FIXTURE_CREATED_AT.to_string(),
+        request,
+        validation_report,
+        repository: GitExportRepositoryState {
+            repository_id: checkpoint.repository_id.clone(),
+            git_root: repo_root_string.clone(),
+            sunlight_repo_root: repo_root_string,
+            reachable_commit_ids: vec![base_commit_id],
+            refs,
+        },
+    })
+}
+
 fn media_type_for_path(path: &str) -> &'static str {
     if path.ends_with(".md") {
         "text/markdown; charset=utf-8"
@@ -2753,6 +3004,239 @@ fn real_projection_materialized_envelope(
     )
 }
 
+fn real_projection_snapshot_json(
+    state: &RealRepoState,
+    projection: &RealProjectionSnapshot,
+) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"schema_version\":1,",
+            "\"record_type\":\"projection\",",
+            "\"id\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"projection_id\":\"{}\",",
+            "\"purpose\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"manifest_digest\":\"{}\",",
+            "\"created_from_content_tree\":\"{}\",",
+            "\"materialized_root\":{},",
+            "\"entry_count\":{},",
+            "\"source_truth\":\"sunlight_persisted_resolved_view\",",
+            "\"privacy_class\":\"local_only\"",
+            "}}"
+        ),
+        json_escape(&projection.projection_id),
+        json_escape(&state.repository_id),
+        json_escape(&projection.projection_id),
+        json_escape(&projection.purpose),
+        json_escape(&projection.resolved_view_id),
+        single_repo_tree_json(&SingleRepoTree {
+            repository_id: state.repository_id.clone(),
+            tree_hash: projection.tree_hash.clone(),
+        }),
+        json_escape(&projection.manifest_digest),
+        json_escape(&projection.created_from_content_tree),
+        optional_string_json(projection.materialized_root.as_deref()),
+        projection
+            .entries
+            .iter()
+            .filter(|entry| !entry.tombstone)
+            .count(),
+    )
+}
+
+fn real_projection_status_envelope(
+    state: &RealRepoState,
+    projection: &RealProjectionSnapshot,
+) -> String {
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"status.projection\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"lifecycle_state\":\"materialized\",\"projection\":{}}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(&projection.projection_id),
+        json_escape(&projection.resolved_view_id),
+        real_projection_snapshot_json(state, projection),
+    )
+}
+
+fn real_projection_inspect_envelope(
+    state: &RealRepoState,
+    projection: &RealProjectionSnapshot,
+) -> String {
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"inspect.projection\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"projection\":{},\"manifest\":{{\"manifest_digest\":\"{}\",\"source_truth\":\"sunlight_persisted_resolved_view\",\"entries\":{}}}}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(&projection.projection_id),
+        json_escape(&projection.resolved_view_id),
+        real_projection_snapshot_json(state, projection),
+        json_escape(&projection.manifest_digest),
+        real_entries_manifest_json(&projection.entries),
+    )
+}
+
+fn real_checkpoint_snapshot_json(
+    state: &RealRepoState,
+    checkpoint: &RealCheckpointSnapshot,
+) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"schema_version\":1,",
+            "\"record_type\":\"checkpoint\",",
+            "\"id\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"topic_frontier\":{},",
+            "\"entry_count\":{},",
+            "\"created_at\":\"{}\",",
+            "\"source_truth\":\"sunlight_persisted_checkpoint\",",
+            "\"privacy_class\":\"commit_default\"",
+            "}}"
+        ),
+        json_escape(&checkpoint.checkpoint_id),
+        json_escape(&state.repository_id),
+        json_escape(&checkpoint.checkpoint_id),
+        json_escape(&checkpoint.resolved_view_id),
+        single_repo_tree_json(&SingleRepoTree {
+            repository_id: state.repository_id.clone(),
+            tree_hash: checkpoint.tree_hash.clone(),
+        }),
+        real_topic_frontier_pairs_json(&checkpoint.topic_frontier),
+        checkpoint
+            .entries
+            .iter()
+            .filter(|entry| !entry.tombstone)
+            .count(),
+        json_escape(&checkpoint.created_at),
+    )
+}
+
+fn real_checkpoint_status_envelope(
+    state: &RealRepoState,
+    checkpoint: &RealCheckpointSnapshot,
+) -> String {
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"status.checkpoint\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"checkpoint_id\":\"{}\",\"export_ready\":true,\"checkpoint\":{}}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(&checkpoint.checkpoint_id),
+        json_escape(&checkpoint.resolved_view_id),
+        json_escape(&checkpoint.checkpoint_id),
+        real_checkpoint_snapshot_json(state, checkpoint),
+    )
+}
+
+fn real_checkpoint_inspect_envelope(
+    state: &RealRepoState,
+    checkpoint: &RealCheckpointSnapshot,
+) -> String {
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"inspect.checkpoint\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"checkpoint\":{},\"content_snapshot\":{{\"source_truth\":\"sunlight_persisted_checkpoint\",\"entries\":{}}}}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(&checkpoint.checkpoint_id),
+        json_escape(&checkpoint.resolved_view_id),
+        real_checkpoint_snapshot_json(state, checkpoint),
+        real_entries_manifest_json(&checkpoint.entries),
+    )
+}
+
+fn real_export_map_snapshot_json(
+    state: &RealRepoState,
+    export_map: &RealExportMapSnapshot,
+) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"schema_version\":1,",
+            "\"record_type\":\"git_export_map\",",
+            "\"id\":\"{}\",",
+            "\"repository_id\":\"{}\",",
+            "\"export_map_id\":\"{}\",",
+            "\"checkpoint_id\":\"{}\",",
+            "\"tree_identity\":{},",
+            "\"git_ref\":\"{}\",",
+            "\"git_commit_ids\":{},",
+            "\"exported_at\":\"{}\",",
+            "\"source_truth\":\"sunlight_persisted_checkpoint\"",
+            "}}"
+        ),
+        json_escape(&export_map.export_map_id),
+        json_escape(&state.repository_id),
+        json_escape(&export_map.export_map_id),
+        json_escape(&export_map.checkpoint_id),
+        single_repo_tree_json(&SingleRepoTree {
+            repository_id: state.repository_id.clone(),
+            tree_hash: export_map.tree_hash.clone(),
+        }),
+        json_escape(&export_map.git_ref),
+        string_array_json(export_map.git_commit_ids.iter().map(String::as_str)),
+        json_escape(&export_map.exported_at),
+    )
+}
+
+fn real_export_map_status_envelope(
+    state: &RealRepoState,
+    export_map: &RealExportMapSnapshot,
+) -> String {
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"status.export_map\",\"repository_id\":\"{}\",\"ids\":{{\"export_map_id\":\"{}\",\"checkpoint_id\":\"{}\"}},\"git_export\":{{\"lifecycle_state\":\"exported\",\"source_truth\":\"sunlight_persisted_checkpoint\"}},\"export_map\":{}}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(&export_map.export_map_id),
+        json_escape(&export_map.checkpoint_id),
+        real_export_map_snapshot_json(state, export_map),
+    )
+}
+
+fn real_export_map_inspect_envelope(
+    state: &RealRepoState,
+    export_map: &RealExportMapSnapshot,
+) -> String {
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"inspect.export_map\",\"repository_id\":\"{}\",\"ids\":{{\"export_map_id\":\"{}\",\"checkpoint_id\":\"{}\"}},\"export_map\":{}}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(&export_map.export_map_id),
+        json_escape(&export_map.checkpoint_id),
+        real_export_map_snapshot_json(state, export_map),
+    )
+}
+
+fn real_entries_manifest_json(entries: &[RealArtifactEntry]) -> String {
+    format!(
+        "[{}]",
+        entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{{\"path\":\"{}\",\"artifact_id\":\"{}\",\"content_hash\":\"{}\",\"classification\":\"{}\",\"tombstone\":{}}}",
+                    json_escape(&entry.path),
+                    json_escape(&entry.artifact_id),
+                    json_escape(&entry.content_hash),
+                    json_escape(&entry.classification),
+                    entry.tombstone,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn real_topic_frontier_pairs_json(frontier: &[(String, String)]) -> String {
+    let fields = frontier
+        .iter()
+        .map(|(topic_id, revision_id)| {
+            format!(
+                "\"{}\":\"{}\"",
+                json_escape(topic_id),
+                json_escape(revision_id)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{fields}}}")
+}
+
 fn real_status_envelope(
     state: &RealRepoState,
     command: &str,
@@ -2849,6 +3333,33 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
             topic,
             Some(session),
         ));
+    }
+    if let Some(projection) = selector.strip_prefix("projection:") {
+        let projection = state
+            .projections
+            .iter()
+            .find(|candidate| candidate.projection_id == projection)
+            .ok_or_else(|| object_not_found("projection", projection))?;
+        return Ok(real_projection_inspect_envelope(state, projection));
+    }
+    if let Some(checkpoint) = selector.strip_prefix("checkpoint:") {
+        let checkpoint = state
+            .checkpoints
+            .iter()
+            .find(|candidate| candidate.checkpoint_id == checkpoint)
+            .ok_or_else(|| object_not_found("checkpoint", checkpoint))?;
+        return Ok(real_checkpoint_inspect_envelope(state, checkpoint));
+    }
+    if let Some(export_map) = selector
+        .strip_prefix("export_map:")
+        .or_else(|| selector.strip_prefix("export:"))
+    {
+        let export_map = state
+            .export_maps
+            .iter()
+            .find(|candidate| candidate.export_map_id == export_map)
+            .ok_or_else(|| object_not_found("export_map", export_map))?;
+        return Ok(real_export_map_inspect_envelope(state, export_map));
     }
     if let Some(view) = selector.strip_prefix("view:") {
         let resolved = state.resolve_head_view();

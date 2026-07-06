@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sha2::{Digest, Sha256};
 use sunlight_core::artifacts::{
     ArtifactIoError, ArtifactKind, ContentBlob, ContentTree, DeleteRequest, ExpectedHash,
     InMemoryArtifactStore, ListResponse, MetadataSetRequest, MoveRequest, MutationArtifactView,
@@ -74,6 +73,10 @@ use sunlight_core::projection::{
     FIXTURE_INSPECTION_PROJECTION_ID,
 };
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
+use sunlight_core::repo_state::{
+    materialize_real_files, real_artifact_id_for_path, real_content_hash, real_tree_hash,
+    write_real_files_overwrite, RealArtifactEntry, RealRepoState, RepoStateError,
+};
 use sunlight_core::repository::{
     init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
 };
@@ -139,6 +142,33 @@ impl CliError {
     fn with_raw_details_json(mut self, value: impl Into<String>) -> Self {
         self.raw_details_json = Some(value.into());
         self
+    }
+}
+
+impl From<RepoStateError> for CliError {
+    fn from(error: RepoStateError) -> Self {
+        match error {
+            RepoStateError::NotInitialized { path } => {
+                CliError::new("not_initialized", "Sunlight repository is not initialized")
+                    .with_detail("missing", path.display().to_string())
+            }
+            RepoStateError::InvalidState { path, message }
+                if message == "projection root must be an empty directory or a creatable path" =>
+            {
+                CliError::new(
+                    "projection_materialization_projection_root_unavailable",
+                    message,
+                )
+                .with_detail("path", path.display().to_string())
+            }
+            RepoStateError::InvalidState { path, message } => {
+                invalid_request(message).with_detail("path", path.display().to_string())
+            }
+            RepoStateError::Io { path, message } => {
+                invalid_request(message).with_detail("path", path.display().to_string())
+            }
+            RepoStateError::Json(message) => invalid_request(message),
+        }
     }
 }
 
@@ -223,6 +253,30 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
     })?;
     let ingest = RealRepoState::ingest(&report.repo_root, &report.repository_id)?;
     ingest.save(&report.repo_root)?;
+    ingest.persist_record(
+        &report.repo_root,
+        "checkpoints",
+        &ingest.base_checkpoint_id,
+        &format!(
+            "{{\"record_type\":\"checkpoint\",\"id\":\"{}\",\"repository_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"source\":\"worktree_ingest\"}}\n",
+            json_escape(&ingest.base_checkpoint_id),
+            json_escape(&ingest.repository_id),
+            json_escape(&ingest.base_resolved_view_id),
+            json_escape(&ingest.tree_hash),
+        ),
+    )?;
+    ingest.persist_record(
+        &report.repo_root,
+        "views",
+        &ingest.base_resolved_view_id,
+        &format!(
+            "{{\"record_type\":\"resolved_view\",\"id\":\"{}\",\"repository_id\":\"{}\",\"base_checkpoint_ids\":[\"{}\"],\"tree_hash\":\"{}\"}}\n",
+            json_escape(&ingest.base_resolved_view_id),
+            json_escape(&ingest.repository_id),
+            json_escape(&ingest.base_checkpoint_id),
+            json_escape(&ingest.tree_hash),
+        ),
+    )?;
 
     if ctx.json {
         println!(
@@ -1286,314 +1340,90 @@ fn inspect(ctx: &CommandContext) -> Result<(), CliError> {
     ))
 }
 
-#[derive(Debug, Clone)]
-struct RealRepoState {
-    repository_id: String,
-    base_checkpoint_id: String,
-    base_resolved_view_id: String,
-    resolved_view_id: String,
-    tree_hash: String,
-    topic_id: Option<String>,
-    topic_slug: Option<String>,
-    topic_display_name: Option<String>,
-    session_id: Option<String>,
-    actor_id: Option<String>,
-    generation_number: u64,
-    revision_number: u64,
-    head_revision_id: Option<String>,
-    entries: Vec<RealArtifactEntry>,
+fn real_session_id(state: &RealRepoState) -> Result<&str, CliError> {
+    state
+        .session_id
+        .as_deref()
+        .ok_or_else(|| CliError::new("session_not_found", "no native Sunlight session exists"))
 }
 
-#[derive(Debug, Clone)]
-struct RealArtifactEntry {
-    path: String,
-    artifact_id: String,
-    content_hash: String,
-    executable: bool,
-    classification: String,
-    tombstone: bool,
-    bytes: Vec<u8>,
-}
-
-impl RealRepoState {
-    fn ingest(repo_root: &PathBuf, repository_id: &str) -> Result<Self, CliError> {
-        let mut entries = Vec::new();
-        scan_real_repo_files(repo_root, repo_root, &mut entries)?;
-        entries.sort_by(|left, right| left.path.cmp(&right.path));
-        let tree_hash = real_tree_hash(&entries);
-        let state = Self {
-            repository_id: repository_id.to_string(),
-            base_checkpoint_id: "checkpoint_base_0001".to_string(),
-            base_resolved_view_id: "view_base_0001".to_string(),
-            resolved_view_id: "view_base_0001".to_string(),
-            tree_hash,
-            topic_id: None,
-            topic_slug: None,
-            topic_display_name: None,
-            session_id: None,
-            actor_id: None,
-            generation_number: 0,
-            revision_number: 0,
-            head_revision_id: None,
-            entries,
-        };
-        state.persist_blobs(repo_root)?;
-        state.persist_record(
-            repo_root,
-            "checkpoints",
-            &state.base_checkpoint_id,
-            &format!(
-                "{{\"record_type\":\"checkpoint\",\"id\":\"{}\",\"repository_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"source\":\"worktree_ingest\"}}\n",
-                json_escape(&state.base_checkpoint_id),
-                json_escape(&state.repository_id),
-                json_escape(&state.base_resolved_view_id),
-                json_escape(&state.tree_hash),
-            ),
-        )?;
-        state.persist_record(
-            repo_root,
-            "views",
-            &state.base_resolved_view_id,
-            &format!(
-                "{{\"record_type\":\"resolved_view\",\"id\":\"{}\",\"repository_id\":\"{}\",\"base_checkpoint_ids\":[\"{}\"],\"tree_hash\":\"{}\"}}\n",
-                json_escape(&state.base_resolved_view_id),
-                json_escape(&state.repository_id),
-                json_escape(&state.base_checkpoint_id),
-                json_escape(&state.tree_hash),
-            ),
-        )?;
-        Ok(state)
-    }
-
-    fn load(repo_root: &PathBuf) -> Result<Self, CliError> {
-        let path = real_state_path(repo_root);
-        let body = fs::read_to_string(&path).map_err(|_| {
-            CliError::new("not_initialized", "Sunlight repository is not initialized")
-                .with_detail("missing", path.display().to_string())
-        })?;
-        let mut state = Self {
-            repository_id: String::new(),
-            base_checkpoint_id: String::new(),
-            base_resolved_view_id: String::new(),
-            resolved_view_id: String::new(),
-            tree_hash: String::new(),
-            topic_id: None,
-            topic_slug: None,
-            topic_display_name: None,
-            session_id: None,
-            actor_id: None,
-            generation_number: 0,
-            revision_number: 0,
-            head_revision_id: None,
-            entries: Vec::new(),
-        };
-        for line in body.lines() {
-            let fields = line.split('\t').collect::<Vec<_>>();
-            match fields.as_slice() {
-                ["repo", repository_id, base_checkpoint_id, base_view, resolved_view, tree_hash, topic_id, topic_slug, topic_display_name, session_id, actor_id, generation, revision, head_revision] =>
-                {
-                    state.repository_id = (*repository_id).to_string();
-                    state.base_checkpoint_id = (*base_checkpoint_id).to_string();
-                    state.base_resolved_view_id = (*base_view).to_string();
-                    state.resolved_view_id = (*resolved_view).to_string();
-                    state.tree_hash = (*tree_hash).to_string();
-                    state.topic_id = non_empty_string(topic_id);
-                    state.topic_slug = non_empty_string(topic_slug);
-                    state.topic_display_name = non_empty_string(topic_display_name);
-                    state.session_id = non_empty_string(session_id);
-                    state.actor_id = non_empty_string(actor_id);
-                    state.generation_number = generation.parse().unwrap_or(0);
-                    state.revision_number = revision.parse().unwrap_or(0);
-                    state.head_revision_id = non_empty_string(head_revision);
-                }
-                ["file", path, artifact_id, content_hash, executable, classification, tombstone] => {
-                    let bytes = read_real_blob(repo_root, content_hash)?;
-                    state.entries.push(RealArtifactEntry {
-                        path: (*path).to_string(),
-                        artifact_id: (*artifact_id).to_string(),
-                        content_hash: (*content_hash).to_string(),
-                        executable: *executable == "true",
-                        classification: (*classification).to_string(),
-                        tombstone: *tombstone == "true",
-                        bytes,
-                    });
-                }
-                _ => {}
-            }
-        }
-        if state.repository_id.is_empty() {
-            return Err(invalid_request("invalid native Sunlight state")
-                .with_detail("path", path.display().to_string()));
-        }
-        Ok(state)
-    }
-
-    fn save(&self, repo_root: &PathBuf) -> Result<(), CliError> {
-        self.persist_blobs(repo_root)?;
-        let path = real_state_path(repo_root);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                invalid_request(format!("failed to create {}: {error}", parent.display()))
-            })?;
-        }
-        let mut body = String::new();
-        body.push_str(&format!(
-            "repo\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            self.repository_id,
-            self.base_checkpoint_id,
-            self.base_resolved_view_id,
-            self.resolved_view_id,
-            self.tree_hash,
-            self.topic_id.as_deref().unwrap_or(""),
-            self.topic_slug.as_deref().unwrap_or(""),
-            self.topic_display_name.as_deref().unwrap_or(""),
-            self.session_id.as_deref().unwrap_or(""),
-            self.actor_id.as_deref().unwrap_or(""),
-            self.generation_number,
-            self.revision_number,
-            self.head_revision_id.as_deref().unwrap_or(""),
-        ));
-        for entry in &self.entries {
-            body.push_str(&format!(
-                "file\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                entry.path,
-                entry.artifact_id,
-                entry.content_hash,
-                entry.executable,
-                entry.classification,
-                entry.tombstone,
-            ));
-        }
-        fs::write(&path, body).map_err(|error| {
-            invalid_request(format!("failed to write native Sunlight state: {error}"))
-                .with_detail("path", path.display().to_string())
-        })
-    }
-
-    fn persist_blobs(&self, repo_root: &PathBuf) -> Result<(), CliError> {
-        for entry in &self.entries {
-            let path = real_blob_path(repo_root, &entry.content_hash);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|error| {
-                    invalid_request(format!("failed to create {}: {error}", parent.display()))
-                })?;
-            }
-            if !path.exists() {
-                fs::write(&path, &entry.bytes).map_err(|error| {
-                    invalid_request(format!("failed to write content blob: {error}"))
-                        .with_detail("path", path.display().to_string())
-                })?;
-            }
-        }
+fn real_ensure_session(state: &RealRepoState, session_id: &str) -> Result<(), CliError> {
+    if real_session_id(state)? == session_id {
         Ok(())
+    } else {
+        Err(CliError::new(
+            "session_not_found",
+            format!("session `{session_id}` was not found"),
+        )
+        .with_detail("session_id", session_id))
     }
+}
 
-    fn persist_record(
-        &self,
-        repo_root: &PathBuf,
-        dir: &str,
-        id: &str,
-        json: &str,
-    ) -> Result<(), CliError> {
-        let path = repo_root
-            .join(".sunlight")
-            .join(dir)
-            .join(format!("{id}.json"));
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                invalid_request(format!("failed to create {}: {error}", parent.display()))
-            })?;
-        }
-        fs::write(&path, json).map_err(|error| {
-            invalid_request(format!("failed to write Sunlight record: {error}"))
-                .with_detail("path", path.display().to_string())
-        })
+fn real_view(state: &RealRepoState) -> SessionView {
+    SessionView {
+        resolved_view_id: state.resolved_view_id.clone(),
+        session_generation_id: format!("gen_native_{:04}", state.generation_number.max(1)),
+        tree_identity: TreeIdentityView {
+            kind: "SingleRepoTree".to_string(),
+            repository_id: state.repository_id.clone(),
+            tree_hash: state.tree_hash.clone(),
+        },
     }
+}
 
-    fn session_id(&self) -> Result<&str, CliError> {
-        self.session_id
-            .as_deref()
-            .ok_or_else(|| CliError::new("session_not_found", "no native Sunlight session exists"))
-    }
-
-    fn ensure_session(&self, session_id: &str) -> Result<(), CliError> {
-        if self.session_id()? == session_id {
-            Ok(())
-        } else {
-            Err(CliError::new(
-                "session_not_found",
-                format!("session `{session_id}` was not found"),
+fn real_resolved_view(state: &RealRepoState) -> ResolvedViewResult {
+    let tree_entries = state
+        .entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .map(|entry| {
+            (
+                entry.path.clone(),
+                TreeEntryState {
+                    artifact_id: entry.artifact_id.clone(),
+                    path: entry.path.clone(),
+                    content_hash: entry.content_hash.clone(),
+                },
             )
-            .with_detail("session_id", session_id))
-        }
+        })
+        .collect();
+    let topic_frontier = state
+        .topic_id
+        .as_ref()
+        .zip(state.head_revision_id.as_ref())
+        .map(|(topic, revision)| BTreeMap::from([(topic.clone(), revision.clone())]))
+        .unwrap_or_default();
+    ResolvedViewResult {
+        resolved_view_id: state.resolved_view_id.clone(),
+        repository_id: state.repository_id.clone(),
+        base_checkpoint_ids: vec![state.base_checkpoint_id.clone()],
+        topic_frontier,
+        dependency_closure: DependencyClosure {
+            revision_ids: Vec::new(),
+        },
+        operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+        path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+        resolver_order: DeterministicResolverOrder {
+            operation_ids: Vec::new(),
+        },
+        tree_identity: Some(SingleRepoTree {
+            repository_id: state.repository_id.clone(),
+            tree_hash: state.tree_hash.clone(),
+        }),
+        records: Vec::new(),
+        tree_entries,
     }
+}
 
-    fn view(&self) -> SessionView {
-        SessionView {
-            resolved_view_id: self.resolved_view_id.clone(),
-            session_generation_id: format!("gen_native_{:04}", self.generation_number.max(1)),
-            tree_identity: TreeIdentityView {
-                kind: "SingleRepoTree".to_string(),
-                repository_id: self.repository_id.clone(),
-                tree_hash: self.tree_hash.clone(),
-            },
-        }
-    }
-
-    fn resolved_view(&self) -> ResolvedViewResult {
-        let tree_entries = self
-            .entries
-            .iter()
-            .filter(|entry| !entry.tombstone)
-            .map(|entry| {
-                (
-                    entry.path.clone(),
-                    TreeEntryState {
-                        artifact_id: entry.artifact_id.clone(),
-                        path: entry.path.clone(),
-                        content_hash: entry.content_hash.clone(),
-                    },
-                )
-            })
-            .collect();
-        let topic_frontier = self
-            .topic_id
-            .as_ref()
-            .zip(self.head_revision_id.as_ref())
-            .map(|(topic, revision)| BTreeMap::from([(topic.clone(), revision.clone())]))
-            .unwrap_or_default();
-        ResolvedViewResult {
-            resolved_view_id: self.resolved_view_id.clone(),
-            repository_id: self.repository_id.clone(),
-            base_checkpoint_ids: vec![self.base_checkpoint_id.clone()],
-            topic_frontier,
-            dependency_closure: DependencyClosure {
-                revision_ids: Vec::new(),
-            },
-            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
-            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
-            resolver_order: DeterministicResolverOrder {
-                operation_ids: Vec::new(),
-            },
-            tree_identity: Some(SingleRepoTree {
-                repository_id: self.repository_id.clone(),
-                tree_hash: self.tree_hash.clone(),
-            }),
-            records: Vec::new(),
-            tree_entries,
-        }
-    }
-
-    fn entry(&self, path: &str) -> Result<&RealArtifactEntry, CliError> {
-        self.entries
-            .iter()
-            .find(|entry| entry.path == path && !entry.tombstone)
-            .ok_or_else(|| {
-                CliError::new("path_not_found", format!("path `{path}` was not found"))
-                    .with_detail("path", path)
-                    .with_detail("session_generation_id", self.view().session_generation_id)
-            })
-    }
+fn real_entry<'a>(state: &'a RealRepoState, path: &str) -> Result<&'a RealArtifactEntry, CliError> {
+    state.entry(path).ok_or_else(|| {
+        CliError::new("path_not_found", format!("path `{path}` was not found"))
+            .with_detail("path", path)
+            .with_detail(
+                "session_generation_id",
+                real_view(state).session_generation_id,
+            )
+    })
 }
 
 fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Result<(), CliError> {
@@ -1661,7 +1491,7 @@ fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Res
             json_escape(&state.repository_id),
             json_escape(&topic_id),
             json_escape(&state.resolved_view_id),
-            json_escape(&state.view().session_generation_id),
+            json_escape(&real_view(&state).session_generation_id),
             json_escape(&options.actor_id),
         ),
     )?;
@@ -1679,15 +1509,15 @@ fn real_artifact_read(
     options: ArtifactCommandOptions,
 ) -> Result<(), CliError> {
     let state = RealRepoState::load(&PathBuf::from("."))?;
-    state.ensure_session(&options.session_id)?;
-    let entry = state.entry(&options.operands[0])?;
+    real_ensure_session(&state, &options.session_id)?;
+    let entry = real_entry(&state, &options.operands[0])?;
     let bytes = std::str::from_utf8(&entry.bytes)
         .map_err(|_| CliError::new("invalid_content_encoding", "path is not UTF-8 text"))?;
     let response = ReadResponse {
         command: "artifact.read",
         repository_id: state.repository_id.clone(),
         session_id: options.session_id,
-        view: state.view(),
+        view: real_view(&state),
         artifact: real_artifact_view(entry),
         content: sunlight_core::artifacts::ContentView {
             encoding: "utf-8".to_string(),
@@ -1707,13 +1537,13 @@ fn real_artifact_list(
     options: ArtifactCommandOptions,
 ) -> Result<(), CliError> {
     let state = RealRepoState::load(&PathBuf::from("."))?;
-    state.ensure_session(&options.session_id)?;
+    real_ensure_session(&state, &options.session_id)?;
     let prefix = options.operands.first().map(String::as_str).unwrap_or("");
     let response = ListResponse {
         command: "artifact.list",
         repository_id: state.repository_id.clone(),
         session_id: options.session_id,
-        view: state.view(),
+        view: real_view(&state),
         artifacts: state
             .entries
             .iter()
@@ -1741,7 +1571,7 @@ fn real_artifact_search(
     options: ArtifactCommandOptions,
 ) -> Result<(), CliError> {
     let state = RealRepoState::load(&PathBuf::from("."))?;
-    state.ensure_session(&options.session_id)?;
+    real_ensure_session(&state, &options.session_id)?;
     let query = &options.operands[0];
     let mut matches = Vec::new();
     for entry in state.entries.iter().filter(|entry| !entry.tombstone) {
@@ -1763,7 +1593,7 @@ fn real_artifact_search(
         command: "artifact.search",
         repository_id: state.repository_id.clone(),
         session_id: options.session_id,
-        view: state.view(),
+        view: real_view(&state),
         matches,
     };
     if ctx.json {
@@ -1815,7 +1645,7 @@ fn real_artifact_write(
     expected_hash: ExpectedHash,
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&PathBuf::from("."))?;
-    state.ensure_session(&options.session_id)?;
+    real_ensure_session(&state, &options.session_id)?;
     let path = options.operands[0].clone();
     let existing = state
         .entries
@@ -1836,7 +1666,10 @@ fn real_artifact_write(
             )
             .with_detail("path", path)
             .with_detail("expected", expected)
-            .with_detail("session_generation_id", state.view().session_generation_id)
+            .with_detail(
+                "session_generation_id",
+                real_view(&state).session_generation_id,
+            )
             .with_detail("resolved_view_id", state.resolved_view_id.clone()));
         }
         _ => {}
@@ -1959,7 +1792,7 @@ fn real_view_resolve(ctx: &CommandContext, options: ViewResolveOptions) -> Resul
             return Err(object_not_found("checkpoint", base));
         }
     }
-    let view = state.resolved_view();
+    let view = real_resolved_view(&state);
     if ctx.json {
         println!("{}", view_resolve_success_envelope(&view));
     } else {
@@ -2118,7 +1951,7 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
     };
     let command = match ctx.args.as_slice() {
         [_, flag, value] if flag == "--session" => {
-            state.ensure_session(value)?;
+            real_ensure_session(&state, value)?;
             "status.session"
         }
         [_, flag, value] if flag == "--topic" => {
@@ -2184,12 +2017,12 @@ fn real_accept_mutation(
     before: Option<RealArtifactEntry>,
     index: usize,
 ) -> Result<MutationResponse, CliError> {
-    state.ensure_session(session_id)?;
+    real_ensure_session(&state, session_id)?;
     let topic_id = state
         .topic_id
         .clone()
         .ok_or_else(|| CliError::new("topic_not_found", "topic was not found"))?;
-    let prior_view = state.view();
+    let prior_view = real_view(&state);
     let parent_revision_id = state.head_revision_id.clone();
     let mutated_artifact_id = before
         .as_ref()
@@ -2228,7 +2061,7 @@ fn real_accept_mutation(
                 "mutated artifact was not found after mutation",
             )
         })?;
-    let tree_identity = state.view().tree_identity;
+    let tree_identity = real_view(&state).tree_identity;
     let before_hash = before.as_ref().map(|entry| entry.content_hash.clone());
     let after_hash = after.content_hash.clone();
     let kind = match mutation {
@@ -2305,7 +2138,7 @@ fn real_accept_mutation(
         dependency_revision_ids: Vec::new(),
     };
     let session_generation = SessionGenerationMutationRecord {
-        id: state.view().session_generation_id.clone(),
+        id: real_view(&state).session_generation_id.clone(),
         repository_id: state.repository_id.clone(),
         session_id: session_id.to_string(),
         write_topic_id: topic_id.clone(),
@@ -2326,7 +2159,7 @@ fn real_accept_mutation(
         },
         repository_id: state.repository_id.clone(),
         session_id: session_id.to_string(),
-        view: state.view(),
+        view: real_view(&state),
         artifact: MutationArtifactView {
             artifact_id: after.artifact_id,
             path: after.path,
@@ -2365,7 +2198,10 @@ fn finish_real_mutation(
         &repo_root,
         "views",
         &state.resolved_view_id,
-        &format!("{}\n", resolved_view_record_json(&state.resolved_view())),
+        &format!(
+            "{}\n",
+            resolved_view_record_json(&real_resolved_view(&state))
+        ),
     )?;
     if ctx.json {
         println!("{}", mutation_success_envelope(&response));
@@ -2378,107 +2214,12 @@ fn finish_real_mutation(
     Ok(())
 }
 
-fn scan_real_repo_files(
-    repo_root: &PathBuf,
-    current: &PathBuf,
-    entries: &mut Vec<RealArtifactEntry>,
-) -> Result<(), CliError> {
-    let children = fs::read_dir(current).map_err(|error| {
-        invalid_request(format!("failed to scan repository worktree: {error}"))
-            .with_detail("path", current.display().to_string())
-    })?;
-    for child in children {
-        let child = child.map_err(|error| {
-            invalid_request(format!("failed to scan repository worktree: {error}"))
-        })?;
-        let path = child.path();
-        let name = child.file_name();
-        if matches!(name.to_str(), Some(".git" | ".sunlight")) {
-            continue;
-        }
-        let metadata = child.metadata().map_err(|error| {
-            invalid_request(format!("failed to inspect worktree path: {error}"))
-                .with_detail("path", path.display().to_string())
-        })?;
-        if metadata.is_dir() {
-            scan_real_repo_files(repo_root, &path, entries)?;
-        } else if metadata.is_file() {
-            let bytes = fs::read(&path).map_err(|error| {
-                invalid_request(format!("failed to read worktree file: {error}"))
-                    .with_detail("path", path.display().to_string())
-            })?;
-            let relative = path
-                .strip_prefix(repo_root)
-                .map_err(|_| invalid_request("failed to normalize worktree path"))?
-                .to_string_lossy()
-                .replace('\\', "/");
-            entries.push(RealArtifactEntry {
-                artifact_id: real_artifact_id_for_path(&relative),
-                path: relative,
-                content_hash: real_content_hash(&bytes),
-                executable: is_executable(&metadata),
-                classification: "source".to_string(),
-                tombstone: false,
-                bytes,
-            });
-        }
-    }
-    Ok(())
-}
-
-fn real_state_path(repo_root: &PathBuf) -> PathBuf {
-    repo_root
-        .join(".sunlight")
-        .join("records")
-        .join("native-state.tsv")
-}
-
-fn real_blob_path(repo_root: &PathBuf, content_hash: &str) -> PathBuf {
-    repo_root
-        .join(".sunlight")
-        .join("objects")
-        .join("blobs")
-        .join("sha256")
-        .join(content_hash.trim_start_matches("sha256:"))
-}
-
-fn read_real_blob(repo_root: &PathBuf, content_hash: &str) -> Result<Vec<u8>, CliError> {
-    let path = real_blob_path(repo_root, content_hash);
-    fs::read(&path).map_err(|error| {
-        invalid_request(format!("failed to read content blob: {error}"))
-            .with_detail("path", path.display().to_string())
-    })
-}
-
-fn real_content_hash(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
-}
-
-fn real_tree_hash(entries: &[RealArtifactEntry]) -> String {
-    let mut hasher = Sha256::new();
-    for entry in entries.iter().filter(|entry| !entry.tombstone) {
-        hasher.update(entry.path.as_bytes());
-        hasher.update([0]);
-        hasher.update(entry.content_hash.as_bytes());
-        hasher.update([u8::from(entry.executable)]);
-    }
-    format!("tree_{:x}", hasher.finalize())
-}
-
-fn real_artifact_id_for_path(path: &str) -> String {
-    format!("artifact_{}", path.replace(['/', '.', '-'], "_"))
-}
-
 fn real_now_id() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
     format!("unix_ms_{millis}")
-}
-
-fn non_empty_string(value: &str) -> Option<String> {
-    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn real_artifact_view(entry: &RealArtifactEntry) -> SessionVisibleArtifactView {
@@ -2502,7 +2243,10 @@ fn real_entry_index(state: &RealRepoState, path: &str) -> Result<usize, CliError
         .ok_or_else(|| {
             CliError::new("path_not_found", format!("path `{path}` was not found"))
                 .with_detail("path", path)
-                .with_detail("session_generation_id", state.view().session_generation_id)
+                .with_detail(
+                    "session_generation_id",
+                    real_view(&state).session_generation_id,
+                )
         })
 }
 
@@ -2520,7 +2264,10 @@ fn real_precondition_error(
     .with_detail("artifact_id", entry.artifact_id.clone())
     .with_detail("expected", expected)
     .with_detail("actual", entry.content_hash.clone())
-    .with_detail("session_generation_id", state.view().session_generation_id)
+    .with_detail(
+        "session_generation_id",
+        real_view(&state).session_generation_id,
+    )
     .with_detail("resolved_view_id", state.resolved_view_id.clone())
 }
 
@@ -2573,56 +2320,6 @@ fn real_mutation_ref(
     }
 }
 
-fn materialize_real_files(state: &RealRepoState, root: &PathBuf) -> Result<(), CliError> {
-    if root.exists()
-        && fs::read_dir(root)
-            .map_err(|error| invalid_request(error.to_string()))?
-            .next()
-            .is_some()
-    {
-        return Err(CliError::new(
-            "projection_materialization_projection_root_unavailable",
-            "projection root must be an empty directory or a creatable path",
-        ));
-    }
-    fs::create_dir_all(root)
-        .map_err(|error| invalid_request(format!("failed to create projection root: {error}")))?;
-    for entry in state.entries.iter().filter(|entry| !entry.tombstone) {
-        let path = root.join(&entry.path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                invalid_request(format!("failed to create projection directory: {error}"))
-            })?;
-        }
-        fs::write(&path, &entry.bytes).map_err(|error| {
-            invalid_request(format!("failed to write projection file: {error}"))
-        })?;
-    }
-    Ok(())
-}
-
-fn write_real_files_overwrite(state: &RealRepoState, root: &PathBuf) -> Result<(), CliError> {
-    for entry in state.entries.iter().filter(|entry| entry.tombstone) {
-        let path = root.join(&entry.path);
-        if path.is_file() {
-            fs::remove_file(&path).map_err(|error| {
-                invalid_request(format!("failed to remove tombstoned export file: {error}"))
-            })?;
-        }
-    }
-    for entry in state.entries.iter().filter(|entry| !entry.tombstone) {
-        let path = root.join(&entry.path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                invalid_request(format!("failed to create export directory: {error}"))
-            })?;
-        }
-        fs::write(&path, &entry.bytes)
-            .map_err(|error| invalid_request(format!("failed to write export file: {error}")))?;
-    }
-    Ok(())
-}
-
 fn real_checkpoint(state: &RealRepoState) -> CheckpointRecord {
     CheckpointRecord {
         id: format!(
@@ -2668,17 +2365,6 @@ fn real_checkpoint(state: &RealRepoState) -> CheckpointRecord {
     }
 }
 
-#[cfg(unix)]
-fn is_executable(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    metadata.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_metadata: &fs::Metadata) -> bool {
-    false
-}
-
 fn media_type_for_path(path: &str) -> &'static str {
     if path.ends_with(".md") {
         "text/markdown; charset=utf-8"
@@ -2713,13 +2399,13 @@ fn real_session_start_success_envelope(state: &RealRepoState) -> String {
         json_escape(state.topic_id.as_deref().unwrap_or("")),
         json_escape(state.session_id.as_deref().unwrap_or("")),
         json_escape(&state.resolved_view_id),
-        json_escape(&state.view().session_generation_id),
-        view_json(&state.view()),
+        json_escape(&real_view(&state).session_generation_id),
+        view_json(&real_view(&state)),
         json_escape(state.session_id.as_deref().unwrap_or("")),
         json_escape(state.actor_id.as_deref().unwrap_or("")),
         json_escape(state.topic_id.as_deref().unwrap_or("")),
         json_escape(&state.resolved_view_id),
-        json_escape(&state.view().session_generation_id),
+        json_escape(&real_view(&state).session_generation_id),
         phase1_capabilities_json(),
         json_escape(state.topic_id.as_deref().unwrap_or("")),
         optional_string_json(state.head_revision_id.as_deref()),
@@ -2786,14 +2472,14 @@ fn real_status_envelope(state: &RealRepoState, command: &str) -> String {
         optional_string_json(state.session_id.as_deref()),
         optional_string_json(state.topic_id.as_deref()),
         json_escape(&state.resolved_view_id),
-        view_json(&state.view()),
+        view_json(&real_view(&state)),
         state.entries.iter().filter(|entry| !entry.tombstone).count(),
         json_escape(&state.tree_hash),
         json_escape(&state.base_checkpoint_id),
         optional_string_json(state.topic_id.as_deref()),
         optional_string_json(state.head_revision_id.as_deref()),
         optional_string_json(state.session_id.as_deref()),
-        json_escape(&state.view().session_generation_id),
+        json_escape(&real_view(&state).session_generation_id),
     )
 }
 
@@ -2802,12 +2488,12 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
         .strip_prefix("artifact:")
         .or_else(|| selector.strip_prefix("path:"))
     {
-        let entry = state.entry(path)?;
+        let entry = real_entry(&state, path)?;
         return Ok(format!(
             "{{\"ok\":true,\"data\":{{\"command\":\"inspect.artifact\",\"repository_id\":\"{}\",\"ids\":{{\"artifact_id\":\"{}\"}},\"view\":{},\"artifact\":{}}},\"warnings\":[]}}",
             json_escape(&state.repository_id),
             json_escape(&entry.artifact_id),
-            view_json(&state.view()),
+            view_json(&real_view(&state)),
             artifact_json(&real_artifact_view(entry)),
         ));
     }
@@ -2820,7 +2506,7 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
         }
     }
     if let Some(session) = selector.strip_prefix("session:") {
-        state.ensure_session(session)?;
+        real_ensure_session(&state, session)?;
         return Ok(real_status_envelope(state, "inspect.session"));
     }
     if let Some(view) = selector.strip_prefix("view:") {
@@ -2828,8 +2514,8 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
             return Ok(format!("{{\"ok\":true,\"data\":{{\"command\":\"inspect.view\",\"repository_id\":\"{}\",\"ids\":{{\"resolved_view_id\":\"{}\"}},\"view\":{},\"resolved_view\":{}}},\"warnings\":[]}}",
                 json_escape(&state.repository_id),
                 json_escape(view),
-                view_json(&state.view()),
-                resolved_view_record_json(&state.resolved_view()),
+                view_json(&real_view(&state)),
+                resolved_view_record_json(&real_resolved_view(&state)),
             ));
         }
     }

@@ -7,6 +7,7 @@ pub mod identity;
 pub mod policy;
 pub mod projection;
 pub mod records;
+pub mod repo_state;
 pub mod repository;
 pub mod resolver;
 pub mod topics;

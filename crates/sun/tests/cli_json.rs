@@ -81,10 +81,11 @@ fn no_fixture_real_repo_artifact_io_vertical_slice() {
         .output()
         .expect("sun init should run");
     assert_success(&init);
-    assert!(repo
-        .path()
-        .join(".sunlight/records/native-state.tsv")
-        .is_file());
+    let native_state = repo.path().join(".sunlight/records/native-state.json");
+    assert!(native_state.is_file());
+    let native_state_json = fs::read_to_string(native_state).unwrap();
+    assert!(native_state_json.contains("\"schema_version\":1"));
+    assert!(native_state_json.contains("\"record_type\":\"repo_state\""));
 
     let topic = sun()
         .arg("topic")
@@ -128,6 +129,68 @@ fn no_fixture_real_repo_artifact_io_vertical_slice() {
     let read_stdout = stdout(&read);
     assert!(read_stdout.contains("pub fn answer()"));
     let before_hash = json_string_field(&read_stdout, "content_hash");
+
+    let list = sun()
+        .arg("list")
+        .arg("src")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun list should run");
+    assert_success(&list);
+    assert!(stdout(&list).contains("\"path\":\"src/lib.rs\""));
+
+    let readme = sun()
+        .arg("read")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun read README should run");
+    assert_success(&readme);
+    let readme_hash = json_string_field(&stdout(&readme), "content_hash");
+    let readme_patch = repo.write_file(
+        "readme.patch",
+        "--- a/README.md\n+++ b/README.md\n@@\n-needle\n+needle patched\n",
+    );
+    let patch = sun()
+        .arg("patch")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--expect-hash")
+        .arg(&readme_hash)
+        .arg("--patch-file")
+        .arg(&readme_patch)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun patch should run");
+    assert_success(&patch);
+    assert!(stdout(&patch).contains("\"command\":\"artifact.patch\""));
+    let patched_readme_hash = json_string_field(&stdout(&patch), "after_hash");
+
+    let metadata = sun()
+        .arg("metadata")
+        .arg("set")
+        .arg("README.md")
+        .arg("--classification")
+        .arg("generated")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--expect-hash")
+        .arg(&patched_readme_hash)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun metadata set should run");
+    assert_success(&metadata);
+    assert!(stdout(&metadata).contains("\"command\":\"artifact.metadata_set\""));
+    assert!(stdout(&metadata).contains("\"classification\":\"generated\""));
 
     let content = repo.write_file("new-lib.rs", "pub fn answer() -> u32 {\n    43\n}\n");
     let write = sun()
@@ -173,6 +236,41 @@ fn no_fixture_real_repo_artifact_io_vertical_slice() {
         .expect("sun search should run");
     assert_success(&search);
     assert!(stdout(&search).contains("\"path\":\"README.md\""));
+
+    let resolved = sun()
+        .arg("view")
+        .arg("resolve")
+        .arg("--base")
+        .arg("checkpoint_base_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun view resolve should run");
+    assert_success(&resolved);
+    assert!(stdout(&resolved).contains("\"command\":\"view.resolve\""));
+    assert!(stdout(&resolved).contains(&format!("\"resolved_view_id\":\"{resolved_view}\"")));
+
+    let status = sun()
+        .arg("status")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status should run");
+    assert_success(&status);
+    assert!(stdout(&status).contains("\"command\":\"status.session\""));
+
+    let inspect = sun()
+        .arg("inspect")
+        .arg("artifact:README.md")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect should run");
+    assert_success(&inspect);
+    assert!(stdout(&inspect).contains("\"command\":\"inspect.artifact\""));
+    assert!(stdout(&inspect).contains("\"classification\":\"generated\""));
 
     let projection_root = repo.path().join("projection");
     let materialize = sun()

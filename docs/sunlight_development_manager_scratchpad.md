@@ -55,13 +55,14 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | real-repo-artifact-io | WSL Codex CLI | `/home/timothycard/code/Sunlight-2` -> Windows commit `7bbda1a` | Completed | First no-fixture repo-backed authoring bridge. | Windows `cargo fmt --check`, no-fixture CLI tests, full `cargo test`, and `git diff --check` passed. |
 | repo-backed-core-storage | WSL Codex CLI | `/home/timothycard/code/Sunlight-2-core-storage-local` -> Windows commit `3b05cd7` | Completed | Move repo-backed state into `sunlight-core` and replace TSV with schema JSON. | Windows core repo-state tests, no-fixture CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
 | repo-backed-policy-ingest | WSL Codex CLI | `/home/timothycard/code/Sunlight-2-policy-ingest-local` -> Windows commit `f220730` | Completed | Respect Git ignore policy during repo-backed ingestion. | Windows core repo-state tests, ignore-policy no-fixture test, vertical-slice test, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
+| repo-backed-secret-gates | WSL Codex CLI | `/home/timothycard/code/Sunlight-2-secret-gates-local` -> Windows commit `6d92afd` | Completed | Quarantine likely secrets during ingestion and block secret/local-only checkpoint/export. | Windows core repo-state tests, no-fixture tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
 
 ## Delegation Queue
 
-1. Add repo-backed secret detection/classification and export gates; Git ignore support is present but secret handling is not done.
-2. Expand repo-backed state beyond the single active topic/session path.
-3. Expand repo-backed resolver behavior beyond the single active topic/session path.
-4. Make projection, checkpoint, and Git export consume hardened real Sunlight records end-to-end with policy validation.
+1. Expand repo-backed state beyond the single active topic/session path.
+2. Expand repo-backed resolver behavior beyond the single active topic/session path.
+3. Make projection, checkpoint, and Git export consume hardened real Sunlight records end-to-end with policy validation.
+4. Add execution/output-promotion support against repo-backed views rather than fixture-only records.
 5. Keep fixture tests only when they directly support removing fixture dependency.
 
 ## Heartbeat Procedure

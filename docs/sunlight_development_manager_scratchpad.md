@@ -32,8 +32,8 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - Management lane changed on 2026-07-06: work directly in the Windows checkout at `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2`.
 - Older WSL clone rows below are historical checkpoints only; do not treat them as the active work lane.
 - Critical handoff correction: previous fixture-backed acceptance is not product completion.
-- Current implementation reality: fixture prototype plus a growing repo-backed authoring path with durable multi-topic/session state, deterministic conflict reporting, persisted projection/checkpoint/export snapshots, and repo-backed execution/output promotion records; still not the full v0.3 product.
-- Main product gap: complete the no-fixture flow across compatibility import, broader policy validation, operator ergonomics, and production-like acceptance.
+- Current implementation reality: fixture prototype plus a growing repo-backed authoring path with durable multi-topic/session state, deterministic conflict reporting, persisted projection/checkpoint/export snapshots, execution/output promotion, and single-candidate compatibility import from managed projections; still not the full v0.3 product.
+- Main product gap: complete multi-file compatibility transactions and rename handling, then broader policy validation, operator ergonomics, and production-like acceptance.
 
 ## Workstreams
 
@@ -59,11 +59,12 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | repo-backed-resolver | WSL Codex CLI | `/home/timothycard/code/Sunlight-2-resolver-local` -> Windows commit `16b8699` | Completed | Resolve persisted topic heads deterministically, materialize merged views, and report inspectable same-artifact conflicts. | Windows core repo-state tests, no-fixture CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
 | repo-backed-projection-export | WSL Codex CLI | `/home/timothycard/code/Sunlight-2-projection-export-local` -> Windows commit `8041db3` | Completed | Persist projection/checkpoint/export snapshots and export checkpoint bytes after head moves. | Windows core repo-state tests, no-fixture CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
 | repo-backed-execution-output | WSL Codex CLI + manager review fix | `/home/timothycard/code/Sunlight-2-execution-output-local` -> Windows commit `8f9a377` | Completed | Persist repo-backed execution records and promote execution outputs into native topic operations. | Windows no-fixture CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
-| repo-backed-compat-import | Windows Codex CLI `0.144.1` cell `16` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active 2026-07-10 | Implement no-fixture compatibility project/diff/import from real projections into native operations. | Review agent output and working-tree diff; then run targeted no-fixture tests, full `cargo test`, `cargo fmt --check`, and `git diff --check`. |
+| repo-backed-compat-import | Windows Codex CLI `0.144.1` | Windows commit `7de1357` | Completed | Implement no-fixture compatibility project/diff/import from real projections into native operations. | Focused core/state/CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed; modified/new/deleted single-candidate imports reach materialization and Git export. |
+| repo-backed-compat-atomic-multifile | Windows Codex CLI cell `10` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active 2026-07-10 | Import repeated safe compatibility candidates as one durable multi-effect transaction with atomic rejection. | At next heartbeat review output/schema/resolver changes; run focused no-fixture tests, full `cargo test`, formatting, and diff checks. |
 
 ## Delegation Queue
 
-1. Add compatibility import from real projections back into repo-backed Sunlight operations.
+1. Complete atomic multi-file compatibility import, then add unambiguous rename preservation.
 2. Broaden no-fixture policy validation for commit/export/projection/execution records against `.sunlight` policy.
 3. Add a production-like validation repository once Sunlight can run against itself.
 4. Improve operator ergonomics/status for no-fixture workflows.

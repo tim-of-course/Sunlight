@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sunlight_core::records::parse_json_record;
+
 fn sun() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sun"))
 }
@@ -1786,6 +1788,292 @@ fn no_fixture_delete_is_removed_from_local_git_export() {
         !missing.status.success(),
         "remove.txt should be absent from exported commit"
     );
+}
+
+#[test]
+fn no_fixture_compat_project_diff_import_flows_into_native_consumers() {
+    let repo = TestRepo::new("real-compat-vertical");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    write_nested_file(
+        repo.path(),
+        "src/lib.rs",
+        "pub fn answer() -> u32 {\n    42\n}\n",
+    );
+    repo.write_file("README.md", "# Compatibility baseline\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+    start_native_session(&repo, "compat-real");
+
+    let (modified_projection, modified_root, modified_generation) =
+        create_real_compat_projection(&repo);
+    fs::write(
+        modified_root.join("src/lib.rs"),
+        b"pub fn answer() -> u32 {\n    43\n}\n",
+    )
+    .unwrap();
+    repo.write_file("main-worktree-only.txt", "not compatibility truth\n");
+    let modified_diff = real_compat_diff(&repo, &modified_projection);
+    assert!(modified_diff.contains("\"kind\":\"modified_source\""));
+    assert!(!modified_diff.contains("main-worktree-only.txt"));
+    let projection_status = sun()
+        .arg("status")
+        .arg("--projection")
+        .arg(&modified_projection)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status projection should run");
+    assert_success(&projection_status);
+    assert!(stdout(&projection_status).contains("\"lifecycle_state\":\"dirty\""));
+    assert!(stdout(&projection_status).contains("\"dirty_candidate_summary\""));
+    let projection_inspect = sun()
+        .arg("inspect")
+        .arg(format!("projection:{modified_projection}"))
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect projection should run");
+    assert_success(&projection_inspect);
+    assert!(stdout(&projection_inspect).contains("\"manifest_digest\":\"sha256:"));
+    let modified_candidate = candidate_id_for_path(&modified_diff, "src/lib.rs");
+    let modified_import = real_compat_import(
+        &repo,
+        &modified_projection,
+        &modified_candidate,
+        Some(&modified_generation),
+    );
+    assert_success(&modified_import);
+    let modified_stdout = stdout(&modified_import);
+    assert!(modified_stdout.contains("\"command\":\"compat.import\""));
+    assert!(modified_stdout.contains("\"kind\":\"compat_import\""));
+    let modified_operation = json_string_field(&modified_stdout, "operation_transaction_id");
+    let modified_artifact = json_string_field(&modified_stdout, "artifact_id");
+    let modified_view = json_string_field(&modified_stdout, "resolved_view_id");
+
+    let read = sun()
+        .arg("read")
+        .arg("src/lib.rs")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun read should run");
+    assert_success(&read);
+    assert!(stdout(&read).contains("43"));
+    let search = sun()
+        .arg("search")
+        .arg("43")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun search should run");
+    assert_success(&search);
+    assert!(stdout(&search).contains("\"path\":\"src/lib.rs\""));
+
+    let inspect_operation = sun()
+        .arg("inspect")
+        .arg(format!("compat-import:{modified_operation}"))
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect compat import should run");
+    assert_success(&inspect_operation);
+    assert!(stdout(&inspect_operation).contains("\"command\":\"inspect.compat-import\""));
+    assert!(stdout(&inspect_operation).contains(&modified_projection));
+    let status_import = sun()
+        .arg("status")
+        .arg("--compat-import")
+        .arg(&modified_operation)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status compat import should run");
+    assert_success(&status_import);
+    assert!(stdout(&status_import).contains("\"command\":\"status.compat-import\""));
+    let inspect_artifact = sun()
+        .arg("inspect")
+        .arg(format!("artifact:{modified_artifact}"))
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect imported artifact should run");
+    assert_success(&inspect_artifact);
+    assert!(stdout(&inspect_artifact).contains("\"compat_import_provenance\":{"));
+
+    let (new_projection, new_root, _) = create_real_compat_projection(&repo);
+    write_nested_file(
+        &new_root,
+        "src/added.rs",
+        "pub fn added() -> bool { true }\n",
+    );
+    let new_diff = real_compat_diff(&repo, &new_projection);
+    let new_candidate = candidate_id_for_path(&new_diff, "src/added.rs");
+    let new_import = real_compat_import(&repo, &new_projection, &new_candidate, None);
+    assert_success(&new_import);
+    assert!(stdout(&new_import).contains("\"operation_kind\":\"write\""));
+
+    let (delete_projection, delete_root, _) = create_real_compat_projection(&repo);
+    fs::remove_file(delete_root.join("README.md")).unwrap();
+    let delete_diff = real_compat_diff(&repo, &delete_projection);
+    let delete_candidate = candidate_id_for_path(&delete_diff, "README.md");
+    let delete_import = real_compat_import(&repo, &delete_projection, &delete_candidate, None);
+    assert_success(&delete_import);
+    let delete_stdout = stdout(&delete_import);
+    assert!(delete_stdout.contains("\"operation_kind\":\"delete\""));
+    let final_view = json_string_field(&delete_stdout, "resolved_view_id");
+    assert_ne!(modified_view, final_view);
+
+    let status = sun()
+        .arg("status")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status session should run");
+    assert_success(&status);
+    assert!(stdout(&status).contains("\"compatibility_projections\":["));
+    assert!(stdout(&status).contains("\"last_import_operation_id\":\""));
+
+    let materialized = repo.path().join("compat-result");
+    let project = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg(&final_view)
+        .arg("--purpose")
+        .arg("inspection")
+        .arg("--projection-root")
+        .arg(&materialized)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&project);
+    assert!(fs::read_to_string(materialized.join("src/lib.rs"))
+        .unwrap()
+        .contains("43"));
+    assert!(materialized.join("src/added.rs").is_file());
+    assert!(!materialized.join("README.md").exists());
+
+    let checkpoint = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg(&final_view)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun checkpoint create should run");
+    assert_success(&checkpoint);
+    let checkpoint_id = json_string_field(&stdout(&checkpoint), "checkpoint_id");
+    let export = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg(&checkpoint_id)
+        .arg("--branch")
+        .arg("sunlight/compat-real")
+        .arg("--execute-local")
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun git export should run");
+    assert_success(&export);
+    assert!(git(repo.path(), &["show", "sunlight/compat-real:src/lib.rs"]).contains("43"));
+    assert!(git(repo.path(), &["show", "sunlight/compat-real:src/added.rs"]).contains("added"));
+    let missing_readme = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["cat-file", "-e", "sunlight/compat-real:README.md"])
+        .output()
+        .unwrap();
+    assert!(!missing_readme.status.success());
+}
+
+#[test]
+fn no_fixture_compat_import_rejects_secret_and_stale_generation_without_partial_state() {
+    let repo = TestRepo::new("real-compat-atomic");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    repo.write_file("README.md", "baseline\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+    start_native_session(&repo, "compat-atomic");
+
+    let (projection, root, generation) = create_real_compat_projection(&repo);
+    fs::write(root.join("README.md"), b"safe projection edit\n").unwrap();
+    fs::write(root.join(".env"), b"API_KEY=projection-secret\n").unwrap();
+    let diff = real_compat_diff(&repo, &projection);
+    let safe_candidate = candidate_id_for_path(&diff, "README.md");
+    let secret_candidate = candidate_id_for_path(&diff, ".env");
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let before_blocked = fs::read(&state_path).unwrap();
+    let blocked = sun()
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg(&projection)
+        .arg("--candidate")
+        .arg(&safe_candidate)
+        .arg("--candidate")
+        .arg(&secret_candidate)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("blocked sun compat import should run");
+    assert_failure(&blocked);
+    assert!(stdout(&blocked).contains("\"code\":\"compat_secret_detected\""));
+    assert_eq!(before_blocked, fs::read(&state_path).unwrap());
+    assert!(!fs::read_to_string(&state_path)
+        .unwrap()
+        .contains("projection-secret"));
+
+    let read = sun()
+        .arg("read")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun read should run");
+    assert_success(&read);
+    let hash = json_string_field(&stdout(&read), "content_hash");
+    let native_content = repo.write_file("native-content.txt", "native advance\n");
+    let advance = sun()
+        .arg("write")
+        .arg("README.md")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--expect-hash")
+        .arg(&hash)
+        .arg("--content-file")
+        .arg(native_content)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun write should run");
+    assert_success(&advance);
+    let before_stale = fs::read(&state_path).unwrap();
+    let stale = real_compat_import(&repo, &projection, &safe_candidate, Some(&generation));
+    assert_failure(&stale);
+    assert!(stdout(&stale).contains("\"code\":\"compat_precondition_failed\""));
+    assert_eq!(before_stale, fs::read(&state_path).unwrap());
 }
 
 #[test]
@@ -8668,6 +8956,95 @@ fn start_native_session(repo: &TestRepo, slug: &str) {
         .output()
         .expect("sun session start should run");
     assert_success(&session);
+}
+
+fn create_real_compat_projection(repo: &TestRepo) -> (String, PathBuf, String) {
+    let output = sun()
+        .arg("compat")
+        .arg("project")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat project should run");
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert_valid_json(&stdout);
+    let projection_id = json_string_field(&stdout, "projection_id");
+    let generation = json_string_field(&stdout, "session_generation_id");
+    let root = repo
+        .path()
+        .join(".sunlight")
+        .join("projections")
+        .join("compat")
+        .join(&projection_id)
+        .join("root");
+    assert!(root.is_dir());
+    (projection_id, root, generation)
+}
+
+fn real_compat_diff(repo: &TestRepo, projection_id: &str) -> String {
+    let output = sun()
+        .arg("compat")
+        .arg("diff")
+        .arg("--projection")
+        .arg(projection_id)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat diff should run");
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert_valid_json(&stdout);
+    stdout
+}
+
+fn real_compat_import(
+    repo: &TestRepo,
+    projection_id: &str,
+    candidate_id: &str,
+    session_generation_id: Option<&str>,
+) -> Output {
+    let mut command = sun();
+    command
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg(projection_id)
+        .arg("--candidate")
+        .arg(candidate_id);
+    if let Some(generation) = session_generation_id {
+        command.arg("--session-generation").arg(generation);
+    }
+    let output = command
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat import should run");
+    assert_valid_json(&stdout(&output));
+    output
+}
+
+fn candidate_id_for_path(diff_json: &str, path: &str) -> String {
+    let path_marker = format!("\"path\":\"{}\"", path.replace('\\', "\\\\"));
+    let path_index = diff_json
+        .find(&path_marker)
+        .unwrap_or_else(|| panic!("candidate path missing: {path}"));
+    let prefix = &diff_json[..path_index];
+    let id_marker = "\"candidate_delta_id\":\"";
+    let id_start = prefix
+        .rfind(id_marker)
+        .unwrap_or_else(|| panic!("candidate id missing before path: {path}"))
+        + id_marker.len();
+    let remainder = &diff_json[id_start..];
+    remainder[..remainder.find('"').expect("candidate id closing quote")].to_string()
+}
+
+fn assert_valid_json(value: &str) {
+    parse_json_record(value.as_bytes()).unwrap_or_else(|error| {
+        panic!("expected valid JSON, got {error}: {value}");
+    });
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {

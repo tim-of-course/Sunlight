@@ -1,12 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use crate::artifacts::{
     ArtifactIoError, ExpectedHash, MutationArtifactRef, MutationKind, MutationPreconditions,
     MutationRefs, PathPolicy, WriteSetEntry, FILE_OPERATION_SEMANTICS_VERSION, FIXTURE_ACTOR_ID,
-    FIXTURE_SESSION_ID, FIXTURE_WRITE_TOPIC_ID,
+    FIXTURE_SESSION_ID, FIXTURE_WRITE_TOPIC_ID, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
 };
 use crate::projection::{ProjectionPurpose, ProjectionRecord};
 use crate::records::PrivacyClass;
+use crate::repo_state::{
+    detect_secret_reasons, real_content_hash, RealArtifactEntry, RealProjectionSnapshot,
+};
 use crate::resolver::{ResolvedViewResult, SingleRepoTree};
 
 pub const FIXTURE_COMPAT_IMPORT_OPERATION_ID: &str = "op_compat_import_auth_0001";
@@ -16,6 +23,600 @@ pub const FIXTURE_COMPAT_IMPORT_RESOLVED_VIEW_ID: &str = "view_agent_a_after_com
 pub const FIXTURE_COMPAT_IMPORT_TREE_HASH: &str = "tree_after_compat_import_0001";
 pub const FIXTURE_COMPAT_IMPORT_CONTEXT_ID: &str = "ctx_compat_projection_0001";
 pub const FIXTURE_COMPAT_BASELINE_MANIFEST_DIGEST: &str = "sha256:compat_baseline";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealCompatDiff {
+    pub candidates: Vec<CompatCandidateDelta>,
+    pub after_bytes: BTreeMap<String, Vec<u8>>,
+}
+
+pub fn real_compat_baseline_manifest_digest(
+    repository_id: &str,
+    projection_id: &str,
+    session_id: &str,
+    session_generation_id: &str,
+    resolved_view_id: &str,
+    tree_hash: &str,
+    entries: &[RealArtifactEntry],
+) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        repository_id,
+        projection_id,
+        session_id,
+        session_generation_id,
+        resolved_view_id,
+        tree_hash,
+        POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
+        FILE_OPERATION_SEMANTICS_VERSION,
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    let mut entries = entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    for entry in entries {
+        hasher.update(entry.path.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.artifact_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.content_hash.as_bytes());
+        hasher.update([u8::from(entry.executable)]);
+        hasher.update(entry.classification.as_bytes());
+        hasher.update([0]);
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+pub fn diff_real_compat_projection(
+    repo_root: &Path,
+    projection: &RealProjectionSnapshot,
+) -> Result<RealCompatDiff, CompatImportValidationError> {
+    let session_id = projection.session_id.as_deref().unwrap_or("");
+    if projection.purpose != ProjectionPurpose::Compatibility.as_str() {
+        return Err(real_error(
+            CompatImportErrorCode::ProjectionInvalid,
+            projection,
+            Vec::new(),
+            "projection purpose must be compatibility",
+        ));
+    }
+    let Some(root_value) = projection.materialized_root.as_deref() else {
+        return Err(real_error(
+            CompatImportErrorCode::ProjectionInvalid,
+            projection,
+            Vec::new(),
+            "compatibility projection has no persisted materialized root",
+        ));
+    };
+    if session_id.is_empty() || projection.session_generation_id.is_none() {
+        return Err(real_error(
+            CompatImportErrorCode::ProjectionInvalid,
+            projection,
+            Vec::new(),
+            "compatibility projection is not bound to a session generation",
+        ));
+    }
+
+    let root = resolve_projection_root(repo_root, root_value);
+    let managed_root = repo_root.join(".sunlight").join("projections");
+    if fs::symlink_metadata(&root)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(real_error(
+            CompatImportErrorCode::ProjectionInvalid,
+            projection,
+            Vec::new(),
+            "compatibility projection root cannot be a symlink",
+        ));
+    }
+    let canonical_root = fs::canonicalize(&root).map_err(|_| {
+        real_error(
+            CompatImportErrorCode::ProjectionNotFound,
+            projection,
+            Vec::new(),
+            "compatibility projection root was not found",
+        )
+    })?;
+    let canonical_managed = fs::canonicalize(&managed_root).map_err(|_| {
+        real_error(
+            CompatImportErrorCode::ProjectionInvalid,
+            projection,
+            Vec::new(),
+            "managed projection root was not found",
+        )
+    })?;
+    if !canonical_root.starts_with(&canonical_managed) {
+        return Err(real_error(
+            CompatImportErrorCode::ProjectionInvalid,
+            projection,
+            Vec::new(),
+            "compatibility projection root is outside the managed projection root",
+        ));
+    }
+
+    let expected_manifest = real_compat_baseline_manifest_digest(
+        &projection.repository_id,
+        &projection.projection_id,
+        session_id,
+        projection.session_generation_id.as_deref().unwrap_or(""),
+        &projection.resolved_view_id,
+        &projection.tree_hash,
+        &projection.entries,
+    );
+    if projection.manifest_digest != expected_manifest {
+        return Err(real_error(
+            CompatImportErrorCode::ProjectionStale,
+            projection,
+            Vec::new(),
+            "compatibility projection baseline manifest no longer matches persisted metadata",
+        ));
+    }
+
+    let mut scanned = BTreeMap::new();
+    scan_projection_files(&canonical_root, &canonical_root, &mut scanned).map_err(|message| {
+        real_error(
+            CompatImportErrorCode::DiffFailed,
+            projection,
+            Vec::new(),
+            message,
+        )
+    })?;
+    let baseline = projection
+        .entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut candidates = Vec::new();
+    let mut after_bytes = BTreeMap::new();
+
+    for (path, entry) in &baseline {
+        match scanned.remove(*path) {
+            None => candidates.push(real_candidate(
+                projection,
+                CompatCandidateKind::DeletedSource,
+                CompatFileOperationKind::Delete,
+                Some(entry.artifact_id.clone()),
+                (*path).to_string(),
+                Some(entry.content_hash.clone()),
+                None,
+                entry.bytes.len() as u64,
+                entry.executable,
+                entry.classification.clone(),
+                PrivacyClass::PolicyGated,
+                CompatPathPolicyResult {
+                    allowed: true,
+                    normalized_path: Some((*path).to_string()),
+                    reason: None,
+                },
+                None,
+            )),
+            Some(file) if file.blocked_reason.is_some() => {
+                candidates.push(blocked_candidate(projection, *path, file));
+            }
+            Some(file) => {
+                let after_hash = real_content_hash(&file.bytes);
+                if after_hash != entry.content_hash || file.executable != entry.executable {
+                    let (kind, classification, privacy, quarantine, policy) =
+                        classify_projection_path(projection, path, &file.bytes);
+                    let operation_kind = if after_hash == entry.content_hash {
+                        CompatFileOperationKind::Metadata
+                    } else {
+                        CompatFileOperationKind::Patch
+                    };
+                    let candidate_kind = if operation_kind == CompatFileOperationKind::Metadata {
+                        CompatCandidateKind::MetadataChanged
+                    } else if kind == CompatCandidateKind::CreatedSource {
+                        CompatCandidateKind::ModifiedSource
+                    } else {
+                        kind
+                    };
+                    let candidate = real_candidate(
+                        projection,
+                        candidate_kind,
+                        operation_kind,
+                        Some(entry.artifact_id.clone()),
+                        (*path).to_string(),
+                        Some(entry.content_hash.clone()),
+                        Some(after_hash),
+                        file.bytes.len() as u64,
+                        file.executable,
+                        classification,
+                        privacy,
+                        policy,
+                        quarantine,
+                    );
+                    after_bytes.insert(candidate.candidate_delta_id.clone(), file.bytes);
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+
+    for (path, file) in scanned {
+        if file.blocked_reason.is_some() {
+            candidates.push(blocked_candidate(projection, &path, file));
+            continue;
+        }
+        let after_hash = real_content_hash(&file.bytes);
+        let (kind, classification, privacy, quarantine, policy) =
+            classify_projection_path(projection, &path, &file.bytes);
+        let candidate = real_candidate(
+            projection,
+            kind,
+            CompatFileOperationKind::Write,
+            None,
+            path,
+            None,
+            Some(after_hash),
+            file.bytes.len() as u64,
+            file.executable,
+            classification,
+            privacy,
+            policy,
+            quarantine,
+        );
+        after_bytes.insert(candidate.candidate_delta_id.clone(), file.bytes);
+        candidates.push(candidate);
+    }
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(RealCompatDiff {
+        candidates,
+        after_bytes,
+    })
+}
+
+pub fn validate_real_compat_selection(
+    projection: &RealProjectionSnapshot,
+    selected_candidate_delta_ids: &[String],
+    diff: &RealCompatDiff,
+) -> Result<Vec<CompatCandidateDelta>, CompatImportValidationError> {
+    if selected_candidate_delta_ids.is_empty() {
+        return Err(real_error(
+            CompatImportErrorCode::NoSelectedChanges,
+            projection,
+            Vec::new(),
+            "no candidate deltas were selected",
+        ));
+    }
+    let by_id = diff
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.candidate_delta_id.as_str(), candidate))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected = Vec::new();
+    let mut missing = Vec::new();
+    let mut seen = BTreeSet::new();
+    for id in selected_candidate_delta_ids {
+        if !seen.insert(id.as_str()) {
+            continue;
+        }
+        if let Some(candidate) = by_id.get(id.as_str()) {
+            selected.push((*candidate).clone());
+        } else {
+            missing.push(id.clone());
+        }
+    }
+    if !missing.is_empty() {
+        return Err(real_error(
+            CompatImportErrorCode::DiffFailed,
+            projection,
+            missing,
+            "selected compatibility candidate was not present in the current projection diff",
+        ));
+    }
+    for candidate in &selected {
+        let ids = vec![candidate.candidate_delta_id.clone()];
+        if !candidate.path_policy_result.allowed
+            || candidate.kind == CompatCandidateKind::PathPolicyBlocked
+        {
+            return Err(real_error(
+                CompatImportErrorCode::PathPolicyFailed,
+                projection,
+                ids,
+                "selected compatibility candidate violates path policy",
+            ));
+        }
+        match candidate.kind {
+            CompatCandidateKind::SecretLike => {
+                return Err(real_error(
+                    CompatImportErrorCode::SecretDetected,
+                    projection,
+                    ids,
+                    "selected compatibility candidate contains secret-like bytes",
+                ));
+            }
+            CompatCandidateKind::CacheOrBuildOutput | CompatCandidateKind::IgnoredPath => {
+                return Err(real_error(
+                    CompatImportErrorCode::CacheBlocked,
+                    projection,
+                    ids,
+                    "selected compatibility candidate is cache, build, or editor output",
+                ));
+            }
+            CompatCandidateKind::GeneratedSource | CompatCandidateKind::BinaryOrLarge => {
+                return Err(real_error(
+                    CompatImportErrorCode::PolicyFailed,
+                    projection,
+                    ids,
+                    "selected compatibility candidate requires an explicit policy conversion",
+                ));
+            }
+            CompatCandidateKind::ConflictedDelta => {
+                return Err(real_error(
+                    CompatImportErrorCode::ConflictedDelta,
+                    projection,
+                    ids,
+                    "selected compatibility candidate is conflicted",
+                ));
+            }
+            _ => {}
+        }
+    }
+    if selected.len() != 1 {
+        return Err(real_error(
+            CompatImportErrorCode::PartialWriteBlocked,
+            projection,
+            selected_candidate_delta_ids.to_vec(),
+            "this compatibility slice imports exactly one selected source delta atomically",
+        ));
+    }
+    Ok(selected)
+}
+
+#[derive(Debug)]
+struct ScannedProjectionFile {
+    bytes: Vec<u8>,
+    executable: bool,
+    blocked_reason: Option<String>,
+}
+
+fn resolve_projection_root(repo_root: &Path, root: &str) -> PathBuf {
+    let root = PathBuf::from(root);
+    if root.is_absolute() {
+        root
+    } else {
+        repo_root.join(root)
+    }
+}
+
+fn scan_projection_files(
+    root: &Path,
+    current: &Path,
+    files: &mut BTreeMap<String, ScannedProjectionFile>,
+) -> Result<(), String> {
+    let children = fs::read_dir(current)
+        .map_err(|error| format!("failed to read compatibility projection: {error}"))?;
+    for child in children {
+        let child = child.map_err(|error| format!("failed to read compatibility path: {error}"))?;
+        let path = child.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| "compatibility path escaped projection root".to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("failed to inspect compatibility path: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            files.insert(
+                relative,
+                ScannedProjectionFile {
+                    bytes: Vec::new(),
+                    executable: false,
+                    blocked_reason: Some("symlink_not_allowed".to_string()),
+                },
+            );
+        } else if metadata.is_dir() {
+            scan_projection_files(root, &path, files)?;
+        } else if metadata.is_file() {
+            let bytes = fs::read(&path)
+                .map_err(|error| format!("failed to read compatibility file: {error}"))?;
+            files.insert(
+                relative,
+                ScannedProjectionFile {
+                    bytes,
+                    executable: false,
+                    blocked_reason: None,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn classify_projection_path(
+    projection: &RealProjectionSnapshot,
+    path: &str,
+    bytes: &[u8],
+) -> (
+    CompatCandidateKind,
+    String,
+    PrivacyClass,
+    Option<String>,
+    CompatPathPolicyResult,
+) {
+    let normalized = path.replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
+    if let Err(ArtifactIoError::PathPolicyViolation { reason, .. }) =
+        PathPolicy::posix_case_sensitive().validate(&normalized)
+    {
+        return (
+            CompatCandidateKind::PathPolicyBlocked,
+            "policy".to_string(),
+            PrivacyClass::LocalOnly,
+            None,
+            CompatPathPolicyResult {
+                allowed: false,
+                normalized_path: None,
+                reason: Some(reason.as_str().to_string()),
+            },
+        );
+    }
+    let secret_reasons = detect_secret_reasons(&normalized, bytes);
+    if !secret_reasons.is_empty() {
+        return (
+            CompatCandidateKind::SecretLike,
+            "secret".to_string(),
+            PrivacyClass::Secret,
+            Some(format!(
+                "local://.sunlight/quarantine/compat/{}/{}",
+                projection.projection_id,
+                real_content_hash(normalized.as_bytes()).trim_start_matches("sha256:")
+            )),
+            allowed_path(&normalized),
+        );
+    }
+    let segments = lower.split('/').collect::<Vec<_>>();
+    if segments.iter().any(|segment| {
+        matches!(
+            *segment,
+            "target" | "dist" | "build" | "coverage" | "node_modules" | ".cache"
+        )
+    }) {
+        return (
+            CompatCandidateKind::CacheOrBuildOutput,
+            "cache".to_string(),
+            PrivacyClass::LocalOnly,
+            None,
+            allowed_path(&normalized),
+        );
+    }
+    let file_name = lower.rsplit('/').next().unwrap_or("");
+    if file_name.ends_with(".swp")
+        || file_name.ends_with('~')
+        || matches!(file_name, ".ds_store" | "thumbs.db")
+    {
+        return (
+            CompatCandidateKind::IgnoredPath,
+            "ignored".to_string(),
+            PrivacyClass::LocalOnly,
+            None,
+            allowed_path(&normalized),
+        );
+    }
+    (
+        if bytes.len() > 10 * 1024 * 1024 || bytes.iter().any(|byte| *byte == 0) {
+            CompatCandidateKind::BinaryOrLarge
+        } else {
+            CompatCandidateKind::CreatedSource
+        },
+        "source".to_string(),
+        PrivacyClass::PolicyGated,
+        None,
+        allowed_path(&normalized),
+    )
+}
+
+fn allowed_path(path: &str) -> CompatPathPolicyResult {
+    CompatPathPolicyResult {
+        allowed: true,
+        normalized_path: Some(path.to_string()),
+        reason: None,
+    }
+}
+
+fn blocked_candidate(
+    projection: &RealProjectionSnapshot,
+    path: &str,
+    file: ScannedProjectionFile,
+) -> CompatCandidateDelta {
+    real_candidate(
+        projection,
+        CompatCandidateKind::PathPolicyBlocked,
+        CompatFileOperationKind::Write,
+        None,
+        path.to_string(),
+        None,
+        None,
+        0,
+        false,
+        "policy".to_string(),
+        PrivacyClass::LocalOnly,
+        CompatPathPolicyResult {
+            allowed: false,
+            normalized_path: None,
+            reason: file.blocked_reason,
+        },
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn real_candidate(
+    projection: &RealProjectionSnapshot,
+    kind: CompatCandidateKind,
+    operation_kind: CompatFileOperationKind,
+    artifact_id: Option<String>,
+    path: String,
+    before_hash: Option<String>,
+    after_hash: Option<String>,
+    byte_length: u64,
+    executable: bool,
+    classification: String,
+    privacy_class: PrivacyClass,
+    path_policy_result: CompatPathPolicyResult,
+    quarantine_ref: Option<String>,
+) -> CompatCandidateDelta {
+    let identity = format!(
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        projection.projection_id,
+        path,
+        kind.as_str(),
+        operation_kind.as_str(),
+        before_hash.as_deref().unwrap_or("new"),
+        after_hash.as_deref().unwrap_or("deleted"),
+        classification,
+    );
+    let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    CompatCandidateDelta {
+        candidate_delta_id: format!("compat_delta_{}", &digest[..24]),
+        kind,
+        operation_kind,
+        artifact_id,
+        path: path.clone(),
+        source_path: None,
+        before_hash,
+        after_hash,
+        byte_length,
+        executable,
+        media_type: media_type_for_compat_path(&path).to_string(),
+        classification,
+        privacy_class,
+        path_policy_result,
+        quarantine_ref,
+    }
+}
+
+fn media_type_for_compat_path(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(|value| value.to_str()) {
+        Some("rs") => "text/rust; charset=utf-8",
+        Some("js" | "mjs" | "cjs") => "text/javascript; charset=utf-8",
+        Some("ts" | "tsx") => "text/typescript; charset=utf-8",
+        Some("json") => "application/json",
+        Some("toml" | "md" | "txt" | "yml" | "yaml") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn real_error(
+    code: CompatImportErrorCode,
+    projection: &RealProjectionSnapshot,
+    candidate_delta_ids: Vec<String>,
+    message: impl Into<String>,
+) -> CompatImportValidationError {
+    CompatImportValidationError {
+        code,
+        projection_id: projection.projection_id.clone(),
+        session_id: projection.session_id.clone().unwrap_or_default(),
+        candidate_delta_ids,
+        message: message.into(),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompatImportRequest {
@@ -1209,7 +1810,9 @@ mod tests {
     use super::*;
     use crate::artifacts::FIXTURE_REPOSITORY_ID;
     use crate::projection::fixture_compatibility_projection_from_resolved_view;
+    use crate::repo_state::{real_artifact_id_for_path, real_tree_hash};
     use crate::resolver::{fixture_base_entries, fixture_resolver_input, resolve_fixture_view};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn fixture_import_modified_file_creates_one_operation_plan() {
@@ -1441,6 +2044,136 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code, CompatImportErrorCode::PreconditionFailed);
+    }
+
+    #[test]
+    fn real_projection_diff_reads_only_persisted_root_and_classifies_source_operations() {
+        let (repo, projection) = real_projection_fixture();
+        let root = PathBuf::from(projection.materialized_root.as_ref().unwrap());
+        fs::write(root.join("src/lib.rs"), b"pub fn value() -> u32 { 2 }\n").unwrap();
+        fs::write(root.join("src/new.rs"), b"pub fn new_value() {}\n").unwrap();
+        fs::remove_file(root.join("README.md")).unwrap();
+        fs::write(repo.join("outside.txt"), b"must not be diffed\n").unwrap();
+
+        let diff = diff_real_compat_projection(&repo, &projection).unwrap();
+        let by_path = diff
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.path.as_str(), candidate))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            by_path["src/lib.rs"].kind,
+            CompatCandidateKind::ModifiedSource
+        );
+        assert_eq!(
+            by_path["src/new.rs"].kind,
+            CompatCandidateKind::CreatedSource
+        );
+        assert_eq!(
+            by_path["README.md"].kind,
+            CompatCandidateKind::DeletedSource
+        );
+        assert!(!by_path.contains_key("outside.txt"));
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn real_projection_selection_blocks_secret_cache_and_reserved_candidates() {
+        let (repo, projection) = real_projection_fixture();
+        let root = PathBuf::from(projection.materialized_root.as_ref().unwrap());
+        fs::write(root.join(".env"), b"API_KEY=do-not-import\n").unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("target/output.txt"), b"cache\n").unwrap();
+        fs::create_dir_all(root.join(".sunlight")).unwrap();
+        fs::write(root.join(".sunlight/config.toml"), b"blocked\n").unwrap();
+
+        let diff = diff_real_compat_projection(&repo, &projection).unwrap();
+        for (path, expected) in [
+            (".env", CompatImportErrorCode::SecretDetected),
+            ("target/output.txt", CompatImportErrorCode::CacheBlocked),
+            (
+                ".sunlight/config.toml",
+                CompatImportErrorCode::PathPolicyFailed,
+            ),
+        ] {
+            let id = diff
+                .candidates
+                .iter()
+                .find(|candidate| candidate.path == path)
+                .unwrap()
+                .candidate_delta_id
+                .clone();
+            let error = validate_real_compat_selection(&projection, &[id], &diff).unwrap_err();
+            assert_eq!(error.code, expected);
+        }
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    fn real_projection_fixture() -> (PathBuf, RealProjectionSnapshot) {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!(
+            "sunlight-real-compat-core-{}-{suffix}",
+            std::process::id()
+        ));
+        let root = repo
+            .join(".sunlight")
+            .join("projections")
+            .join("compat")
+            .join("projection_test")
+            .join("root");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn value() -> u32 { 1 }\n").unwrap();
+        fs::write(root.join("README.md"), b"# baseline\n").unwrap();
+        let entries = [
+            ("src/lib.rs", b"pub fn value() -> u32 { 1 }\n".as_slice()),
+            ("README.md", b"# baseline\n".as_slice()),
+        ]
+        .into_iter()
+        .map(|(path, bytes)| RealArtifactEntry {
+            path: path.to_string(),
+            artifact_id: real_artifact_id_for_path(path),
+            content_hash: real_content_hash(bytes),
+            executable: false,
+            classification: "source".to_string(),
+            tombstone: false,
+            bytes: bytes.to_vec(),
+        })
+        .collect::<Vec<_>>();
+        let tree_hash = real_tree_hash(&entries);
+        let manifest_digest = real_compat_baseline_manifest_digest(
+            "repo_test",
+            "projection_test",
+            "session_test",
+            "gen_test_0001",
+            "view_test",
+            &tree_hash,
+            &entries,
+        );
+        (
+            repo,
+            RealProjectionSnapshot {
+                projection_id: "projection_test".to_string(),
+                repository_id: "repo_test".to_string(),
+                purpose: "compatibility".to_string(),
+                resolved_view_id: "view_test".to_string(),
+                tree_hash: tree_hash.clone(),
+                manifest_digest,
+                created_from_content_tree: tree_hash,
+                materialized_root: Some(root.display().to_string()),
+                session_id: Some("session_test".to_string()),
+                session_generation_id: Some("gen_test_0001".to_string()),
+                path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+                operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+                strategy: "copy".to_string(),
+                retention_state: "active".to_string(),
+                privacy_class: "local_only".to_string(),
+                last_import_operation_id: None,
+                entries,
+            },
+        )
     }
 
     fn base_view() -> ResolvedViewResult {

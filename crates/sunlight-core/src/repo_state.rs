@@ -94,17 +94,28 @@ pub struct RealOperationRecord {
     pub executable: bool,
     pub tombstone: bool,
     pub bytes: Vec<u8>,
+    pub compat_projection_id: Option<String>,
+    pub compat_candidate_delta_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealProjectionSnapshot {
     pub projection_id: String,
+    pub repository_id: String,
     pub purpose: String,
     pub resolved_view_id: String,
     pub tree_hash: String,
     pub manifest_digest: String,
     pub created_from_content_tree: String,
     pub materialized_root: Option<String>,
+    pub session_id: Option<String>,
+    pub session_generation_id: Option<String>,
+    pub path_policy_id: String,
+    pub operation_semantics_version: String,
+    pub strategy: String,
+    pub retention_state: String,
+    pub privacy_class: String,
+    pub last_import_operation_id: Option<String>,
     pub entries: Vec<RealArtifactEntry>,
 }
 
@@ -1361,6 +1372,21 @@ fn parse_operation(
         classification: required_string(object, "classification", state_path)?,
         executable: required_bool(object, "executable", state_path)?,
         tombstone: required_bool(object, "tombstone", state_path)?,
+        compat_projection_id: optional_string(object, "compat_projection_id", state_path)?,
+        compat_candidate_delta_ids: optional_array(
+            object,
+            "compat_candidate_delta_ids",
+            state_path,
+        )?
+        .iter()
+        .map(|value| match value {
+            JsonValue::String(candidate_id) => Ok(candidate_id.clone()),
+            _ => Err(invalid_state(
+                state_path,
+                "operation compat_candidate_delta_ids must be strings",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?,
     })
 }
 
@@ -1381,6 +1407,7 @@ fn parse_projection_snapshot(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(RealProjectionSnapshot {
         projection_id: required_string(object, "projection_id", state_path)?,
+        repository_id: optional_string(object, "repository_id", state_path)?.unwrap_or_default(),
         purpose: required_string(object, "purpose", state_path)?,
         resolved_view_id: required_string(object, "resolved_view_id", state_path)?,
         tree_hash: required_string(object, "tree_hash", state_path)?,
@@ -1391,6 +1418,23 @@ fn parse_projection_snapshot(
             state_path,
         )?,
         materialized_root: optional_string(object, "materialized_root", state_path)?,
+        session_id: optional_string(object, "session_id", state_path)?,
+        session_generation_id: optional_string(object, "session_generation_id", state_path)?,
+        path_policy_id: optional_string(object, "path_policy_id", state_path)?
+            .unwrap_or_else(|| POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string()),
+        operation_semantics_version: optional_string(
+            object,
+            "operation_semantics_version",
+            state_path,
+        )?
+        .unwrap_or_else(|| FILE_OPERATION_SEMANTICS_VERSION.to_string()),
+        strategy: optional_string(object, "strategy", state_path)?
+            .unwrap_or_else(|| "copy".to_string()),
+        retention_state: optional_string(object, "retention_state", state_path)?
+            .unwrap_or_else(|| "active".to_string()),
+        privacy_class: optional_string(object, "privacy_class", state_path)?
+            .unwrap_or_else(|| "local_only".to_string()),
+        last_import_operation_id: optional_string(object, "last_import_operation_id", state_path)?,
         entries,
     })
 }
@@ -1577,6 +1621,10 @@ fn projection_snapshot_json(projection: &RealProjectionSnapshot) -> JsonValue {
         JsonValue::String(projection.projection_id.clone()),
     );
     object.insert(
+        "repository_id".to_string(),
+        JsonValue::String(projection.repository_id.clone()),
+    );
+    object.insert(
         "purpose".to_string(),
         JsonValue::String(projection.purpose.clone()),
     );
@@ -1599,6 +1647,38 @@ fn projection_snapshot_json(projection: &RealProjectionSnapshot) -> JsonValue {
     object.insert(
         "materialized_root".to_string(),
         optional_json(&projection.materialized_root),
+    );
+    object.insert(
+        "session_id".to_string(),
+        optional_json(&projection.session_id),
+    );
+    object.insert(
+        "session_generation_id".to_string(),
+        optional_json(&projection.session_generation_id),
+    );
+    object.insert(
+        "path_policy_id".to_string(),
+        JsonValue::String(projection.path_policy_id.clone()),
+    );
+    object.insert(
+        "operation_semantics_version".to_string(),
+        JsonValue::String(projection.operation_semantics_version.clone()),
+    );
+    object.insert(
+        "strategy".to_string(),
+        JsonValue::String(projection.strategy.clone()),
+    );
+    object.insert(
+        "retention_state".to_string(),
+        JsonValue::String(projection.retention_state.clone()),
+    );
+    object.insert(
+        "privacy_class".to_string(),
+        JsonValue::String(projection.privacy_class.clone()),
+    );
+    object.insert(
+        "last_import_operation_id".to_string(),
+        optional_json(&projection.last_import_operation_id),
     );
     object.insert(
         "entries".to_string(),
@@ -1903,6 +1983,20 @@ fn operation_json(operation: &RealOperationRecord) -> JsonValue {
     object.insert(
         "tombstone".to_string(),
         JsonValue::Bool(operation.tombstone),
+    );
+    object.insert(
+        "compat_projection_id".to_string(),
+        optional_json(&operation.compat_projection_id),
+    );
+    object.insert(
+        "compat_candidate_delta_ids".to_string(),
+        JsonValue::Array(
+            operation
+                .compat_candidate_delta_ids
+                .iter()
+                .map(|candidate_id| JsonValue::String(candidate_id.clone()))
+                .collect(),
+        ),
     );
     JsonValue::Object(object)
 }
@@ -2526,6 +2620,8 @@ mod tests {
             executable: before.executable,
             tombstone: false,
             bytes: after_bytes.to_vec(),
+            compat_projection_id: None,
+            compat_candidate_delta_ids: Vec::new(),
         }
     }
 }

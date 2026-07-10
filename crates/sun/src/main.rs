@@ -22,10 +22,11 @@ use sunlight_core::checkpoint::{
     FIXTURE_VALIDATION_REPORT_ID,
 };
 use sunlight_core::compat_import::{
-    fixture_basic_app_candidate_deltas, plan_fixture_basic_app_import, CompatCandidateDelta,
-    CompatCandidateKind, CompatImportErrorCode, CompatImportRequest, CompatImportResponse,
-    CompatImportValidationError, CompatImportedArtifact, FIXTURE_COMPAT_BASELINE_MANIFEST_DIGEST,
-    FIXTURE_COMPAT_IMPORT_OPERATION_ID,
+    diff_real_compat_projection, fixture_basic_app_candidate_deltas, plan_fixture_basic_app_import,
+    real_compat_baseline_manifest_digest, validate_real_compat_selection, CompatCandidateDelta,
+    CompatCandidateKind, CompatFileOperationKind, CompatImportErrorCode, CompatImportRequest,
+    CompatImportResponse, CompatImportValidationError, CompatImportedArtifact,
+    FIXTURE_COMPAT_BASELINE_MANIFEST_DIGEST, FIXTURE_COMPAT_IMPORT_OPERATION_ID,
 };
 use sunlight_core::execution::{
     execution_output_promotion_record_from_ids,
@@ -1091,10 +1092,12 @@ fn policy_explain(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn compat_project(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_compat_project_options(ctx)?;
-    if options.fixture != "basic-app" {
+    let Some(fixture) = options.fixture.as_deref() else {
+        return real_compat_project(ctx, options);
+    };
+    if fixture != "basic-app" {
         return Err(
-            invalid_request(format!("unknown fixture `{}`", options.fixture))
-                .with_detail("fixture", options.fixture),
+            invalid_request(format!("unknown fixture `{fixture}`")).with_detail("fixture", fixture)
         );
     }
     ensure_fixture_session(&options.session_id)?;
@@ -1118,10 +1121,12 @@ fn compat_project(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn compat_diff(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_compat_diff_options(ctx)?;
-    if options.fixture != "basic-app" {
+    let Some(fixture) = options.fixture.as_deref() else {
+        return real_compat_diff(ctx, options);
+    };
+    if fixture != "basic-app" {
         return Err(
-            invalid_request(format!("unknown fixture `{}`", options.fixture))
-                .with_detail("fixture", options.fixture),
+            invalid_request(format!("unknown fixture `{fixture}`")).with_detail("fixture", fixture)
         );
     }
 
@@ -1152,10 +1157,12 @@ fn compat_diff(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn compat_import(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_compat_import_options(ctx)?;
-    if options.fixture != "basic-app" {
+    let Some(fixture) = options.fixture.as_deref() else {
+        return real_compat_import(ctx, options);
+    };
+    if fixture != "basic-app" {
         return Err(
-            invalid_request(format!("unknown fixture `{}`", options.fixture))
-                .with_detail("fixture", options.fixture),
+            invalid_request(format!("unknown fixture `{fixture}`")).with_detail("fixture", fixture)
         );
     }
 
@@ -1187,6 +1194,291 @@ fn compat_import(ctx: &CommandContext) -> Result<(), CliError> {
         println!("{} {}", response.operation_id, response.topic_revision_id);
     }
 
+    Ok(())
+}
+
+fn real_compat_project(
+    ctx: &CommandContext,
+    options: CompatProjectOptions,
+) -> Result<(), CliError> {
+    let repo_root = PathBuf::from(".");
+    let mut state = RealRepoState::load(&repo_root)?;
+    let session = real_session(&state, &options.session_id)?.clone();
+    let resolved = state.resolve_session_view(&session);
+    if !resolved.result.conflict_free() {
+        return Err(CliError::new(
+            "compat_projection_invalid",
+            "cannot create a compatibility projection from a conflicted session view",
+        )
+        .with_detail("session_id", options.session_id));
+    }
+    let projection_id = format!(
+        "projection_compat_native_{:04}",
+        state.projections.len() + 1
+    );
+    let root = repo_root
+        .join(".sunlight")
+        .join("projections")
+        .join("compat")
+        .join(&projection_id)
+        .join("root");
+    let view_state = real_view_state(&state, &resolved);
+    materialize_real_files(&view_state, &root)?;
+    let manifest_digest = real_compat_baseline_manifest_digest(
+        &state.repository_id,
+        &projection_id,
+        &session.session_id,
+        &session.session_generation_id,
+        &resolved.result.resolved_view_id,
+        &view_state.tree_hash,
+        &view_state.entries,
+    );
+    let projection = RealProjectionSnapshot {
+        projection_id: projection_id.clone(),
+        repository_id: state.repository_id.clone(),
+        purpose: ProjectionPurpose::Compatibility.as_str().to_string(),
+        resolved_view_id: resolved.result.resolved_view_id.clone(),
+        tree_hash: view_state.tree_hash.clone(),
+        manifest_digest,
+        created_from_content_tree: view_state.tree_hash.clone(),
+        materialized_root: Some(root.display().to_string()),
+        session_id: Some(session.session_id.clone()),
+        session_generation_id: Some(session.session_generation_id.clone()),
+        path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+        operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+        strategy: "copy".to_string(),
+        retention_state: "active".to_string(),
+        privacy_class: "local_only".to_string(),
+        last_import_operation_id: None,
+        entries: view_state.entries.clone(),
+    };
+    state.projections.push(projection.clone());
+    state.save(&repo_root)?;
+    persist_real_projection_record(&state, &projection)?;
+
+    if ctx.json {
+        println!("{}", real_compat_project_envelope(&state, &projection));
+    } else {
+        println!("{} {}", projection_id, root.display());
+    }
+    Ok(())
+}
+
+fn real_compat_diff(ctx: &CommandContext, options: CompatDiffOptions) -> Result<(), CliError> {
+    let repo_root = PathBuf::from(".");
+    let state = RealRepoState::load(&repo_root)?;
+    let projection = state
+        .projections
+        .iter()
+        .find(|projection| projection.projection_id == options.projection_id)
+        .ok_or_else(|| {
+            CliError::new(
+                "compat_projection_not_found",
+                "compatibility projection was not found",
+            )
+            .with_detail("projection_id", options.projection_id.clone())
+        })?;
+    let diff = diff_real_compat_projection(&repo_root, projection).map_err(compat_import_error)?;
+    if ctx.json {
+        println!(
+            "{}",
+            real_compat_diff_envelope(&state, projection, &diff.candidates)
+        );
+    } else {
+        println!(
+            "{} {} candidates",
+            projection.projection_id,
+            diff.candidates.len()
+        );
+    }
+    Ok(())
+}
+
+fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Result<(), CliError> {
+    let repo_root = PathBuf::from(".");
+    let mut state = RealRepoState::load(&repo_root)?;
+    let projection_index = state
+        .projections
+        .iter()
+        .position(|projection| projection.projection_id == options.projection_id)
+        .ok_or_else(|| {
+            CliError::new(
+                "compat_projection_not_found",
+                "compatibility projection was not found",
+            )
+            .with_detail("projection_id", options.projection_id.clone())
+        })?;
+    let projection = state.projections[projection_index].clone();
+    let session_id = projection.session_id.clone().ok_or_else(|| {
+        CliError::new(
+            "compat_projection_invalid",
+            "compatibility projection is not bound to a session",
+        )
+        .with_detail("projection_id", projection.projection_id.clone())
+    })?;
+    let session = real_session(&state, &session_id)?.clone();
+    let expected_generation = options
+        .session_generation_id
+        .as_deref()
+        .unwrap_or_else(|| projection.session_generation_id.as_deref().unwrap_or(""));
+    if session.session_generation_id != expected_generation {
+        return Err(CliError::new(
+            "compat_precondition_failed",
+            "compatibility import session generation precondition failed",
+        )
+        .with_detail("projection_id", projection.projection_id)
+        .with_detail("session_id", session.session_id)
+        .with_detail("expected", expected_generation)
+        .with_detail("actual", session.session_generation_id));
+    }
+    let resolved = state.resolve_session_view(&session);
+    let current_tree = resolved
+        .result
+        .tree_identity
+        .as_ref()
+        .map(|tree| tree.tree_hash.as_str())
+        .unwrap_or("");
+    if resolved.result.resolved_view_id != projection.resolved_view_id
+        || current_tree != projection.tree_hash
+    {
+        return Err(CliError::new(
+            "compat_projection_stale",
+            "compatibility projection baseline no longer matches the session view",
+        )
+        .with_detail("projection_id", projection.projection_id)
+        .with_detail("baseline_resolved_view_id", projection.resolved_view_id)
+        .with_detail("current_resolved_view_id", resolved.result.resolved_view_id));
+    }
+
+    let diff = diff_real_compat_projection(&repo_root, &projection).map_err(compat_import_error)?;
+    let selected = validate_real_compat_selection(&projection, &options.candidate_delta_ids, &diff)
+        .map_err(compat_import_error)?;
+    let candidate = selected
+        .into_iter()
+        .next()
+        .expect("validated one candidate");
+    let before = candidate
+        .before_hash
+        .as_ref()
+        .and_then(|_| {
+            resolved
+                .entries
+                .iter()
+                .find(|entry| entry.path == candidate.path && !entry.tombstone)
+        })
+        .cloned();
+    match (&candidate.before_hash, &before) {
+        (Some(expected), Some(entry)) if expected == &entry.content_hash => {}
+        (Some(_), _) | (None, Some(_)) => {
+            return Err(CliError::new(
+                "compat_precondition_failed",
+                "compatibility candidate no longer matches the session artifact precondition",
+            )
+            .with_detail("projection_id", projection.projection_id)
+            .with_detail("candidate_delta_id", candidate.candidate_delta_id)
+            .with_detail("path", candidate.path));
+        }
+        (None, None) => {}
+    }
+    let after = match candidate.operation_kind {
+        CompatFileOperationKind::Delete => {
+            let mut entry = before.clone().expect("validated delete baseline");
+            entry.tombstone = true;
+            entry
+        }
+        CompatFileOperationKind::Patch
+        | CompatFileOperationKind::Write
+        | CompatFileOperationKind::Metadata => {
+            let bytes = diff
+                .after_bytes
+                .get(&candidate.candidate_delta_id)
+                .cloned()
+                .ok_or_else(|| {
+                    CliError::new(
+                        "compat_diff_failed",
+                        "selected compatibility candidate bytes were not available",
+                    )
+                    .with_detail("candidate_delta_id", candidate.candidate_delta_id.clone())
+                })?;
+            RealArtifactEntry {
+                artifact_id: before
+                    .as_ref()
+                    .map(|entry| entry.artifact_id.clone())
+                    .or_else(|| candidate.artifact_id.clone())
+                    .unwrap_or_else(|| real_artifact_id_for_path(&candidate.path)),
+                path: candidate.path.clone(),
+                content_hash: real_content_hash(&bytes),
+                executable: candidate.executable,
+                classification: candidate.classification.clone(),
+                tombstone: false,
+                bytes,
+            }
+        }
+        CompatFileOperationKind::Move => unreachable!("real diff does not infer renames"),
+    };
+    let response = real_accept_mutation(
+        &mut state,
+        &session_id,
+        "compat_import",
+        &candidate.path,
+        before,
+        after,
+    )?;
+    if let Some(operation) = state.operations.last_mut() {
+        operation.compat_projection_id = Some(projection.projection_id.clone());
+        operation.compat_candidate_delta_ids = vec![candidate.candidate_delta_id.clone()];
+        operation.authored_context_id =
+            format!("ctx_compat_{}", operation.operation_transaction_id);
+    }
+    state.projections[projection_index].last_import_operation_id =
+        Some(response.operation.id.clone());
+    state.save(&repo_root)?;
+    let projection_after = state.projections[projection_index].clone();
+    persist_real_projection_record(&state, &projection_after)?;
+    let operation_record = state.operations.last().expect("accepted operation");
+    let import_record_json = real_compat_import_record_json(
+        &state,
+        &projection_after,
+        operation_record,
+        &candidate,
+        &response,
+    );
+    state.persist_record(
+        &repo_root,
+        "operations",
+        &response.operation.id,
+        &format!("{import_record_json}\n"),
+    )?;
+    state.persist_record(
+        &repo_root,
+        "compat-imports",
+        &response.operation.id,
+        &format!("{import_record_json}\n"),
+    )?;
+    state.persist_record(
+        &repo_root,
+        "topics",
+        &response.topic_revision.id,
+        &format!("{}\n", topic_revision_json(&response)),
+    )?;
+    state.persist_record(
+        &repo_root,
+        "views",
+        &state.resolved_view_id,
+        &format!(
+            "{}\n",
+            resolved_view_record_json(&real_resolved_view(&state))
+        ),
+    )?;
+
+    if ctx.json {
+        println!(
+            "{}",
+            real_compat_import_envelope(&state, &projection_after, &candidate, &response)
+        );
+    } else {
+        println!("{} {}", response.operation.id, response.topic_revision.id);
+    }
     Ok(())
 }
 
@@ -2102,12 +2394,21 @@ fn real_project_materialize(
         materialize_real_files(&view_state, &root)?;
         state.projections.push(RealProjectionSnapshot {
             projection_id: projection_id.clone(),
+            repository_id: state.repository_id.clone(),
             purpose: options.purpose.as_str().to_string(),
             resolved_view_id: view_state.resolved_view_id.clone(),
             tree_hash: view_state.tree_hash.clone(),
             manifest_digest: manifest_digest.clone(),
             created_from_content_tree: view_state.tree_hash.clone(),
             materialized_root: root_string,
+            session_id: None,
+            session_generation_id: None,
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            strategy: "copy".to_string(),
+            retention_state: "active".to_string(),
+            privacy_class: "local_only".to_string(),
+            last_import_operation_id: None,
             entries: view_state.entries.clone(),
         });
         state.save(&PathBuf::from("."))?;
@@ -2128,12 +2429,21 @@ fn real_project_materialize(
     } else if ctx.json {
         state.projections.push(RealProjectionSnapshot {
             projection_id: projection_id.clone(),
+            repository_id: state.repository_id.clone(),
             purpose: options.purpose.as_str().to_string(),
             resolved_view_id: view_state.resolved_view_id.clone(),
             tree_hash: view_state.tree_hash.clone(),
             manifest_digest,
             created_from_content_tree: view_state.tree_hash.clone(),
             materialized_root: None,
+            session_id: None,
+            session_generation_id: None,
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            strategy: "copy".to_string(),
+            retention_state: "active".to_string(),
+            privacy_class: "local_only".to_string(),
+            last_import_operation_id: None,
             entries: view_state.entries.clone(),
         });
         state.save(&PathBuf::from("."))?;
@@ -2176,12 +2486,21 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         real_projection_manifest_digest(&view_state, &projection_id, ProjectionPurpose::Execution);
     state.projections.push(RealProjectionSnapshot {
         projection_id: projection_id.clone(),
+        repository_id: state.repository_id.clone(),
         purpose: "execution".to_string(),
         resolved_view_id: view_state.resolved_view_id.clone(),
         tree_hash: view_state.tree_hash.clone(),
         manifest_digest: manifest_digest.clone(),
         created_from_content_tree: view_state.tree_hash.clone(),
         materialized_root: Some(projection_root.display().to_string()),
+        session_id: None,
+        session_generation_id: None,
+        path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+        operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+        strategy: "copy".to_string(),
+        retention_state: "active".to_string(),
+        privacy_class: "local_only".to_string(),
+        last_import_operation_id: None,
         entries: view_state.entries.clone(),
     });
 
@@ -2708,7 +3027,20 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
                     .iter()
                     .find(|projection| projection.projection_id == *value)
                     .ok_or_else(|| object_not_found("projection", value))?;
-                println!("{}", real_projection_status_envelope(&state, projection));
+                if projection.purpose == "compatibility" {
+                    let diff = diff_real_compat_projection(&PathBuf::from("."), projection)
+                        .map_err(compat_import_error)?;
+                    println!(
+                        "{}",
+                        real_compat_projection_status_envelope(
+                            &state,
+                            projection,
+                            &diff.candidates
+                        )
+                    );
+                } else {
+                    println!("{}", real_projection_status_envelope(&state, projection));
+                }
                 return Ok(true);
             }
             "--checkpoint" => {
@@ -2736,6 +3068,25 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
                     .find(|execution| execution.execution_id == *value)
                     .ok_or_else(|| object_not_found("execution", value))?;
                 println!("{}", real_execution_status_envelope(&state, execution));
+                return Ok(true);
+            }
+            "--compat-import" => {
+                let operation = state
+                    .operations
+                    .iter()
+                    .find(|operation| {
+                        operation.operation_transaction_id == *value
+                            && operation.compat_projection_id.is_some()
+                    })
+                    .ok_or_else(|| object_not_found("compat_import", value))?;
+                println!(
+                    "{}",
+                    real_compat_operation_inspect_envelope(
+                        &state,
+                        operation,
+                        "status.compat-import"
+                    )
+                );
                 return Ok(true);
             }
             _ => {}
@@ -2885,6 +3236,8 @@ fn real_accept_mutation(
         executable: after.executable,
         tombstone: after.tombstone,
         bytes: after.bytes.clone(),
+        compat_projection_id: None,
+        compat_candidate_delta_ids: Vec::new(),
     });
     let session_after = state
         .sessions
@@ -3524,9 +3877,16 @@ fn real_projection_snapshot_json(
             "\"manifest_digest\":\"{}\",",
             "\"created_from_content_tree\":\"{}\",",
             "\"materialized_root\":{},",
+            "\"session_id\":{},",
+            "\"session_generation_id\":{},",
+            "\"path_policy_id\":\"{}\",",
+            "\"operation_semantics_version\":\"{}\",",
+            "\"strategy\":\"{}\",",
+            "\"retention_state\":\"{}\",",
+            "\"privacy_class\":\"{}\",",
+            "\"last_import_operation_id\":{},",
             "\"entry_count\":{},",
-            "\"source_truth\":\"sunlight_persisted_resolved_view\",",
-            "\"privacy_class\":\"local_only\"",
+            "\"source_truth\":\"sunlight_persisted_resolved_view\"",
             "}}"
         ),
         json_escape(&projection.projection_id),
@@ -3541,11 +3901,241 @@ fn real_projection_snapshot_json(
         json_escape(&projection.manifest_digest),
         json_escape(&projection.created_from_content_tree),
         optional_string_json(projection.materialized_root.as_deref()),
+        optional_string_json(projection.session_id.as_deref()),
+        optional_string_json(projection.session_generation_id.as_deref()),
+        json_escape(&projection.path_policy_id),
+        json_escape(&projection.operation_semantics_version),
+        json_escape(&projection.strategy),
+        json_escape(&projection.retention_state),
+        json_escape(&projection.privacy_class),
+        optional_string_json(projection.last_import_operation_id.as_deref()),
         projection
             .entries
             .iter()
             .filter(|entry| !entry.tombstone)
             .count(),
+    )
+}
+
+fn real_compat_project_envelope(
+    state: &RealRepoState,
+    projection: &RealProjectionSnapshot,
+) -> String {
+    let tree = SingleRepoTree {
+        repository_id: state.repository_id.clone(),
+        tree_hash: projection.tree_hash.clone(),
+    };
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"compat.project\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"session_id\":{},\"resolved_view_id\":\"{}\",\"session_generation_id\":{}}},\"projection_id\":\"{}\",\"session_id\":{},\"baseline\":{{\"resolved_view_id\":\"{}\",\"session_generation_id\":{},\"tree_identity\":{},\"manifest_digest\":\"{}\"}},\"purpose\":\"compatibility\",\"root_ref\":{{\"value\":{},\"privacy\":\"local_only_path\",\"privacy_class\":\"local_only\"}},\"strategy\":\"{}\",\"retention_state\":\"{}\",\"privacy_class\":\"{}\",\"path_policy\":{{\"path_policy_id\":\"{}\",\"operation_semantics_version\":\"{}\"}},\"projection\":{}}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(&projection.projection_id),
+        optional_string_json(projection.session_id.as_deref()),
+        json_escape(&projection.resolved_view_id),
+        optional_string_json(projection.session_generation_id.as_deref()),
+        json_escape(&projection.projection_id),
+        optional_string_json(projection.session_id.as_deref()),
+        json_escape(&projection.resolved_view_id),
+        optional_string_json(projection.session_generation_id.as_deref()),
+        single_repo_tree_json(&tree),
+        json_escape(&projection.manifest_digest),
+        optional_string_json(projection.materialized_root.as_deref()),
+        json_escape(&projection.strategy),
+        json_escape(&projection.retention_state),
+        json_escape(&projection.privacy_class),
+        json_escape(&projection.path_policy_id),
+        json_escape(&projection.operation_semantics_version),
+        real_projection_snapshot_json(state, projection),
+    )
+}
+
+fn real_compat_diff_envelope(
+    state: &RealRepoState,
+    projection: &RealProjectionSnapshot,
+    candidates: &[CompatCandidateDelta],
+) -> String {
+    let safe = candidates
+        .iter()
+        .filter(|candidate| is_safe_default_compat_candidate(candidate))
+        .map(|candidate| candidate.candidate_delta_id.as_str());
+    let quarantine = candidates
+        .iter()
+        .filter_map(|candidate| candidate.quarantine_ref.as_deref());
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"compat.diff\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"projection_id\":\"{}\",\"baseline\":{{\"resolved_view_id\":\"{}\",\"tree_identity\":{},\"manifest_digest\":\"{}\"}},\"candidate_counts\":{},\"selected_candidate_delta_ids\":{},\"quarantine_refs\":{},\"candidates\":[{}],\"native_operation_ids\":[],\"native_revision_ids\":[]}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(&projection.projection_id),
+        json_escape(&projection.resolved_view_id),
+        json_escape(&projection.projection_id),
+        json_escape(&projection.resolved_view_id),
+        single_repo_tree_json(&SingleRepoTree {
+            repository_id: state.repository_id.clone(),
+            tree_hash: projection.tree_hash.clone(),
+        }),
+        json_escape(&projection.manifest_digest),
+        compat_candidate_counts_json(candidates),
+        string_array_json(safe),
+        string_array_json(quarantine),
+        candidates
+            .iter()
+            .map(compat_candidate_json)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn real_compat_import_record_json(
+    state: &RealRepoState,
+    projection: &RealProjectionSnapshot,
+    operation: &RealOperationRecord,
+    candidate: &CompatCandidateDelta,
+    response: &MutationResponse,
+) -> String {
+    format!(
+        "{{\"schema_version\":1,\"record_type\":\"operation_transaction\",\"id\":\"{}\",\"repository_id\":\"{}\",\"topic_id\":\"{}\",\"topic_revision_id\":\"{}\",\"session_id\":\"{}\",\"session_generation_id\":\"{}\",\"actor_id\":\"{}\",\"authored_context_id\":\"{}\",\"mutation\":\"compat_import\",\"preconditions\":{{\"projection_id\":\"{}\",\"projection_baseline_resolved_view_id\":\"{}\",\"projection_baseline_tree_hash\":\"{}\",\"session_generation_id\":{},\"selected_candidate_delta_ids\":[\"{}\"]}},\"mutation_payload\":{{\"kind\":\"compat_import\",\"projection_id\":\"{}\",\"baseline_manifest_digest\":\"{}\",\"selected_deltas\":[{{\"candidate_delta_id\":\"{}\",\"operation_kind\":\"{}\",\"path\":\"{}\",\"base_content_hash\":{},\"result_content_hash\":{},\"classification\":\"{}\",\"privacy_class\":\"{}\"}}]}},\"before_refs\":{{\"content_hash\":{}}},\"after_refs\":{{\"content_hash\":{},\"tree_identity\":{}}}}}",
+        json_escape(&operation.operation_transaction_id),
+        json_escape(&state.repository_id),
+        json_escape(&operation.topic_id),
+        json_escape(&operation.topic_revision_id),
+        json_escape(&operation.session_id),
+        json_escape(&response.operation.session_generation_id),
+        json_escape(&response.operation.actor_id),
+        json_escape(&operation.authored_context_id),
+        json_escape(&projection.projection_id),
+        json_escape(&projection.resolved_view_id),
+        json_escape(&projection.tree_hash),
+        optional_string_json(projection.session_generation_id.as_deref()),
+        json_escape(&candidate.candidate_delta_id),
+        json_escape(&projection.projection_id),
+        json_escape(&projection.manifest_digest),
+        json_escape(&candidate.candidate_delta_id),
+        candidate.operation_kind.as_str(),
+        json_escape(&candidate.path),
+        optional_string_json(candidate.before_hash.as_deref()),
+        optional_string_json(candidate.after_hash.as_deref()),
+        json_escape(&candidate.classification),
+        candidate.privacy_class.as_str(),
+        optional_string_json(operation.base_content_hash.as_deref()),
+        if operation.tombstone {
+            "null".to_string()
+        } else {
+            optional_string_json(Some(&operation.result_content_hash))
+        },
+        single_repo_tree_json(&SingleRepoTree {
+            repository_id: response.view.tree_identity.repository_id.clone(),
+            tree_hash: response.view.tree_identity.tree_hash.clone(),
+        }),
+    )
+}
+
+fn real_compat_import_envelope(
+    state: &RealRepoState,
+    projection: &RealProjectionSnapshot,
+    candidate: &CompatCandidateDelta,
+    response: &MutationResponse,
+) -> String {
+    let artifact_id = response.artifact.artifact_id.as_str();
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"compat.import\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"session_id\":\"{}\",\"operation_transaction_id\":\"{}\",\"topic_revision_id\":\"{}\",\"session_generation_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"view\":{},\"projection_id\":\"{}\",\"operation_transaction_id\":\"{}\",\"topic_revision_id\":\"{}\",\"session_generation_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_identity\":{},\"selected_delta_count\":1,\"candidate_delta_ids\":[\"{}\"],\"imported_artifacts\":[{{\"candidate_delta_id\":\"{}\",\"artifact_id\":\"{}\",\"path\":\"{}\",\"operation_kind\":\"{}\",\"before_hash\":{},\"after_hash\":{},\"classification\":\"{}\",\"privacy_class\":\"{}\"}}],\"ignored_candidate_delta_ids\":[],\"quarantine_refs\":[],\"operation\":{},\"topic_revision\":{},\"session_generation\":{}}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(&projection.projection_id),
+        json_escape(&response.session_id),
+        json_escape(&response.operation.id),
+        json_escape(&response.topic_revision.id),
+        json_escape(&response.view.session_generation_id),
+        json_escape(&response.view.resolved_view_id),
+        view_json(&response.view),
+        json_escape(&projection.projection_id),
+        json_escape(&response.operation.id),
+        json_escape(&response.topic_revision.id),
+        json_escape(&response.view.session_generation_id),
+        json_escape(&response.view.resolved_view_id),
+        single_repo_tree_json(&SingleRepoTree {
+            repository_id: response.view.tree_identity.repository_id.clone(),
+            tree_hash: response.view.tree_identity.tree_hash.clone(),
+        }),
+        json_escape(&candidate.candidate_delta_id),
+        json_escape(&candidate.candidate_delta_id),
+        json_escape(artifact_id),
+        json_escape(&candidate.path),
+        candidate.operation_kind.as_str(),
+        optional_string_json(candidate.before_hash.as_deref()),
+        optional_string_json(candidate.after_hash.as_deref()),
+        json_escape(&candidate.classification),
+        candidate.privacy_class.as_str(),
+        real_compat_import_record_json(
+            state,
+            projection,
+            state.operations.last().expect("compat operation"),
+            candidate,
+            response,
+        ),
+        topic_revision_json(response),
+        session_generation_json(response),
+    )
+}
+
+fn real_compat_provenance_json(operation: &RealOperationRecord) -> String {
+    format!(
+        "{{\"operation_transaction_id\":\"{}\",\"projection_id\":{},\"candidate_delta_ids\":{},\"authored_context_id\":\"{}\"}}",
+        json_escape(&operation.operation_transaction_id),
+        optional_string_json(operation.compat_projection_id.as_deref()),
+        string_array_json(
+            operation
+                .compat_candidate_delta_ids
+                .iter()
+                .map(String::as_str)
+        ),
+        json_escape(&operation.authored_context_id),
+    )
+}
+
+fn real_compat_operation_inspect_envelope(
+    state: &RealRepoState,
+    operation: &RealOperationRecord,
+    command: &str,
+) -> String {
+    let projection = operation
+        .compat_projection_id
+        .as_deref()
+        .and_then(|projection_id| {
+            state
+                .projections
+                .iter()
+                .find(|projection| projection.projection_id == projection_id)
+        });
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"operation_transaction_id\":\"{}\",\"topic_revision_id\":\"{}\",\"projection_id\":{}}},\"operation\":{{\"operation_transaction_id\":\"{}\",\"topic_id\":\"{}\",\"topic_revision_id\":\"{}\",\"session_id\":\"{}\",\"artifact_id\":\"{}\",\"path\":\"{}\",\"mutation\":\"{}\",\"authored_context_id\":\"{}\",\"base_content_hash\":{},\"result_content_hash\":\"{}\",\"tombstone\":{},\"mutation_payload\":{{\"kind\":\"{}\",\"projection_id\":{},\"selected_candidate_delta_ids\":{}}}}},\"projection\":{}}},\"warnings\":[]}}",
+        json_escape(command),
+        json_escape(&state.repository_id),
+        json_escape(&operation.operation_transaction_id),
+        json_escape(&operation.topic_revision_id),
+        optional_string_json(operation.compat_projection_id.as_deref()),
+        json_escape(&operation.operation_transaction_id),
+        json_escape(&operation.topic_id),
+        json_escape(&operation.topic_revision_id),
+        json_escape(&operation.session_id),
+        json_escape(&operation.artifact_id),
+        json_escape(&operation.path),
+        json_escape(&operation.mutation),
+        json_escape(&operation.authored_context_id),
+        optional_string_json(operation.base_content_hash.as_deref()),
+        json_escape(&operation.result_content_hash),
+        operation.tombstone,
+        if operation.compat_projection_id.is_some() {
+            "compat_import"
+        } else {
+            operation.mutation.as_str()
+        },
+        optional_string_json(operation.compat_projection_id.as_deref()),
+        string_array_json(
+            operation
+                .compat_candidate_delta_ids
+                .iter()
+                .map(String::as_str)
+        ),
+        projection
+            .map(|projection| real_projection_snapshot_json(state, projection))
+            .unwrap_or_else(|| "null".to_string()),
     )
 }
 
@@ -3559,6 +4149,29 @@ fn real_projection_status_envelope(
         json_escape(&projection.projection_id),
         json_escape(&projection.resolved_view_id),
         real_projection_snapshot_json(state, projection),
+    )
+}
+
+fn real_compat_projection_status_envelope(
+    state: &RealRepoState,
+    projection: &RealProjectionSnapshot,
+    candidates: &[CompatCandidateDelta],
+) -> String {
+    let quarantine_count = candidates
+        .iter()
+        .filter(|candidate| candidate.quarantine_ref.is_some())
+        .count();
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"status.projection\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"lifecycle_state\":\"{}\",\"projection\":{},\"dirty_candidate_summary\":{{\"total\":{},\"counts\":{}}},\"quarantine_count\":{},\"last_import_operation_id\":{}}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(&projection.projection_id),
+        json_escape(&projection.resolved_view_id),
+        if candidates.is_empty() { "clean" } else { "dirty" },
+        real_projection_snapshot_json(state, projection),
+        candidates.len(),
+        compat_candidate_counts_json(candidates),
+        quarantine_count,
+        optional_string_json(projection.last_import_operation_id.as_deref()),
     )
 }
 
@@ -4075,8 +4688,30 @@ fn real_status_envelope(
     let view = session
         .map(|session| real_session_view(state, session))
         .unwrap_or_else(|| real_view(state));
+    let compatibility_projections = session
+        .map(|session| {
+            state
+                .projections
+                .iter()
+                .filter(|projection| {
+                    projection.purpose == "compatibility"
+                        && projection.session_id.as_deref() == Some(session.session_id.as_str())
+                })
+                .map(|projection| {
+                    format!(
+                        "{{\"projection_id\":\"{}\",\"baseline_resolved_view_id\":\"{}\",\"baseline_session_generation_id\":{},\"last_import_operation_id\":{}}}",
+                        json_escape(&projection.projection_id),
+                        json_escape(&projection.resolved_view_id),
+                        optional_string_json(projection.session_generation_id.as_deref()),
+                        optional_string_json(projection.last_import_operation_id.as_deref()),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"quarantined_secret_count\":{},\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"}},\"topic\":{{\"topic_id\":{},\"head_revision_id\":{}}},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\"}}}},\"warnings\":{}}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"quarantined_secret_count\":{},\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"}},\"topic\":{{\"topic_id\":{},\"head_revision_id\":{}}},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]}}}},\"warnings\":{}}}",
         command,
         json_escape(&state.repository_id),
         json_escape(&state.repository_id),
@@ -4092,6 +4727,7 @@ fn real_status_envelope(
         optional_string_json(head_revision_id),
         optional_string_json(session_id),
         json_escape(session_generation_id),
+        compatibility_projections,
         warnings,
     )
 }
@@ -4112,13 +4748,30 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
         .or_else(|| selector.strip_prefix("path:"))
     {
         let resolved = state.resolve_head_view();
-        let entry = real_entry(state, &resolved.entries, path)?;
+        let entry = resolved
+            .entries
+            .iter()
+            .find(|entry| !entry.tombstone && (entry.path == path || entry.artifact_id == path))
+            .ok_or_else(|| object_not_found("artifact", path))?;
+        let latest_operation = state
+            .operations
+            .iter()
+            .rev()
+            .find(|operation| operation.artifact_id == entry.artifact_id);
+        let compat_provenance = latest_operation
+            .filter(|operation| operation.compat_projection_id.is_some())
+            .map(real_compat_provenance_json)
+            .unwrap_or_else(|| "null".to_string());
         return Ok(format!(
-            "{{\"ok\":true,\"data\":{{\"command\":\"inspect.artifact\",\"repository_id\":\"{}\",\"ids\":{{\"artifact_id\":\"{}\"}},\"view\":{},\"artifact\":{}}},\"warnings\":[]}}",
+            "{{\"ok\":true,\"data\":{{\"command\":\"inspect.artifact\",\"repository_id\":\"{}\",\"ids\":{{\"artifact_id\":\"{}\"}},\"view\":{},\"artifact\":{},\"latest_operation_id\":{},\"compat_import_provenance\":{}}},\"warnings\":[]}}",
             json_escape(&state.repository_id),
             json_escape(&entry.artifact_id),
             view_resolve_view_json(&resolved.result),
             artifact_json(&real_artifact_view(entry)),
+            optional_string_json(
+                latest_operation.map(|operation| operation.operation_transaction_id.as_str())
+            ),
+            compat_provenance,
         ));
     }
     if selector == format!("repository:{}", state.repository_id) || selector == "repository" {
@@ -4162,6 +4815,24 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
             .find(|candidate| candidate.projection_id == projection)
             .ok_or_else(|| object_not_found("projection", projection))?;
         return Ok(real_projection_inspect_envelope(state, projection));
+    }
+    if let Some(operation_id) = selector
+        .strip_prefix("compat-import:")
+        .or_else(|| selector.strip_prefix("operation:"))
+    {
+        let operation = state
+            .operations
+            .iter()
+            .find(|operation| operation.operation_transaction_id == operation_id)
+            .ok_or_else(|| object_not_found("operation", operation_id))?;
+        let command = if selector.starts_with("compat-import:") {
+            "inspect.compat-import"
+        } else {
+            "inspect.operation"
+        };
+        return Ok(real_compat_operation_inspect_envelope(
+            state, operation, command,
+        ));
     }
     if let Some(checkpoint) = selector.strip_prefix("checkpoint:") {
         let checkpoint = state
@@ -4370,19 +5041,19 @@ struct ProjectionQuarantineCleanupOptions {
 
 #[derive(Debug)]
 struct CompatProjectOptions {
-    fixture: String,
+    fixture: Option<String>,
     session_id: String,
 }
 
 #[derive(Debug)]
 struct CompatDiffOptions {
-    fixture: String,
+    fixture: Option<String>,
     projection_id: String,
 }
 
 #[derive(Debug)]
 struct CompatImportOptions {
-    fixture: String,
+    fixture: Option<String>,
     projection_id: String,
     session_generation_id: Option<String>,
     candidate_delta_ids: Vec<String>,
@@ -4420,8 +5091,11 @@ fn parse_compat_project_options(ctx: &CommandContext) -> Result<CompatProjectOpt
         }
     }
 
-    let usage = "usage: sun compat project --session <session-id> --fixture basic-app";
-    let fixture = fixture.ok_or_else(|| invalid_request(usage))?;
+    let usage = if fixture.is_some() {
+        "usage: sun compat project --session <session-id> --fixture basic-app"
+    } else {
+        "usage: sun compat project --session <session-id> [--fixture basic-app]"
+    };
     let session_id = session_id.ok_or_else(|| invalid_request(usage))?;
 
     Ok(CompatProjectOptions {
@@ -4462,8 +5136,7 @@ fn parse_compat_diff_options(ctx: &CommandContext) -> Result<CompatDiffOptions, 
         }
     }
 
-    let usage = "usage: sun compat diff --projection <projection-id> --fixture basic-app";
-    let fixture = fixture.ok_or_else(|| invalid_request(usage))?;
+    let usage = "usage: sun compat diff --projection <projection-id> [--fixture basic-app]";
     let projection_id = projection_id.ok_or_else(|| invalid_request(usage))?;
 
     Ok(CompatDiffOptions {
@@ -4522,14 +5195,9 @@ fn parse_compat_import_options(ctx: &CommandContext) -> Result<CompatImportOptio
         }
     }
 
-    let fixture = fixture.ok_or_else(|| {
-        invalid_request(
-            "usage: sun compat import --projection <projection-id> --candidate <candidate-id> [--session-generation <generation-id>] --fixture basic-app",
-        )
-    })?;
     let projection_id = projection_id.ok_or_else(|| {
         invalid_request(
-            "usage: sun compat import --projection <projection-id> --candidate <candidate-id> [--session-generation <generation-id>] --fixture basic-app",
+            "usage: sun compat import --projection <projection-id> --candidate <candidate-id> [--session-generation <generation-id>] [--fixture basic-app]",
         )
     })?;
 

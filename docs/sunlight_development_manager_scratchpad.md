@@ -35,7 +35,7 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - Current implementation reality: fixture prototype plus a substantial repo-backed product path with durable authoring/resolution/projection/execution/checkpoint/export/policy/compatibility features and a no-fixture self-hosting acceptance harness against Sunlight itself; still not the full v0.3 product.
 - Rename-plus-edit remains unresolved because compatibility projections expose no reliable identity signal; fuzzy inference is intentionally excluded.
 - Execution network, filesystem-write, CPU, and memory isolation remain explicitly unenforced; records report these limitations.
-- Main product gap: truthful operator ergonomics, remaining isolation/scalability policy work, and live/daemon workflows.
+- Main product gaps: real projection scalability beyond full copies, remaining execution isolation, session freshness/recovery guardrails, and shared daemon/MCP workflows.
 
 ## Workstreams
 
@@ -69,12 +69,13 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | repo-backed-projection-config-policy | Windows Codex CLI | Windows commit `7ef05fa` | Completed | Honor validated config for managed projection roots and path semantics. | Shared config resolver confines roots and validates constructors/consumers; focused/full tests, formatting, and diff checks passed. |
 | repo-backed-execution-runtime-policy | Windows Codex CLI + manager correction | Windows commit `da994a7` | Completed | Enforce timeout, output bounds, and environment policy for real executions. | Full-stream digest and descendant cleanup review passed repeatedly with normal Windows process permissions; full suite, formatting, and diff checks passed. |
 | self-hosting-production-acceptance | Windows Codex CLI | Windows commit `d1e1d3f` | Completed | Run no-fixture Sunlight end to end against a temporary Git clone of its own real repository. | Structural 50+ file journey covers native authoring/conflicts/projection/compat/execution/policy/export; repeated harness and full suite passed. |
-| repo-backed-operator-ergonomics | Windows Codex CLI cell `104` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active 2026-07-11 | Make help/status/human output truthful and useful for no-fixture operators. | At next heartbeat audit fixture-first wording, summary identities/warnings/human output; run focused/self-hosting/full tests and diff checks. |
+| repo-backed-operator-ergonomics | Windows Codex CLI cell `104` | Windows commit `7b6dd3a` | Completed | Make help/status/human output truthful and useful for no-fixture operators. | Primary help is repo-backed; operational summary/warnings and human inspect/status cover real lifecycle state; focused/self-hosting/full tests, formatting, and diff checks passed. |
+| repo-backed-projection-scalability | Windows Codex CLI cell `123` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active 2026-07-11 | Replace hard-coded real full-copy projection paths with truthful strategy selection, safe Windows COW capability handling, and measured materialization. | At next heartbeat inspect real strategy implementation and atomic fallback/error behavior; run focused/self-hosting/full tests and diff checks. |
 
 ## Delegation Queue
 
-1. Improve operator ergonomics/status for no-fixture workflows.
-2. Address remaining isolation/scalability policy and live/daemon workflow gaps.
+1. Implement and measure safe repo-backed projection scalability beyond hard-coded full copies.
+2. Address remaining execution isolation, session freshness/recovery, and live daemon/MCP workflow gaps.
 3. Keep fixture tests only when they directly support removing fixture dependency.
 
 

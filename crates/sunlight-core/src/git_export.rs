@@ -5,6 +5,7 @@ use crate::checkpoint::{
     FIXTURE_VALIDATION_REPORT_ID,
 };
 use crate::records::PrivacyClass;
+use crate::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use crate::repo_state::{
     detect_secret_reasons, expanded_operation_order, real_content_hash, real_tree_hash,
     RealArtifactEntry, RealRepoState,
@@ -12,8 +13,11 @@ use crate::repo_state::{
 use crate::repository::{RepositoryConfig, CONSERVATIVE_SUNLIGHT_COMMIT_POLICY};
 use crate::resolver::{ResolvedViewResult, SingleRepoTree};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fmt::{Display, Formatter};
+use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,6 +25,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static TEMPORARY_GIT_INDEX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub const CONSERVATIVE_EXPORT_POLICY_ID: &str =
     "git_interop.sunlight_commit_policy.conservative.v1";
+pub const VALIDATION_REPORT_RECORD_SCHEMA_VERSION: u32 = 1;
+const VALIDATION_REPORT_RECORDS_DIR: &str = "validation-reports";
 
 pub struct PersistedGitExportValidationInput<'a> {
     pub config: &'a RepositoryConfig,
@@ -75,6 +81,33 @@ pub struct GitExportValidationFailure {
     pub value: Option<String>,
     pub reason: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitExportValidationReportStoreError {
+    NotFound { path: PathBuf },
+    Invalid { path: PathBuf, message: String },
+    Io { path: PathBuf, message: String },
+}
+
+impl Display for GitExportValidationReportStoreError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { path } => {
+                write!(f, "validation report was not found at {}", path.display())
+            }
+            Self::Invalid { path, message } => {
+                write!(
+                    f,
+                    "invalid validation report at {}: {message}",
+                    path.display()
+                )
+            }
+            Self::Io { path, message } => write!(f, "{message}: {}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for GitExportValidationReportStoreError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitExportValidationCheck {
@@ -1296,29 +1329,491 @@ fn has_promotion_provenance(
 }
 
 fn persisted_validation_report_id(report: &GitExportValidationReport) -> String {
+    let canonical = canonical_json_bytes(&validation_report_identity_json(report))
+        .expect("validation report identity JSON is canonicalizable");
     let mut hasher = Sha256::new();
-    for value in [
-        report.policy_id.as_str(),
-        report.checkpoint_id.as_str(),
-        report.resolved_view_id.as_str(),
-        report.tree_identity.repository_id.as_str(),
-        report.tree_identity.tree_hash.as_str(),
-        report.git_ref.as_str(),
-    ] {
-        hasher.update(value.as_bytes());
-        hasher.update([0]);
-    }
-    for failure in &report.failures {
-        hasher.update(failure.check.as_str().as_bytes());
-        hasher.update([0]);
-        hasher.update(failure.code.as_str().as_bytes());
-        hasher.update([0]);
-        hasher.update(failure.field.as_deref().unwrap_or("").as_bytes());
-        hasher.update([0]);
-        hasher.update(failure.value.as_deref().unwrap_or("").as_bytes());
-        hasher.update([0]);
-    }
+    hasher.update(canonical);
     format!("validation_sha256_{:x}", hasher.finalize())
+}
+
+pub fn validation_report_record_path(repo_root: &Path, validation_report_id: &str) -> PathBuf {
+    validation_report_records_root(repo_root).join(format!("{validation_report_id}.json"))
+}
+
+fn validation_report_records_root(repo_root: &Path) -> PathBuf {
+    repo_root
+        .join(".sunlight")
+        .join("records")
+        .join(VALIDATION_REPORT_RECORDS_DIR)
+}
+
+fn is_persisted_validation_report_id(value: &str) -> bool {
+    value
+        .strip_prefix("validation_sha256_")
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+}
+
+pub fn persist_git_export_validation_report(
+    repo_root: &Path,
+    repository_id: &str,
+    report: &GitExportValidationReport,
+) -> Result<PathBuf, GitExportValidationReportStoreError> {
+    let expected_id = persisted_validation_report_id(report);
+    if !is_persisted_validation_report_id(&report.id)
+        || report.id != expected_id
+        || report.tree_identity.repository_id != repository_id
+    {
+        return Err(GitExportValidationReportStoreError::Invalid {
+            path: validation_report_records_root(repo_root),
+            message:
+                "validation report identity does not match its canonical content or repository"
+                    .to_string(),
+        });
+    }
+    let path = validation_report_record_path(repo_root, &report.id);
+    if path.exists() {
+        let existing = load_git_export_validation_report(repo_root, repository_id, &report.id)?;
+        if existing != *report {
+            return Err(GitExportValidationReportStoreError::Invalid {
+                path,
+                message: "existing validation report does not match the report being upserted"
+                    .to_string(),
+            });
+        }
+        return Ok(validation_report_record_path(repo_root, &report.id));
+    }
+    let parent = path.parent().expect("validation report path has a parent");
+    fs::create_dir_all(parent).map_err(|error| GitExportValidationReportStoreError::Io {
+        path: parent.to_path_buf(),
+        message: format!("failed to create validation report directory: {error}"),
+    })?;
+    let bytes = canonical_json_bytes(&validation_report_record_json(repository_id, report))
+        .map_err(|error| GitExportValidationReportStoreError::Invalid {
+            path: path.clone(),
+            message: error.to_string(),
+        })?;
+    fs::write(&path, bytes).map_err(|error| GitExportValidationReportStoreError::Io {
+        path: path.clone(),
+        message: format!("failed to write validation report: {error}"),
+    })?;
+    Ok(path)
+}
+
+pub fn load_git_export_validation_report(
+    repo_root: &Path,
+    repository_id: &str,
+    validation_report_id: &str,
+) -> Result<GitExportValidationReport, GitExportValidationReportStoreError> {
+    if !is_persisted_validation_report_id(validation_report_id) {
+        return Err(GitExportValidationReportStoreError::Invalid {
+            path: validation_report_records_root(repo_root),
+            message: "validation report ID must use validation_sha256_<64 lowercase hex>"
+                .to_string(),
+        });
+    }
+    let path = validation_report_record_path(repo_root, validation_report_id);
+    let bytes = fs::read(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            GitExportValidationReportStoreError::NotFound { path: path.clone() }
+        } else {
+            GitExportValidationReportStoreError::Io {
+                path: path.clone(),
+                message: format!("failed to read validation report: {error}"),
+            }
+        }
+    })?;
+    let value = parse_json_record(&bytes).map_err(|error| {
+        GitExportValidationReportStoreError::Invalid {
+            path: path.clone(),
+            message: error.to_string(),
+        }
+    })?;
+    let report =
+        parse_validation_report_record(&path, repository_id, validation_report_id, &value)?;
+    let expected = canonical_json_bytes(&validation_report_record_json(repository_id, &report))
+        .expect("parsed validation report JSON is canonicalizable");
+    if bytes != expected {
+        return Err(GitExportValidationReportStoreError::Invalid {
+            path,
+            message: "record bytes are not the canonical JSON for the claimed report".to_string(),
+        });
+    }
+    Ok(report)
+}
+
+fn validation_report_identity_json(report: &GitExportValidationReport) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "schema_version".to_string(),
+        JsonValue::Number(VALIDATION_REPORT_RECORD_SCHEMA_VERSION.to_string()),
+    );
+    object.insert(
+        "record_type".to_string(),
+        JsonValue::String("validation_report".to_string()),
+    );
+    object.insert(
+        "repository_id".to_string(),
+        JsonValue::String(report.tree_identity.repository_id.clone()),
+    );
+    object.insert(
+        "privacy_class".to_string(),
+        JsonValue::String(PrivacyClass::CommitDefault.as_str().to_string()),
+    );
+    object.insert(
+        "policy_id".to_string(),
+        JsonValue::String(report.policy_id.clone()),
+    );
+    object.insert(
+        "checkpoint_id".to_string(),
+        JsonValue::String(report.checkpoint_id.clone()),
+    );
+    object.insert(
+        "resolved_view_id".to_string(),
+        JsonValue::String(report.resolved_view_id.clone()),
+    );
+    object.insert(
+        "tree_identity".to_string(),
+        validation_report_tree_json(&report.tree_identity),
+    );
+    object.insert(
+        "git_ref".to_string(),
+        JsonValue::String(report.git_ref.clone()),
+    );
+    object.insert("ok".to_string(), JsonValue::Bool(report.ok));
+    object.insert(
+        "summary".to_string(),
+        validation_report_summary_json(&report.summary),
+    );
+    object.insert(
+        "failures".to_string(),
+        JsonValue::Array(
+            report
+                .failures
+                .iter()
+                .map(validation_report_failure_json)
+                .collect(),
+        ),
+    );
+    JsonValue::Object(object)
+}
+
+fn validation_report_record_json(
+    repository_id: &str,
+    report: &GitExportValidationReport,
+) -> JsonValue {
+    let JsonValue::Object(mut object) = validation_report_identity_json(report) else {
+        unreachable!()
+    };
+    object.insert("id".to_string(), JsonValue::String(report.id.clone()));
+    object.insert(
+        "repository_id".to_string(),
+        JsonValue::String(repository_id.to_string()),
+    );
+    JsonValue::Object(object)
+}
+
+fn validation_report_tree_json(tree: &SingleRepoTree) -> JsonValue {
+    JsonValue::Object(BTreeMap::from([
+        (
+            "kind".to_string(),
+            JsonValue::String("SingleRepoTree".to_string()),
+        ),
+        (
+            "repository_id".to_string(),
+            JsonValue::String(tree.repository_id.clone()),
+        ),
+        (
+            "tree_hash".to_string(),
+            JsonValue::String(tree.tree_hash.clone()),
+        ),
+    ]))
+}
+
+fn validation_report_summary_json(summary: &GitExportValidationSummary) -> JsonValue {
+    JsonValue::Object(BTreeMap::from([
+        (
+            "records_checked".to_string(),
+            JsonValue::Number(summary.records_checked.to_string()),
+        ),
+        (
+            "payloads_checked".to_string(),
+            JsonValue::Number(summary.payloads_checked.to_string()),
+        ),
+        (
+            "warnings".to_string(),
+            JsonValue::Number(summary.warnings.to_string()),
+        ),
+        (
+            "blocked".to_string(),
+            JsonValue::Number(summary.blocked.to_string()),
+        ),
+    ]))
+}
+
+fn validation_report_failure_json(failure: &GitExportValidationFailure) -> JsonValue {
+    JsonValue::Object(BTreeMap::from([
+        (
+            "check".to_string(),
+            JsonValue::String(failure.check.as_str().to_string()),
+        ),
+        (
+            "code".to_string(),
+            JsonValue::String(failure.code.as_str().to_string()),
+        ),
+        (
+            "field".to_string(),
+            failure
+                .field
+                .as_ref()
+                .map(|value| JsonValue::String(value.clone()))
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "value".to_string(),
+            failure
+                .value
+                .as_ref()
+                .map(|value| JsonValue::String(value.clone()))
+                .unwrap_or(JsonValue::Null),
+        ),
+        (
+            "reason".to_string(),
+            JsonValue::String(failure.reason.clone()),
+        ),
+    ]))
+}
+
+fn parse_validation_report_record(
+    path: &Path,
+    repository_id: &str,
+    validation_report_id: &str,
+    value: &JsonValue,
+) -> Result<GitExportValidationReport, GitExportValidationReportStoreError> {
+    let object = report_object(path, value, "record")?;
+    if report_u32(path, object, "schema_version")? != VALIDATION_REPORT_RECORD_SCHEMA_VERSION {
+        return report_invalid(path, "unsupported validation report schema_version");
+    }
+    if report_string(path, object, "record_type")? != "validation_report"
+        || report_string(path, object, "privacy_class")? != PrivacyClass::CommitDefault.as_str()
+    {
+        return report_invalid(path, "record type or privacy class is invalid");
+    }
+    if report_string(path, object, "id")? != validation_report_id {
+        return report_invalid(path, "record ID does not match the requested report ID");
+    }
+    if report_string(path, object, "repository_id")? != repository_id {
+        return report_invalid(
+            path,
+            "record repository identity does not match the repository",
+        );
+    }
+    let tree_object = report_object(
+        path,
+        report_field(path, object, "tree_identity")?,
+        "tree_identity",
+    )?;
+    if report_string(path, tree_object, "kind")? != "SingleRepoTree" {
+        return report_invalid(path, "tree_identity.kind must be SingleRepoTree");
+    }
+    let tree_repository_id = report_string(path, tree_object, "repository_id")?.to_string();
+    if tree_repository_id != repository_id {
+        return report_invalid(
+            path,
+            "tree identity repository does not match the repository",
+        );
+    }
+    let summary_object = report_object(path, report_field(path, object, "summary")?, "summary")?;
+    let failures = report_array(path, object, "failures")?
+        .iter()
+        .map(|value| parse_validation_report_failure(path, value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let report = GitExportValidationReport {
+        id: validation_report_id.to_string(),
+        policy_id: report_string(path, object, "policy_id")?.to_string(),
+        checkpoint_id: report_string(path, object, "checkpoint_id")?.to_string(),
+        resolved_view_id: report_string(path, object, "resolved_view_id")?.to_string(),
+        tree_identity: SingleRepoTree {
+            repository_id: tree_repository_id,
+            tree_hash: report_string(path, tree_object, "tree_hash")?.to_string(),
+        },
+        git_ref: report_string(path, object, "git_ref")?.to_string(),
+        ok: report_bool(path, object, "ok")?,
+        summary: GitExportValidationSummary {
+            records_checked: report_u32(path, summary_object, "records_checked")?,
+            payloads_checked: report_u32(path, summary_object, "payloads_checked")?,
+            warnings: report_u32(path, summary_object, "warnings")?,
+            blocked: report_u32(path, summary_object, "blocked")?,
+        },
+        failures,
+    };
+    if report.summary.blocked != report.failures.len() as u32
+        || report.ok != report.failures.is_empty()
+        || persisted_validation_report_id(&report) != validation_report_id
+    {
+        return report_invalid(
+            path,
+            "report summary, success state, or content-derived identity failed integrity validation",
+        );
+    }
+    Ok(report)
+}
+
+fn parse_validation_report_failure(
+    path: &Path,
+    value: &JsonValue,
+) -> Result<GitExportValidationFailure, GitExportValidationReportStoreError> {
+    let object = report_object(path, value, "failure")?;
+    let check = match report_string(path, object, "check")? {
+        "conflict_gate" => GitExportValidationCheck::ConflictGate,
+        "repository_config" => GitExportValidationCheck::RepositoryConfig,
+        "policy_class" => GitExportValidationCheck::PolicyClass,
+        "path_scope" => GitExportValidationCheck::PathScope,
+        "reachability" => GitExportValidationCheck::Reachability,
+        "secret_scan" => GitExportValidationCheck::SecretScan,
+        "unsafe_reference" => GitExportValidationCheck::UnsafeReference,
+        "export_shape" => GitExportValidationCheck::ExportShape,
+        "git_ref" => GitExportValidationCheck::GitRef,
+        "execution_raw_exclusion" => GitExportValidationCheck::ExecutionRawExclusion,
+        "generated_policy" => GitExportValidationCheck::GeneratedPolicy,
+        "report_integrity" => GitExportValidationCheck::ReportIntegrity,
+        value => return report_invalid(path, &format!("unknown validation check `{value}`")),
+    };
+    let code = match report_string(path, object, "code")? {
+        "checkpoint_conflicted_view" => GitExportValidationFailureCode::CheckpointConflictedView,
+        "repository_scope_mismatch" => GitExportValidationFailureCode::RepositoryScopeMismatch,
+        "resolved_view_mismatch" => GitExportValidationFailureCode::ResolvedViewMismatch,
+        "tree_identity_mismatch" => GitExportValidationFailureCode::TreeIdentityMismatch,
+        "path_policy_mismatch" => GitExportValidationFailureCode::PathPolicyMismatch,
+        "export_path_unsafe" => GitExportValidationFailureCode::ExportPathUnsafe,
+        "content_hash_mismatch" => GitExportValidationFailureCode::ContentHashMismatch,
+        "secret_detected" => GitExportValidationFailureCode::SecretDetected,
+        "export_policy_failed" => GitExportValidationFailureCode::ExportPolicyFailed,
+        "export_metadata_policy_failed" => {
+            GitExportValidationFailureCode::ExportMetadataPolicyFailed
+        }
+        "export_ref_invalid" => GitExportValidationFailureCode::ExportRefInvalid,
+        "moving_selector" => GitExportValidationFailureCode::MovingSelector,
+        "local_only_evidence_reference" => {
+            GitExportValidationFailureCode::LocalOnlyEvidenceReference
+        }
+        "secret_or_local_only_record" => GitExportValidationFailureCode::SecretOrLocalOnlyRecord,
+        "generated_output_requires_promotion" => {
+            GitExportValidationFailureCode::GeneratedOutputRequiresPromotion
+        }
+        "validation_report_missing" => GitExportValidationFailureCode::ValidationReportMissing,
+        value => {
+            return report_invalid(path, &format!("unknown validation failure code `{value}`"))
+        }
+    };
+    Ok(GitExportValidationFailure {
+        check,
+        code,
+        field: report_optional_string(path, object, "field")?,
+        value: report_optional_string(path, object, "value")?,
+        reason: report_string(path, object, "reason")?.to_string(),
+    })
+}
+
+fn report_field<'a>(
+    path: &Path,
+    object: &'a BTreeMap<String, JsonValue>,
+    field: &str,
+) -> Result<&'a JsonValue, GitExportValidationReportStoreError> {
+    object
+        .get(field)
+        .ok_or_else(|| GitExportValidationReportStoreError::Invalid {
+            path: path.to_path_buf(),
+            message: format!("missing required field `{field}`"),
+        })
+}
+
+fn report_object<'a>(
+    path: &Path,
+    value: &'a JsonValue,
+    field: &str,
+) -> Result<&'a BTreeMap<String, JsonValue>, GitExportValidationReportStoreError> {
+    match value {
+        JsonValue::Object(object) => Ok(object),
+        _ => report_invalid(path, &format!("field `{field}` must be an object")),
+    }
+}
+
+fn report_string<'a>(
+    path: &Path,
+    object: &'a BTreeMap<String, JsonValue>,
+    field: &str,
+) -> Result<&'a str, GitExportValidationReportStoreError> {
+    match report_field(path, object, field)? {
+        JsonValue::String(value) => Ok(value),
+        _ => report_invalid(path, &format!("field `{field}` must be a string")),
+    }
+}
+
+fn report_optional_string(
+    path: &Path,
+    object: &BTreeMap<String, JsonValue>,
+    field: &str,
+) -> Result<Option<String>, GitExportValidationReportStoreError> {
+    match report_field(path, object, field)? {
+        JsonValue::Null => Ok(None),
+        JsonValue::String(value) => Ok(Some(value.clone())),
+        _ => report_invalid(path, &format!("field `{field}` must be a string or null")),
+    }
+}
+
+fn report_bool(
+    path: &Path,
+    object: &BTreeMap<String, JsonValue>,
+    field: &str,
+) -> Result<bool, GitExportValidationReportStoreError> {
+    match report_field(path, object, field)? {
+        JsonValue::Bool(value) => Ok(*value),
+        _ => report_invalid(path, &format!("field `{field}` must be a boolean")),
+    }
+}
+
+fn report_u32(
+    path: &Path,
+    object: &BTreeMap<String, JsonValue>,
+    field: &str,
+) -> Result<u32, GitExportValidationReportStoreError> {
+    match report_field(path, object, field)? {
+        JsonValue::Number(value) => {
+            value
+                .parse()
+                .map_err(|_| GitExportValidationReportStoreError::Invalid {
+                    path: path.to_path_buf(),
+                    message: format!("field `{field}` must be an unsigned 32-bit integer"),
+                })
+        }
+        _ => report_invalid(
+            path,
+            &format!("field `{field}` must be an unsigned 32-bit integer"),
+        ),
+    }
+}
+
+fn report_array<'a>(
+    path: &Path,
+    object: &'a BTreeMap<String, JsonValue>,
+    field: &str,
+) -> Result<&'a [JsonValue], GitExportValidationReportStoreError> {
+    match report_field(path, object, field)? {
+        JsonValue::Array(values) => Ok(values),
+        _ => report_invalid(path, &format!("field `{field}` must be an array")),
+    }
+}
+
+fn report_invalid<T>(path: &Path, message: &str) -> Result<T, GitExportValidationReportStoreError> {
+    Err(GitExportValidationReportStoreError::Invalid {
+        path: path.to_path_buf(),
+        message: message.to_string(),
+    })
 }
 
 pub fn git_export_checkpoint(
@@ -1390,7 +1885,10 @@ fn validate_writer_report(input: &GitExportWriterInput) -> Result<(), GitExportP
     let report = &input.validation_report;
     if !report.ok
         || report.id != request.validation_report_id
+        || report.policy_id != CONSERVATIVE_EXPORT_POLICY_ID
         || report.checkpoint_id != request.checkpoint.id
+        || report.resolved_view_id != request.checkpoint.resolved_view_id
+        || report.tree_identity != request.checkpoint.tree_identity
         || report.git_ref != request.git_ref
     {
         return Err(planning_error(
@@ -1861,6 +2359,39 @@ mod tests {
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn persisted_validation_report_is_canonical_reused_and_integrity_checked() {
+        let repo = TestTempDir::new();
+        let checkpoint = fixture_checkpoint();
+        let request = GitExportRequest::from_checkpoint(&checkpoint);
+        let mut report = validate_git_export_request(&request);
+        report.id = persisted_validation_report_id(&report);
+
+        let first_path =
+            persist_git_export_validation_report(repo.path(), &checkpoint.repository_id, &report)
+                .unwrap();
+        let first_bytes = fs::read(&first_path).unwrap();
+        let second_path =
+            persist_git_export_validation_report(repo.path(), &checkpoint.repository_id, &report)
+                .unwrap();
+
+        assert_eq!(first_path, second_path);
+        assert_eq!(first_bytes, fs::read(&second_path).unwrap());
+        assert_eq!(
+            load_git_export_validation_report(repo.path(), &checkpoint.repository_id, &report.id,)
+                .unwrap(),
+            report
+        );
+
+        let tampered = String::from_utf8(first_bytes)
+            .unwrap()
+            .replace("\"ok\":true", "\"ok\":false");
+        fs::write(&first_path, tampered).unwrap();
+        assert!(matches!(
+            load_git_export_validation_report(repo.path(), &checkpoint.repository_id, &report.id,),
+            Err(GitExportValidationReportStoreError::Invalid { .. })
+        ));
+    }
     #[test]
     fn validates_policy_approved_metadata_only_export() {
         let checkpoint = fixture_checkpoint();

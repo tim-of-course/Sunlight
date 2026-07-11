@@ -7169,6 +7169,53 @@ fn no_fixture_policy_check_and_git_export_share_persisted_validation() {
     assert!(check_stdout.contains("\"tree_identity\":{"));
     assert!(check_stdout.contains("\"payloads_checked\":1"));
     assert!(!check_stdout.contains("fixture"));
+    let report_path = repo
+        .path()
+        .join(".sunlight/records/validation-reports")
+        .join(format!("{report_id}.json"));
+    let report_bytes = fs::read(&report_path).unwrap();
+    parse_json_record(&report_bytes).expect("persisted report should be valid JSON");
+
+    let explain = sun()
+        .arg("policy")
+        .arg("explain")
+        .arg(&report_id)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("real policy explain should run");
+    assert_success(&explain);
+    let explain_stdout = stdout(&explain);
+    assert_valid_json(&explain_stdout);
+    assert!(explain_stdout.contains("\"command\":\"policy.explain\""));
+    assert!(explain_stdout.contains(&format!("\"validation_report_id\":\"{report_id}\"")));
+    assert!(explain_stdout.contains("\"checkpoint_id\":"));
+    assert!(explain_stdout.contains("\"policy_id\":"));
+    assert!(explain_stdout.contains("\"tree_identity\":"));
+
+    let repeated_check = sun()
+        .arg("policy")
+        .arg("check-export")
+        .arg("--checkpoint")
+        .arg(&checkpoint_id)
+        .arg("--branch")
+        .arg(branch)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("repeated real policy check-export should run");
+    assert_success(&repeated_check);
+    assert_eq!(
+        json_string_field(&stdout(&repeated_check), "validation_report_id"),
+        report_id
+    );
+    assert_eq!(
+        fs::read_dir(repo.path().join(".sunlight/records/validation-reports"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(fs::read(&report_path).unwrap(), report_bytes);
 
     let export = sun()
         .arg("git")
@@ -7196,6 +7243,7 @@ fn no_fixture_policy_check_and_git_export_share_persisted_validation() {
     )
     .unwrap();
     assert!(export_record.contains(&format!("\"validation_report_id\":\"{report_id}\"")));
+    assert_eq!(fs::read(&report_path).unwrap(), report_bytes);
 }
 
 #[test]
@@ -7233,6 +7281,8 @@ fn no_fixture_generated_policy_failure_does_not_mutate_git_or_export_maps() {
     assert_success(&checkpoint);
     let checkpoint_id = json_string_field(&stdout(&checkpoint), "checkpoint_id");
     let branch = "refs/heads/sunlight/generated-block";
+    let state_before = fs::read(repo.path().join(".sunlight/records/native-state.json")).unwrap();
+    let commit_count_before = git(repo.path(), &["rev-list", "--all", "--count"]);
 
     let check = sun()
         .arg("policy")
@@ -7250,8 +7300,26 @@ fn no_fixture_generated_policy_failure_does_not_mutate_git_or_export_maps() {
     assert!(check_stdout.contains("\"code\":\"export_policy_failed\""));
     assert!(check_stdout.contains("\"check\":\"generated_policy\""));
     assert!(check_stdout.contains("\"code\":\"generated_output_requires_promotion\""));
+    let report_id = json_string_field(&check_stdout, "id");
+    let report_path = repo
+        .path()
+        .join(".sunlight/records/validation-reports")
+        .join(format!("{report_id}.json"));
+    assert!(report_path.is_file());
+    let explain = sun()
+        .arg("policy")
+        .arg("explain")
+        .arg(&report_id)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("blocked real policy explain should run");
+    assert_success(&explain);
+    let explain_stdout = stdout(&explain);
+    assert!(explain_stdout.contains("\"ok\":false"));
+    assert!(explain_stdout.contains("\"check\":\"generated_policy\""));
+    assert!(explain_stdout.contains("\"value\":\"src/generated.txt\""));
 
-    let state_before = fs::read(repo.path().join(".sunlight/records/native-state.json")).unwrap();
     let export = sun()
         .arg("git")
         .arg("export")
@@ -7266,11 +7334,16 @@ fn no_fixture_generated_policy_failure_does_not_mutate_git_or_export_maps() {
         .expect("blocked generated export should run");
     assert_failure(&export);
     let export_stdout = stdout(&export);
+    assert_eq!(json_string_field(&export_stdout, "id"), report_id);
     assert!(export_stdout.contains("\"check\":\"generated_policy\""));
     assert!(export_stdout.contains("\"commit_created\":false"));
     assert!(export_stdout.contains("\"ref_updated\":false"));
     assert!(export_stdout.contains("\"export_map_written\":false"));
     assert!(!git_ref_exists(repo.path(), branch));
+    assert_eq!(
+        git(repo.path(), &["rev-list", "--all", "--count"]),
+        commit_count_before
+    );
     assert_eq!(
         fs::read(repo.path().join(".sunlight/records/native-state.json")).unwrap(),
         state_before
@@ -7280,6 +7353,62 @@ fn no_fixture_generated_policy_failure_does_not_mutate_git_or_export_maps() {
         .join(".sunlight/export-map")
         .join(format!("export_map_{checkpoint_id}.json"))
         .exists());
+}
+
+#[test]
+fn no_fixture_policy_explain_reports_missing_and_tampered_records() {
+    let repo = TestRepo::new("real-policy-explain-integrity");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "policy-explain-integrity");
+
+    let missing = sun()
+        .arg("policy")
+        .arg("explain")
+        .arg(format!("validation_sha256_{}", "0".repeat(64)))
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("missing real policy explain should run");
+    assert_failure(&missing);
+    let missing_stdout = stdout(&missing);
+    assert!(missing_stdout.contains("\"code\":\"object_not_found\""));
+    assert!(missing_stdout.contains("\"object_type\":\"validation_report\""));
+
+    let checkpoint_id = create_real_base_checkpoint(&repo);
+    let check = sun()
+        .arg("policy")
+        .arg("check-export")
+        .arg("--checkpoint")
+        .arg(checkpoint_id)
+        .arg("--branch")
+        .arg("refs/heads/sunlight/policy-explain-integrity")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("real policy check should run");
+    assert_success(&check);
+    let report_id = json_string_field(&stdout(&check), "validation_report_id");
+    let report_path = repo
+        .path()
+        .join(".sunlight/records/validation-reports")
+        .join(format!("{report_id}.json"));
+    let tampered = fs::read_to_string(&report_path)
+        .unwrap()
+        .replace("\"ok\":true", "\"ok\":false");
+    fs::write(&report_path, tampered).unwrap();
+
+    let explain = sun()
+        .arg("policy")
+        .arg("explain")
+        .arg(&report_id)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("tampered real policy explain should run");
+    assert_failure(&explain);
+    let explain_stdout = stdout(&explain);
+    assert!(explain_stdout.contains("\"code\":\"validation_report_integrity_failed\""));
+    assert!(explain_stdout.contains(&format!("\"validation_report_id\":\"{report_id}\"")));
 }
 
 #[test]

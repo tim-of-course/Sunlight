@@ -42,14 +42,16 @@ use sunlight_core::execution::{
 };
 use sunlight_core::git_export::{
     execute_git_export_writer_plan_fixture, execute_local_git_export_writer, git_export_checkpoint,
+    load_git_export_validation_report, persist_git_export_validation_report,
     plan_git_export_writer, validate_persisted_git_export, GeneratedOutputExportRequirement,
     GitExportCommitPlan, GitExportContentFile, GitExportError, GitExportExecutionError,
     GitExportExecutionFixture, GitExportExecutionResult, GitExportExecutionStep,
     GitExportExecutionStepFixture, GitExportExecutionSummary, GitExportMapStore,
     GitExportPlanningError, GitExportRefUpdatePlan, GitExportRepositoryState, GitExportRequest,
-    GitExportResponse, GitExportValidationFailure, GitExportValidationReport, GitExportWriterInput,
-    GitExportWriterPlan, GitRefState, ImportedBaseGitCommit, InMemoryGitExportMapStore,
-    PersistedGitExportMap, PersistedGitExportValidationInput,
+    GitExportResponse, GitExportValidationFailure, GitExportValidationReport,
+    GitExportValidationReportStoreError, GitExportWriterInput, GitExportWriterPlan, GitRefState,
+    ImportedBaseGitCommit, InMemoryGitExportMapStore, PersistedGitExportMap,
+    PersistedGitExportValidationInput,
 };
 use sunlight_core::policy::{
     validate_candidate_paths, validate_managed_ignore_block, ValidationFailure, ValidationReport,
@@ -1063,6 +1065,7 @@ fn real_policy_check_export(
     })?;
     let report =
         validate_real_export_candidate(&repo_root, &state, &options.checkpoint_id, &git_ref)?;
+    let report = persist_and_reload_real_validation_report(&repo_root, &state, &report)?;
     if !report.ok {
         return Err(policy_check_export_error(&report));
     }
@@ -1116,8 +1119,27 @@ fn policy_explain(ctx: &CommandContext) -> Result<(), CliError> {
         );
     }
 
-    let report = fixture_policy_explain_validation_report(&options.validation_report_id)?;
-    println!("{}", policy_explain_success_envelope(&report));
+    let repo_root = PathBuf::from(".");
+    let (repository_id, report) = match RealRepoState::load(&repo_root) {
+        Ok(state) => {
+            let report = load_git_export_validation_report(
+                &repo_root,
+                &state.repository_id,
+                &options.validation_report_id,
+            )
+            .map_err(|error| validation_report_load_error(&options.validation_report_id, error))?;
+            (Some(state.repository_id), report)
+        }
+        Err(RepoStateError::NotInitialized { .. }) => (
+            None,
+            fixture_policy_explain_validation_report(&options.validation_report_id)?,
+        ),
+        Err(error) => return Err(error.into()),
+    };
+    println!(
+        "{}",
+        policy_explain_success_envelope(repository_id.as_deref(), &report)
+    );
 
     Ok(())
 }
@@ -2972,6 +2994,7 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
         checkpoint.clone(),
         &git_ref,
     )?;
+    let report = persist_and_reload_real_validation_report(&repo_root, &state, &report)?;
     if !report.ok {
         return Err(real_git_export_policy_error(&report));
     }
@@ -3133,6 +3156,17 @@ fn validate_real_export_candidate_with_context(
             state,
         },
     ))
+}
+
+fn persist_and_reload_real_validation_report(
+    repo_root: &PathBuf,
+    state: &RealRepoState,
+    report: &GitExportValidationReport,
+) -> Result<GitExportValidationReport, CliError> {
+    persist_git_export_validation_report(repo_root, &state.repository_id, report)
+        .map_err(|error| validation_report_write_error(&report.id, error))?;
+    load_git_export_validation_report(repo_root, &state.repository_id, &report.id)
+        .map_err(|error| validation_report_load_error(&report.id, error))
 }
 
 fn reject_real_export_blocked_entries(state: &RealRepoState) -> Result<(), CliError> {
@@ -9213,6 +9247,48 @@ fn policy_check_export_error(report: &GitExportValidationReport) -> CliError {
     ))
 }
 
+fn validation_report_write_error(
+    validation_report_id: &str,
+    error: GitExportValidationReportStoreError,
+) -> CliError {
+    validation_report_store_error(
+        "validation_report_write_failed",
+        validation_report_id,
+        error,
+    )
+}
+
+fn validation_report_load_error(
+    validation_report_id: &str,
+    error: GitExportValidationReportStoreError,
+) -> CliError {
+    match error {
+        GitExportValidationReportStoreError::NotFound { .. } => {
+            object_not_found("validation_report", validation_report_id)
+        }
+        error => validation_report_store_error(
+            "validation_report_integrity_failed",
+            validation_report_id,
+            error,
+        ),
+    }
+}
+
+fn validation_report_store_error(
+    code: &'static str,
+    validation_report_id: &str,
+    error: GitExportValidationReportStoreError,
+) -> CliError {
+    let path = match &error {
+        GitExportValidationReportStoreError::NotFound { path }
+        | GitExportValidationReportStoreError::Invalid { path, .. }
+        | GitExportValidationReportStoreError::Io { path, .. } => path.display().to_string(),
+    };
+    CliError::new(code, error.to_string())
+        .with_detail("validation_report_id", validation_report_id)
+        .with_detail("path", path)
+}
+
 fn real_git_export_policy_error(report: &GitExportValidationReport) -> CliError {
     CliError::new(
         "export_policy_failed",
@@ -9640,12 +9716,19 @@ fn policy_check_commit_success_envelope(
     )
 }
 
-fn policy_explain_success_envelope(report: &GitExportValidationReport) -> String {
+fn policy_explain_success_envelope(
+    repository_id: Option<&str>,
+    report: &GitExportValidationReport,
+) -> String {
+    let repository = repository_id
+        .map(|repository_id| format!("\"repository_id\":\"{}\",", json_escape(repository_id)))
+        .unwrap_or_default();
     format!(
         concat!(
             "{{\"ok\":true,",
             "\"data\":{{",
             "\"command\":\"policy.explain\",",
+            "{}",
             "\"validation_report_id\":\"{}\",",
             "\"ids\":{{",
             "\"validation_report_id\":\"{}\"",
@@ -9655,6 +9738,7 @@ fn policy_explain_success_envelope(report: &GitExportValidationReport) -> String
             "\"warnings\":[]",
             "}}"
         ),
+        repository,
         json_escape(&report.id),
         json_escape(&report.id),
         git_export_validation_report_json(report),

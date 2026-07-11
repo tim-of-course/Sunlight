@@ -212,6 +212,7 @@ pub struct RealExportMapSnapshot {
     pub git_ref: String,
     pub git_commit_ids: Vec<String>,
     pub exported_at: String,
+    pub validation_report_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -795,7 +796,7 @@ pub fn resolve_real_repo_view(
     RealResolvedRepoView { result, entries }
 }
 
-fn expanded_operation_order(
+pub fn expanded_operation_order(
     state: &RealRepoState,
     frontier: &BTreeMap<String, String>,
 ) -> Vec<String> {
@@ -1663,6 +1664,7 @@ fn parse_export_map_snapshot(
         git_ref: required_string(object, "git_ref", state_path)?,
         git_commit_ids,
         exported_at: required_string(object, "exported_at", state_path)?,
+        validation_report_id: optional_string(object, "validation_report_id", state_path)?,
     })
 }
 
@@ -1989,6 +1991,12 @@ fn export_map_snapshot_json(export_map: &RealExportMapSnapshot) -> JsonValue {
         "exported_at".to_string(),
         JsonValue::String(export_map.exported_at.clone()),
     );
+    if let Some(validation_report_id) = &export_map.validation_report_id {
+        object.insert(
+            "validation_report_id".to_string(),
+            JsonValue::String(validation_report_id.clone()),
+        );
+    }
     JsonValue::Object(object)
 }
 

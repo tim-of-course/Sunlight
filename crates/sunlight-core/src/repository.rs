@@ -11,6 +11,7 @@ use crate::policy::managed_ignore_block;
 
 pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const CURRENT_STORAGE_SCHEMA_VERSION: u32 = 1;
+pub const CONSERVATIVE_SUNLIGHT_COMMIT_POLICY: &str = "conservative";
 
 const SUNLIGHT_DIR: &str = ".sunlight";
 const CONFIG_FILE: &str = "config.toml";
@@ -162,7 +163,14 @@ sunlight_commit_policy = \"{}\"
             }
         })?;
 
-        Ok(Self {
+        let sunlight_commit_policy =
+            parse_string_key(input, "sunlight_commit_policy").ok_or_else(|| {
+                RepositoryError::InvalidConfig {
+                    path: path.clone(),
+                    message: "missing git_interop.sunlight_commit_policy".to_string(),
+                }
+            })?;
+        let config = Self {
             repository_id,
             config_schema_version: parse_u32_key(input, "config_schema_version").unwrap_or(1),
             storage_schema_version: parse_u32_key(input, "storage_schema_version").unwrap_or(1),
@@ -180,10 +188,43 @@ sunlight_commit_policy = \"{}\"
                     .unwrap_or_else(|| ".sunlight/projections".to_string()),
             },
             git_interop: GitInteropPolicy {
-                sunlight_commit_policy: parse_string_key(input, "sunlight_commit_policy")
-                    .unwrap_or_else(|| "conservative".to_string()),
+                sunlight_commit_policy,
             },
-        })
+        };
+        config.validate(&path)?;
+        Ok(config)
+    }
+
+    pub fn validate(&self, path: impl Into<PathBuf>) -> Result<(), RepositoryError> {
+        let path = path.into();
+        if self.config_schema_version != CURRENT_CONFIG_SCHEMA_VERSION {
+            return Err(RepositoryError::InvalidConfig {
+                path,
+                message: format!(
+                    "unsupported config_schema_version `{}`; expected `{}`",
+                    self.config_schema_version, CURRENT_CONFIG_SCHEMA_VERSION
+                ),
+            });
+        }
+        if self.storage_schema_version != CURRENT_STORAGE_SCHEMA_VERSION {
+            return Err(RepositoryError::InvalidConfig {
+                path,
+                message: format!(
+                    "unsupported storage_schema_version `{}`; expected `{}`",
+                    self.storage_schema_version, CURRENT_STORAGE_SCHEMA_VERSION
+                ),
+            });
+        }
+        if self.git_interop.sunlight_commit_policy != CONSERVATIVE_SUNLIGHT_COMMIT_POLICY {
+            return Err(RepositoryError::InvalidConfig {
+                path,
+                message: format!(
+                    "unsupported git_interop.sunlight_commit_policy `{}`; supported value is `{}`",
+                    self.git_interop.sunlight_commit_policy, CONSERVATIVE_SUNLIGHT_COMMIT_POLICY
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -354,6 +395,22 @@ mod tests {
             fs::read_to_string(gitignore_path).unwrap(),
             "# user managed\n/local/\n"
         );
+    }
+
+    #[test]
+    fn config_rejects_unknown_git_interop_policy() {
+        let path = PathBuf::from(".sunlight/config.toml");
+        let input = RepositoryConfig::new("repo_test".to_string())
+            .to_toml()
+            .replace(
+                "sunlight_commit_policy = \"conservative\"",
+                "sunlight_commit_policy = \"permissive\"",
+            );
+
+        let error = RepositoryConfig::from_toml(&input, path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported git_interop.sunlight_commit_policy `permissive`"));
     }
 
     struct TestRepo {

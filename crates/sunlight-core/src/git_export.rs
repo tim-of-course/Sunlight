@@ -1,10 +1,17 @@
+use crate::artifacts::{PathPolicy, POSIX_CASE_SENSITIVE_PATH_POLICY_ID};
 use crate::checkpoint::{
     CheckpointRecord, ExportShape, ExportShapeKind, GitExportMapRecord, FIXTURE_CREATED_AT,
     FIXTURE_EXPORTED_GIT_REF, FIXTURE_EXPORT_MAP_ID, FIXTURE_GIT_COMMIT_ID,
     FIXTURE_VALIDATION_REPORT_ID,
 };
 use crate::records::PrivacyClass;
-use crate::resolver::SingleRepoTree;
+use crate::repo_state::{
+    detect_secret_reasons, expanded_operation_order, real_content_hash, real_tree_hash,
+    RealArtifactEntry, RealRepoState,
+};
+use crate::repository::{RepositoryConfig, CONSERVATIVE_SUNLIGHT_COMMIT_POLICY};
+use crate::resolver::{ResolvedViewResult, SingleRepoTree};
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -12,6 +19,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static TEMPORARY_GIT_INDEX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+pub const CONSERVATIVE_EXPORT_POLICY_ID: &str =
+    "git_interop.sunlight_commit_policy.conservative.v1";
+
+pub struct PersistedGitExportValidationInput<'a> {
+    pub config: &'a RepositoryConfig,
+    pub request: &'a GitExportRequest,
+    pub resolved_view: &'a ResolvedViewResult,
+    pub entries: &'a [RealArtifactEntry],
+    pub state: &'a RealRepoState,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitExportRequest {
@@ -32,7 +49,10 @@ pub struct GeneratedOutputExportRequirement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitExportValidationReport {
     pub id: String,
+    pub policy_id: String,
     pub checkpoint_id: String,
+    pub resolved_view_id: String,
+    pub tree_identity: SingleRepoTree,
     pub git_ref: String,
     pub ok: bool,
     pub summary: GitExportValidationSummary,
@@ -59,7 +79,11 @@ pub struct GitExportValidationFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitExportValidationCheck {
     ConflictGate,
+    RepositoryConfig,
     PolicyClass,
+    PathScope,
+    Reachability,
+    SecretScan,
     UnsafeReference,
     ExportShape,
     GitRef,
@@ -72,7 +96,11 @@ impl GitExportValidationCheck {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ConflictGate => "conflict_gate",
+            Self::RepositoryConfig => "repository_config",
             Self::PolicyClass => "policy_class",
+            Self::PathScope => "path_scope",
+            Self::Reachability => "reachability",
+            Self::SecretScan => "secret_scan",
             Self::UnsafeReference => "unsafe_reference",
             Self::ExportShape => "export_shape",
             Self::GitRef => "git_ref",
@@ -86,6 +114,13 @@ impl GitExportValidationCheck {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitExportValidationFailureCode {
     CheckpointConflictedView,
+    RepositoryScopeMismatch,
+    ResolvedViewMismatch,
+    TreeIdentityMismatch,
+    PathPolicyMismatch,
+    ExportPathUnsafe,
+    ContentHashMismatch,
+    SecretDetected,
     ExportPolicyFailed,
     ExportMetadataPolicyFailed,
     ExportRefInvalid,
@@ -100,6 +135,13 @@ impl GitExportValidationFailureCode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CheckpointConflictedView => "checkpoint_conflicted_view",
+            Self::RepositoryScopeMismatch => "repository_scope_mismatch",
+            Self::ResolvedViewMismatch => "resolved_view_mismatch",
+            Self::TreeIdentityMismatch => "tree_identity_mismatch",
+            Self::PathPolicyMismatch => "path_policy_mismatch",
+            Self::ExportPathUnsafe => "export_path_unsafe",
+            Self::ContentHashMismatch => "content_hash_mismatch",
+            Self::SecretDetected => "secret_detected",
             Self::ExportPolicyFailed => "export_policy_failed",
             Self::ExportMetadataPolicyFailed => "export_metadata_policy_failed",
             Self::ExportRefInvalid => "export_ref_invalid",
@@ -1036,7 +1078,10 @@ pub fn validate_git_export_request(request: &GitExportRequest) -> GitExportValid
     let blocked = failures.len() as u32;
     GitExportValidationReport {
         id: request.validation_report_id.clone(),
+        policy_id: CONSERVATIVE_EXPORT_POLICY_ID.to_string(),
         checkpoint_id: request.checkpoint.id.clone(),
+        resolved_view_id: request.checkpoint.resolved_view_id.clone(),
+        tree_identity: request.checkpoint.tree_identity.clone(),
         git_ref: request.git_ref.clone(),
         ok: failures.is_empty(),
         summary: GitExportValidationSummary {
@@ -1047,6 +1092,233 @@ pub fn validate_git_export_request(request: &GitExportRequest) -> GitExportValid
         },
         failures,
     }
+}
+
+pub fn validate_persisted_git_export(
+    input: PersistedGitExportValidationInput<'_>,
+) -> GitExportValidationReport {
+    let request = input.request;
+    let mut report = validate_git_export_request(request);
+    let checkpoint = &request.checkpoint;
+    let view = input.resolved_view;
+
+    if input.config.git_interop.sunlight_commit_policy != CONSERVATIVE_SUNLIGHT_COMMIT_POLICY {
+        report.failures.push(failure(
+            GitExportValidationCheck::RepositoryConfig,
+            GitExportValidationFailureCode::ExportPolicyFailed,
+            Some("git_interop.sunlight_commit_policy"),
+            Some(input.config.git_interop.sunlight_commit_policy.clone()),
+            "unsupported repository Git interop policy",
+        ));
+    }
+    if input.config.repository_id != checkpoint.repository_id
+        || view.repository_id != checkpoint.repository_id
+    {
+        report.failures.push(failure(
+            GitExportValidationCheck::RepositoryConfig,
+            GitExportValidationFailureCode::RepositoryScopeMismatch,
+            Some("repository_id"),
+            Some(input.config.repository_id.clone()),
+            "repository config, checkpoint, and resolved view must have the same repository identity",
+        ));
+    }
+    if view.resolved_view_id != checkpoint.resolved_view_id {
+        report.failures.push(failure(
+            GitExportValidationCheck::Reachability,
+            GitExportValidationFailureCode::ResolvedViewMismatch,
+            Some("checkpoint.resolved_view_id"),
+            Some(checkpoint.resolved_view_id.clone()),
+            "persisted checkpoint must resolve to its exact persisted view",
+        ));
+    }
+    if !view.conflict_free() {
+        report.failures.push(failure(
+            GitExportValidationCheck::ConflictGate,
+            GitExportValidationFailureCode::CheckpointConflictedView,
+            Some("resolved_view.conflict_ids"),
+            None,
+            "checkpoint export requires a conflict-free, non-stale resolved view",
+        ));
+    }
+    if view.path_policy_id != POSIX_CASE_SENSITIVE_PATH_POLICY_ID
+        || !input.config.path_policy.case_sensitive
+    {
+        report.failures.push(failure(
+            GitExportValidationCheck::RepositoryConfig,
+            GitExportValidationFailureCode::PathPolicyMismatch,
+            Some("resolved_view.path_policy_id"),
+            Some(view.path_policy_id.clone()),
+            "local MVP export requires the configured POSIX case-sensitive path policy",
+        ));
+    }
+    let computed_tree_hash = real_tree_hash(input.entries);
+    let view_tree_hash = view
+        .tree_identity
+        .as_ref()
+        .map(|tree| tree.tree_hash.as_str());
+    if computed_tree_hash != checkpoint.tree_identity.tree_hash
+        || view_tree_hash != Some(checkpoint.tree_identity.tree_hash.as_str())
+    {
+        report.failures.push(failure(
+            GitExportValidationCheck::Reachability,
+            GitExportValidationFailureCode::TreeIdentityMismatch,
+            Some("checkpoint.tree_identity.tree_hash"),
+            Some(checkpoint.tree_identity.tree_hash.clone()),
+            "persisted checkpoint entries, resolved view, and checkpoint tree identity must match",
+        ));
+    }
+
+    let reachable_operation_ids = expanded_operation_order(input.state, &view.topic_frontier);
+    let path_policy = PathPolicy::posix_case_sensitive();
+    for entry in input.entries.iter().filter(|entry| !entry.tombstone) {
+        if let Err(error) = path_policy.validate(&entry.path) {
+            report.failures.push(failure(
+                GitExportValidationCheck::PathScope,
+                GitExportValidationFailureCode::ExportPathUnsafe,
+                Some("checkpoint.entries[].path"),
+                Some(entry.path.clone()),
+                &format!("checkpoint entry failed export path policy: {error}"),
+            ));
+        }
+        if real_content_hash(&entry.bytes) != entry.content_hash {
+            report.failures.push(failure(
+                GitExportValidationCheck::Reachability,
+                GitExportValidationFailureCode::ContentHashMismatch,
+                Some("checkpoint.entries[].content_hash"),
+                Some(entry.path.clone()),
+                "persisted checkpoint content bytes do not match their content hash",
+            ));
+        }
+        let secret_reasons = detect_secret_reasons(&entry.path, &entry.bytes);
+        if !secret_reasons.is_empty() {
+            report.failures.push(failure(
+                GitExportValidationCheck::SecretScan,
+                GitExportValidationFailureCode::SecretDetected,
+                Some("checkpoint.entries[].path"),
+                Some(entry.path.clone()),
+                &format!(
+                    "checkpoint entry contains secret-like content ({})",
+                    secret_reasons.join(",")
+                ),
+            ));
+        }
+
+        match entry.classification.as_str() {
+            "source" => {}
+            "secret" | "local_only" | "local-only" => report.failures.push(failure(
+                GitExportValidationCheck::PolicyClass,
+                GitExportValidationFailureCode::SecretOrLocalOnlyRecord,
+                Some("checkpoint.entries[].classification"),
+                Some(entry.path.clone()),
+                "secret and local-only artifacts cannot be exported",
+            )),
+            "cache" | "ignored" | "log" => report.failures.push(failure(
+                GitExportValidationCheck::ExecutionRawExclusion,
+                GitExportValidationFailureCode::SecretOrLocalOnlyRecord,
+                Some("checkpoint.entries[].classification"),
+                Some(entry.path.clone()),
+                "cache, ignored, and log artifacts are local-only under conservative export policy",
+            )),
+            "generated" | "generated_artifact" => {
+                if !has_promotion_provenance(
+                    entry,
+                    &reachable_operation_ids,
+                    &input.state.operations,
+                    &input.state.promotions,
+                ) {
+                    report.failures.push(failure(
+                        GitExportValidationCheck::GeneratedPolicy,
+                        GitExportValidationFailureCode::GeneratedOutputRequiresPromotion,
+                        Some("checkpoint.entries[].classification"),
+                        Some(entry.path.clone()),
+                        "generated artifact requires reachable execution-output promotion provenance",
+                    ));
+                }
+            }
+            classification => report.failures.push(failure(
+                GitExportValidationCheck::PolicyClass,
+                GitExportValidationFailureCode::ExportPolicyFailed,
+                Some("checkpoint.entries[].classification"),
+                Some(entry.path.clone()),
+                &format!(
+                    "classification `{classification}` is not exportable under conservative policy"
+                ),
+            )),
+        }
+    }
+
+    let reachable_operations = reachable_operation_ids.len() as u32;
+    report.summary.records_checked =
+        2 + checkpoint.topic_frontier.len() as u32 + reachable_operations;
+    report.summary.payloads_checked = input
+        .entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .count() as u32;
+    report.summary.blocked = report.failures.len() as u32;
+    report.ok = report.failures.is_empty();
+    report.id = persisted_validation_report_id(&report);
+    report
+}
+
+fn has_promotion_provenance(
+    entry: &RealArtifactEntry,
+    reachable_operation_ids: &[String],
+    operations: &[crate::repo_state::RealOperationRecord],
+    promotions: &[crate::repo_state::RealExecutionPromotionSnapshot],
+) -> bool {
+    let promoted_execution_output = promotions.iter().any(|promotion| {
+        promotion.output_path == entry.path
+            && promotion.after_hash == entry.content_hash
+            && reachable_operation_ids.contains(&promotion.operation_transaction_id)
+            && operations.iter().any(|operation| {
+                operation.operation_transaction_id == promotion.operation_transaction_id
+                    && operation.topic_revision_id == promotion.topic_revision_id
+                    && operation.artifact_effects().iter().any(|effect| {
+                        !effect.tombstone
+                            && effect.path == entry.path
+                            && effect.result_content_hash == entry.content_hash
+                    })
+            })
+    });
+    let explicit_classification_operation = operations.iter().any(|operation| {
+        operation.mutation == "metadata_set"
+            && operation.classification == "generated"
+            && reachable_operation_ids.contains(&operation.operation_transaction_id)
+            && operation.artifact_effects().iter().any(|effect| {
+                !effect.tombstone
+                    && effect.path == entry.path
+                    && effect.result_content_hash == entry.content_hash
+                    && effect.classification == "generated"
+            })
+    });
+    promoted_execution_output || explicit_classification_operation
+}
+
+fn persisted_validation_report_id(report: &GitExportValidationReport) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        report.policy_id.as_str(),
+        report.checkpoint_id.as_str(),
+        report.resolved_view_id.as_str(),
+        report.tree_identity.repository_id.as_str(),
+        report.tree_identity.tree_hash.as_str(),
+        report.git_ref.as_str(),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    for failure in &report.failures {
+        hasher.update(failure.check.as_str().as_bytes());
+        hasher.update([0]);
+        hasher.update(failure.code.as_str().as_bytes());
+        hasher.update([0]);
+        hasher.update(failure.field.as_deref().unwrap_or("").as_bytes());
+        hasher.update([0]);
+        hasher.update(failure.value.as_deref().unwrap_or("").as_bytes());
+        hasher.update([0]);
+    }
+    format!("validation_sha256_{:x}", hasher.finalize())
 }
 
 pub fn git_export_checkpoint(

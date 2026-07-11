@@ -42,13 +42,14 @@ use sunlight_core::execution::{
 };
 use sunlight_core::git_export::{
     execute_git_export_writer_plan_fixture, execute_local_git_export_writer, git_export_checkpoint,
-    plan_git_export_writer, GeneratedOutputExportRequirement, GitExportCommitPlan,
-    GitExportContentFile, GitExportError, GitExportExecutionError, GitExportExecutionFixture,
-    GitExportExecutionResult, GitExportExecutionStep, GitExportExecutionStepFixture,
-    GitExportExecutionSummary, GitExportMapStore, GitExportPlanningError, GitExportRefUpdatePlan,
-    GitExportRepositoryState, GitExportRequest, GitExportResponse, GitExportValidationFailure,
-    GitExportValidationReport, GitExportWriterInput, GitExportWriterPlan, GitRefState,
-    ImportedBaseGitCommit, InMemoryGitExportMapStore, PersistedGitExportMap,
+    plan_git_export_writer, validate_persisted_git_export, GeneratedOutputExportRequirement,
+    GitExportCommitPlan, GitExportContentFile, GitExportError, GitExportExecutionError,
+    GitExportExecutionFixture, GitExportExecutionResult, GitExportExecutionStep,
+    GitExportExecutionStepFixture, GitExportExecutionSummary, GitExportMapStore,
+    GitExportPlanningError, GitExportRefUpdatePlan, GitExportRepositoryState, GitExportRequest,
+    GitExportResponse, GitExportValidationFailure, GitExportValidationReport, GitExportWriterInput,
+    GitExportWriterPlan, GitRefState, ImportedBaseGitCommit, InMemoryGitExportMapStore,
+    PersistedGitExportMap, PersistedGitExportValidationInput,
 };
 use sunlight_core::policy::{
     validate_candidate_paths, validate_managed_ignore_block, ValidationFailure, ValidationReport,
@@ -1014,10 +1015,12 @@ fn git_export(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn policy_check_export(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_policy_check_export_options(ctx)?;
-    if options.fixture != "basic-app" {
+    let Some(fixture) = options.fixture.as_deref() else {
+        return real_policy_check_export(ctx, options);
+    };
+    if fixture != "basic-app" {
         return Err(
-            invalid_request(format!("unknown fixture `{}`", options.fixture))
-                .with_detail("fixture", options.fixture),
+            invalid_request(format!("unknown fixture `{fixture}`")).with_detail("fixture", fixture)
         );
     }
 
@@ -1043,6 +1046,35 @@ fn policy_check_export(ctx: &CommandContext) -> Result<(), CliError> {
         println!("{} {}", report.checkpoint_id, report.id);
     }
 
+    Ok(())
+}
+
+fn real_policy_check_export(
+    ctx: &CommandContext,
+    options: PolicyCheckExportOptions,
+) -> Result<(), CliError> {
+    let repo_root = PathBuf::from(".");
+    let state = RealRepoState::load(&repo_root)?;
+    let git_ref = options.git_ref.ok_or_else(|| {
+        invalid_request(
+            "usage: sun policy check-export --checkpoint <checkpoint-id> --branch <git-ref>",
+        )
+        .with_detail("missing", "branch")
+    })?;
+    let report =
+        validate_real_export_candidate(&repo_root, &state, &options.checkpoint_id, &git_ref)?;
+    if !report.ok {
+        return Err(policy_check_export_error(&report));
+    }
+
+    if ctx.json {
+        println!(
+            "{}",
+            policy_check_export_success_envelope_with_repository(&state.repository_id, &report)
+        );
+    } else {
+        println!("{} {}", report.checkpoint_id, report.id);
+    }
     Ok(())
 }
 
@@ -1803,36 +1835,6 @@ fn real_resolve_view_by_id(
     }
 
     Err(object_not_found("resolved_view", view_id))
-}
-
-fn real_resolve_checkpoint_view(
-    state: &RealRepoState,
-    checkpoint_id: &str,
-) -> Result<RealResolvedRepoView, CliError> {
-    if let Some(snapshot) = state
-        .checkpoints
-        .iter()
-        .find(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
-    {
-        return Ok(real_checkpoint_snapshot_resolved_view(state, snapshot));
-    }
-
-    let mut candidates = vec![state.resolve_head_view()];
-    candidates.extend(
-        state
-            .sessions
-            .iter()
-            .map(|session| state.resolve_session_view(session)),
-    );
-    candidates.push(real_base_resolved_repo_view(state));
-    for resolved in candidates {
-        let view_state = real_view_state(state, &resolved);
-        let checkpoint = real_checkpoint(&view_state);
-        if checkpoint.id == checkpoint_id {
-            return Ok(resolved);
-        }
-    }
-    Err(object_not_found("checkpoint", checkpoint_id))
 }
 
 fn real_view_state(state: &RealRepoState, resolved: &RealResolvedRepoView) -> RealRepoState {
@@ -2959,24 +2961,29 @@ fn real_checkpoint_create(
 fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<(), CliError> {
     let repo_root = options.repo.clone().unwrap_or_else(|| PathBuf::from("."));
     let mut state = RealRepoState::load(&repo_root)?;
-    let resolved = real_resolve_checkpoint_view(&state, &options.checkpoint_id)?;
-    if !resolved.result.conflict_free() {
-        return Err(CliError::new(
-            "conflicted_view",
-            "cannot export a conflicted resolved view",
-        )
-        .with_detail("resolved_view_id", resolved.result.resolved_view_id));
+    let git_ref = normalize_git_export_ref(&options.git_ref);
+    let (resolved, view_state, checkpoint) =
+        real_persisted_checkpoint_export_context(&state, &options.checkpoint_id)?;
+    let report = validate_real_export_candidate_with_context(
+        &repo_root,
+        &state,
+        &resolved,
+        &view_state,
+        checkpoint.clone(),
+        &git_ref,
+    )?;
+    if !report.ok {
+        return Err(real_git_export_policy_error(&report));
     }
-    let view_state = real_view_state(&state, &resolved);
-    let checkpoint = real_checkpoint(&view_state);
-    reject_real_export_blocked_entries(&view_state)?;
     if options.write_plan {
         let plan_json = format!(
-            "{{\"ok\":true,\"data\":{{\"command\":\"git.export.plan\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\"}},\"git_ref\":\"{}\",\"content_files\":{}}},\"warnings\":[]}}",
+            "{{\"ok\":true,\"data\":{{\"command\":\"git.export.plan\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\",\"validation_report_id\":\"{}\"}},\"git_ref\":\"{}\",\"content_files\":{},\"validation_report\":{}}},\"warnings\":[]}}",
             json_escape(&state.repository_id),
             json_escape(&checkpoint.id),
-            json_escape(&options.git_ref),
+            json_escape(&report.id),
+            json_escape(&git_ref),
             view_state.entries.iter().filter(|entry| !entry.tombstone).count(),
+            git_export_validation_report_json(&report),
         );
         println!("{plan_json}");
         return Ok(());
@@ -2984,7 +2991,8 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
     if options.execute_local {
         let content_files = real_git_export_content_files(&view_state);
         let tree_hash = checkpoint.tree_identity.tree_hash.clone();
-        let input = real_git_export_writer_input(&repo_root, &options, checkpoint.clone())?;
+        let input =
+            real_git_export_writer_input(&repo_root, &options, checkpoint.clone(), report.clone())?;
         let mut store = InMemoryGitExportMapStore::default();
         let result = execute_local_git_export_writer(input, content_files, &mut store)
             .map_err(git_export_planning_error)?;
@@ -3002,9 +3010,10 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
             export_map_id: export_id.clone(),
             checkpoint_id: checkpoint.id.clone(),
             tree_hash,
-            git_ref: options.git_ref.clone(),
+            git_ref: git_ref.clone(),
             git_commit_ids: vec![commit_id.clone()],
             exported_at: real_now_id(),
+            validation_report_id: Some(report.id.clone()),
         });
         state.save(&repo_root)?;
         state.persist_record(
@@ -3012,38 +3021,118 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
             "export-map",
             &export_id,
             &format!(
-                "{{\"record_type\":\"git_export_map\",\"id\":\"{}\",\"repository_id\":\"{}\",\"checkpoint_id\":\"{}\",\"tree_hash\":\"{}\",\"git_ref\":\"{}\",\"git_commit_ids\":[\"{}\"]}}\n",
+                "{{\"record_type\":\"git_export_map\",\"id\":\"{}\",\"repository_id\":\"{}\",\"checkpoint_id\":\"{}\",\"tree_hash\":\"{}\",\"git_ref\":\"{}\",\"git_commit_ids\":[\"{}\"],\"validation_report_id\":\"{}\"}}\n",
                 json_escape(&export_id),
                 json_escape(&state.repository_id),
                 json_escape(&checkpoint.id),
                 json_escape(&checkpoint.tree_identity.tree_hash),
-                json_escape(&options.git_ref),
+                json_escape(&git_ref),
                 json_escape(&commit_id),
+                json_escape(&report.id),
             ),
         )?;
         if ctx.json {
             println!(
-                "{{\"ok\":true,\"data\":{{\"command\":\"git.export.execute\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\",\"export_map_id\":\"{}\"}},\"checkpoint_id\":\"{}\",\"git_ref\":\"{}\",\"git_commit_ids\":[\"{}\"],\"lifecycle_state\":\"exported\"}},\"warnings\":[]}}",
+                "{{\"ok\":true,\"data\":{{\"command\":\"git.export.execute\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_id\":\"{}\",\"export_map_id\":\"{}\",\"validation_report_id\":\"{}\"}},\"checkpoint_id\":\"{}\",\"git_ref\":\"{}\",\"git_commit_ids\":[\"{}\"],\"validation_report\":{},\"lifecycle_state\":\"exported\"}},\"warnings\":[]}}",
                 json_escape(&state.repository_id),
                 json_escape(&checkpoint.id),
+                json_escape(&checkpoint.resolved_view_id),
+                json_escape(&checkpoint.tree_identity.tree_hash),
                 json_escape(&export_id),
+                json_escape(&report.id),
                 json_escape(&checkpoint.id),
-                json_escape(&options.git_ref),
+                json_escape(&git_ref),
                 json_escape(&commit_id),
+                git_export_validation_report_json(&report),
             );
         } else {
             println!("{} exported", checkpoint.id);
         }
         return Ok(());
     }
-    let response = git_export_checkpoint(GitExportRequest::from_checkpoint(&checkpoint))
-        .map_err(git_export_error)?;
     if ctx.json {
-        println!("{}", git_export_success_envelope(&response));
+        println!(
+            "{{\"ok\":true,\"data\":{{\"command\":\"git.export\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_id\":\"{}\",\"validation_report_id\":\"{}\"}},\"checkpoint_id\":\"{}\",\"git_ref\":\"{}\",\"git_commit_ids\":[],\"export_map\":null,\"validation_report\":{},\"write_performed\":false}},\"warnings\":[]}}",
+            json_escape(&state.repository_id),
+            json_escape(&checkpoint.id),
+            json_escape(&checkpoint.resolved_view_id),
+            json_escape(&checkpoint.tree_identity.tree_hash),
+            json_escape(&report.id),
+            json_escape(&checkpoint.id),
+            json_escape(&git_ref),
+            git_export_validation_report_json(&report),
+        );
     } else {
-        println!("{} {}", response.checkpoint_id, response.git_ref);
+        println!("{} {}", checkpoint.id, git_ref);
     }
     Ok(())
+}
+
+fn normalize_git_export_ref(git_ref: &str) -> String {
+    if git_ref.starts_with("refs/") {
+        git_ref.to_string()
+    } else {
+        format!("refs/heads/{git_ref}")
+    }
+}
+
+fn real_persisted_checkpoint_export_context(
+    state: &RealRepoState,
+    checkpoint_id: &str,
+) -> Result<(RealResolvedRepoView, RealRepoState, CheckpointRecord), CliError> {
+    let snapshot = state
+        .checkpoints
+        .iter()
+        .find(|snapshot| snapshot.checkpoint_id == checkpoint_id)
+        .ok_or_else(|| object_not_found("checkpoint", checkpoint_id))?;
+    let resolved = real_checkpoint_snapshot_resolved_view(state, snapshot);
+    let view_state = real_view_state(state, &resolved);
+    let mut checkpoint = real_checkpoint(&view_state);
+    checkpoint.id = snapshot.checkpoint_id.clone();
+    checkpoint.resolved_view_id = snapshot.resolved_view_id.clone();
+    checkpoint.created_at = snapshot.created_at.clone();
+    Ok((resolved, view_state, checkpoint))
+}
+
+fn validate_real_export_candidate(
+    repo_root: &PathBuf,
+    state: &RealRepoState,
+    checkpoint_id: &str,
+    git_ref: &str,
+) -> Result<GitExportValidationReport, CliError> {
+    let (resolved, view_state, checkpoint) =
+        real_persisted_checkpoint_export_context(state, checkpoint_id)?;
+    validate_real_export_candidate_with_context(
+        repo_root,
+        state,
+        &resolved,
+        &view_state,
+        checkpoint,
+        &normalize_git_export_ref(git_ref),
+    )
+}
+
+fn validate_real_export_candidate_with_context(
+    repo_root: &PathBuf,
+    state: &RealRepoState,
+    resolved: &RealResolvedRepoView,
+    view_state: &RealRepoState,
+    checkpoint: CheckpointRecord,
+    git_ref: &str,
+) -> Result<GitExportValidationReport, CliError> {
+    let config = require_repository_config(repo_root.clone())?;
+    let mut request = GitExportRequest::from_checkpoint(&checkpoint);
+    request.git_ref = git_ref.to_string();
+    request.validation_report_id = "validation_pending".to_string();
+    Ok(validate_persisted_git_export(
+        PersistedGitExportValidationInput {
+            config: &config,
+            request: &request,
+            resolved_view: &resolved.result,
+            entries: &view_state.entries,
+            state,
+        },
+    ))
 }
 
 fn reject_real_export_blocked_entries(state: &RealRepoState) -> Result<(), CliError> {
@@ -3766,6 +3855,7 @@ fn real_git_export_writer_input(
     repo_root: &PathBuf,
     options: &GitExportOptions,
     checkpoint: CheckpointRecord,
+    validation_report: GitExportValidationReport,
 ) -> Result<GitExportWriterInput, CliError> {
     let repo_root = fs::canonicalize(repo_root).map_err(|error| {
         invalid_request(format!(
@@ -3800,8 +3890,7 @@ fn real_git_export_writer_input(
         .collect();
     let mut request = GitExportRequest::from_checkpoint(&checkpoint);
     request.git_ref = target_ref.clone();
-    let mut validation_report = sunlight_core::git_export::validate_git_export_request(&request);
-    validation_report.git_ref = target_ref.clone();
+    request.validation_report_id = validation_report.id.clone();
     Ok(GitExportWriterInput {
         base_checkpoint_ids: vec!["checkpoint_base_0001".to_string()],
         imported_base_commits: vec![ImportedBaseGitCommit {
@@ -5097,7 +5186,7 @@ struct CheckpointCreateOptions {
 
 #[derive(Debug)]
 struct PolicyCheckExportOptions {
-    fixture: String,
+    fixture: Option<String>,
     checkpoint_id: String,
     git_ref: Option<String>,
 }
@@ -5706,15 +5795,9 @@ fn parse_policy_check_export_options(
         }
     }
 
-    let fixture = fixture.ok_or_else(|| {
-        invalid_request(
-            "usage: sun policy check-export --checkpoint <checkpoint-id> --fixture basic-app",
-        )
-        .with_detail("missing", "fixture")
-    })?;
     let checkpoint_id = checkpoint_id.ok_or_else(|| {
         invalid_request(
-            "usage: sun policy check-export --checkpoint <checkpoint-id> --fixture basic-app",
+            "usage: sun policy check-export --checkpoint <checkpoint-id> [--branch <git-ref>] [--fixture basic-app]",
         )
         .with_detail("missing", "checkpoint")
     })?;
@@ -8005,9 +8088,12 @@ fn require_repository_config(repo_root: impl Into<PathBuf>) -> Result<Repository
     })?;
 
     RepositoryConfig::from_toml(&body, config_path.clone()).map_err(|error| {
-        CliError::new("not_initialized", "Sunlight repository is not initialized")
-            .with_detail("path", config_path.display().to_string())
-            .with_detail("source", error.to_string())
+        CliError::new(
+            "invalid_repository_config",
+            "Sunlight repository config is invalid",
+        )
+        .with_detail("path", config_path.display().to_string())
+        .with_detail("source", error.to_string())
     })
 }
 
@@ -9127,6 +9213,17 @@ fn policy_check_export_error(report: &GitExportValidationReport) -> CliError {
     ))
 }
 
+fn real_git_export_policy_error(report: &GitExportValidationReport) -> CliError {
+    CliError::new(
+        "export_policy_failed",
+        "checkpoint failed Git export validation",
+    )
+    .with_raw_details_json(format!(
+        "{{\"validation_report\":{},\"git_write\":{{\"commit_created\":false,\"ref_updated\":false,\"export_map_written\":false}}}}",
+        git_export_validation_report_json(report),
+    ))
+}
+
 fn policy_check_commit_error(
     report: &ValidationReport,
     candidate_paths_checked: usize,
@@ -9480,11 +9577,26 @@ fn git_export_success_envelope(response: &GitExportResponse) -> String {
 }
 
 fn policy_check_export_success_envelope(report: &GitExportValidationReport) -> String {
+    policy_check_export_success_envelope_inner(None, report)
+}
+
+fn policy_check_export_success_envelope_with_repository(
+    repository_id: &str,
+    report: &GitExportValidationReport,
+) -> String {
+    policy_check_export_success_envelope_inner(Some(repository_id), report)
+}
+
+fn policy_check_export_success_envelope_inner(
+    repository_id: Option<&str>,
+    report: &GitExportValidationReport,
+) -> String {
     format!(
         concat!(
             "{{\"ok\":true,",
             "\"data\":{{",
             "\"command\":\"policy.check-export\",",
+            "\"repository_id\":{},",
             "\"checkpoint_id\":\"{}\",",
             "\"validation_report_id\":\"{}\",",
             "\"ids\":{{",
@@ -9496,6 +9608,7 @@ fn policy_check_export_success_envelope(report: &GitExportValidationReport) -> S
             "\"warnings\":[]",
             "}}"
         ),
+        optional_string_json(repository_id),
         json_escape(&report.checkpoint_id),
         json_escape(&report.id),
         json_escape(&report.checkpoint_id),
@@ -10704,7 +10817,10 @@ fn git_export_validation_report_json(report: &GitExportValidationReport) -> Stri
         concat!(
             "{{",
             "\"id\":\"{}\",",
+            "\"policy_id\":\"{}\",",
             "\"checkpoint_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_identity\":{},",
             "\"git_ref\":\"{}\",",
             "\"ok\":{},",
             "\"summary\":{{",
@@ -10717,7 +10833,10 @@ fn git_export_validation_report_json(report: &GitExportValidationReport) -> Stri
             "}}"
         ),
         json_escape(&report.id),
+        json_escape(&report.policy_id),
         json_escape(&report.checkpoint_id),
+        json_escape(&report.resolved_view_id),
+        single_repo_tree_json(&report.tree_identity),
         json_escape(&report.git_ref),
         report.ok,
         report.summary.records_checked,

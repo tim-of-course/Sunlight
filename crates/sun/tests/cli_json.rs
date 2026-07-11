@@ -7121,7 +7121,7 @@ fn policy_check_export_json_fixture_checkpoint_returns_validation_envelope() {
 }
 
 #[test]
-fn policy_check_export_json_fixture_missing_fixture_returns_invalid_request() {
+fn policy_check_export_json_without_initialized_repository_returns_not_initialized() {
     let repo = TestRepo::new("policy-check-export-missing-fixture");
 
     let output = sun()
@@ -7137,11 +7137,229 @@ fn policy_check_export_json_fixture_missing_fixture_returns_invalid_request() {
     assert_failure(&output);
     let stdout = stdout(&output);
     assert!(stdout.contains("\"ok\":false"));
-    assert!(stdout.contains("\"code\":\"invalid_request\""));
-    assert!(stdout.contains(
-        "\"message\":\"usage: sun policy check-export --checkpoint <checkpoint-id> --fixture basic-app\""
-    ));
-    assert!(stdout.contains("\"details\":{\"missing\":\"fixture\"}"));
+    assert!(stdout.contains("\"code\":\"not_initialized\""));
+}
+
+#[test]
+fn no_fixture_policy_check_and_git_export_share_persisted_validation() {
+    let repo = TestRepo::new("real-policy-check-export-success");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "policy-export-success");
+    let checkpoint_id = create_real_base_checkpoint(&repo);
+    let branch = "refs/heads/sunlight/policy-export-success";
+
+    let check = sun()
+        .arg("policy")
+        .arg("check-export")
+        .arg("--checkpoint")
+        .arg(&checkpoint_id)
+        .arg("--branch")
+        .arg(branch)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("real policy check-export should run");
+    assert_success(&check);
+    let check_stdout = stdout(&check);
+    assert_valid_json(&check_stdout);
+    let report_id = json_string_field(&check_stdout, "validation_report_id");
+    assert!(check_stdout
+        .contains("\"policy_id\":\"git_interop.sunlight_commit_policy.conservative.v1\""));
+    assert!(check_stdout.contains("\"resolved_view_id\":\"view_base_0001\""));
+    assert!(check_stdout.contains("\"tree_identity\":{"));
+    assert!(check_stdout.contains("\"payloads_checked\":1"));
+    assert!(!check_stdout.contains("fixture"));
+
+    let export = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg(&checkpoint_id)
+        .arg("--branch")
+        .arg(branch)
+        .arg("--execute-local")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("real git export should run");
+    assert_success(&export);
+    let export_stdout = stdout(&export);
+    assert_valid_json(&export_stdout);
+    assert!(export_stdout.contains(&format!("\"validation_report_id\":\"{report_id}\"")));
+    assert!(export_stdout.contains("\"lifecycle_state\":\"exported\""));
+    assert!(!export_stdout.contains("fixture"));
+    assert!(git_ref_exists(repo.path(), branch));
+    let export_record = fs::read_to_string(
+        repo.path()
+            .join(".sunlight/export-map")
+            .join(format!("export_map_{checkpoint_id}.json")),
+    )
+    .unwrap();
+    assert!(export_record.contains(&format!("\"validation_report_id\":\"{report_id}\"")));
+}
+
+#[test]
+fn no_fixture_generated_policy_failure_does_not_mutate_git_or_export_maps() {
+    let repo = TestRepo::new("real-policy-generated-block");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "generated-block");
+    let generated = repo.write_file("generated.txt", "generated output\n");
+    let write = sun()
+        .arg("write")
+        .arg("src/generated.txt")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--expect-hash")
+        .arg("new")
+        .arg("--content-file")
+        .arg(generated)
+        .arg("--classification")
+        .arg("generated")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("generated write should run");
+    assert_success(&write);
+    let view_id = json_string_field(&stdout(&write), "resolved_view_id");
+    let checkpoint = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg("--view")
+        .arg(view_id)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("generated checkpoint should run");
+    assert_success(&checkpoint);
+    let checkpoint_id = json_string_field(&stdout(&checkpoint), "checkpoint_id");
+    let branch = "refs/heads/sunlight/generated-block";
+
+    let check = sun()
+        .arg("policy")
+        .arg("check-export")
+        .arg("--checkpoint")
+        .arg(&checkpoint_id)
+        .arg("--branch")
+        .arg(branch)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("generated policy check should run");
+    assert_failure(&check);
+    let check_stdout = stdout(&check);
+    assert!(check_stdout.contains("\"code\":\"export_policy_failed\""));
+    assert!(check_stdout.contains("\"check\":\"generated_policy\""));
+    assert!(check_stdout.contains("\"code\":\"generated_output_requires_promotion\""));
+
+    let state_before = fs::read(repo.path().join(".sunlight/records/native-state.json")).unwrap();
+    let export = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg(&checkpoint_id)
+        .arg("--branch")
+        .arg(branch)
+        .arg("--execute-local")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("blocked generated export should run");
+    assert_failure(&export);
+    let export_stdout = stdout(&export);
+    assert!(export_stdout.contains("\"check\":\"generated_policy\""));
+    assert!(export_stdout.contains("\"commit_created\":false"));
+    assert!(export_stdout.contains("\"ref_updated\":false"));
+    assert!(export_stdout.contains("\"export_map_written\":false"));
+    assert!(!git_ref_exists(repo.path(), branch));
+    assert_eq!(
+        fs::read(repo.path().join(".sunlight/records/native-state.json")).unwrap(),
+        state_before
+    );
+    assert!(!repo
+        .path()
+        .join(".sunlight/export-map")
+        .join(format!("export_map_{checkpoint_id}.json"))
+        .exists());
+}
+
+#[test]
+fn no_fixture_persisted_local_only_checkpoint_entry_is_export_blocked() {
+    let repo = TestRepo::new("real-policy-local-only-block");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "local-only-export-block");
+    let checkpoint_id = create_real_base_checkpoint(&repo);
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let mut state = fs::read_to_string(&state_path).unwrap();
+    let checkpoint_offset = state.find("\"checkpoints\":[{").unwrap();
+    let classification_offset = state[checkpoint_offset..]
+        .find("\"classification\":\"source\"")
+        .unwrap()
+        + checkpoint_offset;
+    state.replace_range(
+        classification_offset..classification_offset + "\"classification\":\"source\"".len(),
+        "\"classification\":\"local_only\"",
+    );
+    fs::write(&state_path, state).unwrap();
+
+    let check = sun()
+        .arg("policy")
+        .arg("check-export")
+        .arg("--checkpoint")
+        .arg(&checkpoint_id)
+        .arg("--branch")
+        .arg("refs/heads/sunlight/local-only-block")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("local-only policy check should run");
+    assert_failure(&check);
+    let check_stdout = stdout(&check);
+    assert!(check_stdout.contains("\"check\":\"policy_class\""));
+    assert!(check_stdout.contains("\"code\":\"secret_or_local_only_record\""));
+    assert!(check_stdout.contains("\"value\":\"base.txt\""));
+}
+
+#[test]
+fn no_fixture_unknown_export_policy_is_rejected_without_git_mutation() {
+    let repo = TestRepo::new("real-policy-unknown-config");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "unknown-policy");
+    let checkpoint_id = create_real_base_checkpoint(&repo);
+    let config_path = repo.path().join(".sunlight/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "sunlight_commit_policy = \"conservative\"",
+        "sunlight_commit_policy = \"permissive\"",
+    );
+    fs::write(&config_path, config).unwrap();
+    let branch = "refs/heads/sunlight/unknown-policy";
+
+    for command in ["check", "export"] {
+        let mut invocation = sun();
+        if command == "check" {
+            invocation.arg("policy").arg("check-export");
+        } else {
+            invocation.arg("git").arg("export");
+        }
+        let output = invocation
+            .arg("--checkpoint")
+            .arg(&checkpoint_id)
+            .arg("--branch")
+            .arg(branch)
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .expect("unknown policy command should run");
+        assert_failure(&output);
+        let output = stdout(&output);
+        assert!(output.contains("\"code\":\"invalid_repository_config\""));
+        assert!(output.contains("unsupported git_interop.sunlight_commit_policy `permissive`"));
+    }
+    assert!(!git_ref_exists(repo.path(), branch));
+    assert!(!repo
+        .path()
+        .join(".sunlight/export-map")
+        .join(format!("export_map_{checkpoint_id}.json"))
+        .exists());
 }
 
 #[test]
@@ -9264,6 +9482,20 @@ fn start_native_session(repo: &TestRepo, slug: &str) {
     assert_success(&session);
 }
 
+fn create_real_base_checkpoint(repo: &TestRepo) -> String {
+    let checkpoint = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("real base checkpoint should run");
+    assert_success(&checkpoint);
+    json_string_field(&stdout(&checkpoint), "checkpoint_id")
+}
+
 fn create_real_compat_projection(repo: &TestRepo) -> (String, PathBuf, String) {
     let output = sun()
         .arg("compat")
@@ -9395,6 +9627,17 @@ fn git(repo: &Path, args: &[&str]) -> String {
         stderr(&output)
     );
     stdout(&output)
+}
+
+fn git_ref_exists(repo: &Path, git_ref: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", git_ref])
+        .output()
+        .expect("git rev-parse should run")
+        .status
+        .success()
 }
 
 struct TestRepo {

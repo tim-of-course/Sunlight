@@ -2203,6 +2203,186 @@ fn no_fixture_compat_import_applies_modified_created_and_deleted_as_one_transact
 }
 
 #[test]
+fn no_fixture_compat_exact_rename_preserves_identity_through_export() {
+    let repo = TestRepo::new("real-compat-rename");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    write_nested_file(
+        repo.path(),
+        "src/old_name.rs",
+        "pub fn preserved() -> bool { true }\n",
+    );
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+    start_native_session(&repo, "compat-rename");
+    let baseline_read = sun()
+        .arg("read")
+        .arg("src/old_name.rs")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&baseline_read);
+    let artifact_id = json_string_field(&stdout(&baseline_read), "artifact_id");
+
+    let (projection, root, generation) = create_real_compat_projection(&repo);
+    fs::rename(root.join("src/old_name.rs"), root.join("src/new_name.rs")).unwrap();
+    let diff = real_compat_diff(&repo, &projection);
+    assert!(diff.contains("\"kind\":\"moved_or_renamed\""));
+    assert!(diff.contains("\"operation_kind\":\"move\""));
+    assert!(diff.contains("\"source_path\":\"src/old_name.rs\""));
+    assert!(!diff.contains("\"kind\":\"deleted_source\""));
+    let candidate = candidate_id_for_path(&diff, "src/new_name.rs");
+    let imported = real_compat_import(&repo, &projection, &candidate, Some(&generation));
+    assert_success(&imported);
+    let imported_json = stdout(&imported);
+    assert!(imported_json.contains("\"operation_kind\":\"move\""));
+    assert!(imported_json.contains(&format!("\"artifact_id\":\"{artifact_id}\"")));
+    assert!(imported_json.contains("\"source_path\":\"src/old_name.rs\""));
+    let view = json_string_field(&imported_json, "resolved_view_id");
+
+    let new_read = sun()
+        .arg("read")
+        .arg("src/new_name.rs")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&new_read);
+    assert!(stdout(&new_read).contains(&format!("\"artifact_id\":\"{artifact_id}\"")));
+    let old_read = sun()
+        .arg("read")
+        .arg("src/old_name.rs")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_failure(&old_read);
+    let list = sun()
+        .arg("list")
+        .arg("src")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&list);
+    let list_json = stdout(&list);
+    assert!(list_json.contains("src/new_name.rs"));
+    assert!(!list_json.contains("src/old_name.rs"));
+    let inspect = sun()
+        .arg("inspect")
+        .arg(format!("artifact:{artifact_id}"))
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&inspect);
+    let inspect_json = stdout(&inspect);
+    assert!(inspect_json.contains("\"path_history\":["));
+    assert!(inspect_json.contains("\"path\":\"src/old_name.rs\",\"state\":\"tombstone\""));
+    assert!(inspect_json.contains("\"path\":\"src/new_name.rs\",\"state\":\"active\""));
+
+    let materialized = repo.path().join("compat-rename-result");
+    let project = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg(&view)
+        .arg("--purpose")
+        .arg("inspection")
+        .arg("--projection-root")
+        .arg(&materialized)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&project);
+    assert!(materialized.join("src/new_name.rs").is_file());
+    assert!(!materialized.join("src/old_name.rs").exists());
+
+    let checkpoint = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg(&view)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&checkpoint);
+    let checkpoint_id = json_string_field(&stdout(&checkpoint), "checkpoint_id");
+    let export = sun()
+        .arg("git")
+        .arg("export")
+        .arg("--checkpoint")
+        .arg(&checkpoint_id)
+        .arg("--branch")
+        .arg("sunlight/compat-rename")
+        .arg("--execute-local")
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&export);
+    assert!(git(
+        repo.path(),
+        &["show", "sunlight/compat-rename:src/new_name.rs"]
+    )
+    .contains("preserved"));
+    let missing_old = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["cat-file", "-e", "sunlight/compat-rename:src/old_name.rs"])
+        .output()
+        .unwrap();
+    assert!(!missing_old.status.success());
+}
+
+#[test]
+fn no_fixture_compat_ambiguous_exact_rename_is_atomic() {
+    let repo = TestRepo::new("real-compat-rename-ambiguous");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    write_nested_file(repo.path(), "src/original.rs", "pub fn same() {}\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+    start_native_session(&repo, "compat-rename-ambiguous");
+
+    let (projection, root, generation) = create_real_compat_projection(&repo);
+    let bytes = fs::read(root.join("src/original.rs")).unwrap();
+    fs::remove_file(root.join("src/original.rs")).unwrap();
+    fs::write(root.join("src/copy_a.rs"), &bytes).unwrap();
+    fs::write(root.join("src/copy_b.rs"), &bytes).unwrap();
+    let diff = real_compat_diff(&repo, &projection);
+    assert_eq!(diff.matches("\"kind\":\"moved_or_renamed\"").count(), 2);
+    assert!(diff.contains("\"source_path\":null"));
+    assert!(!diff.contains("\"kind\":\"deleted_source\""));
+    let candidate = candidate_id_for_path(&diff, "src/copy_a.rs");
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let before = fs::read(&state_path).unwrap();
+    let imported = real_compat_import(&repo, &projection, &candidate, Some(&generation));
+    assert_failure(&imported);
+    assert!(stdout(&imported).contains("\"code\":\"compat_ambiguous_rename\""));
+    assert_eq!(before, fs::read(&state_path).unwrap());
+}
+
+#[test]
 fn policy_check_commit_json_after_init_returns_success_envelope() {
     let repo = TestRepo::new("policy-check-commit-success");
 

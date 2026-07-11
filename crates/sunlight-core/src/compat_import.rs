@@ -264,6 +264,7 @@ pub fn diff_real_compat_projection(
         after_bytes.insert(candidate.candidate_delta_id.clone(), file.bytes);
         candidates.push(candidate);
     }
+    infer_exact_content_renames(projection, &mut candidates, &mut after_bytes);
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(RealCompatDiff {
         candidates,
@@ -355,10 +356,110 @@ pub fn validate_real_compat_selection(
                     "selected compatibility candidate is conflicted",
                 ));
             }
+            CompatCandidateKind::MovedOrRenamed => {
+                if candidate.source_path.is_none() {
+                    return Err(real_error(
+                        CompatImportErrorCode::AmbiguousRename,
+                        projection,
+                        ids,
+                        "selected compatibility rename has multiple possible sources or targets",
+                    ));
+                }
+                if candidate.before_hash != candidate.after_hash {
+                    return Err(real_error(
+                        CompatImportErrorCode::AmbiguousRename,
+                        projection,
+                        ids,
+                        "rename-plus-edit identity is unresolved without a reliable identity signal",
+                    ));
+                }
+            }
             _ => {}
         }
     }
     Ok(selected)
+}
+
+fn infer_exact_content_renames(
+    projection: &RealProjectionSnapshot,
+    candidates: &mut Vec<CompatCandidateDelta>,
+    after_bytes: &mut BTreeMap<String, Vec<u8>>,
+) {
+    // Projection snapshots have no stable file identity beyond the baseline artifact and bytes.
+    // Exact hashes are therefore the only safe signal here; changed-content renames stay split.
+    let mut deleted_by_hash = BTreeMap::<String, Vec<usize>>::new();
+    let mut created_by_hash = BTreeMap::<String, Vec<usize>>::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if candidate.kind == CompatCandidateKind::DeletedSource {
+            if let Some(hash) = &candidate.before_hash {
+                deleted_by_hash.entry(hash.clone()).or_default().push(index);
+            }
+        } else if candidate.before_hash.is_none()
+            && candidate.operation_kind == CompatFileOperationKind::Write
+        {
+            if let Some(hash) = &candidate.after_hash {
+                created_by_hash.entry(hash.clone()).or_default().push(index);
+            }
+        }
+    }
+
+    let mut consumed = BTreeSet::new();
+    let mut inferred = Vec::new();
+    for (hash, deleted_indices) in deleted_by_hash {
+        let Some(created_indices) = created_by_hash.get(&hash) else {
+            continue;
+        };
+        let unambiguous = deleted_indices.len() == 1 && created_indices.len() == 1;
+        let sole_target_is_safe_source = unambiguous
+            && candidates[created_indices[0]].kind == CompatCandidateKind::CreatedSource
+            && candidates[deleted_indices[0]].classification == "source";
+        if unambiguous && !sole_target_is_safe_source {
+            continue;
+        }
+
+        let source_paths = deleted_indices
+            .iter()
+            .map(|index| candidates[*index].path.clone())
+            .collect::<Vec<_>>();
+        for target_index in created_indices {
+            let target = &candidates[*target_index];
+            let source = sole_target_is_safe_source.then(|| &candidates[deleted_indices[0]]);
+            let identity = format!(
+                "{}\0{}\0{}\0{}\0{}\0{}",
+                projection.projection_id,
+                source_paths.join("\0"),
+                target.path,
+                hash,
+                target.classification,
+                if unambiguous { "exact" } else { "ambiguous" },
+            );
+            let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+            let mut rename = target.clone();
+            rename.candidate_delta_id = format!("compat_delta_{}", &digest[..24]);
+            rename.kind = CompatCandidateKind::MovedOrRenamed;
+            rename.operation_kind = CompatFileOperationKind::Move;
+            rename.artifact_id = source.and_then(|candidate| candidate.artifact_id.clone());
+            rename.source_path = source.map(|candidate| candidate.path.clone());
+            rename.before_hash = Some(hash.clone());
+            if let Some(bytes) = after_bytes.remove(&target.candidate_delta_id) {
+                after_bytes.insert(rename.candidate_delta_id.clone(), bytes);
+            }
+            inferred.push(rename);
+            consumed.insert(*target_index);
+        }
+        consumed.extend(deleted_indices);
+    }
+
+    if consumed.is_empty() {
+        return;
+    }
+    let mut index = 0usize;
+    candidates.retain(|_| {
+        let keep = !consumed.contains(&index);
+        index += 1;
+        keep
+    });
+    candidates.extend(inferred);
 }
 
 #[derive(Debug)]
@@ -2066,6 +2167,74 @@ mod tests {
             CompatCandidateKind::DeletedSource
         );
         assert!(!by_path.contains_key("outside.txt"));
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn real_projection_diff_infers_only_unambiguous_exact_content_rename() {
+        let (repo, projection) = real_projection_fixture();
+        let root = PathBuf::from(projection.materialized_root.as_ref().unwrap());
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::rename(root.join("README.md"), root.join("docs/README.md")).unwrap();
+
+        let diff = diff_real_compat_projection(&repo, &projection).unwrap();
+        let candidate = diff
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == "docs/README.md")
+            .unwrap();
+        assert_eq!(candidate.kind, CompatCandidateKind::MovedOrRenamed);
+        assert_eq!(candidate.operation_kind, CompatFileOperationKind::Move);
+        assert_eq!(candidate.source_path.as_deref(), Some("README.md"));
+        assert_eq!(
+            candidate.artifact_id.as_deref(),
+            Some(real_artifact_id_for_path("README.md").as_str())
+        );
+        assert_eq!(candidate.before_hash, candidate.after_hash);
+        assert!(!diff
+            .candidates
+            .iter()
+            .any(|candidate| candidate.path == "README.md"));
+        assert!(diff.after_bytes.contains_key(&candidate.candidate_delta_id));
+        validate_real_compat_selection(
+            &projection,
+            std::slice::from_ref(&candidate.candidate_delta_id),
+            &diff,
+        )
+        .unwrap();
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn real_projection_diff_policy_gates_one_source_with_multiple_exact_targets() {
+        let (repo, projection) = real_projection_fixture();
+        let root = PathBuf::from(projection.materialized_root.as_ref().unwrap());
+        let bytes = fs::read(root.join("README.md")).unwrap();
+        fs::remove_file(root.join("README.md")).unwrap();
+        fs::write(root.join("COPY-A.md"), &bytes).unwrap();
+        fs::write(root.join("COPY-B.md"), &bytes).unwrap();
+
+        let diff = diff_real_compat_projection(&repo, &projection).unwrap();
+        let ambiguous = diff
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.kind == CompatCandidateKind::MovedOrRenamed)
+            .collect::<Vec<_>>();
+        assert_eq!(ambiguous.len(), 2);
+        assert!(ambiguous
+            .iter()
+            .all(|candidate| candidate.source_path.is_none()));
+        assert!(!diff
+            .candidates
+            .iter()
+            .any(|candidate| candidate.path == "README.md"));
+        let error = validate_real_compat_selection(
+            &projection,
+            std::slice::from_ref(&ambiguous[0].candidate_delta_id),
+            &diff,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, CompatImportErrorCode::AmbiguousRename);
         fs::remove_dir_all(repo).unwrap();
     }
 

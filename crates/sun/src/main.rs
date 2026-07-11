@@ -1355,6 +1355,10 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
         .map_err(compat_import_error)?;
     let mut changes = Vec::new();
     for candidate in &selected {
+        let before_path = candidate
+            .source_path
+            .as_deref()
+            .unwrap_or(candidate.path.as_str());
         let before = candidate
             .before_hash
             .as_ref()
@@ -1362,7 +1366,7 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
                 resolved
                     .entries
                     .iter()
-                    .find(|entry| entry.path == candidate.path && !entry.tombstone)
+                    .find(|entry| entry.path == before_path && !entry.tombstone)
             })
             .cloned();
         match (&candidate.before_hash, &before) {
@@ -1374,9 +1378,23 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
                 )
                 .with_detail("projection_id", projection.projection_id.clone())
                 .with_detail("candidate_delta_id", candidate.candidate_delta_id.clone())
-                .with_detail("path", candidate.path.clone()));
+                .with_detail("path", before_path));
             }
             (None, None) => {}
+        }
+        if candidate.operation_kind == CompatFileOperationKind::Move
+            && resolved
+                .entries
+                .iter()
+                .any(|entry| entry.path == candidate.path && !entry.tombstone)
+        {
+            return Err(CliError::new(
+                "compat_precondition_failed",
+                "compatibility rename target already exists in the session view",
+            )
+            .with_detail("projection_id", projection.projection_id.clone())
+            .with_detail("candidate_delta_id", candidate.candidate_delta_id.clone())
+            .with_detail("path", candidate.path.clone()));
         }
         let after = match candidate.operation_kind {
             CompatFileOperationKind::Delete => {
@@ -1386,7 +1404,8 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
             }
             CompatFileOperationKind::Patch
             | CompatFileOperationKind::Write
-            | CompatFileOperationKind::Metadata => {
+            | CompatFileOperationKind::Metadata
+            | CompatFileOperationKind::Move => {
                 let bytes = diff
                     .after_bytes
                     .get(&candidate.candidate_delta_id)
@@ -1412,7 +1431,6 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
                     bytes,
                 }
             }
-            CompatFileOperationKind::Move => unreachable!("real diff does not infer renames"),
         };
         changes.push((before, after));
     }
@@ -1421,7 +1439,10 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
         &mut state,
         &session_id,
         "compat_import",
-        &selected[0].path,
+        selected[0]
+            .source_path
+            .as_deref()
+            .unwrap_or(&selected[0].path),
         primary_before,
         primary_after,
     )?;
@@ -1431,17 +1452,35 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
             .iter()
             .map(|candidate| candidate.candidate_delta_id.clone())
             .collect();
-        operation.effects = changes
+        operation.effects = selected
             .iter()
-            .map(|(before, after)| RealOperationEffect {
-                artifact_id: after.artifact_id.clone(),
-                path: after.path.clone(),
-                base_content_hash: before.as_ref().map(|entry| entry.content_hash.clone()),
-                result_content_hash: after.content_hash.clone(),
-                classification: after.classification.clone(),
-                executable: after.executable,
-                tombstone: after.tombstone,
-                bytes: after.bytes.clone(),
+            .zip(&changes)
+            .flat_map(|(candidate, (before, after))| {
+                let mut effects = Vec::new();
+                if candidate.operation_kind == CompatFileOperationKind::Move {
+                    let source = before.as_ref().expect("validated move baseline");
+                    effects.push(RealOperationEffect {
+                        artifact_id: source.artifact_id.clone(),
+                        path: source.path.clone(),
+                        base_content_hash: Some(source.content_hash.clone()),
+                        result_content_hash: source.content_hash.clone(),
+                        classification: source.classification.clone(),
+                        executable: source.executable,
+                        tombstone: true,
+                        bytes: source.bytes.clone(),
+                    });
+                }
+                effects.push(RealOperationEffect {
+                    artifact_id: after.artifact_id.clone(),
+                    path: after.path.clone(),
+                    base_content_hash: before.as_ref().map(|entry| entry.content_hash.clone()),
+                    result_content_hash: after.content_hash.clone(),
+                    classification: after.classification.clone(),
+                    executable: after.executable,
+                    tombstone: after.tombstone,
+                    bytes: after.bytes.clone(),
+                });
+                effects
             })
             .collect();
         operation.authored_context_id =
@@ -4056,12 +4095,19 @@ fn real_compat_import_envelope(
     response: &MutationResponse,
 ) -> String {
     let operation = state.operations.last().expect("compat operation");
-    let imported = candidates.iter().zip(operation.artifact_effects()).map(|(candidate, effect)| format!(
+    let effects = operation.artifact_effects();
+    let imported = candidates.iter().map(|candidate| {
+        let effect = effects.iter().rev().find(|effect| {
+            effect.path == candidate.path && !effect.tombstone
+        }).or_else(|| effects.iter().rev().find(|effect| effect.path == candidate.path))
+            .expect("compat candidate should have a corresponding operation effect");
+        format!(
         "{{\"candidate_delta_id\":\"{}\",\"artifact_id\":\"{}\",\"path\":\"{}\",\"operation_kind\":\"{}\",\"before_hash\":{},\"after_hash\":{},\"classification\":\"{}\",\"privacy_class\":\"{}\"}}",
         json_escape(&candidate.candidate_delta_id), json_escape(&effect.artifact_id), json_escape(&effect.path),
         candidate.operation_kind.as_str(), optional_string_json(effect.base_content_hash.as_deref()),
         if effect.tombstone { "null".to_string() } else { optional_string_json(Some(&effect.result_content_hash)) },
-        json_escape(&effect.classification), candidate.privacy_class.as_str())).collect::<Vec<_>>().join(",");
+        json_escape(&effect.classification), candidate.privacy_class.as_str())
+    }).collect::<Vec<_>>().join(",");
     format!(
         "{{\"ok\":true,\"data\":{{\"command\":\"compat.import\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"session_id\":\"{}\",\"operation_transaction_id\":\"{}\",\"topic_revision_id\":\"{}\",\"session_generation_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"view\":{},\"projection_id\":\"{}\",\"operation_transaction_id\":\"{}\",\"topic_revision_id\":\"{}\",\"session_generation_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_identity\":{},\"selected_delta_count\":{},\"candidate_delta_ids\":{},\"imported_artifacts\":[{}],\"ignored_candidate_delta_ids\":[],\"quarantine_refs\":[],\"operation\":{},\"topic_revision\":{},\"session_generation\":{}}},\"warnings\":[]}}",
         json_escape(&state.repository_id),
@@ -4097,10 +4143,18 @@ fn real_compat_import_envelope(
 }
 
 fn real_compat_selected_delta_json(candidate: &CompatCandidateDelta) -> String {
-    format!("{{\"candidate_delta_id\":\"{}\",\"operation_kind\":\"{}\",\"path\":\"{}\",\"base_content_hash\":{},\"result_content_hash\":{},\"classification\":\"{}\",\"privacy_class\":\"{}\"}}",
+    let operations = if candidate.operation_kind == CompatFileOperationKind::Move {
+        format!("[{{\"operation_kind\":\"move\",\"source_path\":{},\"target_path\":\"{}\",\"base_content_hash\":{},\"result_content_hash\":{}}}]",
+            optional_string_json(candidate.source_path.as_deref()), json_escape(&candidate.path),
+            optional_string_json(candidate.before_hash.as_deref()), optional_string_json(candidate.after_hash.as_deref()))
+    } else {
+        "[]".to_string()
+    };
+    format!("{{\"candidate_delta_id\":\"{}\",\"operation_kind\":\"{}\",\"path\":\"{}\",\"source_path\":{},\"base_content_hash\":{},\"result_content_hash\":{},\"operations\":{},\"classification\":\"{}\",\"privacy_class\":\"{}\"}}",
         json_escape(&candidate.candidate_delta_id), candidate.operation_kind.as_str(), json_escape(&candidate.path),
+        optional_string_json(candidate.source_path.as_deref()),
         optional_string_json(candidate.before_hash.as_deref()), optional_string_json(candidate.after_hash.as_deref()),
-        json_escape(&candidate.classification), candidate.privacy_class.as_str())
+        operations, json_escape(&candidate.classification), candidate.privacy_class.as_str())
 }
 
 fn real_compat_provenance_json(operation: &RealOperationRecord) -> String {
@@ -4803,11 +4857,12 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
             .map(real_compat_provenance_json)
             .unwrap_or_else(|| "null".to_string());
         return Ok(format!(
-            "{{\"ok\":true,\"data\":{{\"command\":\"inspect.artifact\",\"repository_id\":\"{}\",\"ids\":{{\"artifact_id\":\"{}\"}},\"view\":{},\"artifact\":{},\"latest_operation_id\":{},\"compat_import_provenance\":{}}},\"warnings\":[]}}",
+            "{{\"ok\":true,\"data\":{{\"command\":\"inspect.artifact\",\"repository_id\":\"{}\",\"ids\":{{\"artifact_id\":\"{}\"}},\"view\":{},\"artifact\":{},\"path_history\":{},\"latest_operation_id\":{},\"compat_import_provenance\":{}}},\"warnings\":[]}}",
             json_escape(&state.repository_id),
             json_escape(&entry.artifact_id),
             view_resolve_view_json(&resolved.result),
             artifact_json(&real_artifact_view(entry)),
+            real_artifact_path_history_json(state, &entry.artifact_id),
             optional_string_json(
                 latest_operation.map(|operation| operation.operation_transaction_id.as_str())
             ),
@@ -4928,6 +4983,44 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
         "object_not_found",
         "Sunlight object was not found",
     ))
+}
+
+fn real_artifact_path_history_json(state: &RealRepoState, artifact_id: &str) -> String {
+    let mut history = state
+        .base_entries
+        .iter()
+        .filter(|entry| entry.artifact_id == artifact_id)
+        .map(|entry| {
+            format!(
+                "{{\"path\":\"{}\",\"state\":\"{}\",\"operation_transaction_id\":null}}",
+                json_escape(&entry.path),
+                if entry.tombstone {
+                    "tombstone"
+                } else {
+                    "active"
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    for operation in &state.operations {
+        for effect in operation
+            .artifact_effects()
+            .into_iter()
+            .filter(|effect| effect.artifact_id == artifact_id)
+        {
+            history.push(format!(
+                "{{\"path\":\"{}\",\"state\":\"{}\",\"operation_transaction_id\":\"{}\"}}",
+                json_escape(&effect.path),
+                if effect.tombstone {
+                    "tombstone"
+                } else {
+                    "active"
+                },
+                json_escape(&operation.operation_transaction_id),
+            ));
+        }
+    }
+    format!("[{}]", history.join(","))
 }
 
 #[derive(Debug)]

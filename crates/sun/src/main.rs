@@ -211,6 +211,14 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
             print_init_help();
             Ok(())
         }
+        [command, flag] if flag == "--help" || flag == "-h" => {
+            print_command_help(command);
+            Ok(())
+        }
+        [scope, command, flag] if flag == "--help" || flag == "-h" => {
+            print_command_help(&format!("{scope} {command}"));
+            Ok(())
+        }
         [command, ..] if command == "init" => {
             Err(invalid_request("usage: sun init [--repo <path>]"))
         }
@@ -1795,13 +1803,22 @@ fn real_topic<'a>(state: &'a RealRepoState, topic: &str) -> Result<&'a RealTopic
 }
 
 fn real_view(state: &RealRepoState) -> SessionView {
+    let resolved = state.resolve_head_view();
+    let tree = resolved
+        .result
+        .tree_identity
+        .clone()
+        .unwrap_or_else(|| SingleRepoTree {
+            repository_id: state.repository_id.clone(),
+            tree_hash: real_tree_hash(&resolved.entries),
+        });
     SessionView {
-        resolved_view_id: state.resolved_view_id.clone(),
+        resolved_view_id: resolved.result.resolved_view_id,
         session_generation_id: format!("gen_native_{:04}", state.generation_number.max(1)),
         tree_identity: TreeIdentityView {
             kind: "SingleRepoTree".to_string(),
-            repository_id: state.repository_id.clone(),
-            tree_hash: state.tree_hash.clone(),
+            repository_id: tree.repository_id,
+            tree_hash: tree.tree_hash,
         },
     }
 }
@@ -3454,6 +3471,7 @@ fn reject_real_export_blocked_entries(state: &RealRepoState) -> Result<(), CliEr
 }
 
 fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
+    let repo_root = PathBuf::from(".");
     let state = match RealRepoState::load(&PathBuf::from(".")) {
         Ok(state) => state,
         Err(_) => return Ok(false),
@@ -3467,7 +3485,6 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
                     .find(|projection| projection.projection_id == *value)
                     .ok_or_else(|| object_not_found("projection", value))?;
                 if projection.purpose == "compatibility" {
-                    let repo_root = PathBuf::from(".");
                     let projection_policy = require_projection_policy(&repo_root)?;
                     let diff = diff_real_compat_projection(
                         &repo_root,
@@ -3475,16 +3492,42 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
                         projection,
                     )
                     .map_err(compat_import_error)?;
-                    println!(
-                        "{}",
-                        real_compat_projection_status_envelope(
-                            &state,
-                            projection,
-                            &diff.candidates
-                        )
-                    );
+                    if ctx.json {
+                        println!(
+                            "{}",
+                            real_compat_projection_status_envelope(
+                                &state,
+                                projection,
+                                &diff.candidates
+                            )
+                        );
+                    } else {
+                        println!(
+                            "projection {} compatibility {} candidates={} quarantined={}",
+                            projection.projection_id,
+                            if diff.candidates.is_empty() {
+                                "clean"
+                            } else {
+                                "dirty"
+                            },
+                            diff.candidates.len(),
+                            diff.candidates
+                                .iter()
+                                .filter(|candidate| candidate.quarantine_ref.is_some())
+                                .count()
+                        );
+                    }
                 } else {
-                    println!("{}", real_projection_status_envelope(&state, projection));
+                    if ctx.json {
+                        println!("{}", real_projection_status_envelope(&state, projection));
+                    } else {
+                        println!(
+                            "projection {} {} materialized view={}",
+                            projection.projection_id,
+                            projection.purpose,
+                            projection.resolved_view_id
+                        );
+                    }
                 }
                 return Ok(true);
             }
@@ -3494,7 +3537,18 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
                     .iter()
                     .find(|checkpoint| checkpoint.checkpoint_id == *value)
                     .ok_or_else(|| object_not_found("checkpoint", value))?;
-                println!("{}", real_checkpoint_status_envelope(&state, checkpoint));
+                if ctx.json {
+                    println!("{}", real_checkpoint_status_envelope(&state, checkpoint));
+                } else {
+                    let exported = state
+                        .export_maps
+                        .iter()
+                        .any(|map| map.checkpoint_id == checkpoint.checkpoint_id);
+                    println!(
+                        "checkpoint {} export_ready=true exported={exported} view={}",
+                        checkpoint.checkpoint_id, checkpoint.resolved_view_id
+                    );
+                }
                 return Ok(true);
             }
             "--export" | "--export-map" => {
@@ -3503,7 +3557,17 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
                     .iter()
                     .find(|export_map| export_map.export_map_id == *value)
                     .ok_or_else(|| object_not_found("export_map", value))?;
-                println!("{}", real_export_map_status_envelope(&state, export_map));
+                if ctx.json {
+                    println!("{}", real_export_map_status_envelope(&state, export_map));
+                } else {
+                    println!(
+                        "export {} checkpoint={} ref={} commits={}",
+                        export_map.export_map_id,
+                        export_map.checkpoint_id,
+                        export_map.git_ref,
+                        export_map.git_commit_ids.len()
+                    );
+                }
                 return Ok(true);
             }
             "--execution" => {
@@ -3512,7 +3576,17 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
                     .iter()
                     .find(|execution| execution.execution_id == *value)
                     .ok_or_else(|| object_not_found("execution", value))?;
-                println!("{}", real_execution_status_envelope(&state, execution));
+                if ctx.json {
+                    println!("{}", real_execution_status_envelope(&state, execution));
+                } else {
+                    println!(
+                        "execution {} status={} promotion={} view={} isolation=unenforced",
+                        execution.execution_id,
+                        execution.status,
+                        real_execution_promotion_status(&state, execution),
+                        execution.resolved_view_id
+                    );
+                }
                 return Ok(true);
             }
             "--compat-import" => {
@@ -3562,22 +3636,21 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
         [_] => "status.repository",
         _ => return Ok(false),
     };
+    let summary = real_operational_summary(&repo_root, &state);
     if ctx.json {
+        let repository_summary = (command == "status.repository").then_some(&summary);
         println!(
             "{}",
-            real_status_envelope(&state, command, selected_topic, selected_session)
+            real_status_envelope(
+                &state,
+                command,
+                selected_topic,
+                selected_session,
+                repository_summary
+            )
         );
     } else {
-        println!(
-            "{} files={} tree={}",
-            state.repository_id,
-            state
-                .entries
-                .iter()
-                .filter(|entry| !entry.tombstone)
-                .count(),
-            state.tree_hash
-        );
+        print_real_status_text(&state, command, selected_topic, selected_session, &summary);
     }
     Ok(true)
 }
@@ -3607,9 +3680,95 @@ fn real_inspect(ctx: &CommandContext) -> Result<bool, CliError> {
     if ctx.json {
         println!("{}", real_inspect_envelope(&state, selector)?);
     } else {
-        println!("{selector}");
+        print_real_inspect_text(&state, selector)?;
     }
     Ok(true)
+}
+
+fn print_real_inspect_text(state: &RealRepoState, selector: &str) -> Result<(), CliError> {
+    if selector == "repository" || selector == format!("repository:{}", state.repository_id) {
+        let summary = real_operational_summary(Path::new("."), state);
+        print_real_status_text(state, "inspect.repository", None, None, &summary);
+        return Ok(());
+    }
+    if let Some(value) = selector.strip_prefix("topic:") {
+        let topic = real_topic(state, value)?;
+        println!(
+            "topic {} ({}) head={} revisions={}",
+            topic.topic_id,
+            topic.slug,
+            topic.head_revision_id.as_deref().unwrap_or("none"),
+            topic.revision_number
+        );
+        return Ok(());
+    }
+    if let Some(value) = selector.strip_prefix("session:") {
+        let session = real_session(state, value)?;
+        println!(
+            "session {} topic={} generation={} view={}",
+            session.session_id,
+            session.write_topic_id,
+            session.session_generation_id,
+            session.resolved_view_id
+        );
+        return Ok(());
+    }
+    if let Some(value) = selector.strip_prefix("checkpoint:") {
+        let checkpoint = state
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.checkpoint_id == value)
+            .ok_or_else(|| object_not_found("checkpoint", value))?;
+        println!(
+            "checkpoint {} view={} tree={} artifacts={}",
+            checkpoint.checkpoint_id,
+            checkpoint.resolved_view_id,
+            checkpoint.tree_hash,
+            checkpoint
+                .entries
+                .iter()
+                .filter(|entry| !entry.tombstone)
+                .count()
+        );
+        return Ok(());
+    }
+    if let Some(value) = selector
+        .strip_prefix("export:")
+        .or_else(|| selector.strip_prefix("export_map:"))
+    {
+        let map = state
+            .export_maps
+            .iter()
+            .find(|map| map.export_map_id == value)
+            .ok_or_else(|| object_not_found("export_map", value))?;
+        println!(
+            "export {} checkpoint={} ref={} commits={}",
+            map.export_map_id,
+            map.checkpoint_id,
+            map.git_ref,
+            map.git_commit_ids.len()
+        );
+        return Ok(());
+    }
+    if let Some(value) = selector.strip_prefix("projection:") {
+        let projection = state
+            .projections
+            .iter()
+            .find(|projection| projection.projection_id == value)
+            .ok_or_else(|| object_not_found("projection", value))?;
+        println!(
+            "projection {} purpose={} view={} retention={}",
+            projection.projection_id,
+            projection.purpose,
+            projection.resolved_view_id,
+            projection.retention_state
+        );
+        return Ok(());
+    }
+    let envelope = real_inspect_envelope(state, selector)?;
+    println!("{selector}: persisted Sunlight record available (use --json for provenance details)");
+    debug_assert!(envelope.starts_with("{\"ok\":true"));
+    Ok(())
 }
 
 fn real_accept_mutation(
@@ -4621,7 +4780,7 @@ fn real_compat_projection_status_envelope(
         .filter(|candidate| candidate.quarantine_ref.is_some())
         .count();
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"status.projection\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"lifecycle_state\":\"{}\",\"projection\":{},\"dirty_candidate_summary\":{{\"total\":{},\"counts\":{}}},\"quarantine_count\":{},\"last_import_operation_id\":{}}},\"warnings\":[]}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"status.projection\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"lifecycle_state\":\"{}\",\"projection\":{},\"dirty_candidate_summary\":{{\"total\":{},\"counts\":{}}},\"quarantine_count\":{},\"last_import_operation_id\":{}}},\"warnings\":{}}}",
         json_escape(&state.repository_id),
         json_escape(&projection.projection_id),
         json_escape(&projection.resolved_view_id),
@@ -4631,21 +4790,40 @@ fn real_compat_projection_status_envelope(
         compat_candidate_counts_json(candidates),
         quarantine_count,
         optional_string_json(projection.last_import_operation_id.as_deref()),
+        if candidates.is_empty() {
+            "[]".to_string()
+        } else {
+            format!("[{{\"code\":\"dirty_compatibility_projection\",\"message\":\"review the compatibility diff and explicitly import or discard candidates\",\"details\":{{\"projection_id\":\"{}\",\"candidate_count\":{},\"quarantined_count\":{}}}}}]", json_escape(&projection.projection_id), candidates.len(), quarantine_count)
+        },
     )
 }
 
 fn real_projection_inspect_envelope(
     state: &RealRepoState,
     projection: &RealProjectionSnapshot,
+    candidates: Option<&[CompatCandidateDelta]>,
 ) -> String {
+    let candidate_count = candidates.map(<[CompatCandidateDelta]>::len).unwrap_or(0);
+    let lifecycle = if candidate_count == 0 {
+        "materialized"
+    } else {
+        "dirty"
+    };
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"inspect.projection\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"projection\":{},\"manifest\":{{\"manifest_digest\":\"{}\",\"source_truth\":\"sunlight_persisted_resolved_view\",\"entries\":{}}}}},\"warnings\":[]}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"inspect.projection\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"lifecycle_state\":\"{}\",\"projection\":{},\"dirty_candidate_summary\":{{\"total\":{}}},\"manifest\":{{\"manifest_digest\":\"{}\",\"source_truth\":\"sunlight_persisted_resolved_view\",\"entries\":{}}}}},\"warnings\":{}}}",
         json_escape(&state.repository_id),
         json_escape(&projection.projection_id),
         json_escape(&projection.resolved_view_id),
+        lifecycle,
         real_projection_snapshot_json(state, projection),
+        candidate_count,
         json_escape(&projection.manifest_digest),
         real_entries_manifest_json(&projection.entries),
+        if candidate_count == 0 {
+            "[]".to_string()
+        } else {
+            format!("[{{\"code\":\"dirty_compatibility_projection\",\"message\":\"review the compatibility diff and explicitly import or discard candidates\",\"details\":{{\"projection_id\":\"{}\",\"candidate_count\":{}}}}}]", json_escape(&projection.projection_id), candidate_count)
+        },
     )
 }
 
@@ -4946,7 +5124,7 @@ fn real_execution_status_envelope(
             "\"promotion_candidates\":[{}],",
             "\"promotions\":[{}],",
             "\"privacy_semantics\":{{\"execution_record\":\"policy_gated\",\"raw_outputs\":\"not_persisted\",\"promotion_record\":\"policy_gated\",\"durability\":\"persisted_repo_state\"}}",
-            "}},\"warnings\":[]}}"
+            "}},\"warnings\":{}}}"
         ),
         json_escape(&state.repository_id),
         json_escape(&execution.execution_id),
@@ -4964,6 +5142,7 @@ fn real_execution_status_envelope(
         real_execution_promotion_status(state, execution),
         real_execution_promotion_candidates_json(state, execution),
         real_execution_promotions_json(state, execution),
+        real_execution_warnings_json(state, execution),
     )
 }
 
@@ -5026,7 +5205,7 @@ fn real_execution_inspect_envelope(
             "\"promotion_candidates\":[{}],",
             "\"promotions\":[{}],",
             "\"privacy_semantics\":{{\"execution_record\":\"policy_gated\",\"raw_outputs\":\"not_persisted\",\"promotion_record\":\"policy_gated\",\"durability\":\"persisted_repo_state\"}}",
-            "}},\"warnings\":[]}}"
+            "}},\"warnings\":{}}}"
         ),
         json_escape(&state.repository_id),
         real_execution_snapshot_record_json(state, execution),
@@ -5034,7 +5213,24 @@ fn real_execution_inspect_envelope(
         real_execution_promotion_status(state, execution),
         real_execution_promotion_candidates_json(state, execution),
         real_execution_promotions_json(state, execution),
+        real_execution_warnings_json(state, execution),
     )
+}
+
+fn real_execution_warnings_json(
+    state: &RealRepoState,
+    execution: &RealExecutionSnapshot,
+) -> String {
+    let mut warnings = Vec::new();
+    if execution.status == "timeout" {
+        warnings.push("{\"code\":\"execution_timeout\",\"message\":\"inspect the timeout and rerun with an appropriate bounded policy\",\"details\":{}}".to_string());
+    } else if execution.status != "pass" {
+        warnings.push("{\"code\":\"execution_failed\",\"message\":\"inspect the failed execution before checkpointing\",\"details\":{}}".to_string());
+    }
+    if real_execution_promotion_status(state, execution) == "promotion_required" {
+        warnings.push(format!("{{\"code\":\"pending_promotion\",\"message\":\"promote or discard selected execution outputs\",\"details\":{{\"execution_id\":\"{}\"}}}}", json_escape(&execution.execution_id)));
+    }
+    format!("[{}]", warnings.join(","))
 }
 
 fn real_checkpoint_snapshot_json(
@@ -5199,13 +5395,460 @@ fn real_topic_frontier_pairs_json(frontier: &[(String, String)]) -> String {
     format!("{{{fields}}}")
 }
 
+#[derive(Debug, Default)]
+struct RealPolicyStatus {
+    report_count: usize,
+    passed_count: usize,
+    failed_count: usize,
+    invalid_count: usize,
+    invalid_report_ids: Vec<String>,
+    missing_export_report_count: usize,
+}
+
+#[derive(Debug, Default)]
+struct RealOperationalSummary {
+    artifact_count: usize,
+    quarantined_count: usize,
+    conflict_count: usize,
+    staleness_count: usize,
+    projection_counts: BTreeMap<String, usize>,
+    dirty_compat_projection_ids: Vec<String>,
+    invalid_projection_ids: Vec<String>,
+    execution_passed: usize,
+    execution_failed: usize,
+    execution_timeouts: usize,
+    pending_promotions: usize,
+    unexported_checkpoint_ids: Vec<String>,
+    policy: RealPolicyStatus,
+}
+
+fn real_operational_summary(repo_root: &Path, state: &RealRepoState) -> RealOperationalSummary {
+    let resolved = state.resolve_head_view();
+    let mut summary = RealOperationalSummary {
+        artifact_count: state
+            .entries
+            .iter()
+            .filter(|entry| !entry.tombstone)
+            .count(),
+        quarantined_count: state.quarantine.len(),
+        conflict_count: resolved.result.conflicts().count(),
+        staleness_count: resolved.result.staleness().count(),
+        ..RealOperationalSummary::default()
+    };
+    let projection_policy = require_repository_config(repo_root.to_path_buf())
+        .ok()
+        .and_then(|config| resolve_projection_policy(repo_root, &config).ok());
+    for projection in &state.projections {
+        *summary
+            .projection_counts
+            .entry(projection.purpose.clone())
+            .or_default() += 1;
+        if projection.purpose == "compatibility" {
+            let Some(policy) = projection_policy.as_ref() else {
+                summary
+                    .invalid_projection_ids
+                    .push(projection.projection_id.clone());
+                continue;
+            };
+            match diff_real_compat_projection(repo_root, &policy.managed_root, projection) {
+                Ok(diff) if !diff.candidates.is_empty() => summary
+                    .dirty_compat_projection_ids
+                    .push(projection.projection_id.clone()),
+                Ok(_) => {}
+                Err(_) => summary
+                    .invalid_projection_ids
+                    .push(projection.projection_id.clone()),
+            }
+        }
+    }
+    for execution in &state.executions {
+        match execution.status.as_str() {
+            "pass" => summary.execution_passed += 1,
+            "timeout" => summary.execution_timeouts += 1,
+            _ => summary.execution_failed += 1,
+        }
+        if real_execution_promotion_status(state, execution) == "promotion_required" {
+            summary.pending_promotions += execution
+                .outputs
+                .iter()
+                .filter(|output| {
+                    !state.promotions.iter().any(|promotion| {
+                        promotion.execution_id == execution.execution_id
+                            && promotion.output_path == output.path
+                    })
+                })
+                .count();
+        }
+    }
+    summary.unexported_checkpoint_ids = state
+        .checkpoints
+        .iter()
+        .filter(|checkpoint| {
+            !state
+                .export_maps
+                .iter()
+                .any(|map| map.checkpoint_id == checkpoint.checkpoint_id)
+        })
+        .map(|checkpoint| checkpoint.checkpoint_id.clone())
+        .collect();
+    summary.policy = real_policy_status(repo_root, state);
+    summary
+}
+
+fn real_policy_status(repo_root: &Path, state: &RealRepoState) -> RealPolicyStatus {
+    let mut status = RealPolicyStatus::default();
+    let root = repo_root.join(".sunlight/records/validation-reports");
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("invalid_filename")
+                .to_string();
+            match load_git_export_validation_report(repo_root, &state.repository_id, &id) {
+                Ok(report) => {
+                    status.report_count += 1;
+                    if report.ok {
+                        status.passed_count += 1;
+                    } else {
+                        status.failed_count += 1;
+                    }
+                }
+                Err(_) => {
+                    status.invalid_count += 1;
+                    status.invalid_report_ids.push(id);
+                }
+            }
+        }
+    }
+    status.missing_export_report_count = state
+        .export_maps
+        .iter()
+        .filter(|map| match map.validation_report_id.as_deref() {
+            Some(id) => {
+                load_git_export_validation_report(repo_root, &state.repository_id, id).is_err()
+            }
+            None => true,
+        })
+        .count();
+    status
+}
+
+fn real_topic_heads_json(state: &RealRepoState) -> String {
+    format!(
+        "[{}]",
+        state
+            .topics
+            .iter()
+            .map(|topic| format!(
+                "{{\"topic_id\":\"{}\",\"slug\":\"{}\",\"head_revision_id\":{},\"revision_number\":{}}}",
+                json_escape(&topic.topic_id),
+                json_escape(&topic.slug),
+                optional_string_json(topic.head_revision_id.as_deref()),
+                topic.revision_number
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn real_session_heads_json(state: &RealRepoState) -> String {
+    format!(
+        "[{}]",
+        state
+            .sessions
+            .iter()
+            .map(|session| format!(
+                "{{\"session_id\":\"{}\",\"topic_id\":\"{}\",\"resolved_view_id\":\"{}\",\"session_generation_id\":\"{}\"}}",
+                json_escape(&session.session_id),
+                json_escape(&session.write_topic_id),
+                json_escape(&session.resolved_view_id),
+                json_escape(&session.session_generation_id)
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSummary) -> String {
+    let head = state.resolve_head_view();
+    let head_tree_hash = head
+        .result
+        .tree_identity
+        .as_ref()
+        .map(|tree| tree.tree_hash.clone())
+        .unwrap_or_else(|| real_tree_hash(&head.entries));
+    let projections = summary
+        .projection_counts
+        .iter()
+        .map(|(purpose, count)| format!("\"{}\":{}", json_escape(purpose), count))
+        .collect::<Vec<_>>()
+        .join(",");
+    let checkpoints = state
+        .checkpoints
+        .iter()
+        .map(|checkpoint| {
+            format!(
+                "{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"exported\":{}}}",
+                json_escape(&checkpoint.checkpoint_id),
+                json_escape(&checkpoint.resolved_view_id),
+                json_escape(&checkpoint.tree_hash),
+                state
+                    .export_maps
+                    .iter()
+                    .any(|map| map.checkpoint_id == checkpoint.checkpoint_id)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let export_maps = state
+        .export_maps
+        .iter()
+        .map(|map| {
+            format!(
+                "{{\"export_map_id\":\"{}\",\"checkpoint_id\":\"{}\",\"git_ref\":\"{}\",\"git_commit_count\":{}}}",
+                json_escape(&map.export_map_id),
+                json_escape(&map.checkpoint_id),
+                json_escape(&map.git_ref),
+                map.git_commit_ids.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        concat!(
+            "{{\"repository\":{{\"repository_id\":\"{}\",\"base_checkpoint_id\":\"{}\",\"base_resolved_view_id\":\"{}\",\"current_resolved_view_id\":\"{}\",\"tree_hash\":\"{}\"}},",
+            "\"artifacts\":{{\"active\":{},\"quarantined\":{}}},",
+            "\"topics\":{{\"count\":{},\"heads\":{}}},",
+            "\"sessions\":{{\"count\":{},\"heads\":{}}},",
+            "\"resolution\":{{\"conflicts\":{},\"staleness\":{}}},",
+            "\"projections\":{{\"total\":{},\"by_purpose\":{{{}}},\"lifecycle\":{{\"materialized\":{},\"dirty\":{},\"invalid\":{}}}}},",
+            "\"executions\":{{\"total\":{},\"passed\":{},\"failed\":{},\"timeouts\":{},\"pending_promotions\":{}}},",
+            "\"checkpoints\":{{\"count\":{},\"unexported\":{},\"records\":[{}]}},",
+            "\"exports\":{{\"count\":{},\"maps\":[{}]}},",
+            "\"policy\":{{\"reports\":{},\"passed\":{},\"failed\":{},\"invalid_or_tampered\":{},\"missing_export_reports\":{}}},",
+            "\"execution_isolation\":{{\"enforced\":false,\"network\":\"unenforced\",\"filesystem_writes\":\"managed_projection_writable_not_isolated\",\"cpu\":\"unenforced\",\"memory\":\"unenforced\"}}}}"
+        ),
+        json_escape(&state.repository_id),
+        json_escape(&state.base_checkpoint_id),
+        json_escape(&state.base_resolved_view_id),
+        json_escape(&head.result.resolved_view_id),
+        json_escape(&head_tree_hash),
+        summary.artifact_count,
+        summary.quarantined_count,
+        state.topics.len(),
+        real_topic_heads_json(state),
+        state.sessions.len(),
+        real_session_heads_json(state),
+        summary.conflict_count,
+        summary.staleness_count,
+        state.projections.len(),
+        projections,
+        state
+            .projections
+            .len()
+            .saturating_sub(summary.dirty_compat_projection_ids.len() + summary.invalid_projection_ids.len()),
+        summary.dirty_compat_projection_ids.len(),
+        summary.invalid_projection_ids.len(),
+        state.executions.len(),
+        summary.execution_passed,
+        summary.execution_failed,
+        summary.execution_timeouts,
+        summary.pending_promotions,
+        state.checkpoints.len(),
+        summary.unexported_checkpoint_ids.len(),
+        checkpoints,
+        state.export_maps.len(),
+        export_maps,
+        summary.policy.report_count,
+        summary.policy.passed_count,
+        summary.policy.failed_count,
+        summary.policy.invalid_count,
+        summary.policy.missing_export_report_count,
+    )
+}
+
+fn real_operational_warnings_json(
+    state: &RealRepoState,
+    summary: &RealOperationalSummary,
+) -> String {
+    let mut warnings = Vec::new();
+    if summary.quarantined_count > 0 {
+        warnings.push(format!("{{\"code\":\"ingest_secrets_quarantined\",\"message\":\"review quarantined ingest records before checkpointing\",\"details\":{{\"count\":{},\"report\":\"local://.sunlight/quarantine/ingest-report.json\"}}}}", summary.quarantined_count));
+    }
+    if summary.conflict_count > 0 {
+        warnings.push(format!("{{\"code\":\"resolver_conflicts\",\"message\":\"inspect and resolve conflicting topic operations\",\"details\":{{\"count\":{}}}}}", summary.conflict_count));
+    }
+    if summary.staleness_count > 0 {
+        warnings.push(format!("{{\"code\":\"resolver_staleness\",\"message\":\"refresh or reselect stale topic dependencies\",\"details\":{{\"count\":{}}}}}", summary.staleness_count));
+    }
+    if summary.execution_failed > 0 || summary.execution_timeouts > 0 {
+        warnings.push(format!("{{\"code\":\"executions_need_attention\",\"message\":\"inspect failed or timed-out executions before checkpointing\",\"details\":{{\"failed\":{},\"timeouts\":{}}}}}", summary.execution_failed, summary.execution_timeouts));
+    }
+    if summary.pending_promotions > 0 {
+        warnings.push(format!("{{\"code\":\"pending_promotions\",\"message\":\"promote or discard execution outputs\",\"details\":{{\"count\":{}}}}}", summary.pending_promotions));
+    }
+    if !summary.dirty_compat_projection_ids.is_empty() {
+        warnings.push(format!("{{\"code\":\"dirty_compatibility_projections\",\"message\":\"review compatibility diffs and explicitly import or discard them\",\"details\":{{\"projection_ids\":{}}}}}", string_array_json(summary.dirty_compat_projection_ids.iter().map(String::as_str))));
+    }
+    if !summary.invalid_projection_ids.is_empty() {
+        warnings.push(format!("{{\"code\":\"invalid_projection_records\",\"message\":\"inspect or recreate unreadable compatibility projections\",\"details\":{{\"projection_ids\":{}}}}}", string_array_json(summary.invalid_projection_ids.iter().map(String::as_str))));
+    }
+    if !state.operations.is_empty() && state.checkpoints.is_empty() {
+        warnings.push("{\"code\":\"checkpoint_missing\",\"message\":\"create a checkpoint for the authored resolved view\",\"details\":{}}".to_string());
+    }
+    if !summary.unexported_checkpoint_ids.is_empty() {
+        warnings.push(format!("{{\"code\":\"checkpoint_not_exported\",\"message\":\"validate and export ready checkpoints when Git delivery is required\",\"details\":{{\"checkpoint_ids\":{}}}}}", string_array_json(summary.unexported_checkpoint_ids.iter().map(String::as_str))));
+    }
+    if summary.policy.invalid_count > 0 || summary.policy.missing_export_report_count > 0 {
+        warnings.push(format!("{{\"code\":\"policy_report_integrity\",\"message\":\"rerun policy checks for missing, invalid, or tampered validation reports\",\"details\":{{\"invalid_or_tampered\":{},\"missing_export_reports\":{},\"report_ids\":{}}}}}", summary.policy.invalid_count, summary.policy.missing_export_report_count, string_array_json(summary.policy.invalid_report_ids.iter().map(String::as_str))));
+    }
+    format!("[{}]", warnings.join(","))
+}
+
+fn print_real_status_text(
+    state: &RealRepoState,
+    command: &str,
+    topic: Option<&RealTopicRecord>,
+    session: Option<&RealSessionRecord>,
+    summary: &RealOperationalSummary,
+) {
+    let head = state.resolve_head_view();
+    let head_tree_hash = head
+        .result
+        .tree_identity
+        .as_ref()
+        .map(|tree| tree.tree_hash.clone())
+        .unwrap_or_else(|| real_tree_hash(&head.entries));
+    println!("Sunlight {}", state.repository_id);
+    println!(
+        "base {}  view {}  tree {}",
+        state.base_checkpoint_id, head.result.resolved_view_id, head_tree_hash
+    );
+    println!(
+        "artifacts {}  quarantined {}  topics {}  sessions {}",
+        summary.artifact_count,
+        summary.quarantined_count,
+        state.topics.len(),
+        state.sessions.len()
+    );
+    if let Some(topic) = topic {
+        println!(
+            "topic {} ({})  head {}",
+            topic.topic_id,
+            topic.slug,
+            topic.head_revision_id.as_deref().unwrap_or("none")
+        );
+    }
+    if let Some(session) = session {
+        println!(
+            "session {}  generation {}  view {}",
+            session.session_id, session.session_generation_id, session.resolved_view_id
+        );
+    }
+    if command == "status.repository" || command == "inspect.repository" {
+        for topic in &state.topics {
+            println!(
+                "  topic {}  head {}",
+                topic.slug,
+                topic.head_revision_id.as_deref().unwrap_or("none")
+            );
+        }
+        for session in &state.sessions {
+            println!(
+                "  session {}  topic {}  generation {}",
+                session.session_id, session.write_topic_id, session.session_generation_id
+            );
+        }
+    }
+    println!(
+        "resolution conflicts={} stale={}  projections={} dirty-compat={}",
+        summary.conflict_count,
+        summary.staleness_count,
+        state.projections.len(),
+        summary.dirty_compat_projection_ids.len()
+    );
+    println!(
+        "executions pass={} fail={} timeout={} pending-promotions={}",
+        summary.execution_passed,
+        summary.execution_failed,
+        summary.execution_timeouts,
+        summary.pending_promotions
+    );
+    println!(
+        "checkpoints {}  exports {}  policy-reports {} (failed={} invalid={})",
+        state.checkpoints.len(),
+        state.export_maps.len(),
+        summary.policy.report_count,
+        summary.policy.failed_count,
+        summary.policy.invalid_count
+    );
+    println!("execution isolation: network/filesystem-write/cpu/memory unenforced");
+    if summary.quarantined_count > 0 {
+        println!(
+            "warning[ingest_secrets_quarantined]: review .sunlight/quarantine/ingest-report.json"
+        );
+    }
+    if summary.conflict_count > 0 {
+        println!("warning[resolver_conflicts]: inspect and resolve conflicting topic operations");
+    }
+    if summary.staleness_count > 0 {
+        println!("warning[resolver_staleness]: refresh or reselect stale topic dependencies");
+    }
+    if summary.execution_failed > 0 || summary.execution_timeouts > 0 {
+        println!("warning[executions_need_attention]: inspect failed or timed-out executions");
+    }
+    if summary.pending_promotions > 0 {
+        println!("warning[pending_promotions]: promote or discard execution outputs");
+    }
+    if !summary.dirty_compat_projection_ids.is_empty() {
+        println!("warning[dirty_compatibility_projections]: review compatibility diffs and import or discard them");
+    }
+    if !summary.invalid_projection_ids.is_empty() {
+        println!("warning[invalid_projection_records]: inspect or recreate unreadable projections");
+    }
+    if !state.operations.is_empty() && state.checkpoints.is_empty() {
+        println!("warning[checkpoint_missing]: create a checkpoint for the authored resolved view");
+    }
+    if !summary.unexported_checkpoint_ids.is_empty() {
+        println!("warning[checkpoint_not_exported]: validate and export ready checkpoints when Git delivery is required");
+    }
+    if summary.policy.invalid_count > 0 || summary.policy.missing_export_report_count > 0 {
+        println!(
+            "warning[policy_report_integrity]: rerun policy checks for missing or invalid reports"
+        );
+    }
+}
+
 fn real_status_envelope(
     state: &RealRepoState,
     command: &str,
     topic: Option<&RealTopicRecord>,
     session: Option<&RealSessionRecord>,
+    summary: Option<&RealOperationalSummary>,
 ) -> String {
-    let warnings = real_quarantine_warnings_json(state);
+    let include_summary = summary.is_some();
+    let fallback_summary;
+    let summary = match summary {
+        Some(summary) => summary,
+        None => {
+            fallback_summary = real_operational_summary(Path::new("."), state);
+            &fallback_summary
+        }
+    };
+    let warnings = real_operational_warnings_json(state, summary);
+    let summary_extension = if include_summary {
+        format!(
+            ",\"operational_summary\":{}",
+            operational_summary_json(state, summary)
+        )
+    } else {
+        String::new()
+    };
     let topic_id = topic.map(|topic| topic.topic_id.as_str());
     let head_revision_id = topic.and_then(|topic| topic.head_revision_id.as_deref());
     let session_id = session.map(|session| session.session_id.as_str());
@@ -5239,7 +5882,7 @@ fn real_status_envelope(
         })
         .unwrap_or_default();
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"quarantined_secret_count\":{},\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"}},\"topic\":{{\"topic_id\":{},\"head_revision_id\":{}}},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]}}}},\"warnings\":{}}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"quarantined_secret_count\":{},\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"}},\"topic\":{{\"topic_id\":{},\"head_revision_id\":{}}},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]}}{}}},\"warnings\":{}}}",
         command,
         json_escape(&state.repository_id),
         json_escape(&state.repository_id),
@@ -5256,17 +5899,8 @@ fn real_status_envelope(
         optional_string_json(session_id),
         json_escape(session_generation_id),
         compatibility_projections,
+        summary_extension,
         warnings,
-    )
-}
-
-fn real_quarantine_warnings_json(state: &RealRepoState) -> String {
-    if state.quarantine.is_empty() {
-        return "[]".to_string();
-    }
-    format!(
-        "[{{\"code\":\"ingest_secrets_quarantined\",\"message\":\"repo ingestion skipped likely secret files\",\"quarantined_count\":{},\"report\":\"local://.sunlight/quarantine/ingest-report.json\"}}]",
-        state.quarantine.len()
     )
 }
 
@@ -5310,6 +5944,7 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
             "inspect.repository",
             None,
             None,
+            Some(&real_operational_summary(Path::new("."), state)),
         ));
     }
     if let Some(topic) = selector.strip_prefix("topic:") {
@@ -5320,6 +5955,7 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
             state,
             "inspect.topic",
             Some(topic),
+            None,
             None,
         ));
     }
@@ -5336,6 +5972,7 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
             "inspect.session",
             topic,
             Some(session),
+            None,
         ));
     }
     if let Some(projection) = selector.strip_prefix("projection:") {
@@ -5344,7 +5981,25 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
             .iter()
             .find(|candidate| candidate.projection_id == projection)
             .ok_or_else(|| object_not_found("projection", projection))?;
-        return Ok(real_projection_inspect_envelope(state, projection));
+        let candidates = if projection.purpose == "compatibility" {
+            let config = require_repository_config(PathBuf::from("."))?;
+            let policy = resolve_projection_policy(Path::new("."), &config).map_err(|error| {
+                invalid_request(error.to_string())
+                    .with_detail("projection_id", projection.projection_id.clone())
+            })?;
+            Some(
+                diff_real_compat_projection(Path::new("."), &policy.managed_root, projection)
+                    .map_err(compat_import_error)?
+                    .candidates,
+            )
+        } else {
+            None
+        };
+        return Ok(real_projection_inspect_envelope(
+            state,
+            projection,
+            candidates.as_deref(),
+        ));
     }
     if let Some(operation_id) = selector
         .strip_prefix("compat-import:")
@@ -14121,65 +14776,81 @@ fn json_escape(value: &str) -> String {
 fn print_help() {
     println!(
         "\
-sun
+sun - local-first source artifact management
 
 Usage:
   sun init [--repo <path>]
-  sun topic create <slug> --display-name <name> --fixture basic-app --json
-  sun session start --topic <topic> --view <view-selector> --actor <actor-id> --fixture basic-app --json
-  sun read <path> --session <session> --fixture basic-app [--json]
-  sun list [path-prefix] --session <session> --fixture basic-app [--json]
-  sun search <query> --session <session> --fixture basic-app [--json]
-  sun patch <path> --session <session> --fixture basic-app --expect-hash <hash> --patch-file <file> [--json]
-  sun write <path> --session <session> --fixture basic-app --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]
-  sun move <from> <to> --session <session> --fixture basic-app --expect-hash <hash> [--json]
-  sun delete <path> --session <session> --fixture basic-app --expect-hash <hash> [--json]
-  sun metadata set <path> --session <session> --fixture basic-app --expect-hash <hash> --classification <class> [--json]
-  sun view resolve --fixture basic-app --include topic:revision[,topic:revision] [--json]
-  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export --fixture basic-app [--projection-root <empty-path>] [--json]
-  sun projection quarantine-cleanup --projection <projection-id> --projection-root <path> --fixture basic-app [--json]
-  sun run --view <resolved-view-id> --fixture basic-app [--integrity-fixture store-mismatch|scan-missing-blob|verified] --json -- cargo test
-  sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> --fixture basic-app [--json]
-  sun checkpoint create --view <resolved-view-id> --fixture basic-app [--json]
-  sun policy check-commit [--paths <path>...] --json
-  sun policy explain <validation-report-id> --json
-  sun git export --checkpoint <checkpoint-id> --branch <git-ref> --fixture basic-app [--write-plan|--execute-fixture success|ref-update-failure|export-map-failure|--execute-local --repo <path>] --json
-  sun status --view <resolved-view-id> --fixture basic-app [--json]
-  sun status --export <export-map-id> --fixture basic-app [--json]
-  sun status --git <commit-or-ref> --fixture basic-app [--json]
-  sun status --projection <projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|scan-missing-blob|verified] [--json]
-  sun status --execution <execution-id> --fixture basic-app [--promoted] [--json]
-  sun inspect export:<export-map-id> --fixture basic-app [--json]
-  sun inspect git:<commit-or-ref> --fixture basic-app [--json]
-  sun inspect view:<resolved-view-id> --fixture basic-app [--json]
-  sun inspect conflict:<conflict-id> --fixture basic-app [--json]
-  sun inspect projection:<projection-id> --fixture basic-app [--projection-root <local-path>] [--integrity-fixture store-mismatch|scan-missing-blob|verified] [--json]
-  sun inspect execution:<execution-id> --fixture basic-app [--promoted] [--json]
+  sun topic create <slug> --display-name <name> [--json]
+  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]
+  sun read|list|search ... --session <session> [--json]
+  sun patch|write|move|delete|metadata set ... --session <session> [--json]
+  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]
+  sun project materialize --view <view> --purpose execution|compatibility|inspection|export [--projection-root <path>] [--json]
+  sun compat project --session <session> [--json]
+  sun compat diff --projection <projection> [--json]
+  sun compat import --projection <projection> --candidate <candidate> [--json]
+  sun run --view <view> [runtime policy options] -- <command> [args...]
+  sun execution promote-output <execution> --path <path> --session <session> --classification <class> [--json]
+  sun checkpoint create --view <view> [--json]
+  sun policy check-export --checkpoint <checkpoint> [--branch <ref>] [--json]
+  sun policy check-commit [--paths <path>...] [--json]
+  sun policy explain <validation-report> [--json]
+  sun git export --checkpoint <checkpoint> --branch <ref> [--execute-local] [--json]
+  sun status [--topic|--session|--view|--projection|--execution|--checkpoint|--export <id>] [--json]
+  sun inspect <typed-selector> [--json]
 
 Commands:
-  init       Create the conservative local .sunlight repository layout
-  topic      Create fixture-backed Phase 1 topics with stable JSON envelopes
-  session    Start fixture-backed Phase 1 sessions with stable JSON envelopes
-  read       Read a fixture artifact by repository-relative path
-  list       List fixture artifacts by optional path prefix
-  search     Search fixture artifact text literally
-  patch      Apply a fixture-backed unified diff to one artifact
-  write      Write fixture-backed content to one artifact path
-  move       Move a fixture artifact path and preserve artifact identity
-  delete     Tombstone a fixture artifact path with provenance
-  metadata   Set fixture artifact metadata without changing content bytes
-  view       Resolve fixture topic revisions into a candidate view
-  project    Materialize fixture projections for exact resolved views
-  projection Clean up local-only fixture projection quarantine records
-  run        Record a fixture execution for an exact resolved view
-  execution  Promote a declared fixture execution output into a topic operation
-  checkpoint Freeze a fixture resolved view as an in-memory checkpoint
-  policy    Validate Sunlight commit and export policy checks
-  git        Export a fixture checkpoint to a Git ref
-  status     Show fixture object status, including projection integrity diagnostics
-  inspect    Inspect fixture objects and local-only projection diagnostics
+  init       Ingest the repository into persisted Sunlight native state
+  topic      Create durable authoring topics
+  session    Start topic-bound authoring sessions over exact views
+  read/list/search/inspect
+             Query persisted artifacts and provenance
+  patch/write/move/delete/metadata
+             Author native operations with explicit preconditions
+  view       Resolve persisted topic heads into an exact view or conflicts
+  project    Materialize a managed tool projection; it is not source truth
+  compat     Project, review, and explicitly import compatibility edits
+  run        Execute a command against an exact persisted view
+  execution  Promote approved execution outputs into native operations
+  checkpoint Freeze a resolved view for validation and export
+  policy     Validate commit/export policy and inspect persisted reports
+  git        Export a checkpoint to ordinary Git history
+  status     Summarize repository health and object lifecycle state
+  inspect    Inspect a persisted object using a typed selector
+
+Typical journey:
+  sun init
+  sun topic create auth-fix --display-name \"Auth fix\"
+  sun session start --topic auth-fix --view view_base_0001 --actor agent-a
+  sun status
+  sun checkpoint create --view <resolved-view-id>
+  sun policy check-export --checkpoint <checkpoint-id> --branch sunlight/auth-fix
+  sun git export --checkpoint <checkpoint-id> --branch sunlight/auth-fix --execute-local
+
+Compatibility/testing:
+  Add --fixture basic-app to supported commands only when exercising the legacy
+  deterministic fixture contracts. Fixture state is not repository source truth.
 "
     );
+}
+
+fn print_command_help(command: &str) {
+    match command {
+        "status" => println!("sun status\n\nUsage:\n  sun status [--json]\n  sun status --topic <topic> [--json]\n  sun status --session <session> [--json]\n  sun status --view <view> [--json]\n  sun status --projection <projection> [--json]\n  sun status --execution <execution> [--json]\n  sun status --checkpoint <checkpoint> [--json]\n  sun status --export <export-map> [--json]\n\nRepository status is derived from persisted Sunlight state, not git status or the main working tree."),
+        "inspect" => println!("sun inspect\n\nUsage:\n  sun inspect repository [--json]\n  sun inspect topic:<topic>|session:<session>|view:<view> [--json]\n  sun inspect artifact:<path>|operation:<id>|conflict:<id> [--json]\n  sun inspect projection:<id>|execution:<id>|checkpoint:<id>|export:<id> [--json]"),
+        "topic" | "topic create" => println!("sun topic create\n\nUsage:\n  sun topic create <slug> --display-name <name> [--json]\n\nCreates a durable topic in the initialized repository."),
+        "session" | "session start" => println!("sun session start\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]"),
+        "compat" | "compat project" | "compat diff" | "compat import" => println!("sun compat\n\nUsage:\n  sun compat project --session <session> [--json]\n  sun compat diff --projection <projection> [--json]\n  sun compat import --projection <projection> --candidate <candidate> [--json]\n\nCompatibility projections are adapters. Only explicit import creates native operations."),
+        "policy" | "policy check-export" | "policy check-commit" | "policy explain" => println!("sun policy\n\nUsage:\n  sun policy check-export --checkpoint <checkpoint> [--branch <ref>] [--json]\n  sun policy check-commit [--paths <path>...] [--json]\n  sun policy explain <validation-report> [--json]"),
+        "git" | "git export" => println!("sun git export\n\nUsage:\n  sun git export --checkpoint <checkpoint> --branch <ref> [--write-plan|--execute-local] [--repo <path>] [--json]"),
+        "checkpoint" | "checkpoint create" => println!("sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--json]"),
+        "run" => println!("sun run\n\nUsage:\n  sun run --view <resolved-view-id> [--timeout-ms <ms>] [--env-policy clean|allowlist] [--env-allow <name>...] -- <command> [args...]\n\nNetwork, filesystem-write, CPU, and memory isolation remain explicitly unenforced."),
+        "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => println!("sun artifact operations\n\nUsage:\n  sun read <path> --session <session> [--json]\n  sun list [path-prefix] --session <session> [--json]\n  sun search <query> --session <session> [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification <class> [--json]"),
+        "view" | "view resolve" => println!("sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nResolves persisted topic selections; conflicts and staleness remain inspectable records."),
+        "project" | "project materialize" | "projection" | "projection create" => println!("sun project materialize\n\nUsage:\n  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export [--projection-root <path>] [--json]\n\nManaged projections adapt persisted views for filesystem tools and are not source truth."),
+        "execution" | "execution promote-output" => println!("sun execution promote-output\n\nUsage:\n  sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> [--json]"),
+        _ => print_help(),
+    }
 }
 
 fn print_init_help() {

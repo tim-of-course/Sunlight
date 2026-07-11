@@ -48,20 +48,28 @@ The suite runs, in order:
 - `scripts/projection-strategy-smoke`
 - `scripts/mvp-smoke`
 
-`scripts/mvp-smoke` covers the end-to-end fixture path through real local Git
-export with `--execute-local`, including projection status and inspect local
-root verification. See [mvp_smoke.md](mvp_smoke.md) for details.
+For the production-like operator workflow, run the no-fixture self-hosting
+acceptance journey:
+
+```powershell
+cargo test -p sun --test self_hosting
+```
+
+It initializes an isolated Git clone, creates real topics and sessions, authors
+native operations, resolves views and conflicts, materializes projections,
+runs commands, imports compatibility edits, creates checkpoints, checks policy,
+and exports Git history. `sun status` summarizes that persisted repository state;
+it does not treat the clone's main Git working tree as native source truth.
+
+`scripts/mvp-smoke` remains a secondary deterministic compatibility test for the
+legacy `basic-app` fixture path through real local Git export with
+`--execute-local`, including projection status and inspect local-root
+verification. See [mvp_smoke.md](mvp_smoke.md) for fixture-specific details.
 
 Use an individual smoke script when iterating on the covered behavior and the
 Cargo gates have already passed. For validation-plan changes, the aggregate
 suite is the canonical handoff because it includes the validation smoke plus the
 format, check, test, projection strategy, and MVP coverage.
 
-Run the production-like self-hosting acceptance journey by itself with:
-
-```powershell
-cargo test -p sun --test self_hosting
-```
-
-This test uses the built `sun` binary and an isolated local Git clone of this
-repository; it does not require network access or fixture data.
+The self-hosting test uses the built `sun` binary and requires no network access
+or fixture data.

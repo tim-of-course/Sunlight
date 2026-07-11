@@ -11,30 +11,137 @@ fn sun() -> Command {
 }
 
 #[test]
-fn global_help_describes_phase1_fixture_lifecycle_commands() {
+fn global_and_primary_help_describe_repo_backed_operator_workflow() {
     let output = sun().arg("--help").output().expect("sun --help should run");
 
     assert_success(&output);
-    let stdout = stdout(&output);
-    assert!(
-        stdout.contains("sun topic create <slug> --display-name <name> --fixture basic-app --json")
-    );
-    assert!(stdout.contains(
-        "sun session start --topic <topic> --view <view-selector> --actor <actor-id> --fixture basic-app --json"
-    ));
-    assert!(stdout
-        .contains("topic      Create fixture-backed Phase 1 topics with stable JSON envelopes"));
-    assert!(stdout
-        .contains("session    Start fixture-backed Phase 1 sessions with stable JSON envelopes"));
-    assert!(
-        stdout.contains("move       Move a fixture artifact path and preserve artifact identity")
-    );
-    assert!(stdout.contains("delete     Tombstone a fixture artifact path with provenance"));
-    assert!(
-        stdout.contains("metadata   Set fixture artifact metadata without changing content bytes")
-    );
-    assert!(!stdout.contains("parse-only"));
-    assert!(!stdout.contains("persistence is not implemented"));
+    let help = stdout(&output);
+    for expected in [
+        "sun init",
+        "sun topic create <slug> --display-name <name> [--json]",
+        "sun compat import --projection <projection> --candidate <candidate>",
+        "sun run --view <view>",
+        "sun policy check-export --checkpoint <checkpoint>",
+        "sun git export --checkpoint <checkpoint> --branch <ref>",
+        "status     Summarize repository health and object lifecycle state",
+        "Compatibility/testing:",
+    ] {
+        assert!(help.contains(expected), "missing help text: {expected}");
+    }
+    assert!(!help.contains("Create fixture-backed"));
+    assert!(!help.contains("Read a fixture artifact"));
+
+    for command in ["status", "inspect", "run"] {
+        let output = sun()
+            .arg(command)
+            .arg("--help")
+            .output()
+            .expect("primary command help should run");
+        assert_success(&output);
+        assert!(!stdout(&output).contains("--fixture basic-app"));
+    }
+}
+
+#[test]
+fn no_fixture_repository_status_clean_initial_and_active_human_journey() {
+    let repo = TestRepo::new("repository-status-journey");
+    init_local_git_repo(&repo);
+
+    let init = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&init);
+    let clean = sun()
+        .arg("status")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&clean);
+    let clean = stdout(&clean);
+    assert_valid_json(&clean);
+    assert!(clean.contains("\"command\":\"status.repository\""));
+    assert!(clean.contains("\"topics\":{\"count\":0,\"heads\":[]}"));
+    assert!(clean.contains("\"executions\":{\"total\":0"));
+    assert!(clean.contains("\"checkpoints\":{\"count\":0,\"unexported\":0,\"records\":[]}"));
+    assert!(clean.contains("\"execution_isolation\":{\"enforced\":false"));
+    assert!(clean.contains("\"warnings\":[]"));
+
+    let topic = sun()
+        .args([
+            "topic",
+            "create",
+            "operator-flow",
+            "--display-name",
+            "Operator Flow",
+            "--json",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&topic);
+    let session = sun()
+        .args([
+            "session",
+            "start",
+            "--topic",
+            "operator-flow",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "operator",
+            "--json",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&session);
+    let authored = repo.write_file("authored.txt", "authored\n");
+    let write = sun()
+        .args([
+            "write",
+            "authored.txt",
+            "--session",
+            "session_operator",
+            "--expect-hash",
+            "new",
+            "--content-file",
+        ])
+        .arg(authored)
+        .args(["--classification", "source", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&write);
+
+    let active = sun()
+        .args(["status", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&active);
+    let active = stdout(&active);
+    assert_valid_json(&active);
+    assert!(active.contains("\"topic_id\":\"topic_operator_flow\""));
+    assert!(active.contains("\"session_id\":\"session_operator\""));
+    assert!(active.contains("\"code\":\"checkpoint_missing\""));
+
+    let human = sun()
+        .arg("status")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&human);
+    let human = stdout(&human);
+    assert!(human.contains("Sunlight repo-"));
+    assert!(human.contains("topic operator-flow  head rev_operator_flow_0001"));
+    assert!(human.contains("session session_operator"));
+    assert!(human.contains("checkpoints 0  exports 0"));
+    assert!(human.contains("execution isolation:"));
+    assert!(human.contains("warning[checkpoint_missing]: create a checkpoint"));
 }
 
 #[test]
@@ -321,6 +428,20 @@ fn no_fixture_real_repo_artifact_io_vertical_slice() {
         .expect("sun git export should run");
     assert_success(&export);
     assert!(stdout(&export).contains("\"lifecycle_state\":\"exported\""));
+    let delivered_status = sun()
+        .args(["status", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&delivered_status);
+    let delivered_status = stdout(&delivered_status);
+    assert_valid_json(&delivered_status);
+    assert!(
+        delivered_status.contains("\"checkpoints\":{\"count\":1,\"unexported\":0,\"records\":[")
+    );
+    assert!(delivered_status.contains("\"exports\":{\"count\":1,\"maps\":["));
+    assert!(delivered_status.contains("\"policy\":{\"reports\":1,\"passed\":1"));
+    assert!(!delivered_status.contains("\"code\":\"checkpoint_not_exported\""));
     assert_eq!(
         git(repo.path(), &["show", "sunlight/real-io:src/lib.rs"]),
         "pub fn answer() -> u32 {\n    43\n}\n"
@@ -434,6 +555,15 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
     assert!(status_stdout.contains("\"command\":\"status.execution\""));
     assert!(status_stdout.contains("\"resolved_view_id\":\"view_base_0001\""));
     assert!(status_stdout.contains("\"promotion_status\":\"promotion_required\""));
+    assert!(status_stdout.contains("\"code\":\"pending_promotion\""));
+    let repository_status = sun()
+        .args(["status", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&repository_status);
+    assert!(stdout(&repository_status).contains("\"pending_promotions\":1"));
+    assert!(stdout(&repository_status).contains("\"code\":\"pending_promotions\""));
 
     let inspect = sun()
         .arg("inspect")
@@ -599,6 +729,21 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
     assert!(persisted_timeout.contains("\"status\":\"timeout\""));
     assert!(persisted_timeout.contains("\"timed_out\":true"));
     assert!(persisted_timeout.contains("\"runtime_policy\":"));
+    let timeout_status = sun()
+        .args(["status", "--execution", &timeout_execution, "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&timeout_status);
+    assert!(stdout(&timeout_status).contains("\"code\":\"execution_timeout\""));
+    let repository_status = sun()
+        .args(["status", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&repository_status);
+    assert!(stdout(&repository_status).contains("\"timeouts\":1"));
+    assert!(stdout(&repository_status).contains("\"code\":\"executions_need_attention\""));
     let state_after_timeout =
         fs::read_to_string(repo.path().join(".sunlight/records/native-state.json")).unwrap();
     assert!(state_after_timeout.contains("\"operations\":[]"));
@@ -1420,6 +1565,17 @@ fn no_fixture_repo_backed_resolver_merges_independent_topics_and_reports_conflic
             || conflicted_stdout
                 .contains("\"operation_ids\":[\"op_native_0003\",\"op_native_0002\"]")
     );
+
+    let repository_status = sun()
+        .args(["status", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&repository_status);
+    let repository_status = stdout(&repository_status);
+    assert_valid_json(&repository_status);
+    assert!(repository_status.contains("\"resolution\":{\"conflicts\":1"));
+    assert!(repository_status.contains("\"code\":\"resolver_conflicts\""));
 
     let base_projection_root = repo.path().join("base-projection-after-conflict");
     let base_materialize = sun()
@@ -2257,6 +2413,7 @@ fn no_fixture_compat_project_diff_import_flows_into_native_consumers() {
     assert_success(&projection_status);
     assert!(stdout(&projection_status).contains("\"lifecycle_state\":\"dirty\""));
     assert!(stdout(&projection_status).contains("\"dirty_candidate_summary\""));
+    assert!(stdout(&projection_status).contains("\"code\":\"dirty_compatibility_projection\""));
     let projection_inspect = sun()
         .arg("inspect")
         .arg(format!("projection:{modified_projection}"))
@@ -2266,6 +2423,15 @@ fn no_fixture_compat_project_diff_import_flows_into_native_consumers() {
         .expect("sun inspect projection should run");
     assert_success(&projection_inspect);
     assert!(stdout(&projection_inspect).contains("\"manifest_digest\":\"sha256:"));
+    assert!(stdout(&projection_inspect).contains("\"lifecycle_state\":\"dirty\""));
+    let repository_status = sun()
+        .args(["status", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&repository_status);
+    assert!(stdout(&repository_status).contains("\"lifecycle\":{\"materialized\":0,\"dirty\":1"));
+    assert!(stdout(&repository_status).contains("\"code\":\"dirty_compatibility_projections\""));
     let modified_candidate = candidate_id_for_path(&modified_diff, "src/lib.rs");
     let modified_import = real_compat_import(
         &repo,
@@ -7835,6 +8001,15 @@ fn no_fixture_policy_explain_reports_missing_and_tampered_records() {
     let explain_stdout = stdout(&explain);
     assert!(explain_stdout.contains("\"code\":\"validation_report_integrity_failed\""));
     assert!(explain_stdout.contains(&format!("\"validation_report_id\":\"{report_id}\"")));
+    let status = sun()
+        .args(["status", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&status);
+    let status = stdout(&status);
+    assert!(status.contains("\"invalid_or_tampered\":1"));
+    assert!(status.contains("\"code\":\"policy_report_integrity\""));
 }
 
 #[test]

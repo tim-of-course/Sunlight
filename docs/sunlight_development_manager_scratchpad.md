@@ -32,9 +32,10 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - Management lane changed on 2026-07-06: work directly in the Windows checkout at `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2`.
 - Older WSL clone rows below are historical checkpoints only; do not treat them as the active work lane.
 - Critical handoff correction: previous fixture-backed acceptance is not product completion.
-- Current implementation reality: fixture prototype plus a growing repo-backed authoring path with durable multi-topic/session state, deterministic conflict reporting, persisted projection/checkpoint/export snapshots, execution/output promotion, atomic compatibility import with exact renames, canonical export policy reports, and config-driven managed projection/path policy; still not the full v0.3 product.
+- Current implementation reality: fixture prototype plus a growing repo-backed authoring path with durable multi-topic/session state, deterministic conflict reporting, persisted projection/checkpoint/export snapshots, execution/output promotion, atomic compatibility import with exact renames, canonical policy reports, config-driven projection policy, and bounded execution timeout/output/environment controls; still not the full v0.3 product.
 - Rename-plus-edit remains unresolved because compatibility projections expose no reliable identity signal; fuzzy inference is intentionally excluded.
-- Main product gap: broader no-fixture policy validation, operator ergonomics, and production-like acceptance.
+- Execution network, filesystem-write, CPU, and memory isolation remain explicitly unenforced; records report these limitations.
+- Main product gap: production-like self-hosting acceptance, remaining isolation/policy work, and operator ergonomics.
 
 ## Workstreams
 
@@ -66,11 +67,12 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | repo-backed-export-policy | Windows Codex CLI | Windows commit `ef4cf95` | Completed | Add config-driven no-fixture `policy check-export` and make Git export use the same validator. | Shared conservative validator covers identity/conflicts/ref/path/blob/secret/classification/provenance; focused/full tests, formatting, and diff checks passed. |
 | repo-backed-policy-reports | Windows Codex CLI | Windows commit `e4e6775` | Completed | Persist deterministic validation reports and add real `policy explain`. | Canonical content-derived reports persist for pass/fail checks; tamper/missing tests, focused/full tests, formatting, and diff checks passed. |
 | repo-backed-projection-config-policy | Windows Codex CLI | Windows commit `7ef05fa` | Completed | Honor validated config for managed projection roots and path semantics. | Shared config resolver confines roots and validates constructors/consumers; focused/full tests, formatting, and diff checks passed. |
-| repo-backed-execution-runtime-policy | Windows Codex CLI correction cell `82` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active review correction 2026-07-11 | Enforce timeout, output bounds, and environment policy for real executions. | Manager required full-stream digests and descendant-process timeout coverage before commit; review corrected output next heartbeat, then run focused/full tests and diff checks. |
+| repo-backed-execution-runtime-policy | Windows Codex CLI + manager correction | Windows commit `da994a7` | Completed | Enforce timeout, output bounds, and environment policy for real executions. | Full-stream digest and descendant cleanup review passed repeatedly with normal Windows process permissions; full suite, formatting, and diff checks passed. |
+| self-hosting-production-acceptance | Windows Codex CLI cell `94` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active 2026-07-11 | Run no-fixture Sunlight end to end against a temporary Git clone of its own real repository. | At next heartbeat review structural coverage/isolation/runtime/product fixes; repeat harness, full tests, formatting, and diff checks. |
 
 ## Delegation Queue
 
-1. Complete practical execution runtime policy; keep network and filesystem isolation gaps explicit.
+1. Land production-like self-hosting acceptance and fix product gaps it exposes.
 2. Add a production-like validation repository once Sunlight can run against itself.
 3. Improve operator ergonomics/status for no-fixture workflows.
 4. Keep fixture tests only when they directly support removing fixture dependency.

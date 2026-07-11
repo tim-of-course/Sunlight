@@ -551,6 +551,231 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
 }
 
 #[test]
+fn no_fixture_custom_managed_root_drives_compat_and_execution_projections() {
+    let repo = TestRepo::new("custom-managed-projections");
+    repo.write_file("README.md", "# managed roots\n");
+    start_native_session(&repo, "managed-roots");
+    set_projection_default_root(&repo, ".sunlight/custom-managed");
+
+    let project = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--purpose")
+        .arg("inspection")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun project materialize should run");
+    assert_success(&project);
+    let project_stdout = stdout(&project);
+    let inspection_projection_id = json_string_field(&project_stdout, "projection_id");
+    assert!(repo
+        .path()
+        .join(".sunlight/custom-managed/inspection")
+        .join(&inspection_projection_id)
+        .join("root/README.md")
+        .is_file());
+    assert!(project_stdout.contains("custom-managed"));
+
+    let (projection_id, compatibility_root, _) =
+        create_real_compat_projection_at(&repo, ".sunlight/custom-managed");
+    assert!(compatibility_root.join("README.md").is_file());
+    let diff = real_compat_diff(&repo, &projection_id);
+    assert!(diff.contains("\"candidate_counts\":"));
+
+    let run = sun()
+        .arg("run")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--json")
+        .arg("--")
+        .arg("python")
+        .arg("-c")
+        .arg("pass")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run should run");
+    assert_success(&run);
+    let run_stdout = stdout(&run);
+    let execution_id = json_string_field(&run_stdout, "execution_id");
+    let execution_projection_id = json_string_field(&run_stdout, "projection_id");
+    let execution_root = repo
+        .path()
+        .join(".sunlight/custom-managed")
+        .join(&execution_projection_id)
+        .join("root");
+    assert!(execution_root.join("README.md").is_file());
+    let projection_record = fs::read_to_string(
+        repo.path()
+            .join(".sunlight/projections")
+            .join(format!("{execution_projection_id}.json")),
+    )
+    .unwrap();
+    assert!(projection_record.contains("custom-managed"));
+    assert!(!repo
+        .path()
+        .join(".sunlight/projections")
+        .join(&execution_projection_id)
+        .exists());
+
+    for (command, selector) in [
+        ("status", format!("--projection={execution_projection_id}")),
+        ("inspect", format!("projection:{execution_projection_id}")),
+    ] {
+        let output = if command == "status" {
+            sun()
+                .arg("status")
+                .arg("--projection")
+                .arg(&execution_projection_id)
+                .arg("--json")
+                .current_dir(repo.path())
+                .output()
+                .expect("sun status projection should run")
+        } else {
+            sun()
+                .arg("inspect")
+                .arg(&selector)
+                .arg("--json")
+                .current_dir(repo.path())
+                .output()
+                .expect("sun inspect projection should run")
+        };
+        assert_success(&output);
+        assert!(stdout(&output).contains("custom-managed"));
+    }
+
+    let execution_status = sun()
+        .arg("status")
+        .arg("--execution")
+        .arg(&execution_id)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun status execution should run");
+    assert_success(&execution_status);
+    assert_valid_json(&stdout(&execution_status));
+    assert!(stdout(&execution_status).contains("custom-managed"));
+    let execution_inspect = sun()
+        .arg("inspect")
+        .arg(format!("execution:{execution_id}"))
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun inspect execution should run");
+    assert_success(&execution_inspect);
+    assert_valid_json(&stdout(&execution_inspect));
+    assert!(stdout(&execution_inspect).contains("custom-managed"));
+}
+
+#[test]
+fn no_fixture_projection_policy_rejection_precedes_files_state_and_process() {
+    let repo = TestRepo::new("projection-policy-rejection");
+    repo.write_file("README.md", "# policy rejection\n");
+    start_native_session(&repo, "policy-rejection");
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let state_before = fs::read(&state_path).unwrap();
+    let config_path = repo.path().join(".sunlight/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        config.replace("case_sensitive = true", "case_sensitive = false"),
+    )
+    .unwrap();
+    let process_marker = repo.path().join("PROCESS_MUST_NOT_RUN");
+
+    let run = sun()
+        .arg("run")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--json")
+        .arg("--")
+        .arg("python")
+        .arg("-c")
+        .arg("from pathlib import Path; import sys; Path(sys.argv[1]).write_text('ran')")
+        .arg(&process_marker)
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run should reject unsupported config");
+    assert_failure(&run);
+    assert!(stdout(&run).contains("\"code\":\"invalid_repository_config\""));
+    assert!(!process_marker.exists());
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert!(!repo
+        .path()
+        .join(".sunlight/projections/projection_execution_native_0001")
+        .exists());
+
+    fs::write(&config_path, config).unwrap();
+    set_projection_default_root(&repo, "src/projections");
+    let compat = sun()
+        .arg("compat")
+        .arg("project")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat project should reject unsafe config");
+    assert_failure(&compat);
+    assert!(stdout(&compat).contains("source tree"));
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert!(!repo.path().join("src/projections").exists());
+}
+
+#[test]
+fn no_fixture_compat_root_tampering_is_rejected_within_custom_managed_root() {
+    let repo = TestRepo::new("compat-root-tampering");
+    repo.write_file("README.md", "# root tampering\n");
+    start_native_session(&repo, "root-tampering");
+    set_projection_default_root(&repo, ".sunlight/custom-managed");
+    let (projection_id, projection_root, generation) =
+        create_real_compat_projection_at(&repo, ".sunlight/custom-managed");
+    let tampered_root = repo.path().join(".sunlight/custom-managed/tampered/root");
+    fs::create_dir_all(&tampered_root).unwrap();
+    fs::copy(
+        projection_root.join("README.md"),
+        tampered_root.join("README.md"),
+    )
+    .unwrap();
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let state = fs::read_to_string(&state_path).unwrap();
+    let original_json_path = json_string_field(&state, "materialized_root");
+    let tampered_json_path = fs::canonicalize(&tampered_root)
+        .unwrap()
+        .display()
+        .to_string()
+        .replace('\\', "\\\\");
+    let tampered_state = state.replacen(&original_json_path, &tampered_json_path, 1);
+    assert_ne!(tampered_state, state);
+    fs::write(&state_path, &tampered_state).unwrap();
+
+    let diff = sun()
+        .arg("compat")
+        .arg("diff")
+        .arg("--projection")
+        .arg(&projection_id)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun compat diff should reject root tampering");
+    assert_failure(&diff);
+    assert!(stdout(&diff).contains("\"code\":\"compat_projection_invalid\""));
+    assert!(stdout(&diff).contains("configured managed subtree"));
+
+    let import = real_compat_import(
+        &repo,
+        &projection_id,
+        "compat_delta_tampered",
+        Some(&generation),
+    );
+    assert_failure(&import);
+    assert!(stdout(&import).contains("\"code\":\"compat_projection_invalid\""));
+    assert_eq!(fs::read_to_string(&state_path).unwrap(), tampered_state);
+}
+
+#[test]
 fn no_fixture_topics_and_sessions_are_distinct_repo_backed_records() {
     let repo = TestRepo::new("real-multi-topic-session");
     git(repo.path(), &["init", "-b", "main"]);
@@ -9626,6 +9851,13 @@ fn create_real_base_checkpoint(repo: &TestRepo) -> String {
 }
 
 fn create_real_compat_projection(repo: &TestRepo) -> (String, PathBuf, String) {
+    create_real_compat_projection_at(repo, ".sunlight/projections")
+}
+
+fn create_real_compat_projection_at(
+    repo: &TestRepo,
+    managed_root: &str,
+) -> (String, PathBuf, String) {
     let output = sun()
         .arg("compat")
         .arg("project")
@@ -9642,13 +9874,23 @@ fn create_real_compat_projection(repo: &TestRepo) -> (String, PathBuf, String) {
     let generation = json_string_field(&stdout, "session_generation_id");
     let root = repo
         .path()
-        .join(".sunlight")
-        .join("projections")
+        .join(managed_root)
         .join("compat")
         .join(&projection_id)
         .join("root");
     assert!(root.is_dir());
     (projection_id, root, generation)
+}
+
+fn set_projection_default_root(repo: &TestRepo, root: &str) {
+    let config_path = repo.path().join(".sunlight/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    let start = "default_root = \"";
+    let value_start = config.find(start).unwrap() + start.len();
+    let value_end = config[value_start..].find('"').unwrap() + value_start;
+    let mut updated = config;
+    updated.replace_range(value_start..value_end, root);
+    fs::write(config_path, updated).unwrap();
 }
 
 fn real_compat_diff(repo: &TestRepo, projection_id: &str) -> String {

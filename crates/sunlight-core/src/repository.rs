@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::policy::managed_ignore_block;
@@ -12,6 +12,9 @@ use crate::policy::managed_ignore_block;
 pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const CURRENT_STORAGE_SCHEMA_VERSION: u32 = 1;
 pub const CONSERVATIVE_SUNLIGHT_COMMIT_POLICY: &str = "conservative";
+pub const SUPPORTED_UNICODE_NORMALIZATION: &str = "preserve";
+pub const SUPPORTED_SYMLINK_POLICY: &str = "preserve";
+pub const SUPPORTED_EXECUTABLE_BITS_POLICY: &str = "preserve";
 
 const SUNLIGHT_DIR: &str = ".sunlight";
 const CONFIG_FILE: &str = "config.toml";
@@ -52,6 +55,37 @@ pub struct PathPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionPolicy {
     pub default_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProjectionPolicy {
+    pub managed_root: PathBuf,
+    pub managed_root_relative: PathBuf,
+}
+
+impl ResolvedProjectionPolicy {
+    pub fn compatibility_root(&self, projection_id: &str) -> PathBuf {
+        self.managed_root
+            .join("compat")
+            .join(projection_id)
+            .join("root")
+    }
+
+    pub fn execution_root(&self, projection_id: &str) -> PathBuf {
+        self.managed_root.join(projection_id).join("root")
+    }
+
+    pub fn projection_root(&self, purpose: &str, projection_id: &str) -> PathBuf {
+        match purpose {
+            "compatibility" => self.compatibility_root(projection_id),
+            "execution" => self.execution_root(projection_id),
+            purpose => self
+                .managed_root
+                .join(purpose)
+                .join(projection_id)
+                .join("root"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,23 +204,47 @@ sunlight_commit_policy = \"{}\"
                     message: "missing git_interop.sunlight_commit_policy".to_string(),
                 }
             })?;
+        let case_sensitive = parse_bool_key(input, "case_sensitive").ok_or_else(|| {
+            RepositoryError::InvalidConfig {
+                path: path.clone(),
+                message: "missing path_policy.case_sensitive".to_string(),
+            }
+        })?;
+        let unicode_normalization =
+            parse_string_key(input, "unicode_normalization").ok_or_else(|| {
+                RepositoryError::InvalidConfig {
+                    path: path.clone(),
+                    message: "missing path_policy.unicode_normalization".to_string(),
+                }
+            })?;
+        let symlinks =
+            parse_string_key(input, "symlinks").ok_or_else(|| RepositoryError::InvalidConfig {
+                path: path.clone(),
+                message: "missing path_policy.symlinks".to_string(),
+            })?;
+        let executable_bits = parse_string_key(input, "executable_bits").ok_or_else(|| {
+            RepositoryError::InvalidConfig {
+                path: path.clone(),
+                message: "missing path_policy.executable_bits".to_string(),
+            }
+        })?;
+        let default_root = parse_string_key(input, "default_root").ok_or_else(|| {
+            RepositoryError::InvalidConfig {
+                path: path.clone(),
+                message: "missing projection_policy.default_root".to_string(),
+            }
+        })?;
         let config = Self {
             repository_id,
             config_schema_version: parse_u32_key(input, "config_schema_version").unwrap_or(1),
             storage_schema_version: parse_u32_key(input, "storage_schema_version").unwrap_or(1),
             path_policy: PathPolicy {
-                case_sensitive: parse_bool_key(input, "case_sensitive").unwrap_or(true),
-                unicode_normalization: parse_string_key(input, "unicode_normalization")
-                    .unwrap_or_else(|| "preserve".to_string()),
-                symlinks: parse_string_key(input, "symlinks")
-                    .unwrap_or_else(|| "preserve".to_string()),
-                executable_bits: parse_string_key(input, "executable_bits")
-                    .unwrap_or_else(|| "preserve".to_string()),
+                case_sensitive,
+                unicode_normalization,
+                symlinks,
+                executable_bits,
             },
-            projection_policy: ProjectionPolicy {
-                default_root: parse_string_key(input, "default_root")
-                    .unwrap_or_else(|| ".sunlight/projections".to_string()),
-            },
+            projection_policy: ProjectionPolicy { default_root },
             git_interop: GitInteropPolicy {
                 sunlight_commit_policy,
             },
@@ -224,7 +282,178 @@ sunlight_commit_policy = \"{}\"
                 ),
             });
         }
+        if !self.path_policy.case_sensitive {
+            return Err(RepositoryError::InvalidConfig {
+                path,
+                message:
+                    "unsupported path_policy.case_sensitive `false`; the local MVP requires `true`"
+                        .to_string(),
+            });
+        }
+        for (field, actual, supported) in [
+            (
+                "unicode_normalization",
+                self.path_policy.unicode_normalization.as_str(),
+                SUPPORTED_UNICODE_NORMALIZATION,
+            ),
+            (
+                "symlinks",
+                self.path_policy.symlinks.as_str(),
+                SUPPORTED_SYMLINK_POLICY,
+            ),
+            (
+                "executable_bits",
+                self.path_policy.executable_bits.as_str(),
+                SUPPORTED_EXECUTABLE_BITS_POLICY,
+            ),
+        ] {
+            if actual != supported {
+                return Err(RepositoryError::InvalidConfig {
+                    path,
+                    message: format!(
+                        "unsupported path_policy.{field} `{actual}`; supported value is `{supported}`"
+                    ),
+                });
+            }
+        }
         Ok(())
+    }
+}
+
+pub fn resolve_projection_policy(
+    repo_root: impl AsRef<Path>,
+    config: &RepositoryConfig,
+) -> Result<ResolvedProjectionPolicy, RepositoryError> {
+    let repo_root = repo_root.as_ref();
+    let config_path = repo_root.join(SUNLIGHT_DIR).join(CONFIG_FILE);
+    config.validate(&config_path)?;
+    let configured = Path::new(&config.projection_policy.default_root);
+    let mut normalized = PathBuf::new();
+    for component in configured.components() {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {
+                return Err(invalid_projection_root(
+                    &config_path,
+                    &config.projection_policy.default_root,
+                    "must be normalized without `.` components",
+                ));
+            }
+            Component::ParentDir => {
+                return Err(invalid_projection_root(
+                    &config_path,
+                    &config.projection_policy.default_root,
+                    "must not contain parent traversal",
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(invalid_projection_root(
+                    &config_path,
+                    &config.projection_policy.default_root,
+                    "must be repository-relative, not absolute",
+                ));
+            }
+        }
+    }
+    let components = normalized
+        .iter()
+        .map(|value| value.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    if components.is_empty() {
+        return Err(invalid_projection_root(
+            &config_path,
+            &config.projection_policy.default_root,
+            "must not be empty",
+        ));
+    }
+    if components
+        .iter()
+        .any(|component| component.eq_ignore_ascii_case(".git"))
+    {
+        return Err(invalid_projection_root(
+            &config_path,
+            &config.projection_policy.default_root,
+            "must not overlap `.git`",
+        ));
+    }
+    if components.first().map(String::as_str) != Some(SUNLIGHT_DIR) || components.len() < 2 {
+        return Err(invalid_projection_root(
+            &config_path,
+            &config.projection_policy.default_root,
+            "must be a descendant of `.sunlight` and must not overlap the source tree",
+        ));
+    }
+    let protected = AUTHORITATIVE_DIRS.iter().copied().chain([
+        "local",
+        "quarantine",
+        CONFIG_FILE,
+        GITIGNORE_FILE,
+        "index.sqlite",
+    ]);
+    if protected.into_iter().any(|name| components[1] == name) {
+        return Err(invalid_projection_root(
+            &config_path,
+            &config.projection_policy.default_root,
+            "must not overlap authoritative or quarantine state",
+        ));
+    }
+
+    let repo_root = fs::canonicalize(repo_root).map_err(|source| RepositoryError::Io {
+        path: repo_root.to_path_buf(),
+        source,
+    })?;
+    let managed_root = repo_root.join(&normalized);
+    reject_symlinked_managed_components(&repo_root, &normalized, &config_path)?;
+    Ok(ResolvedProjectionPolicy {
+        managed_root,
+        managed_root_relative: normalized,
+    })
+}
+
+fn reject_symlinked_managed_components(
+    repo_root: &Path,
+    relative: &Path,
+    config_path: &Path,
+) -> Result<(), RepositoryError> {
+    let mut current = repo_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(RepositoryError::InvalidConfig {
+                    path: config_path.to_path_buf(),
+                    message: format!(
+                        "unsafe projection_policy.default_root: managed path component `{}` is a symlink",
+                        current.display()
+                    ),
+                });
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(RepositoryError::InvalidConfig {
+                    path: config_path.to_path_buf(),
+                    message: format!(
+                        "unsafe projection_policy.default_root: managed path component `{}` is not a directory",
+                        current.display()
+                    ),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(source) => {
+                return Err(RepositoryError::Io {
+                    path: current,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn invalid_projection_root(path: &Path, value: &str, reason: &str) -> RepositoryError {
+    RepositoryError::InvalidConfig {
+        path: path.to_path_buf(),
+        message: format!("unsafe projection_policy.default_root `{value}`: {reason}"),
     }
 }
 
@@ -411,6 +640,91 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported git_interop.sunlight_commit_policy `permissive`"));
+    }
+
+    #[test]
+    fn config_rejects_missing_and_unsupported_projection_path_policy() {
+        let base = RepositoryConfig::new("repo_test".to_string()).to_toml();
+        for (needle, replacement, expected) in [
+            (
+                "case_sensitive = true",
+                "case_sensitive = false",
+                "path_policy.case_sensitive",
+            ),
+            (
+                "unicode_normalization = \"preserve\"",
+                "unicode_normalization = \"nfc\"",
+                "path_policy.unicode_normalization",
+            ),
+            (
+                "symlinks = \"preserve\"",
+                "symlinks = \"follow\"",
+                "path_policy.symlinks",
+            ),
+            (
+                "executable_bits = \"preserve\"",
+                "executable_bits = \"ignore\"",
+                "path_policy.executable_bits",
+            ),
+            (
+                "default_root = \".sunlight/projections\"\n",
+                "",
+                "missing projection_policy.default_root",
+            ),
+        ] {
+            let error = RepositoryConfig::from_toml(
+                &base.replace(needle, replacement),
+                ".sunlight/config.toml",
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn projection_policy_resolves_safe_custom_root_and_rejects_unsafe_roots() {
+        let repo = TestRepo::new("projection-policy");
+        fs::create_dir_all(repo.path().join(".sunlight")).unwrap();
+        let mut config = RepositoryConfig::new("repo_test".to_string());
+        config.projection_policy.default_root = ".sunlight/custom-projections".to_string();
+
+        let resolved = resolve_projection_policy(repo.path(), &config).unwrap();
+        assert_eq!(
+            resolved.managed_root,
+            fs::canonicalize(repo.path())
+                .unwrap()
+                .join(".sunlight/custom-projections")
+        );
+        assert_eq!(
+            resolved.compatibility_root("projection_1"),
+            resolved.managed_root.join("compat/projection_1/root")
+        );
+        assert_eq!(
+            resolved.execution_root("projection_2"),
+            resolved.managed_root.join("projection_2/root")
+        );
+
+        for root in [
+            "",
+            ".sunlight/../outside",
+            ".git/sunlight",
+            "source-projections",
+            ".sunlight",
+            ".sunlight/objects/projections",
+            ".sunlight/local/projections",
+            ".sunlight/quarantine/projections",
+            ".sunlight/config.toml/projections",
+        ] {
+            config.projection_policy.default_root = root.to_string();
+            let error = resolve_projection_policy(repo.path(), &config).unwrap_err();
+            assert!(
+                error.to_string().contains("projection_policy.default_root"),
+                "root {root:?}: {error}"
+            );
+        }
+        config.projection_policy.default_root = repo.path().join("outside").display().to_string();
+        let error = resolve_projection_policy(repo.path(), &config).unwrap_err();
+        assert!(error.to_string().contains("not absolute"));
     }
 
     struct TestRepo {

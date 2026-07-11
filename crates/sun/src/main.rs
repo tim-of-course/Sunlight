@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -80,13 +80,15 @@ use sunlight_core::projection::{
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repo_state::{
     materialize_real_files, persist_quarantine_report, real_artifact_id_for_path,
-    real_content_hash, real_tree_hash, RealArtifactEntry, RealCheckpointSnapshot,
-    RealExecutionOutputSnapshot, RealExecutionPromotionSnapshot, RealExecutionSnapshot,
-    RealExportMapSnapshot, RealOperationEffect, RealOperationRecord, RealProjectionSnapshot,
-    RealRepoState, RealResolvedRepoView, RealSessionRecord, RealTopicRecord, RepoStateError,
+    real_content_hash, real_tree_hash, scan_real_projection_files_with_quarantine,
+    RealArtifactEntry, RealCheckpointSnapshot, RealExecutionOutputSnapshot,
+    RealExecutionPromotionSnapshot, RealExecutionSnapshot, RealExportMapSnapshot,
+    RealOperationEffect, RealOperationRecord, RealProjectionSnapshot, RealRepoState,
+    RealResolvedRepoView, RealSessionRecord, RealTopicRecord, RepoStateError,
 };
 use sunlight_core::repository::{
-    init_repository, RepositoryConfig, CURRENT_STORAGE_SCHEMA_VERSION,
+    init_repository, resolve_projection_policy, RepositoryConfig, ResolvedProjectionPolicy,
+    CURRENT_STORAGE_SCHEMA_VERSION,
 };
 use sunlight_core::resolver::{
     fixture_auth_revision, fixture_base_entries, fixture_overlapping_auth_revision,
@@ -1256,6 +1258,7 @@ fn real_compat_project(
     options: CompatProjectOptions,
 ) -> Result<(), CliError> {
     let repo_root = PathBuf::from(".");
+    let projection_policy = require_projection_policy(&repo_root)?;
     let mut state = RealRepoState::load(&repo_root)?;
     let session = real_session(&state, &options.session_id)?.clone();
     let resolved = state.resolve_session_view(&session);
@@ -1270,12 +1273,7 @@ fn real_compat_project(
         "projection_compat_native_{:04}",
         state.projections.len() + 1
     );
-    let root = repo_root
-        .join(".sunlight")
-        .join("projections")
-        .join("compat")
-        .join(&projection_id)
-        .join("root");
+    let root = projection_policy.compatibility_root(&projection_id);
     let view_state = real_view_state(&state, &resolved);
     materialize_real_files(&view_state, &root)?;
     let manifest_digest = real_compat_baseline_manifest_digest(
@@ -1320,6 +1318,7 @@ fn real_compat_project(
 
 fn real_compat_diff(ctx: &CommandContext, options: CompatDiffOptions) -> Result<(), CliError> {
     let repo_root = PathBuf::from(".");
+    let projection_policy = require_projection_policy(&repo_root)?;
     let state = RealRepoState::load(&repo_root)?;
     let projection = state
         .projections
@@ -1332,7 +1331,8 @@ fn real_compat_diff(ctx: &CommandContext, options: CompatDiffOptions) -> Result<
             )
             .with_detail("projection_id", options.projection_id.clone())
         })?;
-    let diff = diff_real_compat_projection(&repo_root, projection).map_err(compat_import_error)?;
+    let diff = diff_real_compat_projection(&repo_root, &projection_policy.managed_root, projection)
+        .map_err(compat_import_error)?;
     if ctx.json {
         println!(
             "{}",
@@ -1350,6 +1350,7 @@ fn real_compat_diff(ctx: &CommandContext, options: CompatDiffOptions) -> Result<
 
 fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Result<(), CliError> {
     let repo_root = PathBuf::from(".");
+    let projection_policy = require_projection_policy(&repo_root)?;
     let mut state = RealRepoState::load(&repo_root)?;
     let projection_index = state
         .projections
@@ -1404,7 +1405,9 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
         .with_detail("current_resolved_view_id", resolved.result.resolved_view_id));
     }
 
-    let diff = diff_real_compat_projection(&repo_root, &projection).map_err(compat_import_error)?;
+    let diff =
+        diff_real_compat_projection(&repo_root, &projection_policy.managed_root, &projection)
+            .map_err(compat_import_error)?;
     let selected = validate_real_compat_selection(&projection, &options.candidate_delta_ids, &diff)
         .map_err(compat_import_error)?;
     let mut changes = Vec::new();
@@ -2459,7 +2462,9 @@ fn real_project_materialize(
     ctx: &CommandContext,
     options: ProjectMaterializeOptions,
 ) -> Result<(), CliError> {
-    let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    let repo_root = PathBuf::from(".");
+    let projection_policy = require_projection_policy(&repo_root)?;
+    let mut state = RealRepoState::load(&repo_root)?;
     let resolved = real_resolve_view_by_id(&state, &options.view_id)?;
     if !resolved.result.conflict_free() {
         return Err(CliError::new(
@@ -2476,80 +2481,51 @@ fn real_project_materialize(
     let view_state = real_view_state(&state, &resolved);
     let manifest_digest =
         real_projection_manifest_digest(&view_state, &projection_id, options.purpose);
-    let root_string = options
-        .projection_root
-        .as_ref()
-        .map(|root| root.display().to_string());
-    if let Some(root) = options.projection_root {
-        materialize_real_files(&view_state, &root)?;
-        state.projections.push(RealProjectionSnapshot {
-            projection_id: projection_id.clone(),
-            repository_id: state.repository_id.clone(),
-            purpose: options.purpose.as_str().to_string(),
-            resolved_view_id: view_state.resolved_view_id.clone(),
-            tree_hash: view_state.tree_hash.clone(),
-            manifest_digest: manifest_digest.clone(),
-            created_from_content_tree: view_state.tree_hash.clone(),
-            materialized_root: root_string,
-            session_id: None,
-            session_generation_id: None,
-            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
-            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
-            strategy: "copy".to_string(),
-            retention_state: "active".to_string(),
-            privacy_class: "local_only".to_string(),
-            last_import_operation_id: None,
-            entries: view_state.entries.clone(),
-        });
-        state.save(&PathBuf::from("."))?;
-        persist_real_projection_record(&state, state.projections.last().unwrap())?;
-        if ctx.json {
-            println!(
-                "{}",
-                real_projection_materialized_envelope(
-                    &view_state,
-                    &projection_id,
-                    options.purpose,
-                    &root
-                )
-            );
-        } else {
-            println!("{} {}", projection_id, root.display());
-        }
-    } else if ctx.json {
-        state.projections.push(RealProjectionSnapshot {
-            projection_id: projection_id.clone(),
-            repository_id: state.repository_id.clone(),
-            purpose: options.purpose.as_str().to_string(),
-            resolved_view_id: view_state.resolved_view_id.clone(),
-            tree_hash: view_state.tree_hash.clone(),
-            manifest_digest,
-            created_from_content_tree: view_state.tree_hash.clone(),
-            materialized_root: None,
-            session_id: None,
-            session_generation_id: None,
-            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
-            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
-            strategy: "copy".to_string(),
-            retention_state: "active".to_string(),
-            privacy_class: "local_only".to_string(),
-            last_import_operation_id: None,
-            entries: view_state.entries.clone(),
-        });
-        state.save(&PathBuf::from("."))?;
-        persist_real_projection_record(&state, state.projections.last().unwrap())?;
+    let root = options.projection_root.unwrap_or_else(|| {
+        projection_policy.projection_root(options.purpose.as_str(), &projection_id)
+    });
+    materialize_real_files(&view_state, &root)?;
+    state.projections.push(RealProjectionSnapshot {
+        projection_id: projection_id.clone(),
+        repository_id: state.repository_id.clone(),
+        purpose: options.purpose.as_str().to_string(),
+        resolved_view_id: view_state.resolved_view_id.clone(),
+        tree_hash: view_state.tree_hash.clone(),
+        manifest_digest,
+        created_from_content_tree: view_state.tree_hash.clone(),
+        materialized_root: Some(root.display().to_string()),
+        session_id: None,
+        session_generation_id: None,
+        path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+        operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+        strategy: "copy".to_string(),
+        retention_state: "active".to_string(),
+        privacy_class: "local_only".to_string(),
+        last_import_operation_id: None,
+        entries: view_state.entries.clone(),
+    });
+    state.save(&repo_root)?;
+    persist_real_projection_record(&state, state.projections.last().unwrap())?;
+    if ctx.json {
         println!(
             "{}",
-            real_projection_plan_envelope(&view_state, &projection_id, options.purpose)
+            real_projection_materialized_envelope(
+                &view_state,
+                &projection_id,
+                options.purpose,
+                &root
+            )
         );
     } else {
-        println!("{} .sunlight/projections/{}", projection_id, projection_id);
+        println!("{} {}", projection_id, root.display());
     }
     Ok(())
 }
 
 fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Result<(), CliError> {
-    let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    let repo_root = PathBuf::from(".");
+    let projection_policy = require_projection_policy(&repo_root)?;
+    let mut state = RealRepoState::load(&repo_root)?;
     let relative_cwd = real_execution_relative_cwd(&options.cwd)?;
     let resolved = real_resolve_view_by_id(&state, &options.view_id)?;
     if !resolved.result.conflict_free() {
@@ -2565,11 +2541,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         state.projections.len() + 1
     );
     let execution_id = format!("exec_native_{:04}", state.executions.len() + 1);
-    let projection_root = PathBuf::from(".")
-        .join(".sunlight")
-        .join("projections")
-        .join(&projection_id)
-        .join("root");
+    let projection_root = projection_policy.execution_root(&projection_id);
     materialize_real_files(&view_state, &projection_root)?;
     let execution_cwd = real_execution_cwd_path(&projection_root, &relative_cwd, &options.cwd)?;
     let manifest_digest =
@@ -2609,7 +2581,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     let finished_at = real_now_id();
     let mut projected_entries = Vec::new();
     let mut quarantine = Vec::new();
-    sunlight_core::repo_state::scan_real_repo_files_with_quarantine(
+    scan_real_projection_files_with_quarantine(
         &projection_root,
         &projection_root,
         &mut projected_entries,
@@ -2744,7 +2716,9 @@ fn real_execution_promote_output(
     ctx: &CommandContext,
     options: ExecutionPromoteOutputOptions,
 ) -> Result<(), CliError> {
-    let mut state = RealRepoState::load(&PathBuf::from("."))?;
+    let repo_root = PathBuf::from(".");
+    let projection_policy = require_projection_policy(&repo_root)?;
+    let mut state = RealRepoState::load(&repo_root)?;
     let path = options.path.clone().ok_or_else(|| {
         invalid_request("usage: sun execution promote-output requires --path <path>")
     })?;
@@ -2841,7 +2815,12 @@ fn real_execution_promote_output(
         .materialized_root
         .as_ref()
         .ok_or_else(|| object_not_found("projection", &execution.projection_id))?;
-    let bytes = fs::read(PathBuf::from(root).join(&path)).map_err(|error| {
+    let root = validate_execution_projection_binding(
+        &projection_policy,
+        &execution.projection_id,
+        Path::new(root),
+    )?;
+    let bytes = fs::read(root.join(&path)).map_err(|error| {
         invalid_request(format!("failed to read execution output: {error}"))
             .with_detail("path", &path)
     })?;
@@ -3217,8 +3196,14 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
                     .find(|projection| projection.projection_id == *value)
                     .ok_or_else(|| object_not_found("projection", value))?;
                 if projection.purpose == "compatibility" {
-                    let diff = diff_real_compat_projection(&PathBuf::from("."), projection)
-                        .map_err(compat_import_error)?;
+                    let repo_root = PathBuf::from(".");
+                    let projection_policy = require_projection_policy(&repo_root)?;
+                    let diff = diff_real_compat_projection(
+                        &repo_root,
+                        &projection_policy.managed_root,
+                        projection,
+                    )
+                    .map_err(compat_import_error)?;
                     println!(
                         "{}",
                         real_compat_projection_status_envelope(
@@ -3998,24 +3983,6 @@ fn real_session_start_success_envelope(
     )
 }
 
-fn real_projection_plan_envelope(
-    state: &RealRepoState,
-    projection_id: &str,
-    purpose: ProjectionPurpose,
-) -> String {
-    format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"projection.materialize\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"view\":{{\"resolved_view_id\":\"{}\",\"tree_identity\":{}}},\"projection_id\":\"{}\",\"purpose\":\"{}\",\"selected_strategy\":\"copy\",\"strategy\":\"copy\",\"tree_identity\":{},\"source\":\"resolved_content_tree\",\"local_materialization\":null}},\"warnings\":[]}}",
-        json_escape(&state.repository_id),
-        json_escape(projection_id),
-        json_escape(&state.resolved_view_id),
-        json_escape(&state.resolved_view_id),
-        single_repo_tree_json(&SingleRepoTree { repository_id: state.repository_id.clone(), tree_hash: state.tree_hash.clone() }),
-        json_escape(projection_id),
-        purpose.as_str(),
-        single_repo_tree_json(&SingleRepoTree { repository_id: state.repository_id.clone(), tree_hash: state.tree_hash.clone() }),
-    )
-}
-
 fn real_projection_materialized_envelope(
     state: &RealRepoState,
     projection_id: &str,
@@ -4622,6 +4589,18 @@ fn real_execution_promotions_json(
         .join(",")
 }
 
+fn real_execution_projection_json(
+    state: &RealRepoState,
+    execution: &RealExecutionSnapshot,
+) -> String {
+    state
+        .projections
+        .iter()
+        .find(|projection| projection.projection_id == execution.projection_id)
+        .map(|projection| real_projection_snapshot_json(state, projection))
+        .unwrap_or_else(|| "null".to_string())
+}
+
 fn real_execution_status_envelope(
     state: &RealRepoState,
     execution: &RealExecutionSnapshot,
@@ -4635,6 +4614,7 @@ fn real_execution_status_envelope(
             "\"ids\":{{\"execution_id\":\"{}\",\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},",
             "\"execution_id\":\"{}\",",
             "\"projection_id\":\"{}\",",
+            "\"projection\":{},",
             "\"resolved_view_id\":\"{}\",",
             "\"tree_identity\":{},",
             "\"result\":{},",
@@ -4651,6 +4631,7 @@ fn real_execution_status_envelope(
         json_escape(&execution.resolved_view_id),
         json_escape(&execution.execution_id),
         json_escape(&execution.projection_id),
+        real_execution_projection_json(state, execution),
         json_escape(&execution.resolved_view_id),
         single_repo_tree_json(&record.tree_identity),
         execution_result_json(&record),
@@ -4711,6 +4692,7 @@ fn real_execution_inspect_envelope(
             "\"command\":\"inspect.execution\",",
             "\"repository_id\":\"{}\",",
             "\"execution\":{},",
+            "\"projection\":{},",
             "\"promotion_status\":\"{}\",",
             "\"promotion_candidates\":[{}],",
             "\"promotions\":[{}],",
@@ -4719,6 +4701,7 @@ fn real_execution_inspect_envelope(
         ),
         json_escape(&state.repository_id),
         real_execution_snapshot_record_json(state, execution),
+        real_execution_projection_json(state, execution),
         real_execution_promotion_status(state, execution),
         real_execution_promotion_candidates_json(state, execution),
         real_execution_promotions_json(state, execution),
@@ -8129,6 +8112,72 @@ fn require_repository_config(repo_root: impl Into<PathBuf>) -> Result<Repository
         .with_detail("path", config_path.display().to_string())
         .with_detail("source", error.to_string())
     })
+}
+
+fn require_projection_policy(
+    repo_root: impl Into<PathBuf>,
+) -> Result<ResolvedProjectionPolicy, CliError> {
+    let repo_root = repo_root.into();
+    let config = require_repository_config(repo_root.clone())?;
+    resolve_projection_policy(&repo_root, &config).map_err(|error| {
+        CliError::new(
+            "invalid_repository_config",
+            "Sunlight repository projection/path policy is invalid",
+        )
+        .with_detail(
+            "path",
+            repo_root
+                .join(".sunlight")
+                .join("config.toml")
+                .display()
+                .to_string(),
+        )
+        .with_detail("source", error.to_string())
+    })
+}
+
+fn validate_execution_projection_binding(
+    policy: &ResolvedProjectionPolicy,
+    projection_id: &str,
+    persisted_root: &Path,
+) -> Result<PathBuf, CliError> {
+    if fs::symlink_metadata(persisted_root)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(CliError::new(
+            "execution_projection_invalid",
+            "execution projection root cannot be a symlink",
+        )
+        .with_detail("projection_id", projection_id));
+    }
+    let actual = fs::canonicalize(persisted_root).map_err(|error| {
+        CliError::new(
+            "execution_projection_invalid",
+            "execution projection root was not found",
+        )
+        .with_detail("projection_id", projection_id)
+        .with_detail("source", error.to_string())
+    })?;
+    let expected_root = policy.execution_root(projection_id);
+    let expected = fs::canonicalize(&expected_root).map_err(|error| {
+        CliError::new(
+            "execution_projection_invalid",
+            "configured execution projection root was not found",
+        )
+        .with_detail("projection_id", projection_id)
+        .with_detail("source", error.to_string())
+    })?;
+    if actual != expected || !actual.starts_with(&policy.managed_root) {
+        return Err(CliError::new(
+            "execution_projection_invalid",
+            "execution projection root does not match its configured managed subtree",
+        )
+        .with_detail("projection_id", projection_id)
+        .with_detail("actual_root", actual.display().to_string())
+        .with_detail("expected_root", expected.display().to_string()));
+    }
+    Ok(actual)
 }
 
 fn invalid_request(message: impl Into<String>) -> CliError {

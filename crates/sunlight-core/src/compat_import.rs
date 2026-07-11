@@ -73,6 +73,7 @@ pub fn real_compat_baseline_manifest_digest(
 
 pub fn diff_real_compat_projection(
     repo_root: &Path,
+    managed_root: &Path,
     projection: &RealProjectionSnapshot,
 ) -> Result<RealCompatDiff, CompatImportValidationError> {
     let session_id = projection.session_id.as_deref().unwrap_or("");
@@ -102,7 +103,6 @@ pub fn diff_real_compat_projection(
     }
 
     let root = resolve_projection_root(repo_root, root_value);
-    let managed_root = repo_root.join(".sunlight").join("projections");
     if fs::symlink_metadata(&root)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
@@ -122,7 +122,7 @@ pub fn diff_real_compat_projection(
             "compatibility projection root was not found",
         )
     })?;
-    let canonical_managed = fs::canonicalize(&managed_root).map_err(|_| {
+    let canonical_managed = fs::canonicalize(managed_root).map_err(|_| {
         real_error(
             CompatImportErrorCode::ProjectionInvalid,
             projection,
@@ -136,6 +136,26 @@ pub fn diff_real_compat_projection(
             projection,
             Vec::new(),
             "compatibility projection root is outside the managed projection root",
+        ));
+    }
+    let expected_root = managed_root
+        .join("compat")
+        .join(&projection.projection_id)
+        .join("root");
+    let canonical_expected = fs::canonicalize(&expected_root).map_err(|_| {
+        real_error(
+            CompatImportErrorCode::ProjectionInvalid,
+            projection,
+            Vec::new(),
+            "configured compatibility projection root was not found",
+        )
+    })?;
+    if canonical_root != canonical_expected {
+        return Err(real_error(
+            CompatImportErrorCode::ProjectionInvalid,
+            projection,
+            Vec::new(),
+            "compatibility projection root does not match its configured managed subtree",
         ));
     }
 
@@ -2148,7 +2168,9 @@ mod tests {
         fs::remove_file(root.join("README.md")).unwrap();
         fs::write(repo.join("outside.txt"), b"must not be diffed\n").unwrap();
 
-        let diff = diff_real_compat_projection(&repo, &projection).unwrap();
+        let diff =
+            diff_real_compat_projection(&repo, &repo.join(".sunlight/projections"), &projection)
+                .unwrap();
         let by_path = diff
             .candidates
             .iter()
@@ -2177,7 +2199,9 @@ mod tests {
         fs::create_dir_all(root.join("docs")).unwrap();
         fs::rename(root.join("README.md"), root.join("docs/README.md")).unwrap();
 
-        let diff = diff_real_compat_projection(&repo, &projection).unwrap();
+        let diff =
+            diff_real_compat_projection(&repo, &repo.join(".sunlight/projections"), &projection)
+                .unwrap();
         let candidate = diff
             .candidates
             .iter()
@@ -2214,7 +2238,9 @@ mod tests {
         fs::write(root.join("COPY-A.md"), &bytes).unwrap();
         fs::write(root.join("COPY-B.md"), &bytes).unwrap();
 
-        let diff = diff_real_compat_projection(&repo, &projection).unwrap();
+        let diff =
+            diff_real_compat_projection(&repo, &repo.join(".sunlight/projections"), &projection)
+                .unwrap();
         let ambiguous = diff
             .candidates
             .iter()
@@ -2248,7 +2274,9 @@ mod tests {
         fs::create_dir_all(root.join(".sunlight")).unwrap();
         fs::write(root.join(".sunlight/config.toml"), b"blocked\n").unwrap();
 
-        let diff = diff_real_compat_projection(&repo, &projection).unwrap();
+        let diff =
+            diff_real_compat_projection(&repo, &repo.join(".sunlight/projections"), &projection)
+                .unwrap();
         for (path, expected) in [
             (".env", CompatImportErrorCode::SecretDetected),
             ("target/output.txt", CompatImportErrorCode::CacheBlocked),

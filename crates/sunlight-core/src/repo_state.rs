@@ -7,7 +7,9 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-use crate::artifacts::{FILE_OPERATION_SEMANTICS_VERSION, POSIX_CASE_SENSITIVE_PATH_POLICY_ID};
+use crate::artifacts::{
+    PathPolicy, FILE_OPERATION_SEMANTICS_VERSION, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
+};
 use crate::records::{canonical_json_bytes, parse_json_record, JsonValue, RecordError};
 use crate::resolver::{
     resolve_fixture_view, DeterministicResolverOrder, OperationRef, PathRef, ResolvedViewResult,
@@ -1000,6 +1002,55 @@ pub fn scan_real_repo_files_with_quarantine(
     scan_real_repo_files_fallback(repo_root, current, entries, quarantine)
 }
 
+pub fn scan_real_projection_files_with_quarantine(
+    projection_root: &Path,
+    current: &Path,
+    entries: &mut Vec<RealArtifactEntry>,
+    quarantine: &mut Vec<RealQuarantineEntry>,
+) -> Result<(), RepoStateError> {
+    let children = fs::read_dir(current)
+        .map_err(|error| io_error(current, "failed to scan projection", error))?;
+    for child in children {
+        let child = child.map_err(|error| RepoStateError::Io {
+            path: current.to_path_buf(),
+            message: format!("failed to scan projection: {error}"),
+        })?;
+        let path = child.path();
+        let relative = path
+            .strip_prefix(projection_root)
+            .map_err(|_| invalid_state(projection_root, "projection path escaped its root"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        PathPolicy::posix_case_sensitive()
+            .validate(&relative)
+            .map_err(|error| {
+                invalid_state(
+                    &path,
+                    &format!("projection output path failed configured path policy: {error}"),
+                )
+            })?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| io_error(&path, "failed to inspect projection path", error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(invalid_state(
+                &path,
+                "projection symlinks are not supported by the local MVP scanner",
+            ));
+        }
+        if metadata.is_dir() {
+            scan_real_projection_files_with_quarantine(
+                projection_root,
+                &path,
+                entries,
+                quarantine,
+            )?;
+        } else if metadata.is_file() {
+            ingest_real_repo_path(projection_root, &relative, entries, quarantine)?;
+        }
+    }
+    Ok(())
+}
+
 fn scan_real_repo_files_fallback(
     repo_root: &Path,
     current: &Path,
@@ -1250,6 +1301,38 @@ pub fn real_artifact_id_for_path(path: &str) -> String {
 }
 
 pub fn materialize_real_files(state: &RealRepoState, root: &Path) -> Result<(), RepoStateError> {
+    let path_policy = PathPolicy::posix_case_sensitive();
+    for entry in state.entries.iter().filter(|entry| !entry.tombstone) {
+        path_policy
+            .validate(&entry.path)
+            .map_err(|error| RepoStateError::InvalidState {
+                path: root.to_path_buf(),
+                message: format!(
+                    "projection content path `{}` failed configured path policy: {error}",
+                    entry.path
+                ),
+            })?;
+    }
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(RepoStateError::InvalidState {
+                path: root.to_path_buf(),
+                message: "projection root cannot be a symlink".to_string(),
+            });
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(RepoStateError::InvalidState {
+                path: root.to_path_buf(),
+                message: "projection root must be an empty directory or a creatable path"
+                    .to_string(),
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io_error(root, "failed to inspect projection root", error));
+        }
+    }
     if root.exists()
         && fs::read_dir(root)
             .map_err(|error| io_error(root, "failed to inspect projection root", error))?
@@ -1272,7 +1355,30 @@ pub fn materialize_real_files(state: &RealRepoState, root: &Path) -> Result<(), 
         }
         fs::write(&path, &entry.bytes)
             .map_err(|error| io_error(&path, "failed to write projection file", error))?;
+        set_projection_executable(&path, entry.executable)?;
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_projection_executable(path: &Path, executable: bool) -> Result<(), RepoStateError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| io_error(path, "failed to inspect projection permissions", error))?
+        .permissions();
+    let mode = permissions.mode();
+    permissions.set_mode(if executable {
+        mode | 0o111
+    } else {
+        mode & !0o111
+    });
+    fs::set_permissions(path, permissions)
+        .map_err(|error| io_error(path, "failed to preserve projection executable bit", error))
+}
+
+#[cfg(not(unix))]
+fn set_projection_executable(_path: &Path, _executable: bool) -> Result<(), RepoStateError> {
     Ok(())
 }
 

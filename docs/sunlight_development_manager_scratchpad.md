@@ -32,7 +32,7 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - Management lane changed on 2026-07-06: work directly in the Windows checkout at `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2`.
 - Older WSL clone rows below are historical checkpoints only; do not treat them as the active work lane.
 - Critical handoff correction: previous fixture-backed acceptance is not product completion.
-- Current implementation reality: fixture prototype plus a growing repo-backed authoring path with durable multi-topic/session state, deterministic conflict reporting, persisted projection/checkpoint/export snapshots, execution/output promotion, atomic multi-file compatibility import, and exact-content rename preservation; still not the full v0.3 product.
+- Current implementation reality: fixture prototype plus a growing repo-backed authoring path with durable multi-topic/session state, deterministic conflict reporting, persisted projection/checkpoint/export snapshots, execution/output promotion, atomic compatibility import with exact renames, and config-driven shared export policy validation; still not the full v0.3 product.
 - Rename-plus-edit remains unresolved because compatibility projections expose no reliable identity signal; fuzzy inference is intentionally excluded.
 - Main product gap: broader no-fixture policy validation, operator ergonomics, and production-like acceptance.
 
@@ -63,11 +63,12 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | repo-backed-compat-import | Windows Codex CLI `0.144.1` | Windows commit `7de1357` | Completed | Implement no-fixture compatibility project/diff/import from real projections into native operations. | Focused core/state/CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed; modified/new/deleted single-candidate imports reach materialization and Git export. |
 | repo-backed-compat-atomic-multifile | Windows Codex CLI | Windows commit `ba4a1eb` | Completed | Import repeated safe compatibility candidates as one durable multi-effect transaction with atomic rejection. | Core/state/CLI focused tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed; modified/new/deleted effects share one operation/revision/generation. |
 | repo-backed-compat-rename | Windows Codex CLI | Windows commit `d51d0d1` | Completed | Detect conservative unambiguous renames, preserve artifact identity, and atomically reject ambiguous matches. | Exact-hash one-to-one rename only; focused core/CLI tests, full `cargo test`, formatting, and diff checks passed; ambiguous matches leave native state unchanged. |
-| repo-backed-export-policy | Windows Codex CLI cell `31` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active 2026-07-10 | Add config-driven no-fixture `policy check-export` and make Git export use the same validator. | At next heartbeat audit policy bypasses/check-export divergence; run focused/full tests, formatting, and diff checks. |
+| repo-backed-export-policy | Windows Codex CLI | Windows commit `ef4cf95` | Completed | Add config-driven no-fixture `policy check-export` and make Git export use the same validator. | Shared conservative validator covers identity/conflicts/ref/path/blob/secret/classification/provenance; focused/full tests, formatting, and diff checks passed. |
+| repo-backed-policy-reports | Windows Codex CLI cell `50` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active 2026-07-11 | Persist deterministic validation reports and add real `policy explain`. | At next heartbeat audit report integrity/failure side effects/identity consistency; run focused/full tests, formatting, and diff checks. |
 
 ## Delegation Queue
 
-1. Broaden no-fixture policy validation for commit/export/projection/execution records against `.sunlight` policy.
+1. Complete persisted export reports, then broaden projection/execution policy validation against `.sunlight` config.
 2. Add a production-like validation repository once Sunlight can run against itself.
 3. Improve operator ergonomics/status for no-fixture workflows.
 4. Keep fixture tests only when they directly support removing fixture dependency.

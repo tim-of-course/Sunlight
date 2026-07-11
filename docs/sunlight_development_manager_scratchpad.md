@@ -1,4 +1,4 @@
-# Sunlight Development Manager Scratchpad
+﻿# Sunlight Development Manager Scratchpad
 
 Purpose: keep one compact, current coordination record for Sunlight development. This file is the heartbeat handoff point and must stay under 20000 characters.
 
@@ -17,7 +17,7 @@ $p = "docs/sunlight_development_manager_scratchpad.md"; $n = (Get-Content -Raw -
 - Keep a development-manager stance: plan slices, keep changes coherent, review before committing, and redirect if a path blocks.
 - Commit coherent progress checkpoints as work lands.
 - Keep moving until the v0.3 local MVP is complete; if one slice blocks, switch to another useful slice.
-- Heartbeat every 55 minutes, generically for the whole project, using this scratchpad as the resume point.
+- Heartbeat every 300 minutes, generically for the whole project, using this scratchpad as the resume point.
 - MVP means a real local tool that can manage production codebases using all features in `docs/sunlight_consolidated_architecture_v0_3.md`, not only a proof of concept.
 
 ## Product Goal
@@ -32,8 +32,8 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - Management lane changed on 2026-07-06: work directly in the Windows checkout at `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2`.
 - Older WSL clone rows below are historical checkpoints only; do not treat them as the active work lane.
 - Critical handoff correction: previous fixture-backed acceptance is not product completion.
-- Current implementation reality: fixture prototype plus a growing repo-backed authoring path with durable multi-topic/session state, deterministic conflict reporting, persisted projection/checkpoint/export snapshots, execution/output promotion, and single-candidate compatibility import from managed projections; still not the full v0.3 product.
-- Main product gap: complete multi-file compatibility transactions and rename handling, then broader policy validation, operator ergonomics, and production-like acceptance.
+- Current implementation reality: fixture prototype plus a growing repo-backed authoring path with durable multi-topic/session state, deterministic conflict reporting, persisted projection/checkpoint/export snapshots, execution/output promotion, and atomic multi-file compatibility import from managed projections; still not the full v0.3 product.
+- Main product gap: complete compatibility rename preservation, then broader policy validation, operator ergonomics, and production-like acceptance.
 
 ## Workstreams
 
@@ -60,11 +60,12 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | repo-backed-projection-export | WSL Codex CLI | `/home/timothycard/code/Sunlight-2-projection-export-local` -> Windows commit `8041db3` | Completed | Persist projection/checkpoint/export snapshots and export checkpoint bytes after head moves. | Windows core repo-state tests, no-fixture CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
 | repo-backed-execution-output | WSL Codex CLI + manager review fix | `/home/timothycard/code/Sunlight-2-execution-output-local` -> Windows commit `8f9a377` | Completed | Persist repo-backed execution records and promote execution outputs into native topic operations. | Windows no-fixture CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed. |
 | repo-backed-compat-import | Windows Codex CLI `0.144.1` | Windows commit `7de1357` | Completed | Implement no-fixture compatibility project/diff/import from real projections into native operations. | Focused core/state/CLI tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed; modified/new/deleted single-candidate imports reach materialization and Git export. |
-| repo-backed-compat-atomic-multifile | Windows Codex CLI cell `10` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active 2026-07-10 | Import repeated safe compatibility candidates as one durable multi-effect transaction with atomic rejection. | At next heartbeat review output/schema/resolver changes; run focused no-fixture tests, full `cargo test`, formatting, and diff checks. |
+| repo-backed-compat-atomic-multifile | Windows Codex CLI | Windows commit `ba4a1eb` | Completed | Import repeated safe compatibility candidates as one durable multi-effect transaction with atomic rejection. | Core/state/CLI focused tests, full `cargo test`, `cargo fmt --check`, and `git diff --check` passed; modified/new/deleted effects share one operation/revision/generation. |
+| repo-backed-compat-rename | Windows Codex CLI cell `12` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active 2026-07-10 | Detect conservative unambiguous renames, preserve artifact identity, and atomically reject ambiguous matches. | At next heartbeat review false-positive risk, resolver/path history, schema changes, focused/full tests, formatting, and diff checks. |
 
 ## Delegation Queue
 
-1. Complete atomic multi-file compatibility import, then add unambiguous rename preservation.
+1. Complete unambiguous compatibility rename preservation and document any soundly deferred rename-plus-edit limitation.
 2. Broaden no-fixture policy validation for commit/export/projection/execution records against `.sunlight` policy.
 3. Add a production-like validation repository once Sunlight can run against itself.
 4. Improve operator ergonomics/status for no-fixture workflows.

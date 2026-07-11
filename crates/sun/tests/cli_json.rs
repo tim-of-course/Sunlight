@@ -2077,6 +2077,132 @@ fn no_fixture_compat_import_rejects_secret_and_stale_generation_without_partial_
 }
 
 #[test]
+fn no_fixture_compat_import_applies_modified_created_and_deleted_as_one_transaction() {
+    let repo = TestRepo::new("real-compat-multi");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    write_nested_file(repo.path(), "src/lib.rs", "pub fn answer() -> u32 { 42 }\n");
+    repo.write_file("README.md", "baseline\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+    start_native_session(&repo, "compat-multi");
+
+    let (projection, root, generation) = create_real_compat_projection(&repo);
+    fs::write(root.join("src/lib.rs"), b"pub fn answer() -> u32 { 43 }\n").unwrap();
+    write_nested_file(&root, "src/added.rs", "pub fn added() -> bool { true }\n");
+    fs::remove_file(root.join("README.md")).unwrap();
+    let diff = real_compat_diff(&repo, &projection);
+    let candidates = vec![
+        candidate_id_for_path(&diff, "src/lib.rs"),
+        candidate_id_for_path(&diff, "src/added.rs"),
+        candidate_id_for_path(&diff, "README.md"),
+        candidate_id_for_path(&diff, "src/lib.rs"),
+    ];
+    let imported = real_compat_import_many(&repo, &projection, &candidates, Some(&generation));
+    assert_success(&imported);
+    let output = stdout(&imported);
+    assert!(output.contains("\"selected_delta_count\":3"));
+    assert_eq!(
+        output
+            .matches("\"operation_transaction_id\":\"op_native_0001\"")
+            .count(),
+        3
+    );
+    assert!(output.contains("\"topic_revision_id\":\"rev_compat_multi_0001\""));
+    assert!(output.contains("\"session_generation_id\":\"gen_agent_a_0002\""));
+    let view = json_string_field(&output, "resolved_view_id");
+    let operation = json_string_field(&output, "operation_transaction_id");
+    for (command, selector) in [("inspect", format!("compat-import:{operation}"))] {
+        let result = sun()
+            .arg(command)
+            .arg(selector)
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert_success(&result);
+        let text = stdout(&result);
+        assert!(
+            text.contains("src/lib.rs")
+                && text.contains("src/added.rs")
+                && text.contains("README.md")
+        );
+    }
+    let status = sun()
+        .arg("status")
+        .arg("--compat-import")
+        .arg(&operation)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&status);
+    assert!(stdout(&status).contains("\"artifact_effects\":["));
+    let list = sun()
+        .arg("list")
+        .arg("src")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&list);
+    assert!(stdout(&list).contains("src/added.rs"));
+    let search = sun()
+        .arg("search")
+        .arg("added")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&search);
+    assert!(stdout(&search).contains("src/added.rs"));
+
+    let materialized = repo.path().join("compat-multi-result");
+    let project = sun()
+        .arg("project")
+        .arg("materialize")
+        .arg(&view)
+        .arg("--purpose")
+        .arg("inspection")
+        .arg("--projection-root")
+        .arg(&materialized)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&project);
+    assert!(fs::read_to_string(materialized.join("src/lib.rs"))
+        .unwrap()
+        .contains("43"));
+    assert!(materialized.join("src/added.rs").is_file());
+    assert!(!materialized.join("README.md").exists());
+
+    let state =
+        fs::read_to_string(repo.path().join(".sunlight/records/native-state.json")).unwrap();
+    assert_eq!(
+        state
+            .matches("\"operation_transaction_id\":\"op_native_0001\"")
+            .count(),
+        1
+    );
+    assert_eq!(
+        state
+            .matches("\"topic_revision_id\":\"rev_compat_multi_0001\"")
+            .count(),
+        1
+    );
+    assert!(state.contains("\"effects\":[{"));
+}
+
+#[test]
 fn policy_check_commit_json_after_init_returns_success_envelope() {
     let repo = TestRepo::new("policy-check-commit-success");
 
@@ -9022,6 +9148,33 @@ fn real_compat_import(
         .current_dir(repo.path())
         .output()
         .expect("sun compat import should run");
+    assert_valid_json(&stdout(&output));
+    output
+}
+
+fn real_compat_import_many(
+    repo: &TestRepo,
+    projection_id: &str,
+    candidate_ids: &[String],
+    session_generation_id: Option<&str>,
+) -> Output {
+    let mut command = sun();
+    command
+        .arg("compat")
+        .arg("import")
+        .arg("--projection")
+        .arg(projection_id);
+    for candidate_id in candidate_ids {
+        command.arg("--candidate").arg(candidate_id);
+    }
+    if let Some(generation) = session_generation_id {
+        command.arg("--session-generation").arg(generation);
+    }
+    let output = command
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
     assert_valid_json(&stdout(&output));
     output
 }

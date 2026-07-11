@@ -358,14 +358,6 @@ pub fn validate_real_compat_selection(
             _ => {}
         }
     }
-    if selected.len() != 1 {
-        return Err(real_error(
-            CompatImportErrorCode::PartialWriteBlocked,
-            projection,
-            selected_candidate_delta_ids.to_vec(),
-            "this compatibility slice imports exactly one selected source delta atomically",
-        ));
-    }
     Ok(selected)
 }
 

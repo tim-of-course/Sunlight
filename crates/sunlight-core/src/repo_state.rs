@@ -96,6 +96,37 @@ pub struct RealOperationRecord {
     pub bytes: Vec<u8>,
     pub compat_projection_id: Option<String>,
     pub compat_candidate_delta_ids: Vec<String>,
+    pub effects: Vec<RealOperationEffect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealOperationEffect {
+    pub artifact_id: String,
+    pub path: String,
+    pub base_content_hash: Option<String>,
+    pub result_content_hash: String,
+    pub classification: String,
+    pub executable: bool,
+    pub tombstone: bool,
+    pub bytes: Vec<u8>,
+}
+
+impl RealOperationRecord {
+    pub fn artifact_effects(&self) -> Vec<RealOperationEffect> {
+        if !self.effects.is_empty() {
+            return self.effects.clone();
+        }
+        vec![RealOperationEffect {
+            artifact_id: self.artifact_id.clone(),
+            path: self.path.clone(),
+            base_content_hash: self.base_content_hash.clone(),
+            result_content_hash: self.result_content_hash.clone(),
+            classification: self.classification.clone(),
+            executable: self.executable,
+            tombstone: self.tombstone,
+            bytes: self.bytes.clone(),
+        }]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +460,9 @@ impl RealRepoState {
         }
         for operation in &self.operations {
             persist_blob(repo_root, &operation.result_content_hash, &operation.bytes)?;
+            for effect in &operation.effects {
+                persist_blob(repo_root, &effect.result_content_hash, &effect.bytes)?;
+            }
         }
         for projection in &self.projections {
             for entry in &projection.entries {
@@ -785,7 +819,8 @@ fn expanded_same_artifact_conflicts(
     state: &RealRepoState,
     result: &ResolvedViewResult,
 ) -> Vec<ResolverConflictOrStalenessRecord> {
-    let mut latest_by_topic_artifact = BTreeMap::<(String, String), &RealOperationRecord>::new();
+    let mut latest_by_topic_artifact =
+        BTreeMap::<(String, String), (&RealOperationRecord, RealOperationEffect)>::new();
     for operation_id in &result.resolver_order.operation_ids {
         let Some(operation) = state
             .operations
@@ -794,15 +829,21 @@ fn expanded_same_artifact_conflicts(
         else {
             continue;
         };
-        latest_by_topic_artifact.insert(
-            (operation.topic_id.clone(), operation.artifact_id.clone()),
-            operation,
-        );
+        for effect in operation.artifact_effects() {
+            latest_by_topic_artifact.insert(
+                (operation.topic_id.clone(), effect.artifact_id.clone()),
+                (operation, effect),
+            );
+        }
     }
 
-    let mut by_artifact = BTreeMap::<String, Vec<&RealOperationRecord>>::new();
-    for ((_topic_id, artifact_id), operation) in latest_by_topic_artifact {
-        by_artifact.entry(artifact_id).or_default().push(operation);
+    let mut by_artifact =
+        BTreeMap::<String, Vec<(&RealOperationRecord, RealOperationEffect)>>::new();
+    for ((_topic_id, artifact_id), operation_effect) in latest_by_topic_artifact {
+        by_artifact
+            .entry(artifact_id)
+            .or_default()
+            .push(operation_effect);
     }
 
     by_artifact
@@ -813,21 +854,21 @@ fn expanded_same_artifact_conflicts(
             }
             let candidate_hashes = operations
                 .iter()
-                .map(|operation| operation.result_content_hash.clone())
+                .map(|(_, effect)| effect.result_content_hash.clone())
                 .collect::<std::collections::BTreeSet<_>>();
             if candidate_hashes.len() <= 1 {
                 return None;
             }
             let paths = operations
                 .iter()
-                .map(|operation| operation.path.clone())
+                .map(|(_, effect)| effect.path.clone())
                 .collect::<std::collections::BTreeSet<_>>();
             let mut candidate_refs = BTreeMap::new();
             candidate_refs.insert(
                 "base_content_hashes".to_string(),
                 operations
                     .iter()
-                    .filter_map(|operation| operation.base_content_hash.clone())
+                    .filter_map(|(_, effect)| effect.base_content_hash.clone())
                     .collect::<std::collections::BTreeSet<_>>()
                     .into_iter()
                     .collect(),
@@ -858,11 +899,11 @@ fn expanded_same_artifact_conflicts(
                     .collect(),
                 operation_ids: operations
                     .iter()
-                    .map(|operation| operation.operation_transaction_id.clone())
+                    .map(|(operation, _)| operation.operation_transaction_id.clone())
                     .collect(),
                 authored_context_ids: operations
                     .iter()
-                    .map(|operation| operation.authored_context_id.clone())
+                    .map(|(operation, _)| operation.authored_context_id.clone())
                     .collect(),
                 policy_reason:
                     "same artifact operations are not proven commutative under file_ops_v1"
@@ -892,16 +933,18 @@ fn materialize_real_resolved_entries(
         else {
             continue;
         };
-        entries.retain(|entry| entry.artifact_id != operation.artifact_id);
-        entries.push(RealArtifactEntry {
-            path: operation.path.clone(),
-            artifact_id: operation.artifact_id.clone(),
-            content_hash: operation.result_content_hash.clone(),
-            executable: operation.executable,
-            classification: operation.classification.clone(),
-            tombstone: operation.tombstone,
-            bytes: operation.bytes.clone(),
-        });
+        for effect in operation.artifact_effects() {
+            entries.retain(|entry| entry.artifact_id != effect.artifact_id);
+            entries.push(RealArtifactEntry {
+                path: effect.path,
+                artifact_id: effect.artifact_id,
+                content_hash: effect.result_content_hash,
+                executable: effect.executable,
+                classification: effect.classification,
+                tombstone: effect.tombstone,
+                bytes: effect.bytes,
+            });
+        }
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     entries
@@ -1356,6 +1399,10 @@ fn parse_operation(
             )),
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let effects = optional_array(object, "effects", state_path)?
+        .iter()
+        .map(|value| parse_operation_effect(repo_root, value, state_path))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(RealOperationRecord {
         operation_transaction_id: required_string(object, "operation_transaction_id", state_path)?,
         topic_id: required_string(object, "topic_id", state_path)?,
@@ -1387,6 +1434,31 @@ fn parse_operation(
             )),
         })
         .collect::<Result<Vec<_>, _>>()?,
+        effects,
+    })
+}
+
+fn parse_operation_effect(
+    repo_root: &Path,
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealOperationEffect, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(
+            state_path,
+            "operation effect must be a JSON object",
+        ));
+    };
+    let result_content_hash = required_string(object, "result_content_hash", state_path)?;
+    Ok(RealOperationEffect {
+        artifact_id: required_string(object, "artifact_id", state_path)?,
+        path: required_string(object, "path", state_path)?,
+        base_content_hash: optional_string(object, "base_content_hash", state_path)?,
+        bytes: read_real_blob(repo_root, &result_content_hash)?,
+        result_content_hash,
+        classification: required_string(object, "classification", state_path)?,
+        executable: required_bool(object, "executable", state_path)?,
+        tombstone: required_bool(object, "tombstone", state_path)?,
     })
 }
 
@@ -1998,6 +2070,40 @@ fn operation_json(operation: &RealOperationRecord) -> JsonValue {
                 .collect(),
         ),
     );
+    object.insert(
+        "effects".to_string(),
+        JsonValue::Array(
+            operation
+                .effects
+                .iter()
+                .map(operation_effect_json)
+                .collect(),
+        ),
+    );
+    JsonValue::Object(object)
+}
+
+fn operation_effect_json(effect: &RealOperationEffect) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "artifact_id".to_string(),
+        JsonValue::String(effect.artifact_id.clone()),
+    );
+    object.insert("path".to_string(), JsonValue::String(effect.path.clone()));
+    object.insert(
+        "base_content_hash".to_string(),
+        optional_json(&effect.base_content_hash),
+    );
+    object.insert(
+        "result_content_hash".to_string(),
+        JsonValue::String(effect.result_content_hash.clone()),
+    );
+    object.insert(
+        "classification".to_string(),
+        JsonValue::String(effect.classification.clone()),
+    );
+    object.insert("executable".to_string(), JsonValue::Bool(effect.executable));
+    object.insert("tombstone".to_string(), JsonValue::Bool(effect.tombstone));
     JsonValue::Object(object)
 }
 
@@ -2622,6 +2728,63 @@ mod tests {
             bytes: after_bytes.to_vec(),
             compat_projection_id: None,
             compat_candidate_delta_ids: Vec::new(),
+            effects: Vec::new(),
         }
+    }
+
+    #[test]
+    fn multi_effect_operation_materializes_all_artifacts_as_one_revision() {
+        let base = artifact_entry("src/lib.rs", b"old\n");
+        let removed = artifact_entry("README.md", b"remove me\n");
+        let mut state = RealRepoState::ingest(&temp_repo("multi-effect"), "repo_multi").unwrap();
+        state.base_entries = vec![base.clone(), removed.clone()];
+        let mut transaction = operation("op_multi", "topic_code", "rev_code_0001", &base, b"new\n");
+        transaction.effects = vec![
+            RealOperationEffect {
+                artifact_id: base.artifact_id.clone(),
+                path: base.path.clone(),
+                base_content_hash: Some(base.content_hash.clone()),
+                result_content_hash: real_content_hash(b"new\n"),
+                classification: "source".to_string(),
+                executable: false,
+                tombstone: false,
+                bytes: b"new\n".to_vec(),
+            },
+            RealOperationEffect {
+                artifact_id: real_artifact_id_for_path("src/added.rs"),
+                path: "src/added.rs".to_string(),
+                base_content_hash: None,
+                result_content_hash: real_content_hash(b"added\n"),
+                classification: "source".to_string(),
+                executable: false,
+                tombstone: false,
+                bytes: b"added\n".to_vec(),
+            },
+            RealOperationEffect {
+                artifact_id: removed.artifact_id.clone(),
+                path: removed.path.clone(),
+                base_content_hash: Some(removed.content_hash.clone()),
+                result_content_hash: removed.content_hash.clone(),
+                classification: "source".to_string(),
+                executable: false,
+                tombstone: true,
+                bytes: removed.bytes.clone(),
+            },
+        ];
+        state.operations = vec![transaction];
+        let entries = materialize_real_resolved_entries(
+            &state,
+            &DeterministicResolverOrder {
+                operation_ids: vec!["op_multi".to_string()],
+            },
+        );
+        assert_eq!(entries.iter().filter(|entry| !entry.tombstone).count(), 2);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.path == "src/lib.rs" && entry.bytes == b"new\n"));
+        assert!(entries.iter().any(|entry| entry.path == "src/added.rs"));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.path == "README.md" && entry.tombstone));
     }
 }

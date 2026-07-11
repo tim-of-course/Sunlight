@@ -65,12 +65,16 @@ impl ProjectionStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritablePolicy {
     ReadOnlySourcePrivateOutputs,
+    ManagedProjectionWritableNotIsolated,
 }
 
 impl WritablePolicy {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnlySourcePrivateOutputs => "read_only_source_private_outputs",
+            Self::ManagedProjectionWritableNotIsolated => {
+                "managed_projection_writable_not_isolated"
+            }
         }
     }
 }

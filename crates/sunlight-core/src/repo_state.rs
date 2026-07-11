@@ -162,10 +162,24 @@ pub struct RealExecutionSnapshot {
     pub working_directory: String,
     pub exit_code: Option<i32>,
     pub status: String,
-    pub stdout_digest: String,
+    pub timed_out: bool,
+    pub termination_failed: bool,
+    pub wait_failed: bool,
+    pub stdout_observed_digest: String,
     pub stdout_byte_length: u64,
-    pub stderr_digest: String,
+    pub stdout_captured_byte_length: u64,
+    pub stdout_truncated: bool,
+    pub stdout_capture_failed: bool,
+    pub stderr_observed_digest: String,
     pub stderr_byte_length: u64,
+    pub stderr_captured_byte_length: u64,
+    pub stderr_truncated: bool,
+    pub stderr_capture_failed: bool,
+    pub timeout_ms: Option<u64>,
+    pub environment_policy: String,
+    pub environment_allowlist: Vec<String>,
+    pub network_policy: String,
+    pub filesystem_write_policy: String,
     pub outputs: Vec<RealExecutionOutputSnapshot>,
     pub started_at: String,
     pub finished_at: String,
@@ -1648,10 +1662,59 @@ fn parse_execution_snapshot(
         working_directory: required_string(object, "working_directory", state_path)?,
         exit_code: optional_i32(object, "exit_code", state_path)?,
         status: required_string(object, "status", state_path)?,
-        stdout_digest: required_string(object, "stdout_digest", state_path)?,
+        timed_out: optional_bool(object, "timed_out", state_path)?.unwrap_or_else(|| {
+            required_string(object, "status", state_path).is_ok_and(|value| value == "timeout")
+        }),
+        termination_failed: optional_bool(object, "termination_failed", state_path)?
+            .unwrap_or(false),
+        wait_failed: optional_bool(object, "wait_failed", state_path)?.unwrap_or(false),
+        stdout_observed_digest: match optional_string(object, "stdout_observed_digest", state_path)?
+        {
+            Some(digest) => digest,
+            None => required_string(object, "stdout_digest", state_path)?,
+        },
         stdout_byte_length: required_u64(object, "stdout_byte_length", state_path)?,
-        stderr_digest: required_string(object, "stderr_digest", state_path)?,
+        stdout_captured_byte_length: optional_u64(
+            object,
+            "stdout_captured_byte_length",
+            state_path,
+        )?
+        .unwrap_or_else(|| required_u64(object, "stdout_byte_length", state_path).unwrap_or(0)),
+        stdout_truncated: optional_bool(object, "stdout_truncated", state_path)?.unwrap_or(false),
+        stdout_capture_failed: optional_bool(object, "stdout_capture_failed", state_path)?
+            .unwrap_or(false),
+        stderr_observed_digest: match optional_string(object, "stderr_observed_digest", state_path)?
+        {
+            Some(digest) => digest,
+            None => required_string(object, "stderr_digest", state_path)?,
+        },
         stderr_byte_length: required_u64(object, "stderr_byte_length", state_path)?,
+        stderr_captured_byte_length: optional_u64(
+            object,
+            "stderr_captured_byte_length",
+            state_path,
+        )?
+        .unwrap_or_else(|| required_u64(object, "stderr_byte_length", state_path).unwrap_or(0)),
+        stderr_truncated: optional_bool(object, "stderr_truncated", state_path)?.unwrap_or(false),
+        stderr_capture_failed: optional_bool(object, "stderr_capture_failed", state_path)?
+            .unwrap_or(false),
+        timeout_ms: optional_u64(object, "timeout_ms", state_path)?,
+        environment_policy: optional_string(object, "environment_policy", state_path)?
+            .unwrap_or_else(|| "legacy_unrecorded".to_string()),
+        environment_allowlist: optional_array(object, "environment_allowlist", state_path)?
+            .iter()
+            .map(|value| match value {
+                JsonValue::String(name) => Ok(name.clone()),
+                _ => Err(invalid_state(
+                    state_path,
+                    "execution environment_allowlist must contain strings",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        network_policy: optional_string(object, "network_policy", state_path)?
+            .unwrap_or_else(|| "not_enforced".to_string()),
+        filesystem_write_policy: optional_string(object, "filesystem_write_policy", state_path)?
+            .unwrap_or_else(|| "legacy_unrecorded".to_string()),
         outputs,
         started_at: required_string(object, "started_at", state_path)?,
         finished_at: required_string(object, "finished_at", state_path)?,
@@ -1911,20 +1974,85 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
         JsonValue::String(execution.status.clone()),
     );
     object.insert(
-        "stdout_digest".to_string(),
-        JsonValue::String(execution.stdout_digest.clone()),
+        "timed_out".to_string(),
+        JsonValue::Bool(execution.timed_out),
+    );
+    object.insert(
+        "termination_failed".to_string(),
+        JsonValue::Bool(execution.termination_failed),
+    );
+    object.insert(
+        "wait_failed".to_string(),
+        JsonValue::Bool(execution.wait_failed),
+    );
+    object.insert(
+        "stdout_observed_digest".to_string(),
+        JsonValue::String(execution.stdout_observed_digest.clone()),
     );
     object.insert(
         "stdout_byte_length".to_string(),
         JsonValue::Number(execution.stdout_byte_length.to_string()),
     );
     object.insert(
-        "stderr_digest".to_string(),
-        JsonValue::String(execution.stderr_digest.clone()),
+        "stdout_captured_byte_length".to_string(),
+        JsonValue::Number(execution.stdout_captured_byte_length.to_string()),
+    );
+    object.insert(
+        "stdout_truncated".to_string(),
+        JsonValue::Bool(execution.stdout_truncated),
+    );
+    object.insert(
+        "stdout_capture_failed".to_string(),
+        JsonValue::Bool(execution.stdout_capture_failed),
+    );
+    object.insert(
+        "stderr_observed_digest".to_string(),
+        JsonValue::String(execution.stderr_observed_digest.clone()),
     );
     object.insert(
         "stderr_byte_length".to_string(),
         JsonValue::Number(execution.stderr_byte_length.to_string()),
+    );
+    object.insert(
+        "stderr_captured_byte_length".to_string(),
+        JsonValue::Number(execution.stderr_captured_byte_length.to_string()),
+    );
+    object.insert(
+        "stderr_truncated".to_string(),
+        JsonValue::Bool(execution.stderr_truncated),
+    );
+    object.insert(
+        "stderr_capture_failed".to_string(),
+        JsonValue::Bool(execution.stderr_capture_failed),
+    );
+    object.insert(
+        "timeout_ms".to_string(),
+        execution
+            .timeout_ms
+            .map(|value| JsonValue::Number(value.to_string()))
+            .unwrap_or(JsonValue::Null),
+    );
+    object.insert(
+        "environment_policy".to_string(),
+        JsonValue::String(execution.environment_policy.clone()),
+    );
+    object.insert(
+        "environment_allowlist".to_string(),
+        JsonValue::Array(
+            execution
+                .environment_allowlist
+                .iter()
+                .map(|name| JsonValue::String(name.clone()))
+                .collect(),
+        ),
+    );
+    object.insert(
+        "network_policy".to_string(),
+        JsonValue::String(execution.network_policy.clone()),
+    );
+    object.insert(
+        "filesystem_write_policy".to_string(),
+        JsonValue::String(execution.filesystem_write_policy.clone()),
     );
     object.insert(
         "outputs".to_string(),
@@ -2344,6 +2472,39 @@ fn optional_i32(
         _ => Err(invalid_state(
             path,
             format!("field `{field}` must be an integer or null"),
+        )),
+    }
+}
+
+fn optional_u64(
+    object: &BTreeMap<String, JsonValue>,
+    field: &'static str,
+    path: &Path,
+) -> Result<Option<u64>, RepoStateError> {
+    match object.get(field) {
+        Some(JsonValue::Null) | None => Ok(None),
+        Some(JsonValue::Number(value)) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| invalid_state(path, format!("field `{field}` must be an integer"))),
+        _ => Err(invalid_state(
+            path,
+            format!("field `{field}` must be an integer or null"),
+        )),
+    }
+}
+
+fn optional_bool(
+    object: &BTreeMap<String, JsonValue>,
+    field: &'static str,
+    path: &Path,
+) -> Result<Option<bool>, RepoStateError> {
+    match object.get(field) {
+        Some(JsonValue::Null) | None => Ok(None),
+        Some(JsonValue::Bool(value)) => Ok(Some(*value)),
+        _ => Err(invalid_state(
+            path,
+            format!("field `{field}` must be a boolean or null"),
         )),
     }
 }

@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use sunlight_core::records::parse_json_record;
 
 fn sun() -> Command {
@@ -548,6 +549,206 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
         ),
         "promoted needle\n"
     );
+}
+
+#[test]
+fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
+    let repo = TestRepo::new("execution-runtime-policy");
+    repo.write_file("README.md", "# runtime policy\n");
+    start_native_session(&repo, "runtime-policy");
+    let config_path = repo.path().join(".sunlight/config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("timeout_ms = 300000", "timeout_ms = 150")
+        .replace("stdout_limit_bytes = 1048576", "stdout_limit_bytes = 1024")
+        .replace("stderr_limit_bytes = 1048576", "stderr_limit_bytes = 1024");
+    fs::write(&config_path, config).unwrap();
+
+    let timeout = sun()
+        .arg("run")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--json")
+        .arg("--")
+        .arg("python")
+        .arg("-c")
+        .arg(
+            r#"import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',"import time; from pathlib import Path; time.sleep(.7); Path('LATE_MARKER').write_text('late')"]); time.sleep(5)"#,
+        )
+        .current_dir(repo.path())
+        .output()
+        .expect("timed execution should run");
+    assert_success(&timeout);
+    let timeout_stdout = stdout(&timeout);
+    assert_valid_json(&timeout_stdout);
+    assert!(timeout_stdout.contains("\"status\":\"timeout\""));
+    assert!(timeout_stdout.contains("\"timed_out\":true"));
+    assert!(timeout_stdout.contains("\"promotion_candidates\":[]"));
+    assert!(timeout_stdout.contains("\"timeout_ms\":150"));
+    assert!(timeout_stdout.contains("\"network\":\"not_enforced\""));
+    assert!(timeout_stdout
+        .contains("\"filesystem_writes\":\"managed_projection_writable_not_isolated\""));
+    let timeout_execution = json_string_field(&timeout_stdout, "execution_id");
+    let persisted_timeout = fs::read_to_string(
+        repo.path()
+            .join(".sunlight/executions")
+            .join(format!("{timeout_execution}.json")),
+    )
+    .unwrap();
+    assert_valid_json(&persisted_timeout);
+    assert!(persisted_timeout.contains("\"status\":\"timeout\""));
+    assert!(persisted_timeout.contains("\"timed_out\":true"));
+    assert!(persisted_timeout.contains("\"runtime_policy\":"));
+    let state_after_timeout =
+        fs::read_to_string(repo.path().join(".sunlight/records/native-state.json")).unwrap();
+    assert!(state_after_timeout.contains("\"operations\":[]"));
+    let timeout_projection = json_string_field(&timeout_stdout, "projection_id");
+    let late_marker = repo
+        .path()
+        .join(".sunlight/projections")
+        .join(timeout_projection)
+        .join("root/LATE_MARKER");
+    std::thread::sleep(Duration::from_millis(850));
+    assert!(
+        !late_marker.exists(),
+        "timed-out process mutated files after return"
+    );
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("timeout_ms = 150", "timeout_ms = 5000");
+    fs::write(&config_path, config).unwrap();
+
+    let large = sun()
+        .arg("run")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--json")
+        .arg("--")
+        .arg("python")
+        .arg("-c")
+        .arg("import sys; sys.stdout.buffer.write(b'A'*5000); sys.stderr.buffer.write(b'B'*7000)")
+        .current_dir(repo.path())
+        .output()
+        .expect("large-output execution should run");
+    assert_success(&large);
+    let large_stdout = stdout(&large);
+    assert_valid_json(&large_stdout);
+    assert!(large_stdout.contains("\"status\":\"pass\""));
+    assert!(large_stdout.contains(
+        "\"observed_byte_length\":5000,\"captured_byte_length\":1024,\"truncated\":true,\"capture_failed\":false"
+    ));
+    assert!(large_stdout.contains(
+        "\"observed_byte_length\":7000,\"captured_byte_length\":1024,\"truncated\":true,\"capture_failed\":false"
+    ));
+    let complete_stdout_digest = format!("sha256:{:x}", Sha256::digest(vec![b'A'; 5000]));
+    let retained_stdout_prefix_digest = format!("sha256:{:x}", Sha256::digest(vec![b'A'; 1024]));
+    assert!(large_stdout.contains(&format!("\"observed_digest\":\"{complete_stdout_digest}\"")));
+    assert!(!large_stdout.contains(&retained_stdout_prefix_digest));
+    let large_execution = json_string_field(&large_stdout, "execution_id");
+    let persisted_large = fs::read_to_string(
+        repo.path()
+            .join(".sunlight/executions")
+            .join(format!("{large_execution}.json")),
+    )
+    .unwrap();
+    assert_valid_json(&persisted_large);
+    assert!(persisted_large.contains(&format!("\"observed_digest\":\"{complete_stdout_digest}\"")));
+    assert!(!persisted_large.contains(&retained_stdout_prefix_digest));
+    assert!(!large_stdout.contains(&"A".repeat(100)));
+    assert!(!large_stdout.contains(&"B".repeat(100)));
+
+    let secret = "do-not-inherit-this-test-secret";
+    let normal = sun()
+        .arg("run")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--json")
+        .arg("--")
+        .arg("python")
+        .arg("-c")
+        .arg("import os,sys; sys.exit(1 if os.environ.get('SUNLIGHT_TEST_SECRET') else 0)")
+        .env("SUNLIGHT_TEST_SECRET", secret)
+        .current_dir(repo.path())
+        .output()
+        .expect("environment-filtered execution should run");
+    assert_success(&normal);
+    let normal_stdout = stdout(&normal);
+    assert!(normal_stdout.contains("\"status\":\"pass\""));
+    assert!(normal_stdout.contains("\"inheritance\":\"minimal_os_allowlist\""));
+    assert!(normal_stdout.contains("\"values_recorded\":false"));
+    assert!(!normal_stdout.contains(secret));
+    assert!(!normal_stdout.contains("SUNLIGHT_TEST_SECRET"));
+    let execution_id = json_string_field(&normal_stdout, "execution_id");
+
+    for output in [
+        sun()
+            .arg("status")
+            .arg("--execution")
+            .arg(&execution_id)
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .unwrap(),
+        sun()
+            .arg("inspect")
+            .arg(format!("execution:{execution_id}"))
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .unwrap(),
+    ] {
+        assert_success(&output);
+        let body = stdout(&output);
+        assert_valid_json(&body);
+        assert!(body.contains("\"runtime_policy\":"));
+        assert!(body.contains("\"output_capture\":"));
+        assert!(body.contains("\"network\":\"not_enforced\""));
+        assert!(body.contains("\"inheritance\":\"minimal_os_allowlist\""));
+        assert!(!body.contains(secret));
+    }
+}
+
+#[test]
+fn no_fixture_invalid_execution_policy_precedes_projection_process_and_state_mutation() {
+    let repo = TestRepo::new("invalid-execution-policy");
+    repo.write_file("README.md", "# invalid runtime policy\n");
+    start_native_session(&repo, "invalid-runtime-policy");
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let state_before = fs::read(&state_path).unwrap();
+    let projections_root = repo.path().join(".sunlight/projections");
+    let projections_before = fs::read_dir(&projections_root).unwrap().count();
+    let config_path = repo.path().join(".sunlight/config.toml");
+    let config = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("timeout_ms = 300000", "timeout_ms = 0");
+    fs::write(&config_path, config).unwrap();
+
+    let run = sun()
+        .arg("run")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--json")
+        .arg("--")
+        .arg("python")
+        .arg("-c")
+        .arg("from pathlib import Path; Path('PROCESS_MUST_NOT_RUN').write_text('bad')")
+        .current_dir(repo.path())
+        .output()
+        .expect("invalid-policy run should return an error");
+    assert_failure(&run);
+    let body = stdout(&run);
+    assert!(body.contains("\"code\":\"invalid_repository_config\""));
+    assert!(body.contains("execution_policy.timeout_ms"));
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert_eq!(
+        fs::read_dir(&projections_root).unwrap().count(),
+        projections_before
+    );
+    assert!(!repo.path().join("PROCESS_MUST_NOT_RUN").exists());
+    assert!(!repo
+        .path()
+        .join(".sunlight/executions/exec_native_0001.json")
+        .exists());
 }
 
 #[test]

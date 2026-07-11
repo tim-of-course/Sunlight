@@ -15,6 +15,14 @@ pub const CONSERVATIVE_SUNLIGHT_COMMIT_POLICY: &str = "conservative";
 pub const SUPPORTED_UNICODE_NORMALIZATION: &str = "preserve";
 pub const SUPPORTED_SYMLINK_POLICY: &str = "preserve";
 pub const SUPPORTED_EXECUTABLE_BITS_POLICY: &str = "preserve";
+pub const DEFAULT_EXECUTION_TIMEOUT_MS: u64 = 300_000;
+pub const DEFAULT_EXECUTION_STDOUT_LIMIT_BYTES: u64 = 1_048_576;
+pub const DEFAULT_EXECUTION_STDERR_LIMIT_BYTES: u64 = 1_048_576;
+pub const CONSERVATIVE_ENVIRONMENT_INHERITANCE: &str = "minimal_os_allowlist";
+pub const NOT_ENFORCED_NETWORK_POLICY: &str = "not_enforced";
+
+const MAX_EXECUTION_TIMEOUT_MS: u64 = 86_400_000;
+const MAX_EXECUTION_OUTPUT_LIMIT_BYTES: u64 = 67_108_864;
 
 const SUNLIGHT_DIR: &str = ".sunlight";
 const CONFIG_FILE: &str = "config.toml";
@@ -41,6 +49,7 @@ pub struct RepositoryConfig {
     pub storage_schema_version: u32,
     pub path_policy: PathPolicy,
     pub projection_policy: ProjectionPolicy,
+    pub execution_policy: ExecutionPolicy,
     pub git_interop: GitInteropPolicy,
 }
 
@@ -55,6 +64,15 @@ pub struct PathPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionPolicy {
     pub default_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionPolicy {
+    pub timeout_ms: u64,
+    pub stdout_limit_bytes: u64,
+    pub stderr_limit_bytes: u64,
+    pub environment_inheritance: String,
+    pub network_policy: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +169,13 @@ impl RepositoryConfig {
             projection_policy: ProjectionPolicy {
                 default_root: ".sunlight/projections".to_string(),
             },
+            execution_policy: ExecutionPolicy {
+                timeout_ms: DEFAULT_EXECUTION_TIMEOUT_MS,
+                stdout_limit_bytes: DEFAULT_EXECUTION_STDOUT_LIMIT_BYTES,
+                stderr_limit_bytes: DEFAULT_EXECUTION_STDERR_LIMIT_BYTES,
+                environment_inheritance: CONSERVATIVE_ENVIRONMENT_INHERITANCE.to_string(),
+                network_policy: NOT_ENFORCED_NETWORK_POLICY.to_string(),
+            },
             git_interop: GitInteropPolicy {
                 sunlight_commit_policy: "conservative".to_string(),
             },
@@ -173,6 +198,13 @@ executable_bits = \"{}\"
 [projection_policy]
 default_root = \"{}\"
 
+[execution_policy]
+timeout_ms = {}
+stdout_limit_bytes = {}
+stderr_limit_bytes = {}
+environment_inheritance = \"{}\"
+network_policy = \"{}\"
+
 [git_interop]
 sunlight_commit_policy = \"{}\"
 ",
@@ -184,6 +216,11 @@ sunlight_commit_policy = \"{}\"
             escape_toml(&self.path_policy.symlinks),
             escape_toml(&self.path_policy.executable_bits),
             escape_toml(&self.projection_policy.default_root),
+            self.execution_policy.timeout_ms,
+            self.execution_policy.stdout_limit_bytes,
+            self.execution_policy.stderr_limit_bytes,
+            escape_toml(&self.execution_policy.environment_inheritance),
+            escape_toml(&self.execution_policy.network_policy),
             escape_toml(&self.git_interop.sunlight_commit_policy),
         )
     }
@@ -245,6 +282,38 @@ sunlight_commit_policy = \"{}\"
                 executable_bits,
             },
             projection_policy: ProjectionPolicy { default_root },
+            execution_policy: ExecutionPolicy {
+                timeout_ms: parse_u64_key_or_default(
+                    input,
+                    "timeout_ms",
+                    DEFAULT_EXECUTION_TIMEOUT_MS,
+                    &path,
+                )?,
+                stdout_limit_bytes: parse_u64_key_or_default(
+                    input,
+                    "stdout_limit_bytes",
+                    DEFAULT_EXECUTION_STDOUT_LIMIT_BYTES,
+                    &path,
+                )?,
+                stderr_limit_bytes: parse_u64_key_or_default(
+                    input,
+                    "stderr_limit_bytes",
+                    DEFAULT_EXECUTION_STDERR_LIMIT_BYTES,
+                    &path,
+                )?,
+                environment_inheritance: parse_string_key_or_default(
+                    input,
+                    "environment_inheritance",
+                    CONSERVATIVE_ENVIRONMENT_INHERITANCE,
+                    &path,
+                )?,
+                network_policy: parse_string_key_or_default(
+                    input,
+                    "network_policy",
+                    NOT_ENFORCED_NETWORK_POLICY,
+                    &path,
+                )?,
+            },
             git_interop: GitInteropPolicy {
                 sunlight_commit_policy,
             },
@@ -279,6 +348,54 @@ sunlight_commit_policy = \"{}\"
                 message: format!(
                     "unsupported git_interop.sunlight_commit_policy `{}`; supported value is `{}`",
                     self.git_interop.sunlight_commit_policy, CONSERVATIVE_SUNLIGHT_COMMIT_POLICY
+                ),
+            });
+        }
+        if self.execution_policy.timeout_ms == 0
+            || self.execution_policy.timeout_ms > MAX_EXECUTION_TIMEOUT_MS
+        {
+            return Err(RepositoryError::InvalidConfig {
+                path,
+                message: format!(
+                    "unsafe execution_policy.timeout_ms `{}`; expected 1..={MAX_EXECUTION_TIMEOUT_MS}",
+                    self.execution_policy.timeout_ms
+                ),
+            });
+        }
+        for (field, value) in [
+            (
+                "stdout_limit_bytes",
+                self.execution_policy.stdout_limit_bytes,
+            ),
+            (
+                "stderr_limit_bytes",
+                self.execution_policy.stderr_limit_bytes,
+            ),
+        ] {
+            if value == 0 || value > MAX_EXECUTION_OUTPUT_LIMIT_BYTES {
+                return Err(RepositoryError::InvalidConfig {
+                    path,
+                    message: format!(
+                        "unsafe execution_policy.{field} `{value}`; expected 1..={MAX_EXECUTION_OUTPUT_LIMIT_BYTES}"
+                    ),
+                });
+            }
+        }
+        if self.execution_policy.environment_inheritance != CONSERVATIVE_ENVIRONMENT_INHERITANCE {
+            return Err(RepositoryError::InvalidConfig {
+                path,
+                message: format!(
+                    "unsupported execution_policy.environment_inheritance `{}`; supported value is `{CONSERVATIVE_ENVIRONMENT_INHERITANCE}`",
+                    self.execution_policy.environment_inheritance
+                ),
+            });
+        }
+        if self.execution_policy.network_policy != NOT_ENFORCED_NETWORK_POLICY {
+            return Err(RepositoryError::InvalidConfig {
+                path,
+                message: format!(
+                    "unsupported execution_policy.network_policy `{}`; supported value is `{NOT_ENFORCED_NETWORK_POLICY}`",
+                    self.execution_policy.network_policy
                 ),
             });
         }
@@ -565,6 +682,52 @@ fn parse_u32_key(input: &str, key: &str) -> Option<u32> {
     })
 }
 
+fn parse_u64_key_or_default(
+    input: &str,
+    key: &str,
+    default: u64,
+    path: &Path,
+) -> Result<u64, RepositoryError> {
+    let prefix = format!("{} = ", key);
+    let Some(value) = input
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix))
+    else {
+        return Ok(default);
+    };
+    value
+        .parse::<u64>()
+        .map_err(|_| RepositoryError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: format!("invalid execution_policy.{key} `{value}`; expected an integer"),
+        })
+}
+
+fn parse_string_key_or_default(
+    input: &str,
+    key: &str,
+    default: &str,
+    path: &Path,
+) -> Result<String, RepositoryError> {
+    let prefix = format!("{} = ", key);
+    let Some(value) = input
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix))
+    else {
+        return Ok(default.to_string());
+    };
+    let Some(value) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return Err(RepositoryError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: format!("invalid execution_policy.{key}; expected a quoted string"),
+        });
+    };
+    Ok(value.replace("\\\"", "\"").replace("\\\\", "\\"))
+}
+
 fn parse_bool_key(input: &str, key: &str) -> Option<bool> {
     let prefix = format!("{} = ", key);
     input.lines().find_map(|line| {
@@ -599,6 +762,10 @@ mod tests {
         let config = fs::read_to_string(repo.path().join(".sunlight/config.toml")).unwrap();
         assert!(config.contains("repository_id = \"repo-"));
         assert!(config.contains("sunlight_commit_policy = \"conservative\""));
+        assert!(config.contains("[execution_policy]"));
+        assert!(config.contains("timeout_ms = 300000"));
+        assert!(config.contains("environment_inheritance = \"minimal_os_allowlist\""));
+        assert!(config.contains("network_policy = \"not_enforced\""));
 
         let gitignore = fs::read_to_string(repo.path().join(".sunlight/.gitignore")).unwrap();
         assert!(gitignore.contains("/local/"));
@@ -640,6 +807,88 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported git_interop.sunlight_commit_policy `permissive`"));
+    }
+
+    #[test]
+    fn old_config_without_execution_keys_loads_conservative_defaults() {
+        let input = RepositoryConfig::new("repo_test".to_string())
+            .to_toml()
+            .lines()
+            .filter(|line| {
+                !matches!(
+                    line.trim(),
+                    "[execution_policy]"
+                        | "timeout_ms = 300000"
+                        | "stdout_limit_bytes = 1048576"
+                        | "stderr_limit_bytes = 1048576"
+                        | "environment_inheritance = \"minimal_os_allowlist\""
+                        | "network_policy = \"not_enforced\""
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config = RepositoryConfig::from_toml(&input, ".sunlight/config.toml").unwrap();
+        assert_eq!(
+            config.execution_policy.timeout_ms,
+            DEFAULT_EXECUTION_TIMEOUT_MS
+        );
+        assert_eq!(
+            config.execution_policy.stdout_limit_bytes,
+            DEFAULT_EXECUTION_STDOUT_LIMIT_BYTES
+        );
+        assert_eq!(
+            config.execution_policy.environment_inheritance,
+            CONSERVATIVE_ENVIRONMENT_INHERITANCE
+        );
+        assert_eq!(
+            config.execution_policy.network_policy,
+            NOT_ENFORCED_NETWORK_POLICY
+        );
+    }
+
+    #[test]
+    fn config_rejects_unsafe_execution_policy_values() {
+        let base = RepositoryConfig::new("repo_test".to_string()).to_toml();
+        for (needle, replacement, expected) in [
+            (
+                "timeout_ms = 300000",
+                "timeout_ms = 0",
+                "execution_policy.timeout_ms",
+            ),
+            (
+                "stdout_limit_bytes = 1048576",
+                "stdout_limit_bytes = 999999999",
+                "execution_policy.stdout_limit_bytes",
+            ),
+            (
+                "environment_inheritance = \"minimal_os_allowlist\"",
+                "environment_inheritance = \"all\"",
+                "execution_policy.environment_inheritance",
+            ),
+            (
+                "network_policy = \"not_enforced\"",
+                "network_policy = \"disabled\"",
+                "execution_policy.network_policy",
+            ),
+            (
+                "stderr_limit_bytes = 1048576",
+                "stderr_limit_bytes = invalid",
+                "execution_policy.stderr_limit_bytes",
+            ),
+            (
+                "environment_inheritance = \"minimal_os_allowlist\"",
+                "environment_inheritance = 42",
+                "execution_policy.environment_inheritance",
+            ),
+        ] {
+            let error = RepositoryConfig::from_toml(
+                &base.replace(needle, replacement),
+                ".sunlight/config.toml",
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]

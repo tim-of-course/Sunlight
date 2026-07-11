@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
 
 use sunlight_core::artifacts::{
     ArtifactIoError, ArtifactKind, ContentBlob, ContentTree, DeleteRequest, ExpectedHash,
@@ -87,8 +91,8 @@ use sunlight_core::repo_state::{
     RealResolvedRepoView, RealSessionRecord, RealTopicRecord, RepoStateError,
 };
 use sunlight_core::repository::{
-    init_repository, resolve_projection_policy, RepositoryConfig, ResolvedProjectionPolicy,
-    CURRENT_STORAGE_SCHEMA_VERSION,
+    init_repository, resolve_projection_policy, ExecutionPolicy, RepositoryConfig,
+    ResolvedProjectionPolicy, CURRENT_STORAGE_SCHEMA_VERSION,
 };
 use sunlight_core::resolver::{
     fixture_auth_revision, fixture_base_entries, fixture_overlapping_auth_revision,
@@ -2522,8 +2526,251 @@ fn real_project_materialize(
     Ok(())
 }
 
+#[derive(Debug)]
+struct BoundedStreamSummary {
+    observed_digest: String,
+    observed_byte_length: u64,
+    captured_byte_length: u64,
+    truncated: bool,
+    capture_failed: bool,
+}
+
+#[derive(Debug)]
+struct BoundedProcessOutput {
+    status: Option<ExitStatus>,
+    timed_out: bool,
+    termination_failed: bool,
+    wait_failed: bool,
+    stdout: BoundedStreamSummary,
+    stderr: BoundedStreamSummary,
+}
+
+fn execution_environment_allowlist() -> Vec<&'static str> {
+    if cfg!(windows) {
+        vec![
+            "PATH",
+            "PATHEXT",
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "LOCALAPPDATA",
+            "APPDATA",
+        ]
+    } else {
+        vec!["PATH", "HOME", "TMPDIR"]
+    }
+}
+
+fn summarize_bounded_stream<R: Read>(mut stream: R, limit: u64) -> BoundedStreamSummary {
+    let mut hasher = Sha256::new();
+    let mut observed = 0_u64;
+    let mut captured = 0_u64;
+    let mut buffer = [0_u8; 8192];
+    let mut capture_failed = false;
+    loop {
+        let count = match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                capture_failed = true;
+                break;
+            }
+        };
+        observed = observed.saturating_add(count as u64);
+        hasher.update(&buffer[..count]);
+        let remaining = limit.saturating_sub(captured) as usize;
+        let captured_now = count.min(remaining);
+        captured += captured_now as u64;
+    }
+    BoundedStreamSummary {
+        observed_digest: format!("sha256:{:x}", hasher.finalize()),
+        observed_byte_length: observed,
+        captured_byte_length: captured,
+        truncated: observed > captured,
+        capture_failed,
+    }
+}
+
+fn terminate_execution_process_tree(child: &mut Child) -> (bool, bool) {
+    let pid = child.id().to_string();
+    #[cfg(windows)]
+    {
+        let tree_killed = Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !tree_killed {
+            return (true, child.kill().is_ok());
+        }
+        return (false, true);
+    }
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{pid}");
+        let group_killed = Command::new("kill")
+            .args(["-KILL", "--", &process_group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !group_killed {
+            return (true, child.kill().is_ok());
+        }
+        return (false, true);
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let root_killed = child.kill().is_ok();
+        (!root_killed, root_killed)
+    }
+}
+
+fn run_bounded_process(
+    argv: &[String],
+    cwd: &Path,
+    policy: &ExecutionPolicy,
+) -> io::Result<BoundedProcessOutput> {
+    let allowlist = execution_environment_allowlist();
+    let mut command = Command::new(&argv[0]);
+    command
+        .args(argv.iter().skip(1))
+        .current_dir(cwd)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in &allowlist {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    let stdout_limit = policy.stdout_limit_bytes;
+    let stderr_limit = policy.stderr_limit_bytes;
+    let stdout_reader = child.stdout.take().map(|stdout| {
+        thread::Builder::new()
+            .name("sun-stdout-reader".to_string())
+            .spawn(move || summarize_bounded_stream(stdout, stdout_limit))
+    });
+    let stderr_reader = child.stderr.take().map(|stderr| {
+        thread::Builder::new()
+            .name("sun-stderr-reader".to_string())
+            .spawn(move || summarize_bounded_stream(stderr, stderr_limit))
+    });
+    let deadline = Instant::now() + Duration::from_millis(policy.timeout_ms);
+    let mut status = None;
+    let mut timed_out = false;
+    let mut termination_failed = false;
+    let mut wait_failed = false;
+    let mut child_reaped = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(exit_status)) => {
+                status = Some(exit_status);
+                child_reaped = true;
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                wait_failed = true;
+                let (tree_failed, root_termination_started) =
+                    terminate_execution_process_tree(&mut child);
+                termination_failed = tree_failed;
+                if root_termination_started {
+                    match child.wait() {
+                        Ok(exit_status) => {
+                            status = Some(exit_status);
+                            child_reaped = true;
+                        }
+                        Err(_) => wait_failed = true,
+                    }
+                }
+                break;
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            match child.try_wait() {
+                Ok(Some(exit_status)) => {
+                    status = Some(exit_status);
+                    child_reaped = true;
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => wait_failed = true,
+            }
+            timed_out = true;
+            let (tree_failed, root_termination_started) =
+                terminate_execution_process_tree(&mut child);
+            termination_failed = tree_failed;
+            if root_termination_started {
+                match child.wait() {
+                    Ok(exit_status) => {
+                        status = Some(exit_status);
+                        child_reaped = true;
+                    }
+                    Err(_) => wait_failed = true,
+                }
+            } else {
+                wait_failed = true;
+            }
+            break;
+        }
+        thread::sleep((deadline - now).min(Duration::from_millis(10)));
+    }
+    let failed_summary = || BoundedStreamSummary {
+        observed_digest: real_content_hash(&[]),
+        observed_byte_length: 0,
+        captured_byte_length: 0,
+        truncated: false,
+        capture_failed: true,
+    };
+    let streams_closed = child_reaped && !termination_failed;
+    let stdout = if streams_closed {
+        stdout_reader
+            .and_then(Result::ok)
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_else(failed_summary)
+    } else {
+        failed_summary()
+    };
+    let stderr = if streams_closed {
+        stderr_reader
+            .and_then(Result::ok)
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_else(failed_summary)
+    } else {
+        failed_summary()
+    };
+    Ok(BoundedProcessOutput {
+        status,
+        timed_out,
+        termination_failed,
+        wait_failed,
+        stdout,
+        stderr,
+    })
+}
+
 fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Result<(), CliError> {
     let repo_root = PathBuf::from(".");
+    let config = require_repository_config(repo_root.clone())?;
+    let execution_policy = config.execution_policy.clone();
     let projection_policy = require_projection_policy(&repo_root)?;
     let mut state = RealRepoState::load(&repo_root)?;
     let relative_cwd = real_execution_relative_cwd(&options.cwd)?;
@@ -2567,17 +2814,16 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     });
 
     let started_at = real_now_id();
-    let command_output = Command::new(&options.command_argv[0])
-        .args(options.command_argv.iter().skip(1))
-        .current_dir(execution_cwd)
-        .output()
-        .map_err(|error| {
-            CliError::new(
-                "execution_command_failed",
-                format!("failed to run command: {error}"),
-            )
-            .with_detail("command", options.command_argv.join(" "))
-        })?;
+    let command_output =
+        run_bounded_process(&options.command_argv, &execution_cwd, &execution_policy).map_err(
+            |error| {
+                CliError::new(
+                    "execution_command_failed",
+                    format!("failed to run command: {error}"),
+                )
+                .with_detail("command", options.command_argv.join(" "))
+            },
+        )?;
     let finished_at = real_now_id();
     let mut projected_entries = Vec::new();
     let mut quarantine = Vec::new();
@@ -2589,7 +2835,15 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     )?;
     projected_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let outputs = real_execution_outputs(&view_state.entries, &projected_entries);
-    let status = if command_output.status.success() {
+    let status = if command_output.stdout.capture_failed
+        || command_output.stderr.capture_failed
+        || command_output.termination_failed
+        || command_output.wait_failed
+    {
+        "fail"
+    } else if command_output.timed_out {
+        "timeout"
+    } else if command_output.status.is_some_and(|status| status.success()) {
         "pass"
     } else {
         "fail"
@@ -2601,12 +2855,29 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         tree_hash: view_state.tree_hash.clone(),
         command_argv: options.command_argv,
         working_directory: options.cwd,
-        exit_code: command_output.status.code(),
+        exit_code: command_output.status.and_then(|status| status.code()),
         status: status.to_string(),
-        stdout_digest: real_content_hash(&command_output.stdout),
-        stdout_byte_length: command_output.stdout.len() as u64,
-        stderr_digest: real_content_hash(&command_output.stderr),
-        stderr_byte_length: command_output.stderr.len() as u64,
+        timed_out: command_output.timed_out,
+        termination_failed: command_output.termination_failed,
+        wait_failed: command_output.wait_failed,
+        stdout_observed_digest: command_output.stdout.observed_digest,
+        stdout_byte_length: command_output.stdout.observed_byte_length,
+        stdout_captured_byte_length: command_output.stdout.captured_byte_length,
+        stdout_truncated: command_output.stdout.truncated,
+        stdout_capture_failed: command_output.stdout.capture_failed,
+        stderr_observed_digest: command_output.stderr.observed_digest,
+        stderr_byte_length: command_output.stderr.observed_byte_length,
+        stderr_captured_byte_length: command_output.stderr.captured_byte_length,
+        stderr_truncated: command_output.stderr.truncated,
+        stderr_capture_failed: command_output.stderr.capture_failed,
+        timeout_ms: Some(execution_policy.timeout_ms),
+        environment_policy: execution_policy.environment_inheritance,
+        environment_allowlist: execution_environment_allowlist()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        network_policy: execution_policy.network_policy,
+        filesystem_write_policy: "managed_projection_writable_not_isolated".to_string(),
         outputs,
         started_at,
         finished_at,
@@ -4396,13 +4667,15 @@ fn real_execution_record(
             platform_hint: "local".to_string(),
             arch: std::env::consts::ARCH.to_string(),
             sunlight_build_id: "sun-cli".to_string(),
-            command_runner_version: "local_process_v1".to_string(),
+            command_runner_version: "bounded_local_process_v2".to_string(),
             tool_hints: Vec::new(),
-            env_policy: "default_redacted".to_string(),
-            redacted_env_allowlist_digest: "sha256:redacted".to_string(),
+            env_policy: execution.environment_policy.clone(),
+            redacted_env_allowlist_digest: real_content_hash(
+                execution.environment_allowlist.join("\n").as_bytes(),
+            ),
             network_policy: sunlight_core::execution::NetworkPolicy::NotEnforced,
             sandbox_writable_policy:
-                sunlight_core::execution::WritablePolicy::ReadOnlySourcePrivateOutputs,
+                sunlight_core::execution::WritablePolicy::ManagedProjectionWritableNotIsolated,
             digest: format!("sha256:{}", execution.execution_id),
         },
         projection_id: execution.projection_id.clone(),
@@ -4415,13 +4688,13 @@ fn real_execution_record(
         outputs: real_execution_output_summaries(execution),
         promotions: Vec::new(),
         result: sunlight_core::execution::ExecutionResult {
-            status: if execution.status == "pass" {
-                sunlight_core::execution::ExecutionStatus::Pass
-            } else {
-                sunlight_core::execution::ExecutionStatus::Fail
+            status: match execution.status.as_str() {
+                "pass" => sunlight_core::execution::ExecutionStatus::Pass,
+                "timeout" => sunlight_core::execution::ExecutionStatus::Timeout,
+                _ => sunlight_core::execution::ExecutionStatus::Fail,
             },
             exit_code: execution.exit_code,
-            timed_out: false,
+            timed_out: execution.timed_out,
         },
         started_at: execution.started_at.clone(),
         finished_at: execution.finished_at.clone(),
@@ -4441,7 +4714,7 @@ fn real_execution_output_summaries(
             kind: OutputKind::StdoutSummary,
             classification: OutputClassification::Log,
             path: None,
-            digest: execution.stdout_digest.clone(),
+            digest: execution.stdout_observed_digest.clone(),
             byte_length: execution.stdout_byte_length,
             privacy_class: sunlight_core::records::PrivacyClass::LocalOnly,
         },
@@ -4449,7 +4722,7 @@ fn real_execution_output_summaries(
             kind: OutputKind::StderrSummary,
             classification: OutputClassification::Log,
             path: None,
-            digest: execution.stderr_digest.clone(),
+            digest: execution.stderr_observed_digest.clone(),
             byte_length: execution.stderr_byte_length,
             privacy_class: sunlight_core::records::PrivacyClass::LocalOnly,
         },
@@ -4524,9 +4797,52 @@ fn real_execution_snapshot_record_json(
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{{},\"output_files\":[{}],\"raw_output_policy\":\"local_only\",\"source_truth\":\"sunlight_persisted_execution\"}}",
+        "{{{},\"runtime_policy\":{},\"output_capture\":{},\"output_files\":[{}],\"raw_output_policy\":\"not_persisted\",\"source_truth\":\"sunlight_persisted_execution\"}}",
         execution_record_json(&record).trim_start_matches('{').trim_end_matches('}'),
+        real_execution_runtime_policy_json(execution),
+        real_execution_output_capture_json(execution),
         output_paths,
+    )
+}
+
+fn real_execution_runtime_policy_json(execution: &RealExecutionSnapshot) -> String {
+    format!(
+        concat!(
+            "{{\"timeout_ms\":{},",
+            "\"environment\":{{\"inheritance\":\"{}\",\"allowlist\":{},\"values_recorded\":false}},",
+            "\"network\":\"{}\",",
+            "\"filesystem_writes\":\"{}\"}}"
+        ),
+        execution
+            .timeout_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        json_escape(&execution.environment_policy),
+        string_array_json(execution.environment_allowlist.iter().map(String::as_str)),
+        json_escape(&execution.network_policy),
+        json_escape(&execution.filesystem_write_policy),
+    )
+}
+
+fn real_execution_output_capture_json(execution: &RealExecutionSnapshot) -> String {
+    format!(
+        concat!(
+            "{{\"stdout\":{{\"observed_digest\":\"{}\",\"observed_byte_length\":{},\"captured_byte_length\":{},\"truncated\":{},\"capture_failed\":{}}},",
+            "\"stderr\":{{\"observed_digest\":\"{}\",\"observed_byte_length\":{},\"captured_byte_length\":{},\"truncated\":{},\"capture_failed\":{}}},",
+            "\"process_control\":{{\"termination_failed\":{},\"wait_failed\":{}}}}}"
+        ),
+        json_escape(&execution.stdout_observed_digest),
+        execution.stdout_byte_length,
+        execution.stdout_captured_byte_length,
+        execution.stdout_truncated,
+        execution.stdout_capture_failed,
+        json_escape(&execution.stderr_observed_digest),
+        execution.stderr_byte_length,
+        execution.stderr_captured_byte_length,
+        execution.stderr_truncated,
+        execution.stderr_capture_failed,
+        execution.termination_failed,
+        execution.wait_failed,
     )
 }
 
@@ -4618,11 +4934,13 @@ fn real_execution_status_envelope(
             "\"resolved_view_id\":\"{}\",",
             "\"tree_identity\":{},",
             "\"result\":{},",
+            "\"runtime_policy\":{},",
+            "\"output_capture\":{},",
             "\"output_summary_counts\":{},",
             "\"promotion_status\":\"{}\",",
             "\"promotion_candidates\":[{}],",
             "\"promotions\":[{}],",
-            "\"privacy_semantics\":{{\"execution_record\":\"policy_gated\",\"raw_outputs\":\"local_only\",\"promotion_record\":\"policy_gated\",\"durability\":\"persisted_repo_state\"}}",
+            "\"privacy_semantics\":{{\"execution_record\":\"policy_gated\",\"raw_outputs\":\"not_persisted\",\"promotion_record\":\"policy_gated\",\"durability\":\"persisted_repo_state\"}}",
             "}},\"warnings\":[]}}"
         ),
         json_escape(&state.repository_id),
@@ -4635,6 +4953,8 @@ fn real_execution_status_envelope(
         json_escape(&execution.resolved_view_id),
         single_repo_tree_json(&record.tree_identity),
         execution_result_json(&record),
+        real_execution_runtime_policy_json(execution),
+        real_execution_output_capture_json(execution),
         output_summary_counts_json(&record),
         real_execution_promotion_status(state, execution),
         real_execution_promotion_candidates_json(state, execution),
@@ -4663,6 +4983,8 @@ fn real_execution_run_success_envelope(
             "\"projection_id\":\"{}\",",
             "\"tree_identity\":{},",
             "\"result\":{},",
+            "\"runtime_policy\":{},",
+            "\"output_capture\":{},",
             "\"output_summary_counts\":{},",
             "\"promotion_candidates\":[{}]",
             "}},\"warnings\":[]}}"
@@ -4677,6 +4999,8 @@ fn real_execution_run_success_envelope(
         json_escape(&execution.projection_id),
         single_repo_tree_json(&record.tree_identity),
         execution_result_json(&record),
+        real_execution_runtime_policy_json(execution),
+        real_execution_output_capture_json(execution),
         output_summary_counts_json(&record),
         real_execution_promotion_candidates_json(state, execution),
     )
@@ -4696,7 +5020,7 @@ fn real_execution_inspect_envelope(
             "\"promotion_status\":\"{}\",",
             "\"promotion_candidates\":[{}],",
             "\"promotions\":[{}],",
-            "\"privacy_semantics\":{{\"execution_record\":\"policy_gated\",\"raw_outputs\":\"local_only\",\"promotion_record\":\"policy_gated\",\"durability\":\"persisted_repo_state\"}}",
+            "\"privacy_semantics\":{{\"execution_record\":\"policy_gated\",\"raw_outputs\":\"not_persisted\",\"promotion_record\":\"policy_gated\",\"durability\":\"persisted_repo_state\"}}",
             "}},\"warnings\":[]}}"
         ),
         json_escape(&state.repository_id),

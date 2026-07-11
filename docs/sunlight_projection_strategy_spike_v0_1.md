@@ -134,3 +134,32 @@ Decision from this host probe:
 Any future move toward a faster-than-copy default should still keep `copy` as
 the fallback and must include command compatibility plus store-integrity checks.
 
+## Windows-primary production slice
+
+The repo-backed Windows MVP now uses one materializer for `sun project
+materialize`, compatibility projections, and execution projections. It reads
+persisted content blobs, stages beside the requested root, verifies every
+materialized file by content hash, and publishes the root only after the whole
+view succeeds. The mutable Git worktree is not a materialization input.
+
+Automatic selection attempts Windows `FSCTL_DUPLICATE_EXTENTS_TO_FILE` block
+cloning for cluster-aligned extents. A projection is recorded as `reflink` only
+when that API actually clones at least one extent on the destination volume;
+unaligned tails are copied and counted. Windows guarantees isolation between
+files after a successful block clone. Unsupported volumes or views without a
+cloneable extent fall back to an explicit full byte copy. Writable hardlinks
+and unimplemented overlay/copy-up strategies are never selected.
+
+`--strategy <name> --no-copy-fallback` makes the strategy required. An
+unsupported required strategy returns
+`projection_materialization_unsupported_filesystem_strategy`, removes staging,
+and persists neither a projection snapshot nor a success record.
+
+Repo-backed projection JSON and persisted snapshots report selected strategy,
+elapsed milliseconds, logical bytes, bytes directly copied/materialized, file
+count, cache-hit/reuse state, integrity revalidation, and storage amplification.
+`physical_allocation_bytes` is `null`: ordinary Windows allocation counters do
+not identify unique newly allocated blocks when extents are shared. No
+exact-view cache is enabled in this slice; reuse is reported as `created` and
+`cache_hit` is false.
+

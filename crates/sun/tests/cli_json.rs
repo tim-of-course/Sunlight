@@ -928,6 +928,13 @@ fn no_fixture_custom_managed_root_drives_compat_and_execution_projections() {
     let (projection_id, compatibility_root, _) =
         create_real_compat_projection_at(&repo, ".sunlight/custom-managed");
     assert!(compatibility_root.join("README.md").is_file());
+    let compat_status = sun()
+        .args(["status", "--projection", &projection_id, "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&compat_status);
+    assert!(stdout(&compat_status).contains("\"materialization\":{"));
     let diff = real_compat_diff(&repo, &projection_id);
     assert!(diff.contains("\"candidate_counts\":"));
 
@@ -945,6 +952,7 @@ fn no_fixture_custom_managed_root_drives_compat_and_execution_projections() {
         .expect("sun run should run");
     assert_success(&run);
     let run_stdout = stdout(&run);
+    assert!(run_stdout.contains("\"materialization\":{"));
     let execution_id = json_string_field(&run_stdout, "execution_id");
     let execution_projection_id = json_string_field(&run_stdout, "projection_id");
     let execution_root = repo
@@ -1013,6 +1021,184 @@ fn no_fixture_custom_managed_root_drives_compat_and_execution_projections() {
     assert_success(&execution_inspect);
     assert_valid_json(&stdout(&execution_inspect));
     assert!(stdout(&execution_inspect).contains("custom-managed"));
+}
+
+#[test]
+fn no_fixture_forced_copy_reports_truthful_metrics_and_isolates_store_mutation() {
+    let repo = TestRepo::new("projection-forced-copy-metrics");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "projection-copy");
+    let root = repo.path().join("forced-copy-root");
+    let output = sun()
+        .args([
+            "project",
+            "materialize",
+            "--view",
+            "view_base_0001",
+            "--purpose",
+            "inspection",
+            "--strategy",
+            "copy",
+            "--no-copy-fallback",
+            "--projection-root",
+        ])
+        .arg(&root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let body = stdout(&output);
+    assert_valid_json(&body);
+    assert!(body.contains("\"selected_strategy\":\"copy\""));
+    assert!(body.contains("\"logical_bytes\":5"));
+    assert!(body.contains("\"physically_materialized_bytes\":5"));
+    assert!(body.contains("\"physical_allocation_bytes\":null"));
+    assert!(body.contains("\"file_count\":1"));
+    assert!(body.contains("\"cache_hit\":false"));
+    assert!(body.contains("\"reuse\":\"created\""));
+    assert!(body.contains("\"integrity_revalidated\":true"));
+    assert!(body.contains("\"storage_amplification\":1.000000"));
+
+    fs::write(root.join("base.txt"), "projection mutation\n").unwrap();
+    let digest = format!("{:x}", Sha256::digest(b"base\n"));
+    assert_eq!(
+        fs::read(
+            repo.path()
+                .join(".sunlight/objects/blobs/sha256")
+                .join(digest)
+        )
+        .unwrap(),
+        b"base\n"
+    );
+
+    let projection_id = json_string_field(&body, "projection_id");
+    for output in [
+        sun()
+            .args(["status", "--projection", &projection_id, "--json"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap(),
+        sun()
+            .arg("inspect")
+            .arg(format!("projection:{projection_id}"))
+            .arg("--json")
+            .current_dir(repo.path())
+            .output()
+            .unwrap(),
+    ] {
+        assert_success(&output);
+        let persisted = stdout(&output);
+        assert!(persisted.contains("\"strategy\":\"copy\""));
+        assert!(persisted.contains("\"logical_bytes\":5"));
+    }
+}
+
+#[test]
+fn no_fixture_unsupported_strategy_falls_back_or_fails_atomically_when_required() {
+    let repo = TestRepo::new("projection-strategy-fallback-atomic");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "projection-fallback");
+
+    let fallback_root = repo.path().join("fallback-root");
+    let fallback = sun()
+        .args([
+            "project",
+            "materialize",
+            "--view",
+            "view_base_0001",
+            "--purpose",
+            "inspection",
+            "--strategy",
+            "hardlink_readonly",
+            "--projection-root",
+        ])
+        .arg(&fallback_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&fallback);
+    assert!(stdout(&fallback).contains("\"selected_strategy\":\"copy\""));
+
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let state_before = fs::read(&state_path).unwrap();
+    let required_root = repo.path().join("required-unsupported-root");
+    let required = sun()
+        .args([
+            "project",
+            "materialize",
+            "--view",
+            "view_base_0001",
+            "--purpose",
+            "inspection",
+            "--strategy",
+            "hardlink_readonly",
+            "--no-copy-fallback",
+            "--projection-root",
+        ])
+        .arg(&required_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_failure(&required);
+    let error = stdout(&required);
+    assert_valid_json(&error);
+    assert!(
+        error.contains("\"code\":\"projection_materialization_unsupported_filesystem_strategy\"")
+    );
+    assert!(error.contains("\"strategy\":\"hardlink_readonly\""));
+    assert!(!required_root.exists());
+    assert_eq!(fs::read(state_path).unwrap(), state_before);
+    assert!(!repo
+        .path()
+        .join(".sunlight/projections/projection_inspection_native_0002.json")
+        .exists());
+}
+
+#[test]
+fn no_fixture_automatic_strategy_reports_real_volume_result_without_assuming_cow() {
+    let repo = TestRepo::new("projection-auto-capability");
+    init_local_git_repo(&repo);
+    repo.write_file("aligned.bin", &"x".repeat(8192));
+    git(repo.path(), &["add", "aligned.bin"]);
+    git(repo.path(), &["commit", "-m", "aligned extent"]);
+    start_native_session(&repo, "projection-auto");
+    let root = repo.path().join("automatic-root");
+    let output = sun()
+        .args([
+            "project",
+            "materialize",
+            "--view",
+            "view_base_0001",
+            "--purpose",
+            "inspection",
+            "--projection-root",
+        ])
+        .arg(&root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let body = stdout(&output);
+    assert_valid_json(&body);
+    let strategy = json_string_field(&body, "selected_strategy");
+    assert!(
+        strategy == "copy" || strategy == "reflink",
+        "unexpected strategy: {strategy}"
+    );
+    if strategy == "reflink" {
+        assert!(!body.contains("\"physically_materialized_bytes\":8197"));
+    } else {
+        assert!(body.contains("\"physically_materialized_bytes\":8197"));
+    }
+    fs::write(root.join("aligned.bin"), "private write").unwrap();
+    assert_eq!(
+        fs::read_to_string(repo.path().join("aligned.bin")).unwrap(),
+        "x".repeat(8192)
+    );
 }
 
 #[test]

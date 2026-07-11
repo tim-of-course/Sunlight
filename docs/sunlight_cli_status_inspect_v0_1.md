@@ -206,6 +206,14 @@ Required rules:
 
 Projection materialization must persist a local-only projection manifest before status or inspect can turn local root verification from scan summaries into content verification. The manifest is derived from native source records at materialization time, not from a later filesystem scan.
 
+For repo-backed projections, the persisted projection snapshot also exposes a
+`materialization` object through projection status/inspect and through embedded
+execution projection records. Its strategy and metrics describe the completed
+staged materialization. `physical_allocation_bytes: null` means unique physical
+allocation is not knowable; it must not be replaced with apparent file length.
+`cache_hit: false` and `reuse: "created"` explicitly mean no reusable exact-view
+cache participated.
+
 ```json
 {
   "schema_version": 1,

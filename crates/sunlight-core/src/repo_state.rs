@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -146,10 +147,55 @@ pub struct RealProjectionSnapshot {
     pub path_policy_id: String,
     pub operation_semantics_version: String,
     pub strategy: String,
+    pub materialization: Option<RealProjectionMaterializationMetrics>,
     pub retention_state: String,
     pub privacy_class: String,
     pub last_import_operation_id: Option<String>,
     pub entries: Vec<RealArtifactEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealProjectionMaterializationMetrics {
+    pub elapsed_ms: u64,
+    pub logical_bytes: u64,
+    pub physically_materialized_bytes: Option<u64>,
+    pub physical_allocation_bytes: Option<u64>,
+    pub file_count: u64,
+    pub cache_hit: bool,
+    pub reuse: String,
+    pub integrity_revalidated: bool,
+    pub storage_amplification_millionths: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealProjectionStrategy {
+    Copy,
+    Reflink,
+    HardlinkReadonly,
+    OverlayCopyup,
+}
+
+impl RealProjectionStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Reflink => "reflink",
+            Self::HardlinkReadonly => "hardlink_readonly",
+            Self::OverlayCopyup => "overlay_copyup",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealProjectionMaterializationRequest {
+    pub required_strategy: Option<RealProjectionStrategy>,
+    pub fallback_to_copy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealProjectionMaterialization {
+    pub strategy: RealProjectionStrategy,
+    pub metrics: RealProjectionMaterializationMetrics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,10 +294,23 @@ pub struct RealQuarantineEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoStateError {
-    NotInitialized { path: PathBuf },
-    InvalidState { path: PathBuf, message: String },
-    Io { path: PathBuf, message: String },
+    NotInitialized {
+        path: PathBuf,
+    },
+    InvalidState {
+        path: PathBuf,
+        message: String,
+    },
+    Io {
+        path: PathBuf,
+        message: String,
+    },
     Json(String),
+    ProjectionStrategyUnsupported {
+        strategy: String,
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 impl Display for RepoStateError {
@@ -273,6 +332,15 @@ impl Display for RepoStateError {
             }
             Self::Io { path, message } => write!(f, "{message}: {}", path.display()),
             Self::Json(message) => write!(f, "invalid Sunlight repository state JSON: {message}"),
+            Self::ProjectionStrategyUnsupported {
+                strategy,
+                path,
+                reason,
+            } => write!(
+                f,
+                "projection strategy `{strategy}` is unsupported at {}: {reason}",
+                path.display()
+            ),
         }
     }
 }
@@ -1319,6 +1387,105 @@ pub fn real_artifact_id_for_path(path: &str) -> String {
 }
 
 pub fn materialize_real_files(state: &RealRepoState, root: &Path) -> Result<(), RepoStateError> {
+    materialize_real_projection(
+        Path::new("."),
+        state,
+        root,
+        &RealProjectionMaterializationRequest {
+            required_strategy: Some(RealProjectionStrategy::Copy),
+            fallback_to_copy: false,
+        },
+    )?;
+    Ok(())
+}
+
+pub fn materialize_real_projection(
+    repo_root: &Path,
+    state: &RealRepoState,
+    root: &Path,
+    request: &RealProjectionMaterializationRequest,
+) -> Result<RealProjectionMaterialization, RepoStateError> {
+    validate_real_projection_root(state, root)?;
+    let started = Instant::now();
+    let preferred = request
+        .required_strategy
+        .unwrap_or(RealProjectionStrategy::Reflink);
+    let strategies = if preferred == RealProjectionStrategy::Copy {
+        vec![RealProjectionStrategy::Copy]
+    } else if request.fallback_to_copy {
+        vec![preferred, RealProjectionStrategy::Copy]
+    } else {
+        vec![preferred]
+    };
+    let mut unsupported_reason = None;
+    for strategy in strategies {
+        let staging = projection_staging_path(root);
+        cleanup_projection_staging(&staging);
+        fs::create_dir_all(&staging).map_err(|error| {
+            io_error(&staging, "failed to create projection staging root", error)
+        })?;
+        let result = materialize_real_projection_strategy(repo_root, state, &staging, strategy);
+        match result {
+            Ok(attempt) => {
+                if let Err(error) = publish_projection_staging(root, &staging) {
+                    cleanup_projection_staging(&staging);
+                    return Err(error);
+                }
+                let logical_bytes = state
+                    .entries
+                    .iter()
+                    .filter(|entry| !entry.tombstone)
+                    .map(|entry| entry.bytes.len() as u64)
+                    .sum::<u64>();
+                let file_count = state
+                    .entries
+                    .iter()
+                    .filter(|entry| !entry.tombstone)
+                    .count() as u64;
+                let physically_materialized_bytes = match strategy {
+                    RealProjectionStrategy::Copy => Some(logical_bytes),
+                    RealProjectionStrategy::Reflink => Some(attempt.bytes_copied),
+                    _ => None,
+                };
+                return Ok(RealProjectionMaterialization {
+                    strategy,
+                    metrics: RealProjectionMaterializationMetrics {
+                        elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        logical_bytes,
+                        physically_materialized_bytes,
+                        physical_allocation_bytes: None,
+                        file_count,
+                        cache_hit: false,
+                        reuse: "created".to_string(),
+                        integrity_revalidated: true,
+                        storage_amplification_millionths: if logical_bytes == 0 {
+                            None
+                        } else {
+                            physically_materialized_bytes
+                                .map(|bytes| bytes.saturating_mul(1_000_000) / logical_bytes)
+                        },
+                    },
+                });
+            }
+            Err(StrategyAttemptError::Unsupported(reason)) => {
+                cleanup_projection_staging(&staging);
+                unsupported_reason = Some(reason);
+            }
+            Err(StrategyAttemptError::State(error)) => {
+                cleanup_projection_staging(&staging);
+                return Err(error);
+            }
+        }
+    }
+    Err(RepoStateError::ProjectionStrategyUnsupported {
+        strategy: preferred.as_str().to_string(),
+        path: root.to_path_buf(),
+        reason: unsupported_reason
+            .unwrap_or_else(|| "no safe implementation is available".to_string()),
+    })
+}
+
+fn validate_real_projection_root(state: &RealRepoState, root: &Path) -> Result<(), RepoStateError> {
     let path_policy = PathPolicy::posix_case_sensitive();
     for entry in state.entries.iter().filter(|entry| !entry.tombstone) {
         path_policy
@@ -1362,20 +1529,268 @@ pub fn materialize_real_files(state: &RealRepoState, root: &Path) -> Result<(), 
             message: "projection root must be an empty directory or a creatable path".to_string(),
         });
     }
-    fs::create_dir_all(root)
-        .map_err(|error| io_error(root, "failed to create projection root", error))?;
+    Ok(())
+}
+
+enum StrategyAttemptError {
+    Unsupported(String),
+    State(RepoStateError),
+}
+
+struct StrategyAttemptMetrics {
+    bytes_copied: u64,
+}
+
+fn materialize_real_projection_strategy(
+    repo_root: &Path,
+    state: &RealRepoState,
+    root: &Path,
+    strategy: RealProjectionStrategy,
+) -> Result<StrategyAttemptMetrics, StrategyAttemptError> {
+    if matches!(
+        strategy,
+        RealProjectionStrategy::HardlinkReadonly | RealProjectionStrategy::OverlayCopyup
+    ) {
+        return Err(StrategyAttemptError::Unsupported(
+            "the writable local MVP has no safe hardlink/copy-up or overlay implementation"
+                .to_string(),
+        ));
+    }
+    let mut bytes_copied = 0u64;
+    let mut bytes_cloned = 0u64;
     for entry in state.entries.iter().filter(|entry| !entry.tombstone) {
         let path = root.join(&entry.path);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
-                io_error(parent, "failed to create projection directory", error)
+                StrategyAttemptError::State(io_error(
+                    parent,
+                    "failed to create projection directory",
+                    error,
+                ))
             })?;
         }
-        fs::write(&path, &entry.bytes)
-            .map_err(|error| io_error(&path, "failed to write projection file", error))?;
-        set_projection_executable(&path, entry.executable)?;
+        match strategy {
+            RealProjectionStrategy::Copy => {
+                fs::write(&path, &entry.bytes).map_err(|error| {
+                    StrategyAttemptError::State(io_error(
+                        &path,
+                        "failed to write full-copy projection file",
+                        error,
+                    ))
+                })?;
+                bytes_copied = bytes_copied.saturating_add(entry.bytes.len() as u64);
+            }
+            RealProjectionStrategy::Reflink => {
+                let cloned = clone_file_cow(
+                    &real_blob_path(repo_root, &entry.content_hash),
+                    &path,
+                    entry.bytes.len() as u64,
+                )
+                .map_err(StrategyAttemptError::Unsupported)?;
+                bytes_cloned = bytes_cloned.saturating_add(cloned);
+                bytes_copied = bytes_copied.saturating_add(entry.bytes.len() as u64 - cloned);
+            }
+            _ => unreachable!(),
+        }
+        set_projection_executable(&path, entry.executable).map_err(StrategyAttemptError::State)?;
+        let materialized = fs::read(&path).map_err(|error| {
+            StrategyAttemptError::State(io_error(&path, "failed to verify projection file", error))
+        })?;
+        if real_content_hash(&materialized) != entry.content_hash {
+            return Err(StrategyAttemptError::State(RepoStateError::InvalidState {
+                path,
+                message: "materialized projection content failed integrity verification"
+                    .to_string(),
+            }));
+        }
     }
-    Ok(())
+    if strategy == RealProjectionStrategy::Reflink && bytes_cloned == 0 {
+        return Err(StrategyAttemptError::Unsupported(
+            "the view has no cluster-aligned extent that the volume can block-clone".to_string(),
+        ));
+    }
+    Ok(StrategyAttemptMetrics { bytes_copied })
+}
+
+fn projection_staging_path(root: &Path) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("projection");
+    root.with_file_name(format!(
+        ".{name}.sunlight-staging-{}-{nonce}",
+        std::process::id()
+    ))
+}
+
+fn cleanup_projection_staging(path: &Path) {
+    if path.is_dir() {
+        let _ = fs::remove_dir_all(path);
+    } else if path.exists() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn publish_projection_staging(root: &Path, staging: &Path) -> Result<(), RepoStateError> {
+    if let Some(parent) = root.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| io_error(parent, "failed to create projection parent", error))?;
+    }
+    if root.exists() {
+        fs::remove_dir(root)
+            .map_err(|error| io_error(root, "failed to replace empty projection root", error))?;
+    }
+    fs::rename(staging, root)
+        .map_err(|error| io_error(root, "failed to publish projection atomically", error))
+}
+
+#[cfg(windows)]
+fn clone_file_cow(source: &Path, destination: &Path, length: u64) -> Result<u64, String> {
+    use std::ffi::c_void;
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct DuplicateExtentsData {
+        file_handle: *mut c_void,
+        source_file_offset: i64,
+        target_file_offset: i64,
+        byte_count: i64,
+    }
+    extern "system" {
+        fn DeviceIoControl(
+            device: *mut c_void,
+            control_code: u32,
+            input: *mut c_void,
+            input_size: u32,
+            output: *mut c_void,
+            output_size: u32,
+            bytes_returned: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+        fn GetDiskFreeSpaceW(
+            root_path: *const u16,
+            sectors_per_cluster: *mut u32,
+            bytes_per_sector: *mut u32,
+            free_clusters: *mut u32,
+            total_clusters: *mut u32,
+        ) -> i32;
+        fn GetVolumePathNameW(
+            file_name: *const u16,
+            volume_path_name: *mut u16,
+            buffer_length: u32,
+        ) -> i32;
+    }
+    const FSCTL_DUPLICATE_EXTENTS_TO_FILE: u32 = 0x0009_8344;
+
+    let mut source_file = OpenOptions::new()
+        .read(true)
+        .open(source)
+        .map_err(|error| format!("failed to open immutable blob for block clone: {error}"))?;
+    let mut destination_file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(destination)
+        .map_err(|error| format!("failed to create block-clone destination: {error}"))?;
+    destination_file
+        .set_len(length)
+        .map_err(|error| format!("failed to size block-clone destination: {error}"))?;
+    if length == 0 {
+        return Ok(0);
+    }
+    let mut file_path = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    file_path.push(0);
+    let mut root_path = vec![0u16; 32_768];
+    let volume_ok = unsafe {
+        GetVolumePathNameW(
+            file_path.as_ptr(),
+            root_path.as_mut_ptr(),
+            root_path.len() as u32,
+        )
+    };
+    if volume_ok == 0 {
+        return Err(format!(
+            "failed to resolve Windows block-clone volume: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let (mut sectors, mut bytes_per_sector, mut free, mut total) = (0, 0, 0, 0);
+    let disk_ok = unsafe {
+        GetDiskFreeSpaceW(
+            root_path.as_ptr(),
+            &mut sectors,
+            &mut bytes_per_sector,
+            &mut free,
+            &mut total,
+        )
+    };
+    if disk_ok == 0 || sectors == 0 || bytes_per_sector == 0 {
+        return Err(format!(
+            "failed to determine Windows volume cluster size: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let cluster = u64::from(sectors) * u64::from(bytes_per_sector);
+    let clone_length = length / cluster * cluster;
+    let max_chunk = ((4u64 * 1024 * 1024 * 1024) - cluster) / cluster * cluster;
+    let mut offset = 0u64;
+    while offset < clone_length {
+        let chunk = (clone_length - offset).min(max_chunk);
+        let mut input = DuplicateExtentsData {
+            file_handle: source_file.as_raw_handle(),
+            source_file_offset: offset as i64,
+            target_file_offset: offset as i64,
+            byte_count: chunk as i64,
+        };
+        let mut returned = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                destination_file.as_raw_handle(),
+                FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+                (&mut input as *mut DuplicateExtentsData).cast(),
+                std::mem::size_of::<DuplicateExtentsData>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(format!(
+                "Windows block cloning is unavailable: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        offset += chunk;
+    }
+    if clone_length < length {
+        source_file
+            .seek(SeekFrom::Start(clone_length))
+            .map_err(|error| format!("failed to seek block-clone source tail: {error}"))?;
+        destination_file
+            .seek(SeekFrom::Start(clone_length))
+            .map_err(|error| format!("failed to seek block-clone destination tail: {error}"))?;
+        let mut tail = Vec::with_capacity((length - clone_length) as usize);
+        source_file
+            .read_to_end(&mut tail)
+            .map_err(|error| format!("failed to read block-clone source tail: {error}"))?;
+        destination_file
+            .write_all(&tail)
+            .map_err(|error| format!("failed to write block-clone destination tail: {error}"))?;
+    }
+    Ok(clone_length)
+}
+
+#[cfg(not(windows))]
+fn clone_file_cow(_source: &Path, _destination: &Path, _length: u64) -> Result<u64, String> {
+    Err("this build has no platform COW clone implementation".to_string())
 }
 
 #[cfg(unix)]
@@ -1627,6 +2042,7 @@ fn parse_projection_snapshot(
         .unwrap_or_else(|| FILE_OPERATION_SEMANTICS_VERSION.to_string()),
         strategy: optional_string(object, "strategy", state_path)?
             .unwrap_or_else(|| "copy".to_string()),
+        materialization: parse_projection_materialization_metrics(object, state_path)?,
         retention_state: optional_string(object, "retention_state", state_path)?
             .unwrap_or_else(|| "active".to_string()),
         privacy_class: optional_string(object, "privacy_class", state_path)?
@@ -1634,6 +2050,40 @@ fn parse_projection_snapshot(
         last_import_operation_id: optional_string(object, "last_import_operation_id", state_path)?,
         entries,
     })
+}
+
+fn parse_projection_materialization_metrics(
+    object: &std::collections::BTreeMap<String, JsonValue>,
+    state_path: &Path,
+) -> Result<Option<RealProjectionMaterializationMetrics>, RepoStateError> {
+    let Some(value) = object.get("materialization") else {
+        return Ok(None);
+    };
+    let JsonValue::Object(metrics) = value else {
+        return Err(invalid_state(
+            state_path,
+            "projection materialization must be an object",
+        ));
+    };
+    Ok(Some(RealProjectionMaterializationMetrics {
+        elapsed_ms: required_u64(metrics, "elapsed_ms", state_path)?,
+        logical_bytes: required_u64(metrics, "logical_bytes", state_path)?,
+        physically_materialized_bytes: optional_u64(
+            metrics,
+            "physically_materialized_bytes",
+            state_path,
+        )?,
+        physical_allocation_bytes: optional_u64(metrics, "physical_allocation_bytes", state_path)?,
+        file_count: required_u64(metrics, "file_count", state_path)?,
+        cache_hit: required_bool(metrics, "cache_hit", state_path)?,
+        reuse: required_string(metrics, "reuse", state_path)?,
+        integrity_revalidated: required_bool(metrics, "integrity_revalidated", state_path)?,
+        storage_amplification_millionths: optional_u64(
+            metrics,
+            "storage_amplification_millionths",
+            state_path,
+        )?,
+    }))
 }
 
 fn parse_execution_snapshot(
@@ -1916,6 +2366,14 @@ fn projection_snapshot_json(projection: &RealProjectionSnapshot) -> JsonValue {
         JsonValue::String(projection.strategy.clone()),
     );
     object.insert(
+        "materialization".to_string(),
+        projection
+            .materialization
+            .as_ref()
+            .map(projection_materialization_metrics_json)
+            .unwrap_or(JsonValue::Null),
+    );
+    object.insert(
         "retention_state".to_string(),
         JsonValue::String(projection.retention_state.clone()),
     );
@@ -1930,6 +2388,55 @@ fn projection_snapshot_json(projection: &RealProjectionSnapshot) -> JsonValue {
     object.insert(
         "entries".to_string(),
         JsonValue::Array(projection.entries.iter().map(entry_json).collect()),
+    );
+    JsonValue::Object(object)
+}
+
+fn projection_materialization_metrics_json(
+    metrics: &RealProjectionMaterializationMetrics,
+) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "elapsed_ms".to_string(),
+        JsonValue::Number(metrics.elapsed_ms.to_string()),
+    );
+    object.insert(
+        "logical_bytes".to_string(),
+        JsonValue::Number(metrics.logical_bytes.to_string()),
+    );
+    object.insert(
+        "physically_materialized_bytes".to_string(),
+        metrics
+            .physically_materialized_bytes
+            .map(|value| JsonValue::Number(value.to_string()))
+            .unwrap_or(JsonValue::Null),
+    );
+    object.insert(
+        "physical_allocation_bytes".to_string(),
+        metrics
+            .physical_allocation_bytes
+            .map(|value| JsonValue::Number(value.to_string()))
+            .unwrap_or(JsonValue::Null),
+    );
+    object.insert(
+        "file_count".to_string(),
+        JsonValue::Number(metrics.file_count.to_string()),
+    );
+    object.insert("cache_hit".to_string(), JsonValue::Bool(metrics.cache_hit));
+    object.insert(
+        "reuse".to_string(),
+        JsonValue::String(metrics.reuse.clone()),
+    );
+    object.insert(
+        "integrity_revalidated".to_string(),
+        JsonValue::Bool(metrics.integrity_revalidated),
+    );
+    object.insert(
+        "storage_amplification_millionths".to_string(),
+        metrics
+            .storage_amplification_millionths
+            .map(|value| JsonValue::Number(value.to_string()))
+            .unwrap_or(JsonValue::Null),
     );
     JsonValue::Object(object)
 }

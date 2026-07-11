@@ -2357,6 +2357,7 @@ mod tests {
                 path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
                 operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
                 strategy: "copy".to_string(),
+                materialization: None,
                 retention_state: "active".to_string(),
                 privacy_class: "local_only".to_string(),
                 last_import_operation_id: None,

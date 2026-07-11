@@ -779,6 +779,10 @@ pub fn resolve_real_repo_view(
             .records
             .extend(expanded_same_artifact_conflicts(state, &result));
     }
+    if !result.records.is_empty() {
+        result.tree_identity = None;
+        result.tree_entries.clear();
+    }
     let entries = if result.records.is_empty() {
         materialize_real_resolved_entries(state, &result.resolver_order)
     } else {
@@ -2964,6 +2968,33 @@ mod tests {
             vec!["op_alt_code_0001", "op_code_0001"]
         );
         assert_eq!(conflict.path_refs[0].path, "src/lib.rs");
+
+        let followup = artifact_entry("src/followup.rs", b"pub fn followup() {}\n");
+        state.base_entries.push(followup.clone());
+        state.entries.push(followup.clone());
+        state.operations.push(operation(
+            "op_code_0002",
+            "topic_code",
+            "rev_code_0002",
+            &followup,
+            b"pub fn followup() { println!(\"done\"); }\n",
+        ));
+        let code_topic = state
+            .topics
+            .iter_mut()
+            .find(|topic| topic.topic_id == "topic_code")
+            .unwrap();
+        code_topic.head_revision_id = Some("rev_code_0002".to_string());
+        code_topic.revision_number = 2;
+
+        let expanded_conflict = state.resolve_head_view();
+        assert!(!expanded_conflict.result.conflict_free());
+        assert!(expanded_conflict.result.tree_identity.is_none());
+        assert!(expanded_conflict.result.tree_entries.is_empty());
+        assert_eq!(
+            expanded_conflict.result.conflicts().next().unwrap().id,
+            "conflict_src_lib_rs_0001"
+        );
     }
 
     fn artifact_entry(path: &str, bytes: &[u8]) -> RealArtifactEntry {

@@ -4008,14 +4008,19 @@ fn apply_real_patch(before: &str, patch: &str) -> Result<(String, usize), CliErr
     let mut removed = Vec::new();
     let mut added = Vec::new();
     let mut hunk_count = 0;
+    let line_ending = if before.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     for line in patch.lines() {
         if line.starts_with("@@") {
             hunk_count += 1;
         } else if line.starts_with("---") || line.starts_with("+++") || line.starts_with("diff ") {
         } else if let Some(rest) = line.strip_prefix('-') {
-            removed.push(format!("{rest}\n"));
+            removed.push(format!("{rest}{line_ending}"));
         } else if let Some(rest) = line.strip_prefix('+') {
-            added.push(format!("{rest}\n"));
+            added.push(format!("{rest}{line_ending}"));
         }
     }
     let before_block = removed.concat();

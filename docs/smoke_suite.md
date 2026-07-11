@@ -56,3 +56,12 @@ Use an individual smoke script when iterating on the covered behavior and the
 Cargo gates have already passed. For validation-plan changes, the aggregate
 suite is the canonical handoff because it includes the validation smoke plus the
 format, check, test, projection strategy, and MVP coverage.
+
+Run the production-like self-hosting acceptance journey by itself with:
+
+```powershell
+cargo test -p sun --test self_hosting
+```
+
+This test uses the built `sun` binary and an isolated local Git clone of this
+repository; it does not require network access or fixture data.

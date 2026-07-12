@@ -35,7 +35,7 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - Current implementation reality: fixture prototype plus a substantial repo-backed product path with durable authoring/resolution/projection/execution/checkpoint/export/policy/compatibility features and a no-fixture self-hosting acceptance harness against Sunlight itself; still not the full v0.3 product.
 - Rename-plus-edit remains unresolved because compatibility projections expose no reliable identity signal; fuzzy inference is intentionally excluded.
 - Execution network, filesystem-write, CPU, and memory isolation remain explicitly unenforced; records report these limitations.
-- Main product gaps: reusable/cross-platform projection scaling, remaining execution isolation, durable session refresh/recovery guardrails, and shared daemon/MCP workflows.
+- Main product gaps: atomic repository recovery/multi-record durability, reusable cross-platform projection scaling, remaining execution isolation, and shared daemon/MCP workflows.
 
 ## Workstreams
 
@@ -71,12 +71,13 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | self-hosting-production-acceptance | Windows Codex CLI | Windows commit `d1e1d3f` | Completed | Run no-fixture Sunlight end to end against a temporary Git clone of its own real repository. | Structural 50+ file journey covers native authoring/conflicts/projection/compat/execution/policy/export; repeated harness and full suite passed. |
 | repo-backed-operator-ergonomics | Windows Codex CLI cell `104` | Windows commit `7b6dd3a` | Completed | Make help/status/human output truthful and useful for no-fixture operators. | Primary help is repo-backed; operational summary/warnings and human inspect/status cover real lifecycle state; focused/self-hosting/full tests, formatting, and diff checks passed. |
 | repo-backed-projection-scalability | Windows Codex CLI cell `123` | Windows commit `0e5f90a` | Completed | Replace hard-coded real full-copy projection paths with truthful strategy selection, safe Windows COW capability handling, and measured materialization. | Shared staged materializer uses genuine Windows block cloning when supported and explicit copy fallback; focused/self-hosting/full tests passed. Current NTFS host verified fallback/atomicity; cache reuse and non-Windows COW remain open. |
-| repo-backed-session-refresh | Windows Codex CLI cells `139`, correction `146` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Manager correction active 2026-07-11 | Add durable explicit session refresh policies, exact frontiers, monotonic generations, and conflict-safe rollback. | Initial slice passed its tests, but review found generation IDs collide when one actor owns multiple sessions. Correction must centralize per-session identity, add a real regression test, and align success publication order before manager verification/commit. |
+| repo-backed-session-refresh | Windows Codex CLI cells `139`, correction `146` | Windows commit `e6b2d6d` | Completed | Add durable explicit session refresh policies, exact frontiers, monotonic generations, and conflict-safe rollback. | Manual/follow/none, exact frontiers, blocked rollback, migration, and same-actor multi-session lineages verified; focused/self-hosting/full tests passed after manager correction. |
+| repo-backed-atomic-recovery | Windows Codex CLI cell `155` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active 2026-07-11 | Add Windows-correct atomic state/record publication, interrupted-write recovery, and derivable generation-record reconciliation. | At next heartbeat audit replace/flush semantics, journal selection, failpoint coverage, evidence retention, and residual multi-record risk; run focused/self-hosting/full tests and diff checks. |
 
 ## Delegation Queue
 
-1. Implement durable repo-backed session refresh and exact frontier preservation.
-2. Address remaining execution isolation, projection cache/cross-platform scaling, recovery, and live daemon/MCP workflow gaps.
+1. Implement atomic native-state/record publication and deterministic interrupted-write recovery.
+2. Address remaining execution isolation, projection cache/cross-platform scaling, and live daemon/MCP workflow gaps.
 3. Keep fixture tests only when they directly support removing fixture dependency.
 
 

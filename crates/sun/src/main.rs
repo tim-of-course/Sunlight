@@ -7,6 +7,7 @@ use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod mcp;
 #[cfg(windows)]
 mod windows_job;
 
@@ -114,6 +115,15 @@ const FIXTURE_STALE_COMPATIBILITY_PROJECTION_ID: &str =
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("mcp") {
+        return match mcp::serve_from_args(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("sun mcp: {message}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let json = args.iter().any(|arg| arg == "--json");
 
     match run(args) {
@@ -15686,6 +15696,7 @@ Usage:
   sun git export --checkpoint <checkpoint> --branch <ref> [--execute-local] [--json]
   sun status [--topic|--session|--view|--projection|--execution|--checkpoint|--export <id>] [--json]
   sun inspect <typed-selector> [--json]
+  sun mcp serve --repo <initialized-repo>
 
 Commands:
   init       Ingest the repository into persisted Sunlight native state
@@ -15705,6 +15716,7 @@ Commands:
   git        Export a checkpoint to ordinary Git history
   status     Summarize repository health and object lifecycle state
   inspect    Inspect a persisted object using a typed selector
+  mcp        Serve repository-confined MCP JSON-RPC 2.0 tools over local stdio
 
 Typical journey:
   sun init
@@ -15739,6 +15751,7 @@ fn print_command_help(command: &str) {
         "view" | "view resolve" => println!("sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nResolves persisted topic selections; conflicts and staleness remain inspectable records."),
         "project" | "project materialize" | "projection" | "projection create" => println!("sun project materialize\n\nUsage:\n  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export [--strategy copy|reflink|hardlink_readonly|overlay_copyup] [--no-copy-fallback] [--projection-root <path>] [--json]\n\nManaged projections adapt persisted views for filesystem tools and are not source truth. Automatic selection prefers safe Windows block cloning and falls back to full copy; --no-copy-fallback makes the requested strategy required."),
         "execution" | "execution promote-output" => println!("sun execution promote-output\n\nUsage:\n  sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> [--json]"),
+        "mcp" | "mcp serve" => println!("sun mcp serve\n\nUsage:\n  sun mcp serve --repo <initialized-repo>\n\nRuns MCP JSON-RPC 2.0 over newline-delimited stdio. The server is bound to one canonical initialized repository; stdout contains protocol messages only."),
         _ => print_help(),
     }
 }

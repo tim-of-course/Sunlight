@@ -9,5 +9,6 @@ name = "sun"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = "1.0"
 sha2 = "0.10"
 sunlight-core = { path = "../sunlight-core" }

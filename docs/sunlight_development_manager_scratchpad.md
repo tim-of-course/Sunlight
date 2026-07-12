@@ -34,8 +34,8 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - Critical handoff correction: previous fixture-backed acceptance is not product completion.
 - Current implementation reality: fixture prototype plus a substantial repo-backed product path with durable authoring/resolution/projection/execution/checkpoint/export/policy/compatibility features and a no-fixture self-hosting acceptance harness against Sunlight itself; still not the full v0.3 product.
 - Rename-plus-edit remains unresolved because compatibility projections expose no reliable identity signal; fuzzy inference is intentionally excluded.
-- Execution network, filesystem-write, CPU, and memory isolation remain explicitly unenforced; records report these limitations.
-- Main product gaps: network/filesystem and resource execution isolation, reusable cross-platform projection scaling, and shared daemon/MCP workflows.
+- Windows executions enforce process-tree, CPU, memory, and process-count limits with Job Objects; network and broad filesystem-write isolation remain explicitly unenforced.
+- Main product gaps: network/filesystem execution isolation, reusable cross-platform projection scaling, and shared daemon/MCP workflows.
 
 ## Workstreams
 
@@ -74,12 +74,13 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | repo-backed-session-refresh | Windows Codex CLI cells `139`, correction `146` | Windows commit `e6b2d6d` | Completed | Add durable explicit session refresh policies, exact frontiers, monotonic generations, and conflict-safe rollback. | Manual/follow/none, exact frontiers, blocked rollback, migration, and same-actor multi-session lineages verified; focused/self-hosting/full tests passed after manager correction. |
 | repo-backed-atomic-recovery | Windows Codex CLI cell `155` | Windows commit `eb35899` | Completed | Add Windows-correct atomic state/record publication, interrupted-write recovery, and derivable generation-record reconciliation. | ReplaceFileW/journal recovery and failpoints verified under normal Windows permissions; focused/self-hosting/full tests passed. Individual records are atomic; command batches remain open. |
 | repo-backed-command-transactions | Windows Codex CLI cells `168`, correction `176` | Windows commit `c4b9813` | Completed | Add a durable outbox transaction for canonical state plus declared derived-record batches. | Recoverable batches, narrow portable IDs, Windows writer locking, sequence CAS, ADS/tamper tests, real recovery, self-hosting, and full suite passed after manager correction. |
-| repo-backed-windows-execution-containment | Windows Codex CLI cell `188` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active 2026-07-12 | Enforce Windows process-tree, CPU, memory, and process-count limits with fail-closed Job Objects. | At next heartbeat audit suspended launch/no-escape race, job cleanup, resource-result truthfulness, fail-closed behavior, and promotion compatibility; run focused/self-hosting/full tests and diff checks. |
+| repo-backed-windows-execution-containment | Windows Codex CLI cell `188` | Windows commit `40f73bc` | Completed | Enforce Windows process-tree, CPU, memory, and process-count limits with fail-closed Job Objects. | Suspended assign-before-resume launch, resource attribution, descendant cleanup, fail-closed setup, promotion, self-hosting, and full workspace passed under normal Windows permissions. |
+| repo-backed-local-mcp | Windows Codex CLI cell `202` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active 2026-07-12 | Add a repo-confined persistent stdio MCP server exposing the full no-fixture workflow through typed tools. | At next heartbeat audit protocol framing/capabilities, tool completeness, argv/path/content confinement, output bounds, child cleanup, and real-agent journey; run focused/self-hosting/full tests and diff checks. |
 
 ## Delegation Queue
 
-1. Enforce Windows execution process-tree and CPU/memory/process resource isolation.
-2. Address remaining network/filesystem isolation, projection cache/cross-platform scaling, and live daemon/MCP workflows.
+1. Add a production local stdio MCP transport over the complete repo-backed workflow.
+2. Address remaining network/filesystem isolation, projection cache/cross-platform scaling, and dashboard/live-daemon workflows.
 3. Keep fixture tests only when they directly support removing fixture dependency.
 
 

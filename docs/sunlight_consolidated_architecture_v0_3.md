@@ -506,6 +506,18 @@ The default must be conservative: .sunlight is a repository namespace, not a pro
 | Compaction | Operation transactions can be compacted or summarized under retention policy while checkpoints and landed provenance remain durable. |
 | Path policy | Declare case sensitivity, Unicode normalization, symlink handling, executable bits, permissions, and platform compatibility in resolved view identity. |
 
+### 13.1.1 Local publication durability and recovery
+
+The local MVP publishes `records/native-state.json` from a flushed staged file and records the intended canonical SHA-256 plus monotonic `publication_sequence` in `.sunlight/local/recovery/native-state/journal.json`. The staged file, backup, and journal are local-only recovery aids, never durable source truth. On Windows, replacement of an existing canonical file uses `ReplaceFileW`; initial publication uses write-through `MoveFileExW`. Implementations must not assume Unix rename-over-existing behavior.
+
+Startup validates the canonical, staged, and backup paths as complete repository states. With a valid journal it accepts the canonical candidate matching the journal sequence and digest, or publishes the matching staged candidate when replacement had not happened. If the intended bytes are malformed but the canonical or replacement backup is fully valid, it deterministically restores the valid candidate with the highest publication sequence and preserves bounded local evidence for the `state_recovery_rolled_back` warning. The next successful state publication cleans that superseded evidence. Completed debris is removed only after the canonical candidate validates. If no fully valid candidate exists, recovery returns `state_recovery_failed` with all inspectable candidate paths and retains evidence.
+
+Individual derived JSON records use canonical JSON bytes, a flushed local-only stage, and the same OS-correct atomic replacement primitive, so a final record path is old, new, or absent rather than partially written. After canonical load, missing session-generation mirrors are rebuilt from canonical `session_generations`. Operation, checkpoint, validation/export, conflict, view, projection, and export-map records are not synthesized unless their canonical data makes that exact mirror derivable.
+
+Content-addressed blobs are also flushed and atomically created before a state publication may reference them. An existing blob whose bytes do not match its content-addressed path is retained as corruption evidence and blocks publication instead of being silently overwritten.
+
+This is not yet a general multi-record transaction: a command that updates canonical state and then publishes several derived records can be interrupted between individually atomic publications. Session-generation mirrors are reconciled on load; other missing derived records remain inspectable omissions and require the originating command or future repair tooling.
+
 ## 13.2 Implementation stack
 
 The core engine should start in Rust. This is a source-control engine, projection manager, content-addressed store, patch applicator, command runner, and Git interop tool. Starting in a low-level systems language avoids an expensive rewrite after behavior becomes compatibility-sensitive.

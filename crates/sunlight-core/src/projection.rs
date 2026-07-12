@@ -8,6 +8,7 @@ use sha2::{Digest as ShaDigest, Sha256};
 
 use crate::artifacts::{ArtifactKind, ContentBlob, ContentTree, PathPolicy};
 use crate::records::{canonical_json_bytes, JsonValue, PrivacyClass, RECORD_SCHEMA_VERSION};
+use crate::repo_state::durable_publish_json_bytes;
 use crate::resolver::{ResolvedViewResult, SingleRepoTree};
 
 pub const FIXTURE_EXECUTION_PROJECTION_ID: &str = "projection_exec_auth_profile_0001";
@@ -2067,6 +2068,7 @@ pub fn persist_projection_quarantine_local_record(
     projection_root: impl AsRef<Path>,
     quarantine: &ProjectionQuarantineResult,
 ) -> std::io::Result<PathBuf> {
+    let projection_root = projection_root.as_ref();
     let path = projection_quarantine_local_record_path(projection_root, quarantine);
     let Some(parent) = path.parent() else {
         return Err(std::io::Error::new(
@@ -2077,7 +2079,13 @@ pub fn persist_projection_quarantine_local_record(
     fs::create_dir_all(parent)?;
     let bytes = canonical_json_bytes(&quarantine.to_json_value())
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    fs::write(&path, bytes)?;
+    durable_publish_json_bytes(
+        projection_root,
+        &path,
+        &bytes,
+        "derived_record_after_prepare",
+    )
+    .map_err(std::io::Error::other)?;
     Ok(path)
 }
 
@@ -2198,7 +2206,13 @@ fn persist_projection_manifest_local_record(
             Some(projection.strategy),
         )
     })?;
-    fs::write(&path, bytes).map_err(|_| {
+    durable_publish_json_bytes(
+        projection_root,
+        &path,
+        &bytes,
+        "derived_record_after_prepare",
+    )
+    .map_err(|_| {
         materialization_error(
             ProjectionMaterializationErrorCode::ProjectionWriteFailed,
             view,

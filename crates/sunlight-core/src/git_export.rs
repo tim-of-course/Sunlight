@@ -7,8 +7,8 @@ use crate::checkpoint::{
 use crate::records::PrivacyClass;
 use crate::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use crate::repo_state::{
-    detect_secret_reasons, expanded_operation_order, real_content_hash, real_tree_hash,
-    RealArtifactEntry, RealRepoState,
+    detect_secret_reasons, durable_publish_json_bytes, expanded_operation_order, real_content_hash,
+    real_tree_hash, RealArtifactEntry, RealRepoState,
 };
 use crate::repository::{RepositoryConfig, CONSERVATIVE_SUNLIGHT_COMMIT_POLICY};
 use crate::resolver::{ResolvedViewResult, SingleRepoTree};
@@ -1397,10 +1397,12 @@ pub fn persist_git_export_validation_report(
             path: path.clone(),
             message: error.to_string(),
         })?;
-    fs::write(&path, bytes).map_err(|error| GitExportValidationReportStoreError::Io {
-        path: path.clone(),
-        message: format!("failed to write validation report: {error}"),
-    })?;
+    durable_publish_json_bytes(repo_root, &path, &bytes, "derived_record_after_prepare").map_err(
+        |error| GitExportValidationReportStoreError::Io {
+            path: path.clone(),
+            message: format!("failed to durably publish validation report: {error}"),
+        },
+    )?;
     Ok(path)
 }
 

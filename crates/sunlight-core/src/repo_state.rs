@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +23,7 @@ pub const REPO_STATE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealRepoState {
+    pub publication_sequence: u64,
     pub repository_id: String,
     pub base_checkpoint_id: String,
     pub base_resolved_view_id: String,
@@ -327,6 +329,13 @@ pub enum RepoStateError {
         message: String,
     },
     Json(String),
+    Recovery {
+        canonical: PathBuf,
+        staged: PathBuf,
+        backup: PathBuf,
+        journal: PathBuf,
+        message: String,
+    },
     ProjectionStrategyUnsupported {
         strategy: String,
         path: PathBuf,
@@ -353,6 +362,20 @@ impl Display for RepoStateError {
             }
             Self::Io { path, message } => write!(f, "{message}: {}", path.display()),
             Self::Json(message) => write!(f, "invalid Sunlight repository state JSON: {message}"),
+            Self::Recovery {
+                canonical,
+                staged,
+                backup,
+                journal,
+                message,
+            } => write!(
+                f,
+                "Sunlight state recovery failed: {message}; canonical={}, staged={}, backup={}, journal={}",
+                canonical.display(),
+                staged.display(),
+                backup.display(),
+                journal.display()
+            ),
             Self::ProjectionStrategyUnsupported {
                 strategy,
                 path,
@@ -382,6 +405,7 @@ impl RealRepoState {
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         let tree_hash = real_tree_hash(&entries);
         let state = Self {
+            publication_sequence: 0,
             repository_id: repository_id.to_string(),
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             base_resolved_view_id: "view_base_0001".to_string(),
@@ -413,10 +437,19 @@ impl RealRepoState {
     }
 
     pub fn load(repo_root: &Path) -> Result<Self, RepoStateError> {
+        recover_state_publication(repo_root)?;
         let path = real_state_path(repo_root);
+        let state = Self::load_from_path(repo_root, &path)?;
+        state.reconcile_session_generation_records(repo_root)?;
+        Ok(state)
+    }
+
+    fn load_from_path(repo_root: &Path, path: &Path) -> Result<Self, RepoStateError> {
         let body = fs::read(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                RepoStateError::NotInitialized { path: path.clone() }
+                RepoStateError::NotInitialized {
+                    path: path.to_path_buf(),
+                }
             } else {
                 io_error(&path, "failed to read native Sunlight state", error)
             }
@@ -578,6 +611,8 @@ impl RealRepoState {
         }
 
         let mut state = Self {
+            publication_sequence: optional_u64(&object, "publication_sequence", &path)?
+                .unwrap_or(0),
             repository_id: required_string(&object, "repository_id", &path)?,
             base_checkpoint_id: required_string(&object, "base_checkpoint_id", &path)?,
             base_resolved_view_id: required_string(&object, "base_resolved_view_id", &path)?,
@@ -618,9 +653,20 @@ impl RealRepoState {
             fs::create_dir_all(parent)
                 .map_err(|error| io_error(parent, "failed to create state directory", error))?;
         }
-        let body = canonical_json_bytes(&self.to_json_value())?;
-        fs::write(&path, body)
-            .map_err(|error| io_error(&path, "failed to write native Sunlight state", error))
+        recover_state_publication(repo_root)?;
+        let on_disk_sequence = if path.exists() {
+            Self::load_from_path(repo_root, &path)?.publication_sequence
+        } else {
+            0
+        };
+        let mut published = self.clone();
+        published.publication_sequence = self
+            .publication_sequence
+            .max(on_disk_sequence)
+            .checked_add(1)
+            .ok_or_else(|| invalid_state(&path, "publication_sequence overflow"))?;
+        let body = canonical_json_bytes(&published.to_json_value())?;
+        publish_native_state(repo_root, &path, published.publication_sequence, &body)
     }
 
     pub fn persist_blobs(&self, repo_root: &Path) -> Result<(), RepoStateError> {
@@ -657,12 +703,33 @@ impl RealRepoState {
             .join(".sunlight")
             .join(dir)
             .join(format!("{id}.json"));
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| io_error(parent, "failed to create record directory", error))?;
+        let value =
+            parse_json_record(json.as_bytes()).map_err(|error| RepoStateError::InvalidState {
+                path: path.clone(),
+                message: format!("derived record is not valid JSON: {error}"),
+            })?;
+        let bytes = canonical_json_bytes(&value)?;
+        durable_publish_json_bytes(repo_root, &path, &bytes, "derived_record_after_prepare")
+    }
+
+    fn reconcile_session_generation_records(&self, repo_root: &Path) -> Result<(), RepoStateError> {
+        for generation in &self.session_generations {
+            let path = repo_root
+                .join(".sunlight")
+                .join("session-generations")
+                .join(format!("{}.json", generation.session_generation_id));
+            if !path.exists() {
+                let value = session_generation_json(generation);
+                let bytes = canonical_json_bytes(&value)?;
+                durable_publish_json_bytes(
+                    repo_root,
+                    &path,
+                    &bytes,
+                    "derived_record_after_prepare",
+                )?;
+            }
         }
-        fs::write(&path, json)
-            .map_err(|error| io_error(&path, "failed to write Sunlight record", error))
+        Ok(())
     }
 
     pub fn to_json_value(&self) -> JsonValue {
@@ -670,6 +737,10 @@ impl RealRepoState {
         object.insert(
             "schema_version".to_string(),
             JsonValue::Number(REPO_STATE_SCHEMA_VERSION.to_string()),
+        );
+        object.insert(
+            "publication_sequence".to_string(),
+            JsonValue::Number(self.publication_sequence.to_string()),
         );
         object.insert(
             "record_type".to_string(),
@@ -1416,8 +1487,7 @@ pub fn persist_quarantine_report(
         JsonValue::Array(quarantine.iter().map(quarantine_json).collect()),
     );
     let body = canonical_json_bytes(&JsonValue::Object(object))?;
-    fs::write(&path, body)
-        .map_err(|error| io_error(&path, "failed to write quarantine report", error))
+    durable_publish_json_bytes(repo_root, &path, &body, "derived_record_after_prepare")
 }
 
 pub fn real_state_path(repo_root: &Path) -> PathBuf {
@@ -1425,6 +1495,517 @@ pub fn real_state_path(repo_root: &Path) -> PathBuf {
         .join(".sunlight")
         .join("records")
         .join("native-state.json")
+}
+
+const STATE_PUBLICATION_FAILPOINT_ENV: &str = "SUNLIGHT_TEST_FAILPOINT";
+
+struct StateRecoveryPaths {
+    root: PathBuf,
+    staged: PathBuf,
+    backup: PathBuf,
+    journal: PathBuf,
+}
+
+fn state_recovery_paths(repo_root: &Path) -> StateRecoveryPaths {
+    let root = repo_root
+        .join(".sunlight")
+        .join("local")
+        .join("recovery")
+        .join("native-state");
+    StateRecoveryPaths {
+        staged: root.join("staged.json"),
+        backup: root.join("backup.json"),
+        journal: root.join("journal.json"),
+        root,
+    }
+}
+
+fn publish_native_state(
+    repo_root: &Path,
+    canonical: &Path,
+    sequence: u64,
+    bytes: &[u8],
+) -> Result<(), RepoStateError> {
+    let recovery = state_recovery_paths(repo_root);
+    fs::create_dir_all(&recovery.root).map_err(|error| {
+        io_error(
+            &recovery.root,
+            "failed to create native-state recovery directory",
+            error,
+        )
+    })?;
+    remove_file_if_exists(&recovery.staged)?;
+    remove_file_if_exists(&recovery.backup)?;
+    remove_file_if_exists(&recovery.journal)?;
+
+    write_flushed_file(&recovery.staged, bytes)?;
+    let digest = format!("sha256:{:x}", Sha256::digest(bytes));
+    let journal_value = JsonValue::Object(BTreeMap::from([
+        (
+            "record_type".to_string(),
+            JsonValue::String("native_state_publication".to_string()),
+        ),
+        (
+            "schema_version".to_string(),
+            JsonValue::Number("1".to_string()),
+        ),
+        (
+            "publication_sequence".to_string(),
+            JsonValue::Number(sequence.to_string()),
+        ),
+        ("intended_sha256".to_string(), JsonValue::String(digest)),
+    ]));
+    let journal_bytes = canonical_json_bytes(&journal_value)?;
+    let journal_stage = recovery.root.join("journal.preparing.json");
+    remove_file_if_exists(&journal_stage)?;
+    write_flushed_file(&journal_stage, &journal_bytes)?;
+    atomic_replace_file(&journal_stage, &recovery.journal, None)?;
+
+    trigger_failpoint("state_after_prepare", canonical)?;
+    atomic_replace_file(&recovery.staged, canonical, Some(recovery.backup.as_path()))?;
+    trigger_failpoint("state_after_replace", canonical)?;
+
+    RealRepoState::load_from_path(repo_root, canonical)?;
+    cleanup_state_recovery(&recovery)?;
+    cleanup_recovery_evidence(&recovery)?;
+    Ok(())
+}
+
+fn recover_state_publication(repo_root: &Path) -> Result<(), RepoStateError> {
+    let canonical = real_state_path(repo_root);
+    let recovery = state_recovery_paths(repo_root);
+    if !recovery.journal.exists() {
+        if canonical.exists() {
+            if RealRepoState::load_from_path(repo_root, &canonical).is_ok() {
+                cleanup_state_recovery(&recovery)?;
+                return Ok(());
+            }
+            return Err(recovery_error(
+                &canonical,
+                &recovery,
+                "canonical state is malformed and no valid publication journal exists; evidence was retained"
+                    .to_string(),
+            ));
+        }
+        if recovery.staged.exists() || recovery.backup.exists() {
+            return Err(recovery_error(
+                &canonical,
+                &recovery,
+                "canonical state is missing and unjournaled recovery candidates exist; evidence was retained"
+                    .to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let journal_bytes = fs::read(&recovery.journal).map_err(|error| {
+        recovery_error(
+            &canonical,
+            &recovery,
+            format!("failed to read journal: {error}"),
+        )
+    })?;
+    let journal = parse_json_record(&journal_bytes).map_err(|error| {
+        recovery_error(
+            &canonical,
+            &recovery,
+            format!("journal is malformed and evidence was retained: {error}"),
+        )
+    })?;
+    let JsonValue::Object(journal) = journal else {
+        return Err(recovery_error(
+            &canonical,
+            &recovery,
+            "journal root is not an object; evidence was retained".to_string(),
+        ));
+    };
+    let sequence =
+        required_u64(&journal, "publication_sequence", &recovery.journal).map_err(|error| {
+            recovery_error(
+                &canonical,
+                &recovery,
+                format!("journal sequence is invalid and evidence was retained: {error}"),
+            )
+        })?;
+    let digest =
+        required_string(&journal, "intended_sha256", &recovery.journal).map_err(|error| {
+            recovery_error(
+                &canonical,
+                &recovery,
+                format!("journal digest is invalid and evidence was retained: {error}"),
+            )
+        })?;
+
+    let intended = |path: &Path| -> bool {
+        let Ok(bytes) = fs::read(path) else {
+            return false;
+        };
+        if format!("sha256:{:x}", Sha256::digest(&bytes)) != digest {
+            return false;
+        }
+        RealRepoState::load_from_path(repo_root, path)
+            .is_ok_and(|state| state.publication_sequence == sequence)
+    };
+
+    if intended(&canonical) {
+        cleanup_state_recovery(&recovery)?;
+        return Ok(());
+    }
+    if intended(&recovery.staged) {
+        remove_file_if_exists(&recovery.backup)?;
+        atomic_replace_file(
+            &recovery.staged,
+            &canonical,
+            Some(recovery.backup.as_path()),
+        )?;
+        if !intended(&canonical) {
+            return Err(recovery_error(
+                &canonical,
+                &recovery,
+                "recovered canonical state failed post-publication validation; evidence was retained"
+                    .to_string(),
+            ));
+        }
+        cleanup_state_recovery(&recovery)?;
+        return Ok(());
+    }
+
+    let canonical_state = RealRepoState::load_from_path(repo_root, &canonical).ok();
+    let backup_state = RealRepoState::load_from_path(repo_root, &recovery.backup).ok();
+    let fallback = match (&canonical_state, &backup_state) {
+        (Some(canonical_state), Some(backup_state)) => {
+            if backup_state.publication_sequence > canonical_state.publication_sequence {
+                Some((recovery.backup.as_path(), backup_state.publication_sequence))
+            } else {
+                Some((canonical.as_path(), canonical_state.publication_sequence))
+            }
+        }
+        (Some(state), None) => Some((canonical.as_path(), state.publication_sequence)),
+        (None, Some(state)) => Some((recovery.backup.as_path(), state.publication_sequence)),
+        (None, None) => None,
+    };
+    if let Some((fallback_path, fallback_sequence)) = fallback {
+        let evidence = recovery.root.join(format!("evidence-{sequence}"));
+        fs::create_dir_all(&evidence).map_err(|error| {
+            io_error(
+                &evidence,
+                "failed to preserve interrupted publication evidence",
+                error,
+            )
+        })?;
+        if fallback_path == recovery.backup {
+            atomic_replace_file(
+                &recovery.backup,
+                &canonical,
+                Some(&evidence.join("rejected-canonical.json")),
+            )?;
+        }
+        preserve_recovery_evidence(&recovery.staged, &evidence.join("rejected-staged.json"))?;
+        preserve_recovery_evidence(&recovery.journal, &evidence.join("journal.json"))?;
+        remove_file_if_exists(&recovery.backup)?;
+        RealRepoState::load_from_path(repo_root, &canonical)?;
+        let notice = JsonValue::Object(BTreeMap::from([
+            (
+                "record_type".to_string(),
+                JsonValue::String("native_state_recovery_rollback".to_string()),
+            ),
+            (
+                "intended_publication_sequence".to_string(),
+                JsonValue::Number(sequence.to_string()),
+            ),
+            (
+                "recovered_publication_sequence".to_string(),
+                JsonValue::Number(fallback_sequence.to_string()),
+            ),
+        ]));
+        write_flushed_file(
+            &evidence.join("recovery.json"),
+            &canonical_json_bytes(&notice)?,
+        )?;
+        return Ok(());
+    }
+
+    Err(recovery_error(
+        &canonical,
+        &recovery,
+        format!(
+            "no fully valid candidate matches intended publication sequence {sequence} and digest {digest}; evidence was retained"
+        ),
+    ))
+}
+
+fn preserve_recovery_evidence(source: &Path, destination: &Path) -> Result<(), RepoStateError> {
+    if !source.exists() {
+        return Ok(());
+    }
+    fs::rename(source, destination)
+        .map_err(|error| io_error(destination, "failed to preserve recovery evidence", error))
+}
+
+fn recovery_error(
+    canonical: &Path,
+    recovery: &StateRecoveryPaths,
+    message: String,
+) -> RepoStateError {
+    RepoStateError::Recovery {
+        canonical: canonical.to_path_buf(),
+        staged: recovery.staged.clone(),
+        backup: recovery.backup.clone(),
+        journal: recovery.journal.clone(),
+        message,
+    }
+}
+
+fn cleanup_state_recovery(recovery: &StateRecoveryPaths) -> Result<(), RepoStateError> {
+    remove_file_if_exists(&recovery.staged)?;
+    remove_file_if_exists(&recovery.backup)?;
+    remove_file_if_exists(&recovery.root.join("journal.preparing.json"))?;
+    remove_file_if_exists(&recovery.journal)
+}
+
+fn cleanup_recovery_evidence(recovery: &StateRecoveryPaths) -> Result<(), RepoStateError> {
+    let Ok(entries) = fs::read_dir(&recovery.root) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            io_error(&recovery.root, "failed to inspect recovery evidence", error)
+        })?;
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+            && entry.file_name().to_string_lossy().starts_with("evidence-")
+        {
+            fs::remove_dir_all(entry.path()).map_err(|error| {
+                io_error(
+                    &entry.path(),
+                    "failed to clean superseded recovery evidence",
+                    error,
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub fn durable_publish_json_bytes(
+    repo_root: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+    failpoint: &str,
+) -> Result<(), RepoStateError> {
+    let value = parse_json_record(bytes).map_err(|error| RepoStateError::InvalidState {
+        path: final_path.to_path_buf(),
+        message: format!("durable record is not valid JSON: {error}"),
+    })?;
+    let canonical = canonical_json_bytes(&value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(final_path.to_string_lossy().as_bytes());
+    let name = format!("{:x}", hasher.finalize());
+    let root = repo_root
+        .join(".sunlight")
+        .join("local")
+        .join("record-publication");
+    fs::create_dir_all(&root)
+        .map_err(|error| io_error(&root, "failed to create record staging directory", error))?;
+    let staged = root.join(format!("{name}.staged"));
+    let backup = root.join(format!("{name}.backup"));
+    remove_file_if_exists(&staged)?;
+    remove_file_if_exists(&backup)?;
+    write_flushed_file(&staged, &canonical)?;
+    trigger_failpoint(failpoint, final_path)?;
+    atomic_replace_file(&staged, final_path, Some(&backup))?;
+    remove_file_if_exists(&backup)?;
+    remove_dir_if_empty(&root)?;
+    if let Some(local_root) = root.parent() {
+        remove_dir_if_empty(local_root)?;
+    }
+    Ok(())
+}
+
+fn write_flushed_file(path: &Path, bytes: &[u8]) -> Result<(), RepoStateError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            io_error(parent, "failed to create durable staging directory", error)
+        })?;
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| io_error(path, "failed to create durable staged file", error))?;
+    file.write_all(bytes)
+        .map_err(|error| io_error(path, "failed to write durable staged file", error))?;
+    file.sync_all()
+        .map_err(|error| io_error(path, "failed to flush durable staged file", error))
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), RepoStateError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error(
+            path,
+            "failed to clean publication artifact",
+            error,
+        )),
+    }
+}
+
+fn remove_dir_if_empty(path: &Path) -> Result<(), RepoStateError> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(io_error(
+            path,
+            "failed to clean empty publication directory",
+            error,
+        )),
+    }
+}
+
+fn trigger_failpoint(name: &str, path: &Path) -> Result<(), RepoStateError> {
+    let scoped_name = format!("{name}|{}", path.display());
+    if cfg!(debug_assertions)
+        && std::env::var(STATE_PUBLICATION_FAILPOINT_ENV)
+            .ok()
+            .as_deref()
+            == Some(scoped_name.as_str())
+    {
+        return Err(RepoStateError::Io {
+            path: path.to_path_buf(),
+            message: format!("deterministic test failpoint `{name}`"),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(
+    staged: &Path,
+    final_path: &Path,
+    backup: Option<&Path>,
+) -> Result<(), RepoStateError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    extern "system" {
+        fn ReplaceFileW(
+            replaced_file_name: *const u16,
+            replacement_file_name: *const u16,
+            backup_file_name: *const u16,
+            replace_flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    if let Some(parent) = final_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| io_error(parent, "failed to create publication directory", error))?;
+    }
+    let windows_path = |path: &Path| -> Result<PathBuf, RepoStateError> {
+        if path.exists() {
+            return fs::canonicalize(path).map_err(|error| {
+                io_error(path, "failed to normalize Windows publication path", error)
+            });
+        }
+        let parent = path.parent().ok_or_else(|| RepoStateError::Io {
+            path: path.to_path_buf(),
+            message: "Windows publication path has no parent".to_string(),
+        })?;
+        let parent = fs::canonicalize(parent).map_err(|error| {
+            io_error(
+                parent,
+                "failed to normalize Windows publication parent",
+                error,
+            )
+        })?;
+        Ok(
+            parent.join(path.file_name().ok_or_else(|| RepoStateError::Io {
+                path: path.to_path_buf(),
+                message: "Windows publication path has no file name".to_string(),
+            })?),
+        )
+    };
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let staged_api_path = windows_path(staged)?;
+    let final_api_path = windows_path(final_path)?;
+    let backup_api_path = backup.map(windows_path).transpose()?;
+    let staged_wide = wide(&staged_api_path);
+    let final_wide = wide(&final_api_path);
+    let result = if final_path.exists() {
+        let backup_wide = backup_api_path.as_deref().map(wide);
+        unsafe {
+            ReplaceFileW(
+                final_wide.as_ptr(),
+                staged_wide.as_ptr(),
+                backup_wide
+                    .as_ref()
+                    .map_or(std::ptr::null(), |path| path.as_ptr()),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        }
+    } else {
+        unsafe {
+            MoveFileExW(
+                staged_wide.as_ptr(),
+                final_wide.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        }
+    };
+    if result == 0 {
+        return Err(io_error(
+            final_path,
+            "failed to atomically publish durable file",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(
+    staged: &Path,
+    final_path: &Path,
+    backup: Option<&Path>,
+) -> Result<(), RepoStateError> {
+    if let Some(parent) = final_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| io_error(parent, "failed to create publication directory", error))?;
+    }
+    if final_path.exists() {
+        if let Some(backup) = backup {
+            fs::hard_link(final_path, backup).map_err(|error| {
+                io_error(backup, "failed to preserve publication backup", error)
+            })?;
+        }
+    }
+    fs::rename(staged, final_path).map_err(|error| {
+        io_error(
+            final_path,
+            "failed to atomically publish durable file",
+            error,
+        )
+    })
 }
 
 pub fn real_blob_path(repo_root: &Path, content_hash: &str) -> PathBuf {
@@ -1443,13 +2024,44 @@ pub fn read_real_blob(repo_root: &Path, content_hash: &str) -> Result<Vec<u8>, R
 
 fn persist_blob(repo_root: &Path, content_hash: &str, bytes: &[u8]) -> Result<(), RepoStateError> {
     let path = real_blob_path(repo_root, content_hash);
+    if real_content_hash(bytes) != content_hash {
+        return Err(RepoStateError::InvalidState {
+            path,
+            message: "content blob bytes do not match their content-addressed path".to_string(),
+        });
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| io_error(parent, "failed to create blob directory", error))?;
     }
-    if !path.exists() {
-        fs::write(&path, bytes)
-            .map_err(|error| io_error(&path, "failed to write content blob", error))?;
+    if path.exists() {
+        let existing = fs::read(&path)
+            .map_err(|error| io_error(&path, "failed to validate existing content blob", error))?;
+        if existing != bytes {
+            return Err(RepoStateError::InvalidState {
+                path,
+                message: "existing content blob is malformed; evidence was retained".to_string(),
+            });
+        }
+        return Ok(());
+    }
+
+    let root = repo_root
+        .join(".sunlight")
+        .join("local")
+        .join("blob-publication");
+    fs::create_dir_all(&root)
+        .map_err(|error| io_error(&root, "failed to create blob staging directory", error))?;
+    let staged = root.join(format!(
+        "{}.staged",
+        content_hash.trim_start_matches("sha256:")
+    ));
+    remove_file_if_exists(&staged)?;
+    write_flushed_file(&staged, bytes)?;
+    atomic_replace_file(&staged, &path, None)?;
+    remove_dir_if_empty(&root)?;
+    if let Some(local_root) = root.parent() {
+        remove_dir_if_empty(local_root)?;
     }
     Ok(())
 }
@@ -3069,6 +3681,18 @@ fn session_json(session: &RealSessionRecord) -> JsonValue {
 fn session_generation_json(generation: &RealSessionGenerationRecord) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert(
+        "schema_version".to_string(),
+        JsonValue::Number("1".to_string()),
+    );
+    object.insert(
+        "record_type".to_string(),
+        JsonValue::String("session_generation".to_string()),
+    );
+    object.insert(
+        "id".to_string(),
+        JsonValue::String(generation.session_generation_id.clone()),
+    );
+    object.insert(
         "session_generation_id".to_string(),
         JsonValue::String(generation.session_generation_id.clone()),
     );
@@ -3103,6 +3727,10 @@ fn session_generation_json(generation: &RealSessionGenerationRecord) -> JsonValu
     object.insert(
         "created_by".to_string(),
         JsonValue::String(generation.created_by.clone()),
+    );
+    object.insert(
+        "privacy_class".to_string(),
+        JsonValue::String("local_only".to_string()),
     );
     JsonValue::Object(object)
 }
@@ -3382,6 +4010,132 @@ mod tests {
     }
 
     #[test]
+    fn durable_publication_recovers_failpoints_and_repairs_generation_records() {
+        let repo = temp_repo("durable-publication");
+        fs::write(repo.join("README.md"), b"# durable\n").unwrap();
+        let mut state = RealRepoState::ingest(&repo, "repo_durable").unwrap();
+        state.save(&repo).unwrap();
+        let canonical = real_state_path(&repo);
+        let old_bytes = fs::read(&canonical).unwrap();
+        assert_eq!(RealRepoState::load(&repo).unwrap().publication_sequence, 1);
+
+        state.generation_number = 1;
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            format!("state_after_prepare|{}", canonical.display()),
+        );
+        let error = state.save(&repo).unwrap_err();
+        std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
+        assert!(error.to_string().contains("state_after_prepare"));
+        assert_eq!(fs::read(&canonical).unwrap(), old_bytes);
+
+        let recovered = RealRepoState::load(&repo).unwrap();
+        assert_eq!(recovered.generation_number, 1);
+        assert_eq!(recovered.publication_sequence, 2);
+        parse_json_record(&fs::read(&canonical).unwrap()).unwrap();
+        let recovery = state_recovery_paths(&repo);
+        assert!(!recovery.journal.exists());
+        assert!(!recovery.staged.exists());
+        assert!(!recovery.backup.exists());
+
+        let mut next = recovered.clone();
+        next.generation_number = 2;
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            format!("state_after_replace|{}", canonical.display()),
+        );
+        let error = next.save(&repo).unwrap_err();
+        std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
+        assert!(error.to_string().contains("state_after_replace"));
+        let visible = RealRepoState::load_from_path(&repo, &canonical).unwrap();
+        assert_eq!(visible.generation_number, 2);
+        assert_eq!(visible.publication_sequence, 3);
+        fs::write(&canonical, b"{\"interrupted\":").unwrap();
+        let recovered = RealRepoState::load(&repo).unwrap();
+        assert_eq!(recovered.generation_number, 1);
+        assert_eq!(recovered.publication_sequence, 2);
+        parse_json_record(&fs::read(&canonical).unwrap()).unwrap();
+        assert!(fs::read_dir(&recovery.root)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("evidence-")));
+
+        let record_path = repo
+            .join(".sunlight")
+            .join("operations")
+            .join("op_atomic.json");
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            format!("derived_record_after_prepare|{}", record_path.display()),
+        );
+        let error = recovered
+            .persist_record(&repo, "operations", "op_atomic", "{\"new\":true}")
+            .unwrap_err();
+        std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
+        assert!(error.to_string().contains("derived_record_after_prepare"));
+        assert!(!record_path.exists());
+        recovered
+            .persist_record(&repo, "operations", "op_atomic", "{ \"new\" : true }")
+            .unwrap();
+        assert_eq!(fs::read(&record_path).unwrap(), b"{\"new\":true}");
+        parse_json_record(&fs::read(&record_path).unwrap()).unwrap();
+
+        let mut with_generation = recovered.clone();
+        with_generation.sessions.push(RealSessionRecord {
+            session_id: "session_repair".to_string(),
+            actor_id: "agent-repair".to_string(),
+            write_topic_id: "topic_repair".to_string(),
+            resolved_view_id: with_generation.resolved_view_id.clone(),
+            session_generation_id: "gen_repair_0001".to_string(),
+            generation_number: 1,
+            topic_frontier: BTreeMap::new(),
+            refresh_policy: "none".to_string(),
+        });
+        with_generation
+            .session_generations
+            .push(RealSessionGenerationRecord {
+                session_generation_id: "gen_repair_0001".to_string(),
+                session_id: "session_repair".to_string(),
+                write_topic_id: "topic_repair".to_string(),
+                base_resolved_view_id: with_generation.base_resolved_view_id.clone(),
+                resolved_view_id: with_generation.resolved_view_id.clone(),
+                topic_frontier: BTreeMap::new(),
+                generation_number: 1,
+                refresh_policy: "none".to_string(),
+                created_by: "test".to_string(),
+            });
+        with_generation.save(&repo).unwrap();
+        let generation_path = repo.join(".sunlight/session-generations/gen_repair_0001.json");
+        assert!(!generation_path.exists());
+        RealRepoState::load(&repo).unwrap();
+        let generation = parse_json_record(&fs::read(&generation_path).unwrap()).unwrap();
+        let JsonValue::Object(generation) = generation else {
+            panic!("generation record must be an object");
+        };
+        assert_eq!(
+            generation.get("record_type"),
+            Some(&JsonValue::String("session_generation".to_string()))
+        );
+
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            format!("state_after_prepare|{}", canonical.display()),
+        );
+        let mut interrupted = with_generation.clone();
+        interrupted.generation_number = 9;
+        interrupted.save(&repo).unwrap_err();
+        std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
+        fs::write(&recovery.staged, b"{\"truncated\":").unwrap();
+        fs::write(&canonical, b"{\"also_truncated\":").unwrap();
+        let error = RealRepoState::load(&repo).unwrap_err();
+        assert!(matches!(error, RepoStateError::Recovery { .. }));
+        assert!(recovery.staged.exists());
+        assert!(recovery.journal.exists());
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
     fn legacy_session_state_loads_with_effective_frontier_and_pinned_policy() {
         let repo = temp_repo("legacy-session-frontier");
         let mut state = RealRepoState::ingest(&repo, "repo_legacy").unwrap();
@@ -3642,6 +4396,7 @@ mod tests {
             bytes,
         }];
         let state = RealRepoState {
+            publication_sequence: 0,
             repository_id: "repo_paths".to_string(),
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             base_resolved_view_id: "view_base_0001".to_string(),
@@ -3687,6 +4442,7 @@ mod tests {
         let readme = artifact_entry("README.md", b"# Base\n");
         let lib = artifact_entry("src/lib.rs", b"pub fn value() -> u32 { 1 }\n");
         let mut state = RealRepoState {
+            publication_sequence: 0,
             repository_id: "repo_resolve".to_string(),
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             base_resolved_view_id: "view_base_0001".to_string(),

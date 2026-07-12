@@ -69,7 +69,7 @@ fn no_fixture_repository_status_clean_initial_and_active_human_journey() {
     assert!(clean.contains("\"executions\":{\"total\":0"));
     assert!(clean.contains("\"checkpoints\":{\"count\":0,\"unexported\":0,\"records\":[]}"));
     assert!(clean.contains("\"execution_isolation\":{\"enforced\":false"));
-    assert!(clean.contains("\"warnings\":[]"));
+    assert!(clean.contains("\"code\":\"multi_record_publication_non_atomic\""));
 
     let topic = sun()
         .args([
@@ -142,6 +142,7 @@ fn no_fixture_repository_status_clean_initial_and_active_human_journey() {
     assert!(human.contains("session session_operator"));
     assert!(human.contains("checkpoints 0  exports 0"));
     assert!(human.contains("execution isolation:"));
+    assert!(human.contains("warning[multi_record_publication_non_atomic]"));
     assert!(human.contains("warning[checkpoint_missing]: create a checkpoint"));
 }
 
@@ -165,6 +166,115 @@ fn init_json_returns_repository_success_envelope() {
     assert!(stdout.contains("\"view\":null"));
     assert!(stdout.contains("\"warnings\":[]"));
     assert!(repo.path().join(".sunlight/config.toml").is_file());
+}
+
+#[test]
+fn no_fixture_interrupted_state_publication_recovers_and_continues() {
+    let repo = TestRepo::new("interrupted-state-recovery");
+    init_local_git_repo(&repo);
+    let init = sun()
+        .args(["init", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&init);
+
+    let canonical = repo
+        .path()
+        .join(".sunlight")
+        .join("records")
+        .join("native-state.json");
+    let old = fs::read(&canonical).unwrap();
+    let process_canonical = PathBuf::from(".")
+        .join(".sunlight")
+        .join("records")
+        .join("native-state.json");
+    let interrupted = sun()
+        .args([
+            "topic",
+            "create",
+            "recovered",
+            "--display-name",
+            "Recovered",
+            "--json",
+        ])
+        .env(
+            "SUNLIGHT_TEST_FAILPOINT",
+            format!("state_after_prepare|{}", process_canonical.display()),
+        )
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+    assert_eq!(fs::read(&canonical).unwrap(), old);
+    assert_valid_json(&fs::read_to_string(&canonical).unwrap());
+    let recovery_root = repo
+        .path()
+        .join(".sunlight")
+        .join("local")
+        .join("recovery")
+        .join("native-state");
+    assert!(recovery_root.join("journal.json").is_file());
+    assert!(recovery_root.join("staged.json").is_file());
+
+    let status = sun()
+        .args(["status", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&status);
+    let status_json = stdout(&status);
+    assert_valid_json(&status_json);
+    assert!(status_json.contains("\"topic_id\":\"topic_recovered\""));
+    assert!(!recovery_root.join("journal.json").exists());
+    assert!(!recovery_root.join("staged.json").exists());
+    assert!(!recovery_root.join("backup.json").exists());
+
+    let session = sun()
+        .args([
+            "session",
+            "start",
+            "--topic",
+            "recovered",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "recovery-agent",
+            "--json",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&session);
+    let content = repo.write_file("continued.txt", "continued after recovery\n");
+    let write = sun()
+        .args([
+            "write",
+            "continued.txt",
+            "--session",
+            "session_recovery_agent",
+            "--expect-hash",
+            "new",
+            "--content-file",
+        ])
+        .arg(content)
+        .args(["--classification", "source", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&write);
+    assert_valid_json(&stdout(&write));
+    let final_status = sun()
+        .args(["status", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&final_status);
+    assert!(stdout(&final_status).contains("rev_recovered_0001"));
+    assert!(repo
+        .path()
+        .join(".sunlight/session-generations/gen_recovery_agent_0002.json")
+        .is_file());
 }
 
 #[test]

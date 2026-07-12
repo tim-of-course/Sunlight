@@ -184,6 +184,17 @@ impl From<RepoStateError> for CliError {
                 invalid_request(message).with_detail("path", path.display().to_string())
             }
             RepoStateError::Json(message) => invalid_request(message),
+            RepoStateError::Recovery {
+                canonical,
+                staged,
+                backup,
+                journal,
+                message,
+            } => CliError::new("state_recovery_failed", message)
+                .with_detail("canonical", canonical.display().to_string())
+                .with_detail("staged", staged.display().to_string())
+                .with_detail("backup", backup.display().to_string())
+                .with_detail("journal", journal.display().to_string()),
             RepoStateError::ProjectionStrategyUnsupported {
                 strategy,
                 path,
@@ -3720,7 +3731,8 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
     let repo_root = PathBuf::from(".");
     let state = match RealRepoState::load(&PathBuf::from(".")) {
         Ok(state) => state,
-        Err(_) => return Ok(false),
+        Err(RepoStateError::NotInitialized { .. }) => return Ok(false),
+        Err(error) => return Err(error.into()),
     };
     if let [_, flag, value] = ctx.args.as_slice() {
         match flag.as_str() {
@@ -3904,7 +3916,8 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
 fn real_inspect(ctx: &CommandContext) -> Result<bool, CliError> {
     let state = match RealRepoState::load(&PathBuf::from(".")) {
         Ok(state) => state,
-        Err(_) => return Ok(false),
+        Err(RepoStateError::NotInitialized { .. }) => return Ok(false),
+        Err(error) => return Err(error.into()),
     };
     let selector = match ctx.args.iter().skip(1).find(|arg| !arg.starts_with("--")) {
         Some(selector) => selector,
@@ -5808,6 +5821,7 @@ struct RealPolicyStatus {
 
 #[derive(Debug, Default)]
 struct RealOperationalSummary {
+    recovery_rollback_evidence: bool,
     artifact_count: usize,
     quarantined_count: usize,
     conflict_count: usize,
@@ -5826,6 +5840,15 @@ struct RealOperationalSummary {
 fn real_operational_summary(repo_root: &Path, state: &RealRepoState) -> RealOperationalSummary {
     let resolved = state.resolve_head_view();
     let mut summary = RealOperationalSummary {
+        recovery_rollback_evidence: fs::read_dir(
+            repo_root.join(".sunlight/local/recovery/native-state"),
+        )
+        .ok()
+        .is_some_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("evidence-"))
+        }),
         artifact_count: state
             .entries
             .iter()
@@ -6076,8 +6099,15 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
 fn real_operational_warnings_json(
     state: &RealRepoState,
     summary: &RealOperationalSummary,
+    command: &str,
 ) -> String {
     let mut warnings = Vec::new();
+    if matches!(command, "status.repository" | "inspect.repository") {
+        warnings.push("{\"code\":\"multi_record_publication_non_atomic\",\"message\":\"canonical state and each JSON record publish atomically, but a command that publishes several records is not yet all-or-nothing\",\"details\":{\"repaired_derived_records\":[\"session_generation\"]}}".to_string());
+    }
+    if summary.recovery_rollback_evidence {
+        warnings.push("{\"code\":\"state_recovery_rolled_back\",\"message\":\"an interrupted malformed publication was rolled back to the newest fully valid state\",\"details\":{\"evidence_root\":\"local://.sunlight/local/recovery/native-state\"}}".to_string());
+    }
     if summary.quarantined_count > 0 {
         warnings.push(format!("{{\"code\":\"ingest_secrets_quarantined\",\"message\":\"review quarantined ingest records before checkpointing\",\"details\":{{\"count\":{},\"report\":\"local://.sunlight/quarantine/ingest-report.json\"}}}}", summary.quarantined_count));
     }
@@ -6200,6 +6230,12 @@ fn print_real_status_text(
         summary.policy.invalid_count
     );
     println!("execution isolation: network/filesystem-write/cpu/memory unenforced");
+    if command == "status.repository" || command == "inspect.repository" {
+        println!("warning[multi_record_publication_non_atomic]: canonical state and individual JSON records are atomic; multi-record commands are not yet all-or-nothing");
+    }
+    if summary.recovery_rollback_evidence {
+        println!("warning[state_recovery_rolled_back]: inspect .sunlight/local/recovery/native-state before the next successful state publication cleans the evidence");
+    }
     if summary.quarantined_count > 0 {
         println!(
             "warning[ingest_secrets_quarantined]: review .sunlight/quarantine/ingest-report.json"
@@ -6252,7 +6288,7 @@ fn real_status_envelope(
             &fallback_summary
         }
     };
-    let warnings = real_operational_warnings_json(state, summary);
+    let warnings = real_operational_warnings_json(state, summary, command);
     let summary_extension = if include_summary {
         format!(
             ",\"operational_summary\":{}",

@@ -54,6 +54,10 @@ If multiple conditions apply, expose the most blocking state and list supporting
 | Checkpoint | `frozen` requires exact conflict-free resolved view, tree identity, and selected evidence. `export_ready` additionally requires passing policy validation. Export refs may be appended after Git export, but the frozen tree and evidence do not change. |
 | Git export | `validated` is not exported. `exported` requires a persisted `git_export_map`. `partial` means Git artifacts were created but native mapping or ref update did not fully persist. Git commits remain compatibility artifacts, not native authorship. |
 
+Repository status and repository inspect include the advisory warning `multi_record_publication_non_atomic`: canonical state and each derived JSON record are atomically published, but one command's group of records is not yet an all-or-nothing transaction. Missing session-generation mirrors are repaired from canonical state on load; status must not claim the same repair for operation, checkpoint, validation-report, conflict, view, projection, or export-map records.
+
+Interrupted canonical publication is recovered before status or inspect reads state. If the journal's intended sequence and digest match a fully valid canonical or staged candidate, recovery completes and removes staged/backup/journal debris. If the intended bytes are malformed but a fully valid canonical or backup candidate exists, recovery selects the highest sequence, preserves bounded evidence, and reports advisory warning `state_recovery_rolled_back` until the next successful state publication cleans that evidence. If no candidate is fully valid, the CLI returns stable error `state_recovery_failed` with `canonical`, `staged`, `backup`, and `journal` paths; it must not fall back to fixture output, delete evidence, or silently parse malformed bytes.
+
 ## Policy Failure Operator Rules
 
 Commit and export policy failures are hard gates. Status and inspect surfaces

@@ -1,4 +1,4 @@
-﻿# Sunlight Development Manager Scratchpad
+# Sunlight Development Manager Scratchpad
 
 Purpose: keep one compact, current coordination record for Sunlight development. This file is the heartbeat handoff point and must stay under 20000 characters.
 
@@ -32,10 +32,10 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - Management lane changed on 2026-07-06: work directly in the Windows checkout at `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2`.
 - Older WSL clone rows below are historical checkpoints only; do not treat them as the active work lane.
 - Critical handoff correction: previous fixture-backed acceptance is not product completion.
-- Current implementation reality: fixture prototype plus a substantial repo-backed product path with durable authoring/resolution/projection/execution/checkpoint/export/policy/compatibility features and a no-fixture self-hosting acceptance harness against Sunlight itself; still not the full v0.3 product.
+- Current implementation reality: fixture prototype plus a substantial repo-backed product path with durable authoring/resolution/projection/execution/checkpoint/export/policy/compatibility features, no-fixture self-hosting acceptance, and a repository-confined local MCP transport; still not the full v0.3 product.
 - Rename-plus-edit remains unresolved because compatibility projections expose no reliable identity signal; fuzzy inference is intentionally excluded.
 - Windows executions enforce process-tree, CPU, memory, and process-count limits with Job Objects; network and broad filesystem-write isolation remain explicitly unenforced.
-- Main product gaps: network/filesystem execution isolation, reusable cross-platform projection scaling, and shared daemon/MCP workflows.
+- Main product gaps: network/filesystem execution isolation, reusable cross-platform projection scaling/cache reuse, and a shared in-process engine/daemon boundary beyond the transitional MCP subprocess adapter.
 
 ## Workstreams
 
@@ -75,12 +75,13 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | repo-backed-atomic-recovery | Windows Codex CLI cell `155` | Windows commit `eb35899` | Completed | Add Windows-correct atomic state/record publication, interrupted-write recovery, and derivable generation-record reconciliation. | ReplaceFileW/journal recovery and failpoints verified under normal Windows permissions; focused/self-hosting/full tests passed. Individual records are atomic; command batches remain open. |
 | repo-backed-command-transactions | Windows Codex CLI cells `168`, correction `176` | Windows commit `c4b9813` | Completed | Add a durable outbox transaction for canonical state plus declared derived-record batches. | Recoverable batches, narrow portable IDs, Windows writer locking, sequence CAS, ADS/tamper tests, real recovery, self-hosting, and full suite passed after manager correction. |
 | repo-backed-windows-execution-containment | Windows Codex CLI cell `188` | Windows commit `40f73bc` | Completed | Enforce Windows process-tree, CPU, memory, and process-count limits with fail-closed Job Objects. | Suspended assign-before-resume launch, resource attribution, descendant cleanup, fail-closed setup, promotion, self-hosting, and full workspace passed under normal Windows permissions. |
-| repo-backed-local-mcp | Windows Codex CLI cell `202` | `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2` on `main` | Active 2026-07-12 | Add a repo-confined persistent stdio MCP server exposing the full no-fixture workflow through typed tools. | At next heartbeat audit protocol framing/capabilities, tool completeness, argv/path/content confinement, output bounds, child cleanup, and real-agent journey; run focused/self-hosting/full tests and diff checks. |
+| repo-backed-local-mcp | Windows Codex CLI cell `202` | Windows commit `e8565f0` | Completed | Add a repo-confined persistent stdio MCP server exposing the full no-fixture workflow through typed tools. | Protocol lifecycle, 26 typed tools, path/argv/content confinement, bounded contained children, malformed recovery, real Git-repo journey, self-hosting, and all 383 workspace tests passed. |
+| repo-backed-windows-filesystem-isolation | Windows Codex CLI process `31244` | `main`, log `C:\tmp\sunlight-filesystem-isolation.jsonl` | Active 2026-07-12 | Enforce fail-closed Windows execution filesystem-write confinement while preserving private outputs, evidence, and promotion. | At next heartbeat review feasibility and OS primitive, host-sentinel/descendant/setup-failure tests, truthful records, promotion, self-hosting, full suite, formatting, and diff hygiene. |
 
 ## Delegation Queue
 
-1. Add a production local stdio MCP transport over the complete repo-backed workflow.
-2. Address remaining network/filesystem isolation, projection cache/cross-platform scaling, and dashboard/live-daemon workflows.
+1. Enforce fail-closed Windows execution filesystem-write isolation, then network isolation, with truthful evidence and no regression to output promotion.
+2. Add reusable projection cache/cross-platform scaling, then replace the MCP subprocess adapter with a shared engine/daemon boundary.
 3. Keep fixture tests only when they directly support removing fixture dependency.
 
 

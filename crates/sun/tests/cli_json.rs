@@ -1001,7 +1001,7 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
     let config_path = repo.path().join(".sunlight/config.toml");
     let config = fs::read_to_string(&config_path)
         .unwrap()
-        .replace("timeout_ms = 300000", "timeout_ms = 150")
+        .replace("timeout_ms = 300000", "timeout_ms = 2000")
         .replace("stdout_limit_bytes = 1048576", "stdout_limit_bytes = 1024")
         .replace("stderr_limit_bytes = 1048576", "stderr_limit_bytes = 1024");
     fs::write(&config_path, config).unwrap();
@@ -1015,7 +1015,7 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
         .arg("python")
         .arg("-c")
         .arg(
-            r#"import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',"import time; from pathlib import Path; time.sleep(.7); Path('LATE_MARKER').write_text('late')"]); time.sleep(5)"#,
+            r#"import subprocess,sys,time; from pathlib import Path; p=subprocess.Popen([sys.executable,'-c',"import time; from pathlib import Path; time.sleep(3); Path('LATE_MARKER').write_text('late')"]); Path('CHILD_PID').write_text(str(p.pid)); time.sleep(5)"#,
         )
         .current_dir(repo.path())
         .output()
@@ -1026,7 +1026,7 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
     assert!(timeout_stdout.contains("\"status\":\"timeout\""));
     assert!(timeout_stdout.contains("\"timed_out\":true"));
     assert!(timeout_stdout.contains("\"promotion_candidates\":[]"));
-    assert!(timeout_stdout.contains("\"timeout_ms\":150"));
+    assert!(timeout_stdout.contains("\"timeout_ms\":2000"));
     assert!(timeout_stdout.contains("\"network\":\"not_enforced\""));
     assert!(timeout_stdout
         .contains("\"filesystem_writes\":\"managed_projection_writable_not_isolated\""));
@@ -1063,16 +1063,44 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
     let late_marker = repo
         .path()
         .join(".sunlight/projections")
-        .join(timeout_projection)
+        .join(&timeout_projection)
         .join("root/LATE_MARKER");
-    std::thread::sleep(Duration::from_millis(850));
+    #[cfg(windows)]
+    let child_pid = fs::read_to_string(
+        repo.path()
+            .join(".sunlight/projections")
+            .join(&timeout_projection)
+            .join("root/CHILD_PID"),
+    )
+    .expect("descendant PID helper should be recorded before timeout");
+    std::thread::sleep(Duration::from_millis(3200));
     assert!(
         !late_marker.exists(),
         "timed-out process mutated files after return"
     );
+    #[cfg(windows)]
+    {
+        let still_alive = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}",
+                    child_pid.trim()
+                ),
+            ])
+            .output()
+            .expect("descendant liveness probe should run");
+        assert!(
+            !still_alive.status.success(),
+            "timed-out descendant {} survived Job Object termination",
+            child_pid.trim()
+        );
+    }
     let config = fs::read_to_string(&config_path)
         .unwrap()
-        .replace("timeout_ms = 150", "timeout_ms = 5000");
+        .replace("timeout_ms = 2000", "timeout_ms = 5000");
     fs::write(&config_path, config).unwrap();
 
     let large = sun()
@@ -1162,6 +1190,157 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
         assert!(body.contains("\"network\":\"not_enforced\""));
         assert!(body.contains("\"inheritance\":\"minimal_os_allowlist\""));
         assert!(!body.contains(secret));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_job_object_enforces_cpu_memory_and_active_process_limits() {
+    let repo = TestRepo::new("windows-job-resource-limits");
+    repo.write_file("README.md", "# Windows Job Object limits\n");
+    start_native_session(&repo, "windows-job-limits");
+    let config_path = repo.path().join(".sunlight/config.toml");
+    let base_config = fs::read_to_string(&config_path).unwrap();
+
+    let normal = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            "python",
+            "-c",
+            "pass",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("Windows containment probe should run");
+    if !normal.status.success()
+        && stdout(&normal).contains("\"code\":\"execution_containment_setup_failed\"")
+    {
+        eprintln!(
+            "skipping Windows Job Object enforcement test: host specifically rejected Job Object setup"
+        );
+        return;
+    }
+    assert_success(&normal);
+    let normal_body = stdout(&normal);
+    assert!(normal_body.contains("\"status\":\"pass\""));
+    assert!(normal_body.contains("\"process_tree\":\"windows_job_object_kill_on_close\""));
+    assert!(normal_body.contains("\"cpu\":\"windows_job_object_cpu_time\""));
+    assert!(normal_body.contains("\"memory\":\"windows_job_object_process_and_job_memory\""));
+
+    let ordinary_failure = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            "python",
+            "-c",
+            "raise SystemExit(7)",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&ordinary_failure);
+    let ordinary_failure = stdout(&ordinary_failure);
+    assert!(ordinary_failure.contains("\"status\":\"fail\""));
+    assert!(ordinary_failure.contains("\"exit_code\":7"));
+    assert!(ordinary_failure.contains("\"termination_reason\":\"command_exit\""));
+
+    let cases = [
+        (
+            base_config
+                .replace(
+                    "process_memory_limit_bytes = 2147483648",
+                    "process_memory_limit_bytes = 67108864",
+                )
+                .replace(
+                    "job_memory_limit_bytes = 4294967296",
+                    "job_memory_limit_bytes = 134217728",
+                ),
+            "x=bytearray(512*1024*1024); import time; time.sleep(5)",
+            "process_memory_limit",
+        ),
+        (
+            base_config
+                .replace(
+                    "process_memory_limit_bytes = 2147483648",
+                    "process_memory_limit_bytes = 268435456",
+                )
+                .replace(
+                    "job_memory_limit_bytes = 4294967296",
+                    "job_memory_limit_bytes = 335544320",
+                ),
+            "import subprocess,sys,time; children=[subprocess.Popen([sys.executable,'-c','import time; x=bytearray(200*1024*1024); time.sleep(5)']) for _ in range(2)]; [child.wait() for child in children]; time.sleep(5)",
+            "job_memory_limit",
+        ),
+        (
+            base_config.replace(
+                "cpu_time_limit_ms = 300000",
+                "cpu_time_limit_ms = 100",
+            ),
+            "while True: pass",
+            "cpu_time_limit",
+        ),
+        (
+            base_config.replace(
+                "active_process_limit = 32",
+                "active_process_limit = 1",
+            ),
+            "import subprocess,sys,time; subprocess.run([sys.executable,'-c','import time; time.sleep(5)']); time.sleep(5)",
+            "active_process_limit",
+        ),
+    ];
+    for (config, script, expected_reason) in cases {
+        fs::write(&config_path, config).unwrap();
+        let output = sun()
+            .args([
+                "run",
+                "--view",
+                "view_base_0001",
+                "--json",
+                "--",
+                "python",
+                "-c",
+                script,
+            ])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert_success(&output);
+        let body = stdout(&output);
+        assert_valid_json(&body);
+        assert!(
+            body.contains("\"status\":\"policy_blocked\""),
+            "resource case did not persist policy_blocked: {body}"
+        );
+        assert!(
+            body.contains(&format!("\"termination_reason\":\"{expected_reason}\"")),
+            "resource case did not persist {expected_reason}: {body}"
+        );
+        let execution_id = json_string_field(&body, "execution_id");
+        for inspected in [
+            sun()
+                .args(["status", "--execution", &execution_id, "--json"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap(),
+            sun()
+                .args(["inspect", &format!("execution:{execution_id}"), "--json"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap(),
+        ] {
+            assert_success(&inspected);
+            let inspected = stdout(&inspected);
+            assert!(inspected.contains("\"code\":\"execution_resource_policy_blocked\""));
+            assert!(inspected.contains(expected_reason));
+            assert!(inspected.contains("\"limits\":"));
+        }
     }
 }
 

@@ -18,11 +18,19 @@ pub const SUPPORTED_EXECUTABLE_BITS_POLICY: &str = "preserve";
 pub const DEFAULT_EXECUTION_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_EXECUTION_STDOUT_LIMIT_BYTES: u64 = 1_048_576;
 pub const DEFAULT_EXECUTION_STDERR_LIMIT_BYTES: u64 = 1_048_576;
+pub const DEFAULT_EXECUTION_PROCESS_MEMORY_LIMIT_BYTES: u64 = 2_147_483_648;
+pub const DEFAULT_EXECUTION_JOB_MEMORY_LIMIT_BYTES: u64 = 4_294_967_296;
+pub const DEFAULT_EXECUTION_CPU_TIME_LIMIT_MS: u64 = 300_000;
+pub const DEFAULT_EXECUTION_ACTIVE_PROCESS_LIMIT: u32 = 32;
 pub const CONSERVATIVE_ENVIRONMENT_INHERITANCE: &str = "minimal_os_allowlist";
 pub const NOT_ENFORCED_NETWORK_POLICY: &str = "not_enforced";
 
 const MAX_EXECUTION_TIMEOUT_MS: u64 = 86_400_000;
 const MAX_EXECUTION_OUTPUT_LIMIT_BYTES: u64 = 67_108_864;
+const MIN_EXECUTION_MEMORY_LIMIT_BYTES: u64 = 16_777_216;
+const MAX_EXECUTION_MEMORY_LIMIT_BYTES: u64 = 1_099_511_627_776;
+const MAX_EXECUTION_CPU_TIME_LIMIT_MS: u64 = 86_400_000;
+const MAX_EXECUTION_ACTIVE_PROCESS_LIMIT: u32 = 1_024;
 
 const SUNLIGHT_DIR: &str = ".sunlight";
 const CONFIG_FILE: &str = "config.toml";
@@ -71,6 +79,10 @@ pub struct ExecutionPolicy {
     pub timeout_ms: u64,
     pub stdout_limit_bytes: u64,
     pub stderr_limit_bytes: u64,
+    pub process_memory_limit_bytes: u64,
+    pub job_memory_limit_bytes: u64,
+    pub cpu_time_limit_ms: u64,
+    pub active_process_limit: u32,
     pub environment_inheritance: String,
     pub network_policy: String,
 }
@@ -173,6 +185,10 @@ impl RepositoryConfig {
                 timeout_ms: DEFAULT_EXECUTION_TIMEOUT_MS,
                 stdout_limit_bytes: DEFAULT_EXECUTION_STDOUT_LIMIT_BYTES,
                 stderr_limit_bytes: DEFAULT_EXECUTION_STDERR_LIMIT_BYTES,
+                process_memory_limit_bytes: DEFAULT_EXECUTION_PROCESS_MEMORY_LIMIT_BYTES,
+                job_memory_limit_bytes: DEFAULT_EXECUTION_JOB_MEMORY_LIMIT_BYTES,
+                cpu_time_limit_ms: DEFAULT_EXECUTION_CPU_TIME_LIMIT_MS,
+                active_process_limit: DEFAULT_EXECUTION_ACTIVE_PROCESS_LIMIT,
                 environment_inheritance: CONSERVATIVE_ENVIRONMENT_INHERITANCE.to_string(),
                 network_policy: NOT_ENFORCED_NETWORK_POLICY.to_string(),
             },
@@ -202,6 +218,10 @@ default_root = \"{}\"
 timeout_ms = {}
 stdout_limit_bytes = {}
 stderr_limit_bytes = {}
+process_memory_limit_bytes = {}
+job_memory_limit_bytes = {}
+cpu_time_limit_ms = {}
+active_process_limit = {}
 environment_inheritance = \"{}\"
 network_policy = \"{}\"
 
@@ -219,6 +239,10 @@ sunlight_commit_policy = \"{}\"
             self.execution_policy.timeout_ms,
             self.execution_policy.stdout_limit_bytes,
             self.execution_policy.stderr_limit_bytes,
+            self.execution_policy.process_memory_limit_bytes,
+            self.execution_policy.job_memory_limit_bytes,
+            self.execution_policy.cpu_time_limit_ms,
+            self.execution_policy.active_process_limit,
             escape_toml(&self.execution_policy.environment_inheritance),
             escape_toml(&self.execution_policy.network_policy),
             escape_toml(&self.git_interop.sunlight_commit_policy),
@@ -301,6 +325,30 @@ sunlight_commit_policy = \"{}\"
                     DEFAULT_EXECUTION_STDERR_LIMIT_BYTES,
                     &path,
                 )?,
+                process_memory_limit_bytes: parse_u64_key_or_default(
+                    input,
+                    "process_memory_limit_bytes",
+                    DEFAULT_EXECUTION_PROCESS_MEMORY_LIMIT_BYTES,
+                    &path,
+                )?,
+                job_memory_limit_bytes: parse_u64_key_or_default(
+                    input,
+                    "job_memory_limit_bytes",
+                    DEFAULT_EXECUTION_JOB_MEMORY_LIMIT_BYTES,
+                    &path,
+                )?,
+                cpu_time_limit_ms: parse_u64_key_or_default(
+                    input,
+                    "cpu_time_limit_ms",
+                    DEFAULT_EXECUTION_CPU_TIME_LIMIT_MS,
+                    &path,
+                )?,
+                active_process_limit: parse_u32_key_or_default(
+                    input,
+                    "active_process_limit",
+                    DEFAULT_EXECUTION_ACTIVE_PROCESS_LIMIT,
+                    &path,
+                )?,
                 environment_inheritance: parse_string_key_or_default(
                     input,
                     "environment_inheritance",
@@ -380,6 +428,57 @@ sunlight_commit_policy = \"{}\"
                     ),
                 });
             }
+        }
+        for (field, value) in [
+            (
+                "process_memory_limit_bytes",
+                self.execution_policy.process_memory_limit_bytes,
+            ),
+            (
+                "job_memory_limit_bytes",
+                self.execution_policy.job_memory_limit_bytes,
+            ),
+        ] {
+            if !(MIN_EXECUTION_MEMORY_LIMIT_BYTES..=MAX_EXECUTION_MEMORY_LIMIT_BYTES)
+                .contains(&value)
+            {
+                return Err(RepositoryError::InvalidConfig {
+                    path: path.clone(),
+                    message: format!(
+                        "unsafe execution_policy.{field} `{value}`; expected {MIN_EXECUTION_MEMORY_LIMIT_BYTES}..={MAX_EXECUTION_MEMORY_LIMIT_BYTES}"
+                    ),
+                });
+            }
+        }
+        if self.execution_policy.job_memory_limit_bytes
+            < self.execution_policy.process_memory_limit_bytes
+        {
+            return Err(RepositoryError::InvalidConfig {
+                path: path.clone(),
+                message: "unsafe execution_policy.job_memory_limit_bytes; expected a value greater than or equal to process_memory_limit_bytes".to_string(),
+            });
+        }
+        if self.execution_policy.cpu_time_limit_ms == 0
+            || self.execution_policy.cpu_time_limit_ms > MAX_EXECUTION_CPU_TIME_LIMIT_MS
+        {
+            return Err(RepositoryError::InvalidConfig {
+                path: path.clone(),
+                message: format!(
+                    "unsafe execution_policy.cpu_time_limit_ms `{}`; expected 1..={MAX_EXECUTION_CPU_TIME_LIMIT_MS}",
+                    self.execution_policy.cpu_time_limit_ms
+                ),
+            });
+        }
+        if self.execution_policy.active_process_limit == 0
+            || self.execution_policy.active_process_limit > MAX_EXECUTION_ACTIVE_PROCESS_LIMIT
+        {
+            return Err(RepositoryError::InvalidConfig {
+                path: path.clone(),
+                message: format!(
+                    "unsafe execution_policy.active_process_limit `{}`; expected 1..={MAX_EXECUTION_ACTIVE_PROCESS_LIMIT}",
+                    self.execution_policy.active_process_limit
+                ),
+            });
         }
         if self.execution_policy.environment_inheritance != CONSERVATIVE_ENVIRONMENT_INHERITANCE {
             return Err(RepositoryError::InvalidConfig {
@@ -703,6 +802,27 @@ fn parse_u64_key_or_default(
         })
 }
 
+fn parse_u32_key_or_default(
+    input: &str,
+    key: &str,
+    default: u32,
+    path: &Path,
+) -> Result<u32, RepositoryError> {
+    let prefix = format!("{} = ", key);
+    let Some(value) = input
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix))
+    else {
+        return Ok(default);
+    };
+    value
+        .parse::<u32>()
+        .map_err(|_| RepositoryError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: format!("invalid execution_policy.{key} `{value}`; expected an integer"),
+        })
+}
+
 fn parse_string_key_or_default(
     input: &str,
     key: &str,
@@ -764,6 +884,10 @@ mod tests {
         assert!(config.contains("sunlight_commit_policy = \"conservative\""));
         assert!(config.contains("[execution_policy]"));
         assert!(config.contains("timeout_ms = 300000"));
+        assert!(config.contains("process_memory_limit_bytes = 2147483648"));
+        assert!(config.contains("job_memory_limit_bytes = 4294967296"));
+        assert!(config.contains("cpu_time_limit_ms = 300000"));
+        assert!(config.contains("active_process_limit = 32"));
         assert!(config.contains("environment_inheritance = \"minimal_os_allowlist\""));
         assert!(config.contains("network_policy = \"not_enforced\""));
 
@@ -821,6 +945,10 @@ mod tests {
                         | "timeout_ms = 300000"
                         | "stdout_limit_bytes = 1048576"
                         | "stderr_limit_bytes = 1048576"
+                        | "process_memory_limit_bytes = 2147483648"
+                        | "job_memory_limit_bytes = 4294967296"
+                        | "cpu_time_limit_ms = 300000"
+                        | "active_process_limit = 32"
                         | "environment_inheritance = \"minimal_os_allowlist\""
                         | "network_policy = \"not_enforced\""
                 )
@@ -836,6 +964,22 @@ mod tests {
         assert_eq!(
             config.execution_policy.stdout_limit_bytes,
             DEFAULT_EXECUTION_STDOUT_LIMIT_BYTES
+        );
+        assert_eq!(
+            config.execution_policy.process_memory_limit_bytes,
+            DEFAULT_EXECUTION_PROCESS_MEMORY_LIMIT_BYTES
+        );
+        assert_eq!(
+            config.execution_policy.job_memory_limit_bytes,
+            DEFAULT_EXECUTION_JOB_MEMORY_LIMIT_BYTES
+        );
+        assert_eq!(
+            config.execution_policy.cpu_time_limit_ms,
+            DEFAULT_EXECUTION_CPU_TIME_LIMIT_MS
+        );
+        assert_eq!(
+            config.execution_policy.active_process_limit,
+            DEFAULT_EXECUTION_ACTIVE_PROCESS_LIMIT
         );
         assert_eq!(
             config.execution_policy.environment_inheritance,
@@ -875,6 +1019,26 @@ mod tests {
                 "stderr_limit_bytes = 1048576",
                 "stderr_limit_bytes = invalid",
                 "execution_policy.stderr_limit_bytes",
+            ),
+            (
+                "process_memory_limit_bytes = 2147483648",
+                "process_memory_limit_bytes = 1024",
+                "execution_policy.process_memory_limit_bytes",
+            ),
+            (
+                "job_memory_limit_bytes = 4294967296",
+                "job_memory_limit_bytes = 1073741824",
+                "execution_policy.job_memory_limit_bytes",
+            ),
+            (
+                "cpu_time_limit_ms = 300000",
+                "cpu_time_limit_ms = 0",
+                "execution_policy.cpu_time_limit_ms",
+            ),
+            (
+                "active_process_limit = 32",
+                "active_process_limit = invalid",
+                "execution_policy.active_process_limit",
             ),
             (
                 "environment_inheritance = \"minimal_os_allowlist\"",

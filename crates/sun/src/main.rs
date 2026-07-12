@@ -7,6 +7,9 @@ use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+mod windows_job;
+
 use sha2::{Digest, Sha256};
 
 use sunlight_core::artifacts::{
@@ -2844,8 +2847,84 @@ struct BoundedProcessOutput {
     timed_out: bool,
     termination_failed: bool,
     wait_failed: bool,
+    resource_termination: Option<String>,
     stdout: BoundedStreamSummary,
     stderr: BoundedStreamSummary,
+}
+
+#[derive(Debug)]
+enum ProcessRunError {
+    Command(io::Error),
+    ContainmentSetup(io::Error),
+}
+
+struct ExecutionChild {
+    #[cfg(windows)]
+    contained: windows_job::ContainedChild,
+    #[cfg(not(windows))]
+    child: Child,
+}
+
+impl ExecutionChild {
+    fn spawn(command: Command, policy: &ExecutionPolicy) -> Result<Self, ProcessRunError> {
+        #[cfg(windows)]
+        {
+            return windows_job::ContainedChild::spawn(command, policy)
+                .map(|contained| Self { contained })
+                .map_err(|error| match error {
+                    windows_job::ContainmentSpawnError::Setup(error) => {
+                        ProcessRunError::ContainmentSetup(error)
+                    }
+                    windows_job::ContainmentSpawnError::Command(error) => {
+                        ProcessRunError::Command(error)
+                    }
+                });
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = policy;
+            command
+                .spawn()
+                .map(|child| Self { child })
+                .map_err(ProcessRunError::Command)
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        #[cfg(windows)]
+        {
+            &mut self.contained.child
+        }
+        #[cfg(not(windows))]
+        {
+            &mut self.child
+        }
+    }
+
+    fn poll_resource_termination(&self) -> io::Result<Option<String>> {
+        #[cfg(windows)]
+        {
+            self.contained
+                .poll_resource_termination()
+                .map(|reason| reason.map(|reason| reason.as_str().to_string()))
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(None)
+        }
+    }
+
+    fn terminate_tree(&mut self) -> (bool, bool) {
+        #[cfg(windows)]
+        {
+            let terminated = self.contained.terminate().is_ok();
+            (!terminated, terminated)
+        }
+        #[cfg(not(windows))]
+        {
+            terminate_execution_process_tree(&mut self.child)
+        }
+    }
 }
 
 fn execution_environment_allowlist() -> Vec<&'static str> {
@@ -2900,22 +2979,9 @@ fn summarize_bounded_stream<R: Read>(mut stream: R, limit: u64) -> BoundedStream
     }
 }
 
+#[cfg(not(windows))]
 fn terminate_execution_process_tree(child: &mut Child) -> (bool, bool) {
     let pid = child.id().to_string();
-    #[cfg(windows)]
-    {
-        let tree_killed = Command::new("taskkill")
-            .args(["/PID", &pid, "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        if !tree_killed {
-            return (true, child.kill().is_ok());
-        }
-        return (false, true);
-    }
     #[cfg(unix)]
     {
         let process_group = format!("-{pid}");
@@ -2942,7 +3008,7 @@ fn run_bounded_process(
     argv: &[String],
     cwd: &Path,
     policy: &ExecutionPolicy,
-) -> io::Result<BoundedProcessOutput> {
+) -> Result<BoundedProcessOutput, ProcessRunError> {
     let allowlist = execution_environment_allowlist();
     let mut command = Command::new(&argv[0]);
     command
@@ -2962,27 +3028,78 @@ fn run_bounded_process(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn()?;
+    let mut execution_child = ExecutionChild::spawn(command, policy)?;
     let stdout_limit = policy.stdout_limit_bytes;
     let stderr_limit = policy.stderr_limit_bytes;
-    let stdout_reader = child.stdout.take().map(|stdout| {
+    let stdout_reader = execution_child.child_mut().stdout.take().map(|stdout| {
         thread::Builder::new()
             .name("sun-stdout-reader".to_string())
             .spawn(move || summarize_bounded_stream(stdout, stdout_limit))
     });
-    let stderr_reader = child.stderr.take().map(|stderr| {
+    let stderr_reader = execution_child.child_mut().stderr.take().map(|stderr| {
         thread::Builder::new()
             .name("sun-stderr-reader".to_string())
             .spawn(move || summarize_bounded_stream(stderr, stderr_limit))
     });
+    let capture_setup_failed = stdout_reader.as_ref().is_some_and(Result::is_err)
+        || stderr_reader.as_ref().is_some_and(Result::is_err);
     let deadline = Instant::now() + Duration::from_millis(policy.timeout_ms);
     let mut status = None;
     let mut timed_out = false;
     let mut termination_failed = false;
     let mut wait_failed = false;
+    let mut resource_termination = None;
     let mut child_reaped = false;
     loop {
-        match child.try_wait() {
+        if capture_setup_failed {
+            wait_failed = true;
+            let (tree_failed, root_termination_started) = execution_child.terminate_tree();
+            termination_failed = tree_failed;
+            if root_termination_started {
+                match execution_child.child_mut().wait() {
+                    Ok(exit_status) => {
+                        status = Some(exit_status);
+                        child_reaped = true;
+                    }
+                    Err(_) => wait_failed = true,
+                }
+            }
+            break;
+        }
+        match execution_child.poll_resource_termination() {
+            Ok(Some(reason)) => {
+                resource_termination = Some(reason);
+                let (tree_failed, root_termination_started) = execution_child.terminate_tree();
+                termination_failed = tree_failed;
+                if root_termination_started {
+                    match execution_child.child_mut().wait() {
+                        Ok(exit_status) => {
+                            status = Some(exit_status);
+                            child_reaped = true;
+                        }
+                        Err(_) => wait_failed = true,
+                    }
+                }
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                wait_failed = true;
+                let (tree_failed, root_termination_started) = execution_child.terminate_tree();
+                termination_failed = tree_failed;
+                if root_termination_started {
+                    match execution_child.child_mut().wait() {
+                        Ok(exit_status) => {
+                            status = Some(exit_status);
+                            child_reaped = true;
+                        }
+                        Err(_) => wait_failed = true,
+                    }
+                }
+                break;
+            }
+        }
+        match execution_child.child_mut().try_wait() {
             Ok(Some(exit_status)) => {
                 status = Some(exit_status);
                 child_reaped = true;
@@ -2991,11 +3108,10 @@ fn run_bounded_process(
             Ok(None) => {}
             Err(_) => {
                 wait_failed = true;
-                let (tree_failed, root_termination_started) =
-                    terminate_execution_process_tree(&mut child);
+                let (tree_failed, root_termination_started) = execution_child.terminate_tree();
                 termination_failed = tree_failed;
                 if root_termination_started {
-                    match child.wait() {
+                    match execution_child.child_mut().wait() {
                         Ok(exit_status) => {
                             status = Some(exit_status);
                             child_reaped = true;
@@ -3008,7 +3124,7 @@ fn run_bounded_process(
         }
         let now = Instant::now();
         if now >= deadline {
-            match child.try_wait() {
+            match execution_child.child_mut().try_wait() {
                 Ok(Some(exit_status)) => {
                     status = Some(exit_status);
                     child_reaped = true;
@@ -3018,11 +3134,10 @@ fn run_bounded_process(
                 Err(_) => wait_failed = true,
             }
             timed_out = true;
-            let (tree_failed, root_termination_started) =
-                terminate_execution_process_tree(&mut child);
+            let (tree_failed, root_termination_started) = execution_child.terminate_tree();
             termination_failed = tree_failed;
             if root_termination_started {
-                match child.wait() {
+                match execution_child.child_mut().wait() {
                     Ok(exit_status) => {
                         status = Some(exit_status);
                         child_reaped = true;
@@ -3035,6 +3150,14 @@ fn run_bounded_process(
             break;
         }
         thread::sleep((deadline - now).min(Duration::from_millis(10)));
+    }
+    #[cfg(windows)]
+    if child_reaped && !timed_out && resource_termination.is_none() {
+        let (tree_failed, _) = execution_child.terminate_tree();
+        termination_failed |= tree_failed;
+        if let Ok(reason) = execution_child.poll_resource_termination() {
+            resource_termination = reason;
+        }
     }
     let failed_summary = || BoundedStreamSummary {
         observed_digest: real_content_hash(&[]),
@@ -3065,6 +3188,7 @@ fn run_bounded_process(
         timed_out,
         termination_failed,
         wait_failed,
+        resource_termination,
         stdout,
         stderr,
     })
@@ -3132,12 +3256,18 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     let started_at = real_now_id();
     let command_output =
         run_bounded_process(&options.command_argv, &execution_cwd, &execution_policy).map_err(
-            |error| {
-                CliError::new(
+            |error| match error {
+                ProcessRunError::Command(error) => CliError::new(
                     "execution_command_failed",
                     format!("failed to run command: {error}"),
                 )
-                .with_detail("command", options.command_argv.join(" "))
+                .with_detail("command", options.command_argv.join(" ")),
+                ProcessRunError::ContainmentSetup(error) => CliError::new(
+                    "execution_containment_setup_failed",
+                    format!("failed to establish execution containment: {error}"),
+                )
+                .with_detail("platform", std::env::consts::OS)
+                .with_detail("command_started", "false"),
             },
         )?;
     let finished_at = real_now_id();
@@ -3151,7 +3281,9 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     )?;
     projected_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let outputs = real_execution_outputs(&view_state.entries, &projected_entries);
-    let status = if command_output.stdout.capture_failed
+    let status = if command_output.resource_termination.is_some() {
+        "policy_blocked"
+    } else if command_output.stdout.capture_failed
         || command_output.stderr.capture_failed
         || command_output.termination_failed
         || command_output.wait_failed
@@ -3164,6 +3296,19 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     } else {
         "fail"
     };
+    let termination_reason = command_output.resource_termination.clone().or_else(|| {
+        if command_output.timed_out {
+            Some("wall_clock_timeout".to_string())
+        } else if command_output.stdout.capture_failed
+            || command_output.stderr.capture_failed
+            || command_output.termination_failed
+            || command_output.wait_failed
+        {
+            Some("runner_failure".to_string())
+        } else {
+            Some("command_exit".to_string())
+        }
+    });
     let execution = RealExecutionSnapshot {
         execution_id: execution_id.clone(),
         projection_id: projection_id.clone(),
@@ -3174,6 +3319,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         exit_code: command_output.status.and_then(|status| status.code()),
         status: status.to_string(),
         timed_out: command_output.timed_out,
+        termination_reason,
         termination_failed: command_output.termination_failed,
         wait_failed: command_output.wait_failed,
         stdout_observed_digest: command_output.stdout.observed_digest,
@@ -3187,6 +3333,25 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         stderr_truncated: command_output.stderr.truncated,
         stderr_capture_failed: command_output.stderr.capture_failed,
         timeout_ms: Some(execution_policy.timeout_ms),
+        process_memory_limit_bytes: Some(execution_policy.process_memory_limit_bytes),
+        job_memory_limit_bytes: Some(execution_policy.job_memory_limit_bytes),
+        cpu_time_limit_ms: Some(execution_policy.cpu_time_limit_ms),
+        active_process_limit: Some(execution_policy.active_process_limit),
+        process_tree_policy: if cfg!(windows) {
+            "windows_job_object_kill_on_close".to_string()
+        } else {
+            "not_enforced".to_string()
+        },
+        cpu_policy: if cfg!(windows) {
+            "windows_job_object_cpu_time".to_string()
+        } else {
+            "not_enforced".to_string()
+        },
+        memory_policy: if cfg!(windows) {
+            "windows_job_object_process_and_job_memory".to_string()
+        } else {
+            "not_enforced".to_string()
+        },
         environment_policy: execution_policy.environment_inheritance,
         environment_allowlist: execution_environment_allowlist()
             .into_iter()
@@ -5321,10 +5486,12 @@ fn real_execution_record(
             status: match execution.status.as_str() {
                 "pass" => sunlight_core::execution::ExecutionStatus::Pass,
                 "timeout" => sunlight_core::execution::ExecutionStatus::Timeout,
+                "policy_blocked" => sunlight_core::execution::ExecutionStatus::PolicyBlocked,
                 _ => sunlight_core::execution::ExecutionStatus::Fail,
             },
             exit_code: execution.exit_code,
             timed_out: execution.timed_out,
+            termination_reason: execution.termination_reason.clone(),
         },
         started_at: execution.started_at.clone(),
         finished_at: execution.finished_at.clone(),
@@ -5439,6 +5606,8 @@ fn real_execution_runtime_policy_json(execution: &RealExecutionSnapshot) -> Stri
     format!(
         concat!(
             "{{\"timeout_ms\":{},",
+            "\"limits\":{{\"process_memory_bytes\":{},\"job_memory_bytes\":{},\"cpu_time_ms\":{},\"active_processes\":{}}},",
+            "\"enforcement\":{{\"process_tree\":\"{}\",\"cpu\":\"{}\",\"memory\":\"{}\"}},",
             "\"environment\":{{\"inheritance\":\"{}\",\"allowlist\":{},\"values_recorded\":false}},",
             "\"network\":\"{}\",",
             "\"filesystem_writes\":\"{}\"}}"
@@ -5447,6 +5616,25 @@ fn real_execution_runtime_policy_json(execution: &RealExecutionSnapshot) -> Stri
             .timeout_ms
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_string()),
+        execution
+            .process_memory_limit_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        execution
+            .job_memory_limit_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        execution
+            .cpu_time_limit_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        execution
+            .active_process_limit
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        json_escape(&execution.process_tree_policy),
+        json_escape(&execution.cpu_policy),
+        json_escape(&execution.memory_policy),
         json_escape(&execution.environment_policy),
         string_array_json(execution.environment_allowlist.iter().map(String::as_str)),
         json_escape(&execution.network_policy),
@@ -5459,7 +5647,7 @@ fn real_execution_output_capture_json(execution: &RealExecutionSnapshot) -> Stri
         concat!(
             "{{\"stdout\":{{\"observed_digest\":\"{}\",\"observed_byte_length\":{},\"captured_byte_length\":{},\"truncated\":{},\"capture_failed\":{}}},",
             "\"stderr\":{{\"observed_digest\":\"{}\",\"observed_byte_length\":{},\"captured_byte_length\":{},\"truncated\":{},\"capture_failed\":{}}},",
-            "\"process_control\":{{\"termination_failed\":{},\"wait_failed\":{}}}}}"
+            "\"process_control\":{{\"termination_reason\":{},\"termination_failed\":{},\"wait_failed\":{}}}}}"
         ),
         json_escape(&execution.stdout_observed_digest),
         execution.stdout_byte_length,
@@ -5471,6 +5659,7 @@ fn real_execution_output_capture_json(execution: &RealExecutionSnapshot) -> Stri
         execution.stderr_captured_byte_length,
         execution.stderr_truncated,
         execution.stderr_capture_failed,
+        optional_string_json(execution.termination_reason.as_deref()),
         execution.termination_failed,
         execution.wait_failed,
     )
@@ -5673,6 +5862,11 @@ fn real_execution_warnings_json(
     let mut warnings = Vec::new();
     if execution.status == "timeout" {
         warnings.push("{\"code\":\"execution_timeout\",\"message\":\"inspect the timeout and rerun with an appropriate bounded policy\",\"details\":{}}".to_string());
+    } else if execution.status == "policy_blocked" {
+        warnings.push(format!(
+            "{{\"code\":\"execution_resource_policy_blocked\",\"message\":\"the execution was terminated by a configured resource limit\",\"details\":{{\"termination_reason\":{}}}}}",
+            optional_string_json(execution.termination_reason.as_deref())
+        ));
     } else if execution.status != "pass" {
         warnings.push("{\"code\":\"execution_failed\",\"message\":\"inspect the failed execution before checkpointing\",\"details\":{}}".to_string());
     }
@@ -6090,7 +6284,7 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
             "\"checkpoints\":{{\"count\":{},\"unexported\":{},\"records\":[{}]}},",
             "\"exports\":{{\"count\":{},\"maps\":[{}]}},",
             "\"policy\":{{\"reports\":{},\"passed\":{},\"failed\":{},\"invalid_or_tampered\":{},\"missing_export_reports\":{}}},",
-            "\"execution_isolation\":{{\"enforced\":false,\"network\":\"unenforced\",\"filesystem_writes\":\"managed_projection_writable_not_isolated\",\"cpu\":\"unenforced\",\"memory\":\"unenforced\"}}}}"
+            "\"execution_isolation\":{{\"enforced\":false,\"process_tree\":\"{}\",\"network\":\"unenforced\",\"filesystem_writes\":\"managed_projection_writable_not_isolated\",\"cpu\":\"{}\",\"memory\":\"{}\"}}}}"
         ),
         json_escape(&state.repository_id),
         json_escape(&state.base_checkpoint_id),
@@ -6128,6 +6322,9 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
         summary.policy.failed_count,
         summary.policy.invalid_count,
         summary.policy.missing_export_report_count,
+        if cfg!(windows) { "windows_job_object" } else { "unenforced" },
+        if cfg!(windows) { "windows_job_object_cpu_time" } else { "unenforced" },
+        if cfg!(windows) { "windows_job_object_process_and_job_memory" } else { "unenforced" },
     )
 }
 
@@ -6261,7 +6458,13 @@ fn print_real_status_text(
         summary.policy.failed_count,
         summary.policy.invalid_count
     );
-    println!("execution isolation: network/filesystem-write/cpu/memory unenforced");
+    if cfg!(windows) {
+        println!("execution isolation: process-tree/cpu/memory enforced by Windows Job Objects; network/filesystem-write unenforced");
+    } else {
+        println!(
+            "execution isolation: process-tree/cpu/memory/network/filesystem-write unenforced"
+        );
+    }
     if summary.recovery_rollback_evidence {
         println!("warning[state_recovery_rolled_back]: inspect .sunlight/local/recovery/native-state before the next successful state publication cleans the evidence");
     }
@@ -14588,12 +14791,18 @@ fn export_refs_json(checkpoint: &CheckpointRecord) -> String {
 }
 
 fn execution_result_json(execution: &ExecutionRecord) -> String {
+    let termination_reason = execution
+        .result
+        .termination_reason
+        .as_deref()
+        .map(|reason| format!(",\"termination_reason\":\"{}\"", json_escape(reason)))
+        .unwrap_or_default();
     format!(
         concat!(
             "{{",
             "\"status\":\"{}\",",
             "\"exit_code\":{},",
-            "\"timed_out\":{}",
+            "\"timed_out\":{}{}",
             "}}"
         ),
         execution.result.status.as_str(),
@@ -14603,6 +14812,7 @@ fn execution_result_json(execution: &ExecutionRecord) -> String {
             .map(|code| code.to_string())
             .unwrap_or_else(|| "null".to_string()),
         execution.result.timed_out,
+        termination_reason,
     )
 }
 
@@ -15524,7 +15734,7 @@ fn print_command_help(command: &str) {
         "policy" | "policy check-export" | "policy check-commit" | "policy explain" => println!("sun policy\n\nUsage:\n  sun policy check-export --checkpoint <checkpoint> [--branch <ref>] [--json]\n  sun policy check-commit [--paths <path>...] [--json]\n  sun policy explain <validation-report> [--json]"),
         "git" | "git export" => println!("sun git export\n\nUsage:\n  sun git export --checkpoint <checkpoint> --branch <ref> [--write-plan|--execute-local] [--repo <path>] [--json]"),
         "checkpoint" | "checkpoint create" => println!("sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--json]"),
-        "run" => println!("sun run\n\nUsage:\n  sun run --view <resolved-view-id> [--timeout-ms <ms>] [--env-policy clean|allowlist] [--env-allow <name>...] -- <command> [args...]\n\nNetwork, filesystem-write, CPU, and memory isolation remain explicitly unenforced."),
+        "run" => println!("sun run\n\nUsage:\n  sun run --view <resolved-view-id> -- <command> [args...]\n\nRuntime bounds come from [execution_policy] in .sunlight/config.toml. Windows no-fixture runs enforce process-tree, CPU-time, process/job-memory, and active-process limits with a dedicated Job Object. Non-Windows records those dimensions as unenforced. Network and broad filesystem-write isolation remain explicitly unenforced."),
         "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => println!("sun artifact operations\n\nUsage:\n  sun read <path> --session <session> [--json]\n  sun list [path-prefix] --session <session> [--json]\n  sun search <query> --session <session> [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification <class> [--json]"),
         "view" | "view resolve" => println!("sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nResolves persisted topic selections; conflicts and staleness remain inspectable records."),
         "project" | "project materialize" | "projection" | "projection create" => println!("sun project materialize\n\nUsage:\n  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export [--strategy copy|reflink|hardlink_readonly|overlay_copyup] [--no-copy-fallback] [--projection-root <path>] [--json]\n\nManaged projections adapt persisted views for filesystem tools and are not source truth. Automatic selection prefers safe Windows block cloning and falls back to full copy; --no-copy-fallback makes the requested strategy required."),

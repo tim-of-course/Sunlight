@@ -169,6 +169,7 @@ pub struct ExecutionResult {
     pub status: ExecutionStatus,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    pub termination_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,6 +373,7 @@ pub fn fixture_passing_execution_from_resolved_view(
             status: ExecutionStatus::Pass,
             exit_code: Some(0),
             timed_out: false,
+            termination_reason: None,
         },
         vec![fixture_stdout_summary()],
     )
@@ -387,6 +389,7 @@ pub fn fixture_failing_execution_from_resolved_view(
             status: ExecutionStatus::Fail,
             exit_code: Some(101),
             timed_out: false,
+            termination_reason: None,
         },
         vec![fixture_stdout_summary(), fixture_stderr_summary()],
     )

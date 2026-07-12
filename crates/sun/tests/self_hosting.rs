@@ -443,6 +443,25 @@ fn self_hosting_real_repository_acceptance() {
 
     let run = run_execution(&clone, &imported_view);
     assert_eq!(string(&run, &["data", "result", "status"]), "pass");
+    assert_eq!(
+        string(&run, &["data", "result", "termination_reason"]),
+        "command_exit"
+    );
+    assert_eq!(
+        string(&run, &["data", "runtime_policy", "network"]),
+        "not_enforced"
+    );
+    assert_eq!(
+        string(
+            &run,
+            &["data", "runtime_policy", "enforcement", "process_tree"]
+        ),
+        if cfg!(windows) {
+            "windows_job_object_kill_on_close"
+        } else {
+            "not_enforced"
+        }
+    );
     let execution_id = string(&run, &["data", "execution_id"]).to_string();
     assert!(array(&run, &["data", "promotion_candidates"])
         .iter()

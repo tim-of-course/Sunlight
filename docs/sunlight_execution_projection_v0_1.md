@@ -71,6 +71,12 @@ The command runner stores normalized argv, not a shell string, unless the user e
 
 Raw logs, sandbox directories, package caches, coverage output, and full environment dumps are `local_only` by default.
 
+For no-fixture runs on Windows, the local MVP creates a dedicated Windows Job Object before launching the command. The root process is created with `CREATE_SUSPENDED`, assigned to the fully configured job, and resumed only after assignment succeeds. The job enables kill-on-close, an active-process limit, aggregate and per-process memory limits, and per-process/job user CPU-time limits. Timeout, runner cleanup, and resource-policy termination terminate the complete job and reap the root process. Job completion notifications distinguish `cpu_time_limit`, `process_memory_limit`, `job_memory_limit`, and `active_process_limit` from `wall_clock_timeout` and ordinary `command_exit`. If job creation, configuration, assignment, or resume fails, the run fails closed with `execution_containment_setup_failed`; it never resumes the uncontained process.
+
+Repository `[execution_policy]` keys use integer local-MVP units: `process_memory_limit_bytes` and `job_memory_limit_bytes` are bytes, `cpu_time_limit_ms` is cumulative user CPU milliseconds, and `active_process_limit` counts the root plus all descendants. Defaults are respectively 2 GiB, 4 GiB, 300,000 ms, and 32 processes. Older configs that omit these keys receive those defaults. Memory values are validated from 16 MiB through 1 TiB, job memory must be at least process memory, CPU time from 1 through 86,400,000 ms, and process count from 1 through 1,024.
+
+Non-Windows builds retain bounded output, wall timeout, and their existing best-effort process cleanup, but explicitly record process-tree, CPU, and memory enforcement as `not_enforced`. Network access and writes outside the managed writable projection are not isolated on any platform in this slice; execution/status/inspect surfaces continue to expose those limitations rather than claiming full sandbox enforcement.
+
 ## Execution Record
 
 The Phase 3 `execution` record uses the v1 schema contract.

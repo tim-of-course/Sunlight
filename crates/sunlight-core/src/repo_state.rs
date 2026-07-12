@@ -254,6 +254,7 @@ pub struct RealExecutionSnapshot {
     pub exit_code: Option<i32>,
     pub status: String,
     pub timed_out: bool,
+    pub termination_reason: Option<String>,
     pub termination_failed: bool,
     pub wait_failed: bool,
     pub stdout_observed_digest: String,
@@ -267,6 +268,13 @@ pub struct RealExecutionSnapshot {
     pub stderr_truncated: bool,
     pub stderr_capture_failed: bool,
     pub timeout_ms: Option<u64>,
+    pub process_memory_limit_bytes: Option<u64>,
+    pub job_memory_limit_bytes: Option<u64>,
+    pub cpu_time_limit_ms: Option<u64>,
+    pub active_process_limit: Option<u32>,
+    pub process_tree_policy: String,
+    pub cpu_policy: String,
+    pub memory_policy: String,
     pub environment_policy: String,
     pub environment_allowlist: Vec<String>,
     pub network_policy: String,
@@ -3604,6 +3612,7 @@ fn parse_execution_snapshot(
         timed_out: optional_bool(object, "timed_out", state_path)?.unwrap_or_else(|| {
             required_string(object, "status", state_path).is_ok_and(|value| value == "timeout")
         }),
+        termination_reason: optional_string(object, "termination_reason", state_path)?,
         termination_failed: optional_bool(object, "termination_failed", state_path)?
             .unwrap_or(false),
         wait_failed: optional_bool(object, "wait_failed", state_path)?.unwrap_or(false),
@@ -3638,6 +3647,17 @@ fn parse_execution_snapshot(
         stderr_capture_failed: optional_bool(object, "stderr_capture_failed", state_path)?
             .unwrap_or(false),
         timeout_ms: optional_u64(object, "timeout_ms", state_path)?,
+        process_memory_limit_bytes: optional_u64(object, "process_memory_limit_bytes", state_path)?,
+        job_memory_limit_bytes: optional_u64(object, "job_memory_limit_bytes", state_path)?,
+        cpu_time_limit_ms: optional_u64(object, "cpu_time_limit_ms", state_path)?,
+        active_process_limit: optional_u64(object, "active_process_limit", state_path)?
+            .and_then(|value| u32::try_from(value).ok()),
+        process_tree_policy: optional_string(object, "process_tree_policy", state_path)?
+            .unwrap_or_else(|| "legacy_unrecorded".to_string()),
+        cpu_policy: optional_string(object, "cpu_policy", state_path)?
+            .unwrap_or_else(|| "legacy_unrecorded".to_string()),
+        memory_policy: optional_string(object, "memory_policy", state_path)?
+            .unwrap_or_else(|| "legacy_unrecorded".to_string()),
         environment_policy: optional_string(object, "environment_policy", state_path)?
             .unwrap_or_else(|| "legacy_unrecorded".to_string()),
         environment_allowlist: optional_array(object, "environment_allowlist", state_path)?
@@ -3974,6 +3994,14 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
         JsonValue::Bool(execution.timed_out),
     );
     object.insert(
+        "termination_reason".to_string(),
+        execution
+            .termination_reason
+            .as_ref()
+            .map(|value| JsonValue::String(value.clone()))
+            .unwrap_or(JsonValue::Null),
+    );
+    object.insert(
         "termination_failed".to_string(),
         JsonValue::Bool(execution.termination_failed),
     );
@@ -4027,6 +4055,37 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
             .timeout_ms
             .map(|value| JsonValue::Number(value.to_string()))
             .unwrap_or(JsonValue::Null),
+    );
+    for (key, value) in [
+        (
+            "process_memory_limit_bytes",
+            execution.process_memory_limit_bytes,
+        ),
+        ("job_memory_limit_bytes", execution.job_memory_limit_bytes),
+        ("cpu_time_limit_ms", execution.cpu_time_limit_ms),
+        (
+            "active_process_limit",
+            execution.active_process_limit.map(u64::from),
+        ),
+    ] {
+        object.insert(
+            key.to_string(),
+            value
+                .map(|value| JsonValue::Number(value.to_string()))
+                .unwrap_or(JsonValue::Null),
+        );
+    }
+    object.insert(
+        "process_tree_policy".to_string(),
+        JsonValue::String(execution.process_tree_policy.clone()),
+    );
+    object.insert(
+        "cpu_policy".to_string(),
+        JsonValue::String(execution.cpu_policy.clone()),
+    );
+    object.insert(
+        "memory_policy".to_string(),
+        JsonValue::String(execution.memory_policy.clone()),
     );
     object.insert(
         "environment_policy".to_string(),

@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use sunlight_core::records::parse_json_record;
+use sunlight_core::repo_state::RealRepoState;
 
 fn sun() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sun"))
@@ -69,7 +70,7 @@ fn no_fixture_repository_status_clean_initial_and_active_human_journey() {
     assert!(clean.contains("\"executions\":{\"total\":0"));
     assert!(clean.contains("\"checkpoints\":{\"count\":0,\"unexported\":0,\"records\":[]}"));
     assert!(clean.contains("\"execution_isolation\":{\"enforced\":false"));
-    assert!(clean.contains("\"code\":\"multi_record_publication_non_atomic\""));
+    assert!(!clean.contains("multi_record_publication_non_atomic"));
 
     let topic = sun()
         .args([
@@ -142,7 +143,7 @@ fn no_fixture_repository_status_clean_initial_and_active_human_journey() {
     assert!(human.contains("session session_operator"));
     assert!(human.contains("checkpoints 0  exports 0"));
     assert!(human.contains("execution isolation:"));
-    assert!(human.contains("warning[multi_record_publication_non_atomic]"));
+    assert!(!human.contains("multi_record_publication_non_atomic"));
     assert!(human.contains("warning[checkpoint_missing]: create a checkpoint"));
 }
 
@@ -275,6 +276,194 @@ fn no_fixture_interrupted_state_publication_recovers_and_continues() {
         .path()
         .join(".sunlight/session-generations/gen_recovery_agent_0002.json")
         .is_file());
+}
+
+#[test]
+fn no_fixture_native_mutation_outbox_recovers_every_declared_record_and_continues() {
+    let repo = TestRepo::new("native-mutation-outbox-recovery");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "outbox-native");
+    let canonical = repo.path().join(".sunlight/records/native-state.json");
+    let old = fs::read(&canonical).unwrap();
+    let content = repo.write_file("outbox-native.txt", "published through outbox\n");
+    let interrupted = sun()
+        .args([
+            "write",
+            "outbox-native.txt",
+            "--session",
+            "session_agent_a",
+            "--expect-hash",
+            "new",
+            "--content-file",
+        ])
+        .arg(content)
+        .args(["--classification", "source", "--json"])
+        .env("SUNLIGHT_TEST_FAILPOINT", "batch_after_canonical_commit")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+    assert_ne!(fs::read(&canonical).unwrap(), old);
+    assert!(!repo
+        .path()
+        .join(".sunlight/operations/op_native_0001.json")
+        .exists());
+    assert!(repo
+        .path()
+        .join(".sunlight/local/publication-outbox")
+        .is_dir());
+
+    let recovered = sun()
+        .args(["status", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&recovered);
+    let state = RealRepoState::load(repo.path()).unwrap();
+    for path in [
+        repo.path().join(".sunlight/operations/op_native_0001.json"),
+        repo.path()
+            .join(".sunlight/topics/rev_outbox_native_0001.json"),
+        repo.path()
+            .join(".sunlight/session-generations/gen_agent_a_0002.json"),
+        repo.path()
+            .join(".sunlight/views")
+            .join(format!("{}.json", state.resolved_view_id)),
+    ] {
+        assert!(
+            path.is_file(),
+            "missing recovered record {}",
+            path.display()
+        );
+        assert_valid_json(&fs::read_to_string(path).unwrap());
+    }
+    assert!(!repo
+        .path()
+        .join(".sunlight/local/publication-outbox")
+        .exists());
+
+    let continued = repo.write_file("continued-native.txt", "continued\n");
+    let write = sun()
+        .args([
+            "write",
+            "continued-native.txt",
+            "--session",
+            "session_agent_a",
+            "--expect-hash",
+            "new",
+            "--content-file",
+        ])
+        .arg(continued)
+        .args(["--classification", "source", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&write);
+    assert!(repo
+        .path()
+        .join(".sunlight/operations/op_native_0002.json")
+        .is_file());
+}
+
+#[test]
+fn no_fixture_compat_import_outbox_recovers_mid_batch_and_continues() {
+    let repo = TestRepo::new("compat-import-outbox-recovery");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    write_nested_file(repo.path(), "src/lib.rs", "pub fn answer() -> u32 { 42 }\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "base"]);
+    start_native_session(&repo, "outbox-compat");
+    let (projection_id, projection_root, generation_id) = create_real_compat_projection(&repo);
+    fs::write(
+        projection_root.join("src/lib.rs"),
+        b"pub fn answer() -> u32 { 43 }\n",
+    )
+    .unwrap();
+    let diff = real_compat_diff(&repo, &projection_id);
+    let candidate_id = candidate_id_for_path(&diff, "src/lib.rs");
+    let interrupted = sun()
+        .args([
+            "compat",
+            "import",
+            "--projection",
+            &projection_id,
+            "--candidate",
+            &candidate_id,
+            "--session-generation",
+            &generation_id,
+            "--json",
+        ])
+        .env("SUNLIGHT_TEST_FAILPOINT", "batch_mid_derived_publication")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success());
+    assert!(repo
+        .path()
+        .join(".sunlight/local/publication-outbox")
+        .is_dir());
+
+    let recovered = sun()
+        .args(["status", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&recovered);
+    let state = RealRepoState::load(repo.path()).unwrap();
+    for path in [
+        repo.path()
+            .join(".sunlight/session-generations/gen_agent_a_0002.json"),
+        repo.path()
+            .join(".sunlight/projections")
+            .join(format!("{projection_id}.json")),
+        repo.path().join(".sunlight/operations/op_native_0001.json"),
+        repo.path()
+            .join(".sunlight/compat-imports/op_native_0001.json"),
+        repo.path()
+            .join(".sunlight/topics/rev_outbox_compat_0001.json"),
+        repo.path()
+            .join(".sunlight/views")
+            .join(format!("{}.json", state.resolved_view_id)),
+    ] {
+        assert!(
+            path.is_file(),
+            "missing recovered record {}",
+            path.display()
+        );
+        assert_valid_json(&fs::read_to_string(path).unwrap());
+    }
+    assert!(!repo
+        .path()
+        .join(".sunlight/local/publication-outbox")
+        .exists());
+
+    let read = sun()
+        .args([
+            "read",
+            "src/lib.rs",
+            "--session",
+            "session_agent_a",
+            "--json",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&read);
+    assert!(stdout(&read).contains("43"));
+    let checkpoint = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg(&state.resolved_view_id)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&checkpoint);
 }
 
 #[test]

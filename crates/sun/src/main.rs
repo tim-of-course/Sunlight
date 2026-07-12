@@ -83,14 +83,14 @@ use sunlight_core::projection::{
 };
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repo_state::{
-    materialize_real_projection, native_session_generation_id, persist_quarantine_report,
+    materialize_real_projection, native_session_generation_id, quarantine_report_publication,
     real_artifact_id_for_path, real_content_hash, real_tree_hash,
-    scan_real_projection_files_with_quarantine, RealArtifactEntry, RealCheckpointSnapshot,
-    RealExecutionOutputSnapshot, RealExecutionPromotionSnapshot, RealExecutionSnapshot,
-    RealExportMapSnapshot, RealOperationEffect, RealOperationRecord, RealProjectionMaterialization,
-    RealProjectionMaterializationRequest, RealProjectionSnapshot, RealProjectionStrategy,
-    RealRepoState, RealResolvedRepoView, RealSessionGenerationRecord, RealSessionRecord,
-    RealTopicRecord, RepoStateError,
+    scan_real_projection_files_with_quarantine, DerivedRecordPublication, RealArtifactEntry,
+    RealCheckpointSnapshot, RealExecutionOutputSnapshot, RealExecutionPromotionSnapshot,
+    RealExecutionSnapshot, RealExportMapSnapshot, RealOperationEffect, RealOperationRecord,
+    RealProjectionMaterialization, RealProjectionMaterializationRequest, RealProjectionSnapshot,
+    RealProjectionStrategy, RealRepoState, RealResolvedRepoView, RealSessionGenerationRecord,
+    RealSessionRecord, RealTopicRecord, RepoStateError,
 };
 use sunlight_core::repository::{
     init_repository, resolve_projection_policy, ExecutionPolicy, RepositoryConfig,
@@ -195,6 +195,32 @@ impl From<RepoStateError> for CliError {
                 .with_detail("staged", staged.display().to_string())
                 .with_detail("backup", backup.display().to_string())
                 .with_detail("journal", journal.display().to_string()),
+            RepoStateError::PublicationRecovery { manifest, message } => {
+                CliError::new("publication_outbox_recovery_failed", message)
+                    .with_detail("manifest", manifest.display().to_string())
+            }
+            RepoStateError::WriterBusy { lock, timeout_ms } => CliError::new(
+                "repository_writer_busy",
+                "another Sunlight command is publishing or recovering repository state",
+            )
+            .with_detail("lock", lock.display().to_string())
+            .with_detail("timeout_ms", timeout_ms.to_string()),
+            RepoStateError::ConcurrentStateUpdate {
+                path,
+                expected_sequence,
+                actual_sequence,
+            } => CliError::new(
+                "concurrent_state_update",
+                "repository state changed after this command loaded it; reload and retry",
+            )
+            .with_detail("path", path.display().to_string())
+            .with_detail("expected_sequence", expected_sequence.to_string())
+            .with_detail(
+                "actual_sequence",
+                actual_sequence
+                    .map(|sequence| sequence.to_string())
+                    .unwrap_or_else(|| "missing".to_string()),
+            ),
             RepoStateError::ProjectionStrategyUnsupported {
                 strategy,
                 path,
@@ -299,32 +325,32 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
         invalid_request(error.to_string()).with_detail("command", "repository.init")
     })?;
     let ingest = RealRepoState::ingest(&report.repo_root, &report.repository_id)?;
-    ingest.save(&report.repo_root)?;
-    persist_quarantine_report(&report.repo_root, &ingest.quarantine)?;
-    ingest.persist_record(
-        &report.repo_root,
-        "checkpoints",
-        &ingest.base_checkpoint_id,
-        &format!(
+    let records = vec![
+        quarantine_report_publication(&ingest.quarantine)?,
+        ingest.record_publication(
+            "checkpoints",
+            &ingest.base_checkpoint_id,
+            &format!(
             "{{\"record_type\":\"checkpoint\",\"id\":\"{}\",\"repository_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"source\":\"worktree_ingest\"}}\n",
             json_escape(&ingest.base_checkpoint_id),
             json_escape(&ingest.repository_id),
             json_escape(&ingest.base_resolved_view_id),
             json_escape(&ingest.tree_hash),
-        ),
-    )?;
-    ingest.persist_record(
-        &report.repo_root,
-        "views",
-        &ingest.base_resolved_view_id,
-        &format!(
+            ),
+        )?,
+        ingest.record_publication(
+            "views",
+            &ingest.base_resolved_view_id,
+            &format!(
             "{{\"record_type\":\"resolved_view\",\"id\":\"{}\",\"repository_id\":\"{}\",\"base_checkpoint_ids\":[\"{}\"],\"tree_hash\":\"{}\"}}\n",
             json_escape(&ingest.base_resolved_view_id),
             json_escape(&ingest.repository_id),
             json_escape(&ingest.base_checkpoint_id),
             json_escape(&ingest.tree_hash),
-        ),
-    )?;
+            ),
+        )?,
+    ];
+    ingest.save_with_records(&report.repo_root, &records)?;
 
     if ctx.json {
         println!(
@@ -1356,8 +1382,8 @@ fn real_compat_project(
         entries: view_state.entries.clone(),
     };
     state.projections.push(projection.clone());
-    state.save(&repo_root)?;
-    persist_real_projection_record(&state, &projection)?;
+    let records = vec![real_projection_publication(&state, &projection)?];
+    state.save_with_records(&repo_root, &records)?;
 
     if ctx.json {
         println!("{}", real_compat_project_envelope(&state, &projection));
@@ -1606,14 +1632,7 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
     response.view.tree_identity.tree_hash = state.tree_hash.clone();
     state.projections[projection_index].last_import_operation_id =
         Some(response.operation.id.clone());
-    state.save(&repo_root)?;
-    persist_real_session_generation_record(
-        &state,
-        &response.session_id,
-        &response.session_generation.id,
-    )?;
     let projection_after = state.projections[projection_index].clone();
-    persist_real_projection_record(&state, &projection_after)?;
     let operation_record = state.operations.last().expect("accepted operation");
     let import_record_json = real_compat_import_record_json(
         &state,
@@ -1622,33 +1641,38 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
         &selected,
         &response,
     );
-    state.persist_record(
-        &repo_root,
-        "operations",
-        &response.operation.id,
-        &format!("{import_record_json}\n"),
-    )?;
-    state.persist_record(
-        &repo_root,
-        "compat-imports",
-        &response.operation.id,
-        &format!("{import_record_json}\n"),
-    )?;
-    state.persist_record(
-        &repo_root,
-        "topics",
-        &response.topic_revision.id,
-        &format!("{}\n", topic_revision_json(&response)),
-    )?;
-    state.persist_record(
-        &repo_root,
-        "views",
-        &state.resolved_view_id,
-        &format!(
-            "{}\n",
-            resolved_view_record_json(&real_resolved_view(&state))
-        ),
-    )?;
+    let records = vec![
+        real_session_generation_publication(
+            &state,
+            &response.session_id,
+            &response.session_generation.id,
+        )?,
+        real_projection_publication(&state, &projection_after)?,
+        state.record_publication(
+            "operations",
+            &response.operation.id,
+            &format!("{import_record_json}\n"),
+        )?,
+        state.record_publication(
+            "compat-imports",
+            &response.operation.id,
+            &format!("{import_record_json}\n"),
+        )?,
+        state.record_publication(
+            "topics",
+            &response.topic_revision.id,
+            &format!("{}\n", topic_revision_json(&response)),
+        )?,
+        state.record_publication(
+            "views",
+            &state.resolved_view_id,
+            &format!(
+                "{}\n",
+                resolved_view_record_json(&real_resolved_view(&state))
+            ),
+        )?,
+    ];
+    state.save_with_records(&repo_root, &records)?;
 
     if ctx.json {
         println!(
@@ -2081,9 +2105,7 @@ fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Resul
         revision_number: 0,
     });
     state.sync_compat_fields();
-    state.save(&repo_root)?;
-    state.persist_record(
-        &repo_root,
+    let records = vec![state.record_publication(
         "topics",
         &topic_id,
         &format!(
@@ -2094,7 +2116,8 @@ fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Resul
             json_escape(&options.display_name),
             json_escape(&state.base_checkpoint_id),
         ),
-    )?;
+    )?];
+    state.save_with_records(&repo_root, &records)?;
 
     if ctx.json {
         println!("{}", real_topic_create_success_envelope(&state));
@@ -2183,12 +2206,11 @@ fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Res
         });
     }
     state.sync_compat_fields();
-    state.save(&repo_root)?;
-    state.persist_record(
-        &repo_root,
-        "records",
-        &session_id,
-        &format!(
+    let records = vec![
+        state.record_publication(
+            "records",
+            &session_id,
+            &format!(
             "{{\"record_type\":\"session\",\"id\":\"{}\",\"repository_id\":\"{}\",\"write_topic_id\":\"{}\",\"resolved_view_id\":\"{}\",\"session_generation_id\":\"{}\",\"actor_id\":\"{}\"}}\n",
             json_escape(&session_id),
             json_escape(&state.repository_id),
@@ -2196,15 +2218,16 @@ fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Res
             json_escape(&resolved_view_id),
             json_escape(&session_generation_id),
             json_escape(&options.actor_id),
-        ),
-    )?;
-    persist_real_session_generation_record(&state, &session_id, &session_generation_id)?;
-    state.persist_record(
-        &repo_root,
-        "views",
-        &resolved_view_id,
-        &format!("{}\n", resolved_view_record_json(&selected.result)),
-    )?;
+            ),
+        )?,
+        real_session_generation_publication(&state, &session_id, &session_generation_id)?,
+        state.record_publication(
+            "views",
+            &resolved_view_id,
+            &format!("{}\n", resolved_view_record_json(&selected.result)),
+        )?,
+    ];
+    state.save_with_records(&repo_root, &records)?;
 
     if ctx.json {
         let session = real_session(&state, &session_id)?;
@@ -2269,21 +2292,21 @@ fn real_session_refresh(
             })
             .collect(),
     );
-    state.persist_record(
-        &repo_root,
-        "views",
-        &candidate.result.resolved_view_id,
-        &format!("{}\n", resolved_view_record_json(&candidate.result)),
-    )?;
-    for record in &candidate.result.records {
+    if !candidate.result.conflict_free() {
         state.persist_record(
             &repo_root,
-            "conflicts",
-            &record.id,
-            &format!("{}\n", resolver_record_json(record)),
+            "views",
+            &candidate.result.resolved_view_id,
+            &format!("{}\n", resolved_view_record_json(&candidate.result)),
         )?;
-    }
-    if !candidate.result.conflict_free() {
+        for record in &candidate.result.records {
+            state.persist_record(
+                &repo_root,
+                "conflicts",
+                &record.id,
+                &format!("{}\n", resolver_record_json(record)),
+            )?;
+        }
         let conflict_ids = candidate
             .result
             .conflicts()
@@ -2309,6 +2332,18 @@ fn real_session_refresh(
         )));
     }
 
+    let mut records = vec![state.record_publication(
+        "views",
+        &candidate.result.resolved_view_id,
+        &format!("{}\n", resolved_view_record_json(&candidate.result)),
+    )?];
+    for record in &candidate.result.records {
+        records.push(state.record_publication(
+            "conflicts",
+            &record.id,
+            &format!("{}\n", resolver_record_json(record)),
+        )?);
+    }
     let generation_number = current.generation_number + 1;
     let generation_id = native_session_generation_id(&current.session_id, generation_number);
     let generation = RealSessionGenerationRecord {
@@ -2332,8 +2367,12 @@ fn real_session_refresh(
     session.topic_frontier = candidate.result.topic_frontier;
     session.refresh_policy = options.policy;
     state.sync_compat_fields();
-    state.save(&repo_root)?;
-    persist_real_session_generation_record(&state, &current.session_id, &generation_id)?;
+    records.push(real_session_generation_publication(
+        &state,
+        &current.session_id,
+        &generation_id,
+    )?);
+    state.save_with_records(&repo_root, &records)?;
     let updated = real_session(&state, &current.session_id)?;
 
     if ctx.json {
@@ -2768,8 +2807,11 @@ fn real_project_materialize(
         last_import_operation_id: None,
         entries: view_state.entries.clone(),
     });
-    state.save(&repo_root)?;
-    persist_real_projection_record(&state, state.projections.last().unwrap())?;
+    let records = vec![real_projection_publication(
+        &state,
+        state.projections.last().unwrap(),
+    )?];
+    state.save_with_records(&repo_root, &records)?;
     if ctx.json {
         println!(
             "{}",
@@ -3158,17 +3200,18 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         privacy_class: "policy_gated".to_string(),
     };
     state.executions.push(execution.clone());
-    state.save(&PathBuf::from("."))?;
-    persist_real_projection_record(&state, state.projections.last().unwrap())?;
-    state.persist_record(
-        &PathBuf::from("."),
-        "executions",
-        &execution.execution_id,
-        &format!(
-            "{}\n",
-            real_execution_snapshot_record_json(&state, &execution)
-        ),
-    )?;
+    let records = vec![
+        real_projection_publication(&state, state.projections.last().unwrap())?,
+        state.record_publication(
+            "executions",
+            &execution.execution_id,
+            &format!(
+                "{}\n",
+                real_execution_snapshot_record_json(&state, &execution)
+            ),
+        )?,
+    ];
+    state.save_with_records(&PathBuf::from("."), &records)?;
     if ctx.json {
         println!(
             "{}",
@@ -3489,13 +3532,12 @@ fn real_checkpoint_create(
             entries: view_state.entries.clone(),
         });
     }
-    state.save(&PathBuf::from("."))?;
-    state.persist_record(
-        &PathBuf::from("."),
+    let records = vec![state.record_publication(
         "checkpoints",
         &checkpoint.id,
         &format!("{}\n", checkpoint_json(&checkpoint)),
-    )?;
+    )?];
+    state.save_with_records(&PathBuf::from("."), &records)?;
     if ctx.json {
         println!("{}", checkpoint_create_success_envelope(&checkpoint));
     } else {
@@ -3562,9 +3604,7 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
             exported_at: real_now_id(),
             validation_report_id: Some(report.id.clone()),
         });
-        state.save(&repo_root)?;
-        state.persist_record(
-            &repo_root,
+        let records = vec![state.record_publication(
             "export-map",
             &export_id,
             &format!(
@@ -3577,7 +3617,8 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
                 json_escape(&commit_id),
                 json_escape(&report.id),
             ),
-        )?;
+        )?];
+        state.save_with_records(&repo_root, &records)?;
         if ctx.json {
             println!(
                 "{{\"ok\":true,\"data\":{{\"command\":\"git.export.execute\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_id\":\"{}\",\"export_map_id\":\"{}\",\"validation_report_id\":\"{}\"}},\"checkpoint_id\":\"{}\",\"git_ref\":\"{}\",\"git_commit_ids\":[\"{}\"],\"validation_report\":{},\"lifecycle_state\":\"exported\"}},\"warnings\":[]}}",
@@ -4268,37 +4309,36 @@ fn finish_real_mutation(
     response: MutationResponse,
 ) -> Result<(), CliError> {
     let repo_root = PathBuf::from(".");
-    state.save(&repo_root)?;
-    state.persist_record(
-        &repo_root,
-        "operations",
-        &response.operation.id,
-        &format!("{}\n", operation_json(&response)),
-    )?;
-    state.persist_record(
-        &repo_root,
-        "topics",
-        &response.topic_revision.id,
-        &format!("{}\n", topic_revision_json(&response)),
-    )?;
-    state.persist_record(
-        &repo_root,
-        "views",
-        &state.resolved_view_id,
-        &format!(
-            "{}\n",
-            resolved_view_record_json(
-                &state
-                    .resolve_session_view(real_session(&state, &response.session_id)?)
-                    .result
-            )
-        ),
-    )?;
-    persist_real_session_generation_record(
-        &state,
-        &response.session_id,
-        &response.session_generation.id,
-    )?;
+    let records = vec![
+        state.record_publication(
+            "operations",
+            &response.operation.id,
+            &format!("{}\n", operation_json(&response)),
+        )?,
+        state.record_publication(
+            "topics",
+            &response.topic_revision.id,
+            &format!("{}\n", topic_revision_json(&response)),
+        )?,
+        state.record_publication(
+            "views",
+            &state.resolved_view_id,
+            &format!(
+                "{}\n",
+                resolved_view_record_json(
+                    &state
+                        .resolve_session_view(real_session(&state, &response.session_id)?)
+                        .result
+                )
+            ),
+        )?,
+        real_session_generation_publication(
+            &state,
+            &response.session_id,
+            &response.session_generation.id,
+        )?,
+    ];
+    state.save_with_records(&repo_root, &records)?;
     if ctx.json {
         println!("{}", mutation_success_envelope(&response));
     } else {
@@ -4317,39 +4357,37 @@ fn finish_real_promotion(
     record: ExecutionOutputPromotionRecord,
 ) -> Result<(), CliError> {
     let repo_root = PathBuf::from(".");
-    state.save(&repo_root)?;
-    persist_real_session_generation_record(
-        &state,
-        &response.session_id,
-        &response.session_generation.id,
-    )?;
-    state.persist_record(
-        &repo_root,
-        "operations",
-        &response.operation.id,
-        &format!("{}\n", operation_json(&response)),
-    )?;
-    state.persist_record(
-        &repo_root,
-        "topics",
-        &response.topic_revision.id,
-        &format!("{}\n", topic_revision_json(&response)),
-    )?;
-    state.persist_record(
-        &repo_root,
-        "views",
-        &state.resolved_view_id,
-        &format!(
-            "{}\n",
-            resolved_view_record_json(&real_resolved_view(&state))
-        ),
-    )?;
-    state.persist_record(
-        &repo_root,
-        "promotions",
-        &record.operation_transaction_id,
-        &format!("{}\n", promotion_record_json(&record)),
-    )?;
+    let records = vec![
+        real_session_generation_publication(
+            &state,
+            &response.session_id,
+            &response.session_generation.id,
+        )?,
+        state.record_publication(
+            "operations",
+            &response.operation.id,
+            &format!("{}\n", operation_json(&response)),
+        )?,
+        state.record_publication(
+            "topics",
+            &response.topic_revision.id,
+            &format!("{}\n", topic_revision_json(&response)),
+        )?,
+        state.record_publication(
+            "views",
+            &state.resolved_view_id,
+            &format!(
+                "{}\n",
+                resolved_view_record_json(&real_resolved_view(&state))
+            ),
+        )?,
+        state.record_publication(
+            "promotions",
+            &record.operation_transaction_id,
+            &format!("{}\n", promotion_record_json(&record)),
+        )?,
+    ];
+    state.save_with_records(&repo_root, &records)?;
     if ctx.json {
         let candidate = PromotionCandidateProvenance {
             execution_id: record.execution_id.clone(),
@@ -4370,11 +4408,11 @@ fn finish_real_promotion(
     Ok(())
 }
 
-fn persist_real_session_generation_record(
+fn real_session_generation_publication(
     state: &RealRepoState,
     session_id: &str,
     session_generation_id: &str,
-) -> Result<(), CliError> {
+) -> Result<DerivedRecordPublication, CliError> {
     let generation = state
         .session_generations
         .iter()
@@ -4390,13 +4428,11 @@ fn persist_real_session_generation_record(
             .with_detail("session_id", session_id.to_string())
             .with_detail("session_generation_id", session_generation_id.to_string())
         })?;
-    state.persist_record(
-        &PathBuf::from("."),
+    Ok(state.record_publication(
         "session-generations",
         session_generation_id,
         &format!("{}\n", real_session_generation_record_json(generation)),
-    )?;
-    Ok(())
+    )?)
 }
 
 fn real_execution_outputs(
@@ -4670,18 +4706,17 @@ fn relocate_managed_projection_root(from: &Path, to: &Path) -> Result<(), CliErr
     Ok(())
 }
 
-fn persist_real_projection_record(
+fn real_projection_publication(
     state: &RealRepoState,
     projection: &RealProjectionSnapshot,
-) -> Result<(), CliError> {
-    state
-        .persist_record(
-            &PathBuf::from("."),
+) -> Result<DerivedRecordPublication, CliError> {
+    Ok(state
+        .record_publication(
             "projections",
             &projection.projection_id,
             &format!("{}\n", real_projection_snapshot_json(state, projection)),
         )
-        .map_err(CliError::from)
+        .map_err(CliError::from)?)
 }
 
 fn real_git_export_content_files(state: &RealRepoState) -> Vec<GitExportContentFile> {
@@ -6099,12 +6134,9 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
 fn real_operational_warnings_json(
     state: &RealRepoState,
     summary: &RealOperationalSummary,
-    command: &str,
+    _command: &str,
 ) -> String {
     let mut warnings = Vec::new();
-    if matches!(command, "status.repository" | "inspect.repository") {
-        warnings.push("{\"code\":\"multi_record_publication_non_atomic\",\"message\":\"canonical state and each JSON record publish atomically, but a command that publishes several records is not yet all-or-nothing\",\"details\":{\"repaired_derived_records\":[\"session_generation\"]}}".to_string());
-    }
     if summary.recovery_rollback_evidence {
         warnings.push("{\"code\":\"state_recovery_rolled_back\",\"message\":\"an interrupted malformed publication was rolled back to the newest fully valid state\",\"details\":{\"evidence_root\":\"local://.sunlight/local/recovery/native-state\"}}".to_string());
     }
@@ -6230,9 +6262,6 @@ fn print_real_status_text(
         summary.policy.invalid_count
     );
     println!("execution isolation: network/filesystem-write/cpu/memory unenforced");
-    if command == "status.repository" || command == "inspect.repository" {
-        println!("warning[multi_record_publication_non_atomic]: canonical state and individual JSON records are atomic; multi-record commands are not yet all-or-nothing");
-    }
     if summary.recovery_rollback_evidence {
         println!("warning[state_recovery_rolled_back]: inspect .sunlight/local/recovery/native-state before the next successful state publication cleans the evidence");
     }

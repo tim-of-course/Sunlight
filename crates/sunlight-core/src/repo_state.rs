@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,6 +20,28 @@ use crate::resolver::{
 };
 
 pub const REPO_STATE_SCHEMA_VERSION: u32 = 1;
+
+const DERIVED_RECORD_NAMESPACES: &[&str] = &[
+    "checkpoints",
+    "compat-imports",
+    "conflicts",
+    "executions",
+    "export-map",
+    "operations",
+    "projections",
+    "promotions",
+    "quarantine",
+    "records",
+    "session-generations",
+    "topics",
+    "views",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedRecordPublication {
+    relative_path: String,
+    canonical_bytes: Vec<u8>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealRepoState {
@@ -336,6 +358,19 @@ pub enum RepoStateError {
         journal: PathBuf,
         message: String,
     },
+    PublicationRecovery {
+        manifest: PathBuf,
+        message: String,
+    },
+    WriterBusy {
+        lock: PathBuf,
+        timeout_ms: u64,
+    },
+    ConcurrentStateUpdate {
+        path: PathBuf,
+        expected_sequence: u64,
+        actual_sequence: Option<u64>,
+    },
     ProjectionStrategyUnsupported {
         strategy: String,
         path: PathBuf,
@@ -375,6 +410,28 @@ impl Display for RepoStateError {
                 staged.display(),
                 backup.display(),
                 journal.display()
+            ),
+            Self::PublicationRecovery { manifest, message } => write!(
+                f,
+                "Sunlight publication outbox recovery failed: {message}; manifest={}",
+                manifest.display()
+            ),
+            Self::WriterBusy { lock, timeout_ms } => write!(
+                f,
+                "Sunlight repository writer is busy after {timeout_ms}ms; lock={}",
+                lock.display()
+            ),
+            Self::ConcurrentStateUpdate {
+                path,
+                expected_sequence,
+                actual_sequence,
+            } => write!(
+                f,
+                "concurrent Sunlight state update: expected publication sequence {expected_sequence}, actual {}; state={}",
+                actual_sequence
+                    .map(|sequence| sequence.to_string())
+                    .unwrap_or_else(|| "missing".to_string()),
+                path.display()
             ),
             Self::ProjectionStrategyUnsupported {
                 strategy,
@@ -437,7 +494,9 @@ impl RealRepoState {
     }
 
     pub fn load(repo_root: &Path) -> Result<Self, RepoStateError> {
+        let _writer_lock = RepositoryWriterLock::acquire(repo_root)?;
         recover_state_publication(repo_root)?;
+        recover_publication_outbox(repo_root)?;
         let path = real_state_path(repo_root);
         let state = Self::load_from_path(repo_root, &path)?;
         state.reconcile_session_generation_records(repo_root)?;
@@ -647,26 +706,72 @@ impl RealRepoState {
     }
 
     pub fn save(&self, repo_root: &Path) -> Result<(), RepoStateError> {
+        self.save_with_records(repo_root, &[])
+    }
+
+    pub fn record_publication(
+        &self,
+        dir: &str,
+        id: &str,
+        json: &str,
+    ) -> Result<DerivedRecordPublication, RepoStateError> {
+        if !DERIVED_RECORD_NAMESPACES.contains(&dir) || !is_portable_record_id(id) {
+            return Err(invalid_state(
+                &real_state_path(Path::new(".")),
+                format!("derived record path is outside an allowed .sunlight namespace: {dir}/{id}.json"),
+            ));
+        }
+        let value =
+            parse_json_record(json.as_bytes()).map_err(|error| RepoStateError::InvalidState {
+                path: PathBuf::from(format!(".sunlight/{dir}/{id}.json")),
+                message: format!("derived record is not valid JSON: {error}"),
+            })?;
+        Ok(DerivedRecordPublication {
+            relative_path: format!(".sunlight/{dir}/{id}.json"),
+            canonical_bytes: canonical_json_bytes(&value)?,
+        })
+    }
+
+    pub fn save_with_records(
+        &self,
+        repo_root: &Path,
+        records: &[DerivedRecordPublication],
+    ) -> Result<(), RepoStateError> {
         self.persist_blobs(repo_root)?;
         let path = real_state_path(repo_root);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| io_error(parent, "failed to create state directory", error))?;
         }
+        let _writer_lock = RepositoryWriterLock::acquire(repo_root)?;
         recover_state_publication(repo_root)?;
-        let on_disk_sequence = if path.exists() {
-            Self::load_from_path(repo_root, &path)?.publication_sequence
+        recover_publication_outbox(repo_root)?;
+        let actual_sequence = if path.exists() {
+            Some(Self::load_from_path(repo_root, &path)?.publication_sequence)
         } else {
-            0
+            None
         };
+        let initialization = actual_sequence.is_none() && self.publication_sequence == 0;
+        if !initialization && actual_sequence != Some(self.publication_sequence) {
+            return Err(RepoStateError::ConcurrentStateUpdate {
+                path,
+                expected_sequence: self.publication_sequence,
+                actual_sequence,
+            });
+        }
         let mut published = self.clone();
         published.publication_sequence = self
             .publication_sequence
-            .max(on_disk_sequence)
             .checked_add(1)
             .ok_or_else(|| invalid_state(&path, "publication_sequence overflow"))?;
         let body = canonical_json_bytes(&published.to_json_value())?;
-        publish_native_state(repo_root, &path, published.publication_sequence, &body)
+        publish_state_and_records(
+            repo_root,
+            &path,
+            published.publication_sequence,
+            &body,
+            records,
+        )
     }
 
     pub fn persist_blobs(&self, repo_root: &Path) -> Result<(), RepoStateError> {
@@ -699,6 +804,7 @@ impl RealRepoState {
         id: &str,
         json: &str,
     ) -> Result<(), RepoStateError> {
+        let _writer_lock = RepositoryWriterLock::acquire(repo_root)?;
         let path = repo_root
             .join(".sunlight")
             .join(dir)
@@ -1465,6 +1571,20 @@ pub fn persist_quarantine_report(
         fs::create_dir_all(parent)
             .map_err(|error| io_error(parent, "failed to create quarantine directory", error))?;
     }
+    let body = quarantine_report_bytes(quarantine)?;
+    durable_publish_json_bytes(repo_root, &path, &body, "derived_record_after_prepare")
+}
+
+pub fn quarantine_report_publication(
+    quarantine: &[RealQuarantineEntry],
+) -> Result<DerivedRecordPublication, RepoStateError> {
+    Ok(DerivedRecordPublication {
+        relative_path: ".sunlight/quarantine/ingest-report.json".to_string(),
+        canonical_bytes: quarantine_report_bytes(quarantine)?,
+    })
+}
+
+fn quarantine_report_bytes(quarantine: &[RealQuarantineEntry]) -> Result<Vec<u8>, RepoStateError> {
     let mut object = BTreeMap::new();
     object.insert(
         "record_type".to_string(),
@@ -1486,8 +1606,7 @@ pub fn persist_quarantine_report(
         "entries".to_string(),
         JsonValue::Array(quarantine.iter().map(quarantine_json).collect()),
     );
-    let body = canonical_json_bytes(&JsonValue::Object(object))?;
-    durable_publish_json_bytes(repo_root, &path, &body, "derived_record_after_prepare")
+    canonical_json_bytes(&JsonValue::Object(object)).map_err(RepoStateError::from)
 }
 
 pub fn real_state_path(repo_root: &Path) -> PathBuf {
@@ -1498,6 +1617,621 @@ pub fn real_state_path(repo_root: &Path) -> PathBuf {
 }
 
 const STATE_PUBLICATION_FAILPOINT_ENV: &str = "SUNLIGHT_TEST_FAILPOINT";
+const PUBLICATION_OUTBOX_SCHEMA_VERSION: u64 = 1;
+const WRITER_LOCK_TIMEOUT_MS: u64 = 0;
+
+struct RepositoryWriterLock {
+    file: File,
+    #[cfg(not(windows))]
+    path: PathBuf,
+}
+
+impl RepositoryWriterLock {
+    fn acquire(repo_root: &Path) -> Result<Self, RepoStateError> {
+        let path = repo_root
+            .join(".sunlight")
+            .join("local")
+            .join("command-transaction.lock");
+        let parent = path.parent().expect("writer lock has a parent");
+        fs::create_dir_all(parent)
+            .map_err(|error| io_error(parent, "failed to create writer lock directory", error))?;
+        acquire_repository_writer_lock(&path)
+    }
+}
+
+#[cfg(windows)]
+fn acquire_repository_writer_lock(path: &Path) -> Result<RepositoryWriterLock, RepoStateError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // A zero share mode gives the open file an OS-owned, process-scoped exclusive lease. It is
+    // released automatically even if the process exits while publishing.
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .share_mode(0)
+        .open(path)
+    {
+        Ok(file) => Ok(RepositoryWriterLock { file }),
+        Err(error) if matches!(error.raw_os_error(), Some(32) | Some(33)) => {
+            Err(RepoStateError::WriterBusy {
+                lock: path.to_path_buf(),
+                timeout_ms: WRITER_LOCK_TIMEOUT_MS,
+            })
+        }
+        Err(error) => Err(io_error(path, "failed to acquire writer lock", error)),
+    }
+}
+
+#[cfg(not(windows))]
+fn acquire_repository_writer_lock(path: &Path) -> Result<RepositoryWriterLock, RepoStateError> {
+    use std::os::fd::AsRawFd;
+
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| io_error(path, "failed to open writer lock", error))?;
+    // SAFETY: `file` owns a valid descriptor for the duration of this call and the guard.
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+        Ok(RepositoryWriterLock {
+            file,
+            path: path.to_path_buf(),
+        })
+    } else {
+        let error = std::io::Error::last_os_error();
+        if matches!(error.kind(), std::io::ErrorKind::WouldBlock) {
+            Err(RepoStateError::WriterBusy {
+                lock: path.to_path_buf(),
+                timeout_ms: WRITER_LOCK_TIMEOUT_MS,
+            })
+        } else {
+            Err(io_error(path, "failed to acquire writer lock", error))
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for RepositoryWriterLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+
+        const LOCK_UN: i32 = 8;
+        unsafe extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        // SAFETY: the descriptor remains owned by `self.file` until after this method returns.
+        let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        let _ = &self.path;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RepositoryWriterLock {
+    fn drop(&mut self) {
+        let _ = &self.file;
+    }
+}
+
+#[derive(Debug)]
+struct PublicationManifest {
+    transaction_id: String,
+    target_sequence: u64,
+    target_digest: String,
+    records: Vec<PublicationManifestRecord>,
+}
+
+#[derive(Debug)]
+struct PublicationManifestRecord {
+    final_relative_path: String,
+    canonical_digest: String,
+    staged_relative_path: String,
+}
+
+fn publication_outbox_root(repo_root: &Path) -> PathBuf {
+    repo_root
+        .join(".sunlight")
+        .join("local")
+        .join("publication-outbox")
+}
+
+fn publish_state_and_records(
+    repo_root: &Path,
+    canonical: &Path,
+    sequence: u64,
+    state_bytes: &[u8],
+    records: &[DerivedRecordPublication],
+) -> Result<(), RepoStateError> {
+    let state_digest = sha256_digest(state_bytes);
+    let transaction_id = format!(
+        "publication-{sequence}-{}",
+        state_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(&state_digest)[..16]
+            .to_string()
+    );
+    let outbox_root = publication_outbox_root(repo_root);
+    let transaction_root = outbox_root.join(&transaction_id);
+    let manifest_path = transaction_root.join("manifest.json");
+    if transaction_root.exists() {
+        return Err(publication_recovery_error(
+            &manifest_path,
+            "transaction directory already exists; evidence was retained",
+        ));
+    }
+    fs::create_dir_all(transaction_root.join("staged")).map_err(|error| {
+        io_error(
+            &transaction_root,
+            "failed to create publication outbox transaction",
+            error,
+        )
+    })?;
+
+    let mut manifest_records = Vec::with_capacity(records.len());
+    let mut seen_paths = std::collections::BTreeSet::new();
+    for (index, record) in records.iter().enumerate() {
+        validate_derived_relative_path(repo_root, &record.relative_path, &manifest_path)?;
+        if !seen_paths.insert(record.relative_path.clone()) {
+            return Err(publication_recovery_error(
+                &manifest_path,
+                format!(
+                    "derived record path is declared more than once: {}",
+                    record.relative_path
+                ),
+            ));
+        }
+        let staged_relative_path = format!("staged/{index:04}.json");
+        write_flushed_file(
+            &transaction_root.join(Path::new(&staged_relative_path)),
+            &record.canonical_bytes,
+        )?;
+        manifest_records.push(PublicationManifestRecord {
+            final_relative_path: record.relative_path.clone(),
+            canonical_digest: sha256_digest(&record.canonical_bytes),
+            staged_relative_path,
+        });
+    }
+    let manifest = PublicationManifest {
+        transaction_id,
+        target_sequence: sequence,
+        target_digest: state_digest,
+        records: manifest_records,
+    };
+    let preparing = transaction_root.join("manifest.preparing.json");
+    write_flushed_file(&preparing, &publication_manifest_bytes(&manifest)?)?;
+    atomic_replace_file(&preparing, &manifest_path, None)?;
+
+    trigger_failpoint("batch_before_canonical_commit", canonical)?;
+    publish_native_state(repo_root, canonical, sequence, state_bytes)?;
+    trigger_failpoint("batch_after_canonical_commit", canonical)?;
+    publish_committed_record_batch(repo_root, &transaction_root, &manifest, true)?;
+    Ok(())
+}
+
+fn recover_publication_outbox(repo_root: &Path) -> Result<(), RepoStateError> {
+    let root = publication_outbox_root(repo_root);
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Ok(());
+    };
+    let mut transaction_roots = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            publication_recovery_error(&root, format!("failed to inspect outbox: {error}"))
+        })?;
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            return Err(publication_recovery_error(
+                &entry.path(),
+                "unexpected non-directory outbox evidence was retained",
+            ));
+        }
+        transaction_roots.push(entry.path());
+    }
+    transaction_roots.sort();
+    for transaction_root in transaction_roots {
+        let manifest_path = transaction_root.join("manifest.json");
+        let manifest = load_and_validate_publication_manifest(repo_root, &transaction_root)?;
+        let canonical_path = real_state_path(repo_root);
+        let canonical_bytes = fs::read(&canonical_path).ok();
+        let canonical_state = RealRepoState::load_from_path(repo_root, &canonical_path).ok();
+        let committed = canonical_bytes.as_ref().is_some_and(|bytes| {
+            sha256_digest(bytes) == manifest.target_digest
+                && canonical_state
+                    .as_ref()
+                    .is_some_and(|state| state.publication_sequence == manifest.target_sequence)
+        });
+        if committed {
+            publish_committed_record_batch(repo_root, &transaction_root, &manifest, false)?;
+        } else if canonical_state
+            .as_ref()
+            .is_none_or(|state| state.publication_sequence < manifest.target_sequence)
+        {
+            remove_publication_transaction(&root, &transaction_root)?;
+        } else {
+            return Err(publication_recovery_error(
+                &manifest_path,
+                format!(
+                    "canonical state does not match declared sequence {} and digest {}; evidence was retained",
+                    manifest.target_sequence, manifest.target_digest
+                ),
+            ));
+        }
+    }
+    remove_dir_if_empty(&root)?;
+    if let Some(local) = root.parent() {
+        remove_dir_if_empty(local)?;
+    }
+    Ok(())
+}
+
+fn publish_committed_record_batch(
+    repo_root: &Path,
+    transaction_root: &Path,
+    manifest: &PublicationManifest,
+    run_failpoints: bool,
+) -> Result<(), RepoStateError> {
+    validate_staged_publication_payloads(repo_root, transaction_root, manifest)?;
+    for record in &manifest.records {
+        let staged = transaction_root.join(Path::new(&record.staged_relative_path));
+        let bytes = fs::read(&staged).map_err(|error| {
+            publication_recovery_error(
+                &transaction_root.join("manifest.json"),
+                format!("failed to read declared staged payload: {error}"),
+            )
+        })?;
+        let final_path = repo_root.join(Path::new(&record.final_relative_path));
+        if fs::read(&final_path)
+            .ok()
+            .is_none_or(|existing| existing != bytes)
+        {
+            durable_publish_json_bytes(
+                repo_root,
+                &final_path,
+                &bytes,
+                "batch_record_after_prepare",
+            )?;
+        }
+        if run_failpoints {
+            trigger_failpoint("batch_mid_derived_publication", &final_path)?;
+        }
+    }
+    let completed_path = transaction_root.join("completed.json");
+    if !completed_path.exists() {
+        let completed = JsonValue::Object(BTreeMap::from([
+            (
+                "record_type".to_string(),
+                JsonValue::String("publication_outbox_completion".to_string()),
+            ),
+            (
+                "schema_version".to_string(),
+                JsonValue::Number(PUBLICATION_OUTBOX_SCHEMA_VERSION.to_string()),
+            ),
+            (
+                "transaction_id".to_string(),
+                JsonValue::String(manifest.transaction_id.clone()),
+            ),
+            (
+                "target_canonical_sha256".to_string(),
+                JsonValue::String(manifest.target_digest.clone()),
+            ),
+        ]));
+        write_flushed_file(&completed_path, &canonical_json_bytes(&completed)?)?;
+    }
+    if run_failpoints {
+        trigger_failpoint("batch_after_completion_marker", &completed_path)?;
+    }
+    let outbox_root = publication_outbox_root(repo_root);
+    remove_publication_transaction(&outbox_root, transaction_root)?;
+    remove_dir_if_empty(&outbox_root)?;
+    if let Some(local) = outbox_root.parent() {
+        remove_dir_if_empty(local)?;
+    }
+    Ok(())
+}
+
+fn validate_staged_publication_payloads(
+    repo_root: &Path,
+    transaction_root: &Path,
+    manifest: &PublicationManifest,
+) -> Result<(), RepoStateError> {
+    let manifest_path = transaction_root.join("manifest.json");
+    for record in &manifest.records {
+        validate_derived_relative_path(repo_root, &record.final_relative_path, &manifest_path)?;
+        let staged = transaction_root.join(Path::new(&record.staged_relative_path));
+        let bytes = fs::read(&staged).map_err(|error| {
+            publication_recovery_error(
+                &manifest_path,
+                format!(
+                    "declared staged payload {} is missing or unreadable: {error}; evidence was retained",
+                    record.staged_relative_path
+                ),
+            )
+        })?;
+        if sha256_digest(&bytes) != record.canonical_digest {
+            return Err(publication_recovery_error(
+                &manifest_path,
+                format!(
+                    "declared staged payload {} has a digest mismatch; evidence was retained",
+                    record.staged_relative_path
+                ),
+            ));
+        }
+        let parsed = parse_json_record(&bytes).map_err(|error| {
+            publication_recovery_error(
+                &manifest_path,
+                format!("declared staged payload is invalid JSON: {error}; evidence was retained"),
+            )
+        })?;
+        if canonical_json_bytes(&parsed)? != bytes {
+            return Err(publication_recovery_error(
+                &manifest_path,
+                "declared staged payload is not canonical JSON; evidence was retained",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn load_and_validate_publication_manifest(
+    repo_root: &Path,
+    transaction_root: &Path,
+) -> Result<PublicationManifest, RepoStateError> {
+    let published_manifest = transaction_root.join("manifest.json");
+    let preparing_manifest = transaction_root.join("manifest.preparing.json");
+    let manifest_path = if published_manifest.exists() {
+        published_manifest
+    } else if preparing_manifest.exists() {
+        preparing_manifest
+    } else {
+        published_manifest
+    };
+    let bytes = fs::read(&manifest_path).map_err(|error| {
+        publication_recovery_error(
+            &manifest_path,
+            format!("manifest is missing or unreadable: {error}; evidence was retained"),
+        )
+    })?;
+    let value = parse_json_record(&bytes).map_err(|error| {
+        publication_recovery_error(
+            &manifest_path,
+            format!("manifest is malformed: {error}; evidence was retained"),
+        )
+    })?;
+    if canonical_json_bytes(&value)? != bytes {
+        return Err(publication_recovery_error(
+            &manifest_path,
+            "manifest is not canonical JSON; evidence was retained",
+        ));
+    }
+    let JsonValue::Object(object) = value else {
+        return Err(publication_recovery_error(
+            &manifest_path,
+            "manifest root is not an object; evidence was retained",
+        ));
+    };
+    let manifest_field_error = |error: RepoStateError| {
+        publication_recovery_error(
+            &manifest_path,
+            format!("manifest field is invalid: {error}; evidence was retained"),
+        )
+    };
+    let record_type =
+        required_string(&object, "record_type", &manifest_path).map_err(&manifest_field_error)?;
+    let schema_version =
+        required_u64(&object, "schema_version", &manifest_path).map_err(&manifest_field_error)?;
+    let transaction_id = required_string(&object, "transaction_id", &manifest_path)
+        .map_err(&manifest_field_error)?;
+    if record_type != "publication_outbox" || schema_version != PUBLICATION_OUTBOX_SCHEMA_VERSION {
+        return Err(publication_recovery_error(
+            &manifest_path,
+            "manifest type or schema version is unsupported; evidence was retained",
+        ));
+    }
+    if transaction_root.file_name().and_then(|name| name.to_str()) != Some(&transaction_id) {
+        return Err(publication_recovery_error(
+            &manifest_path,
+            "manifest transaction ID does not match its directory; evidence was retained",
+        ));
+    }
+    let target_sequence = required_u64(&object, "target_publication_sequence", &manifest_path)
+        .map_err(&manifest_field_error)?;
+    let target_digest = required_string(&object, "target_canonical_sha256", &manifest_path)
+        .map_err(&manifest_field_error)?;
+    let values =
+        required_array(&object, "records", &manifest_path).map_err(&manifest_field_error)?;
+    let mut records = Vec::with_capacity(values.len());
+    let mut final_paths = std::collections::BTreeSet::new();
+    for (index, value) in values.iter().enumerate() {
+        let JsonValue::Object(record) = value else {
+            return Err(publication_recovery_error(
+                &manifest_path,
+                "manifest record declaration is not an object; evidence was retained",
+            ));
+        };
+        let final_relative_path = required_string(record, "final_relative_path", &manifest_path)
+            .map_err(&manifest_field_error)?;
+        let canonical_digest = required_string(record, "canonical_sha256", &manifest_path)
+            .map_err(&manifest_field_error)?;
+        let staged_relative_path = required_string(record, "staged_payload", &manifest_path)
+            .map_err(&manifest_field_error)?;
+        if staged_relative_path != format!("staged/{index:04}.json") {
+            return Err(publication_recovery_error(
+                &manifest_path,
+                "manifest staged payload reference is not confined to its transaction; evidence was retained",
+            ));
+        }
+        validate_derived_relative_path(repo_root, &final_relative_path, &manifest_path)?;
+        if !final_paths.insert(final_relative_path.clone()) {
+            return Err(publication_recovery_error(
+                &manifest_path,
+                "manifest declares a duplicate final path; evidence was retained",
+            ));
+        }
+        records.push(PublicationManifestRecord {
+            final_relative_path,
+            canonical_digest,
+            staged_relative_path,
+        });
+    }
+    let manifest = PublicationManifest {
+        transaction_id,
+        target_sequence,
+        target_digest,
+        records,
+    };
+    validate_staged_publication_payloads(repo_root, transaction_root, &manifest)?;
+    Ok(manifest)
+}
+
+fn publication_manifest_bytes(manifest: &PublicationManifest) -> Result<Vec<u8>, RepoStateError> {
+    let records = manifest
+        .records
+        .iter()
+        .map(|record| {
+            JsonValue::Object(BTreeMap::from([
+                (
+                    "canonical_sha256".to_string(),
+                    JsonValue::String(record.canonical_digest.clone()),
+                ),
+                (
+                    "final_relative_path".to_string(),
+                    JsonValue::String(record.final_relative_path.clone()),
+                ),
+                (
+                    "staged_payload".to_string(),
+                    JsonValue::String(record.staged_relative_path.clone()),
+                ),
+            ]))
+        })
+        .collect();
+    canonical_json_bytes(&JsonValue::Object(BTreeMap::from([
+        (
+            "record_type".to_string(),
+            JsonValue::String("publication_outbox".to_string()),
+        ),
+        (
+            "schema_version".to_string(),
+            JsonValue::Number(PUBLICATION_OUTBOX_SCHEMA_VERSION.to_string()),
+        ),
+        (
+            "transaction_id".to_string(),
+            JsonValue::String(manifest.transaction_id.clone()),
+        ),
+        (
+            "target_canonical_sha256".to_string(),
+            JsonValue::String(manifest.target_digest.clone()),
+        ),
+        (
+            "target_publication_sequence".to_string(),
+            JsonValue::Number(manifest.target_sequence.to_string()),
+        ),
+        ("records".to_string(), JsonValue::Array(records)),
+    ])))
+    .map_err(RepoStateError::from)
+}
+
+fn validate_derived_relative_path(
+    repo_root: &Path,
+    relative: &str,
+    evidence_path: &Path,
+) -> Result<(), RepoStateError> {
+    let parts = relative.split('/').collect::<Vec<_>>();
+    let valid = parts.len() == 3
+        && parts[0] == ".sunlight"
+        && DERIVED_RECORD_NAMESPACES.contains(&parts[1])
+        && parts[2]
+            .strip_suffix(".json")
+            .is_some_and(is_portable_record_id)
+        && relative
+            == format!(
+                ".sunlight/{}/{}.json",
+                parts.get(1).unwrap_or(&""),
+                parts
+                    .get(2)
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .unwrap_or("")
+            );
+    if !valid {
+        return Err(publication_recovery_error(
+            evidence_path,
+            format!("derived final path does not use the portable .sunlight record filename grammar: {relative}; evidence was retained"),
+        ));
+    }
+    for path in [
+        repo_root.join(".sunlight"),
+        repo_root.join(".sunlight").join(parts[1]),
+        repo_root.join(Path::new(relative)),
+    ] {
+        if fs::symlink_metadata(&path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(publication_recovery_error(
+                evidence_path,
+                format!(
+                    "derived final path traverses a symlink: {}; evidence was retained",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_portable_record_id(id: &str) -> bool {
+    let mut bytes = id.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric()
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        || id.eq_ignore_ascii_case("native-state")
+    {
+        return false;
+    }
+    let upper = id.to_ascii_uppercase();
+    !matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !(upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'))
+}
+
+fn remove_publication_transaction(
+    outbox_root: &Path,
+    transaction_root: &Path,
+) -> Result<(), RepoStateError> {
+    if transaction_root.parent() != Some(outbox_root) {
+        return Err(publication_recovery_error(
+            transaction_root,
+            "refused to clean a transaction outside the publication outbox",
+        ));
+    }
+    fs::remove_dir_all(transaction_root).map_err(|error| {
+        io_error(
+            transaction_root,
+            "failed to clean completed publication transaction",
+            error,
+        )
+    })
+}
+
+fn publication_recovery_error(path: &Path, message: impl Into<String>) -> RepoStateError {
+    RepoStateError::PublicationRecovery {
+        manifest: path.to_path_buf(),
+        message: message.into(),
+    }
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
 
 struct StateRecoveryPaths {
     root: PathBuf,
@@ -1871,11 +2605,11 @@ fn remove_dir_if_empty(path: &Path) -> Result<(), RepoStateError> {
 
 fn trigger_failpoint(name: &str, path: &Path) -> Result<(), RepoStateError> {
     let scoped_name = format!("{name}|{}", path.display());
+    let selected = std::env::var(STATE_PUBLICATION_FAILPOINT_ENV).ok();
     if cfg!(debug_assertions)
-        && std::env::var(STATE_PUBLICATION_FAILPOINT_ENV)
-            .ok()
+        && selected
             .as_deref()
-            == Some(scoped_name.as_str())
+            .is_some_and(|selected| selected == name || selected == scoped_name)
     {
         return Err(RepoStateError::Io {
             path: path.to_path_buf(),
@@ -3957,6 +4691,11 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
 mod tests {
     use super::*;
     use std::process::Command;
+    use std::sync::Mutex;
+    use std::thread;
+    use std::time::Duration;
+
+    static FAILPOINT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_repo(name: &str) -> PathBuf {
         let mut root = std::env::temp_dir();
@@ -4011,13 +4750,15 @@ mod tests {
 
     #[test]
     fn durable_publication_recovers_failpoints_and_repairs_generation_records() {
+        let _failpoint_guard = FAILPOINT_ENV_LOCK.lock().unwrap();
         let repo = temp_repo("durable-publication");
         fs::write(repo.join("README.md"), b"# durable\n").unwrap();
         let mut state = RealRepoState::ingest(&repo, "repo_durable").unwrap();
         state.save(&repo).unwrap();
+        state = RealRepoState::load(&repo).unwrap();
         let canonical = real_state_path(&repo);
         let old_bytes = fs::read(&canonical).unwrap();
-        assert_eq!(RealRepoState::load(&repo).unwrap().publication_sequence, 1);
+        assert_eq!(state.publication_sequence, 1);
 
         state.generation_number = 1;
         std::env::set_var(
@@ -4107,7 +4848,7 @@ mod tests {
         with_generation.save(&repo).unwrap();
         let generation_path = repo.join(".sunlight/session-generations/gen_repair_0001.json");
         assert!(!generation_path.exists());
-        RealRepoState::load(&repo).unwrap();
+        with_generation = RealRepoState::load(&repo).unwrap();
         let generation = parse_json_record(&fs::read(&generation_path).unwrap()).unwrap();
         let JsonValue::Object(generation) = generation else {
             panic!("generation record must be an object");
@@ -4131,6 +4872,405 @@ mod tests {
         assert!(matches!(error, RepoStateError::Recovery { .. }));
         assert!(recovery.staged.exists());
         assert!(recovery.journal.exists());
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn publication_outbox_rolls_back_replays_blocks_tamper_and_cleans() {
+        let _failpoint_guard = FAILPOINT_ENV_LOCK.lock().unwrap();
+        let repo = temp_repo("publication-outbox");
+        fs::write(repo.join("README.md"), b"# outbox\n").unwrap();
+        let mut state = RealRepoState::ingest(&repo, "repo_outbox").unwrap();
+        state.save(&repo).unwrap();
+        state = RealRepoState::load(&repo).unwrap();
+        let canonical = real_state_path(&repo);
+        let old_canonical = fs::read(&canonical).unwrap();
+
+        state.generation_number = 1;
+        let before_record = state
+            .record_publication("operations", "op_before", "{\"step\":1}")
+            .unwrap();
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            "batch_before_canonical_commit",
+        );
+        assert!(state
+            .save_with_records(&repo, &[before_record])
+            .unwrap_err()
+            .to_string()
+            .contains("batch_before_canonical_commit"));
+        std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
+        assert_eq!(fs::read(&canonical).unwrap(), old_canonical);
+        let prepared_transaction = fs::read_dir(publication_outbox_root(&repo))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let prepared_manifest =
+            fs::read_to_string(prepared_transaction.join("manifest.json")).unwrap();
+        assert!(prepared_manifest.contains("\"transaction_id\":\"publication-2-"));
+        assert!(prepared_manifest.contains("\"target_publication_sequence\":2"));
+        assert!(prepared_manifest.contains("\"target_canonical_sha256\":\"sha256:"));
+        assert!(prepared_manifest
+            .contains("\"final_relative_path\":\".sunlight/operations/op_before.json\""));
+        assert!(prepared_manifest.contains("\"staged_payload\":\"staged/0000.json\""));
+        assert!(prepared_manifest.contains("\"canonical_sha256\":\"sha256:"));
+        let recovered = RealRepoState::load(&repo).unwrap();
+        assert_eq!(recovered.generation_number, 0);
+        assert!(!repo.join(".sunlight/operations/op_before.json").exists());
+        assert!(!publication_outbox_root(&repo).exists());
+
+        let mut after = recovered.clone();
+        after.generation_number = 2;
+        let after_record = after
+            .record_publication("operations", "op_after", "{\"step\":2}")
+            .unwrap();
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            "batch_after_canonical_commit",
+        );
+        assert!(after
+            .save_with_records(&repo, &[after_record])
+            .unwrap_err()
+            .to_string()
+            .contains("batch_after_canonical_commit"));
+        std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
+        assert!(!repo.join(".sunlight/operations/op_after.json").exists());
+        let recovered = RealRepoState::load(&repo).unwrap();
+        assert_eq!(recovered.generation_number, 2);
+        assert_eq!(
+            fs::read(repo.join(".sunlight/operations/op_after.json")).unwrap(),
+            b"{\"step\":2}"
+        );
+        RealRepoState::load(&repo).unwrap();
+        assert!(!publication_outbox_root(&repo).exists());
+
+        let mut middle = recovered.clone();
+        middle.generation_number = 3;
+        let middle_records = [
+            middle
+                .record_publication("operations", "op_middle", "{\"step\":3}")
+                .unwrap(),
+            middle
+                .record_publication("views", "view_middle", "{\"step\":3}")
+                .unwrap(),
+        ];
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            "batch_mid_derived_publication",
+        );
+        assert!(middle
+            .save_with_records(&repo, &middle_records)
+            .unwrap_err()
+            .to_string()
+            .contains("batch_mid_derived_publication"));
+        std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
+        assert!(repo.join(".sunlight/operations/op_middle.json").exists());
+        assert!(!repo.join(".sunlight/views/view_middle.json").exists());
+        let recovered = RealRepoState::load(&repo).unwrap();
+        assert_eq!(recovered.generation_number, 3);
+        assert!(repo.join(".sunlight/views/view_middle.json").exists());
+
+        let mut completed = recovered.clone();
+        completed.generation_number = 4;
+        let completed_record = completed
+            .record_publication("operations", "op_completed", "{\"step\":4}")
+            .unwrap();
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            "batch_after_completion_marker",
+        );
+        assert!(completed
+            .save_with_records(&repo, &[completed_record])
+            .unwrap_err()
+            .to_string()
+            .contains("batch_after_completion_marker"));
+        std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
+        let transaction_root = fs::read_dir(publication_outbox_root(&repo))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(transaction_root.join("completed.json").exists());
+        RealRepoState::load(&repo).unwrap();
+        assert!(!publication_outbox_root(&repo).exists());
+
+        let mut corrupt = RealRepoState::load(&repo).unwrap();
+        corrupt.generation_number = 5;
+        let corrupt_record = corrupt
+            .record_publication("operations", "op_corrupt", "{\"step\":5}")
+            .unwrap();
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            "batch_after_canonical_commit",
+        );
+        corrupt
+            .save_with_records(&repo, &[corrupt_record])
+            .unwrap_err();
+        std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
+        let transaction_root = fs::read_dir(publication_outbox_root(&repo))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::write(
+            transaction_root.join("staged/0000.json"),
+            b"{\"tampered\":true}",
+        )
+        .unwrap();
+        let error = RealRepoState::load(&repo).unwrap_err();
+        assert!(matches!(error, RepoStateError::PublicationRecovery { .. }));
+        assert!(transaction_root.join("manifest.json").exists());
+        assert!(!repo.join(".sunlight/operations/op_corrupt.json").exists());
+
+        let path_repo = temp_repo("publication-outbox-path-tamper");
+        fs::write(path_repo.join("README.md"), b"# path tamper\n").unwrap();
+        let mut path_state = RealRepoState::ingest(&path_repo, "repo_path_tamper").unwrap();
+        path_state.save(&path_repo).unwrap();
+        path_state = RealRepoState::load(&path_repo).unwrap();
+        path_state.generation_number = 1;
+        let path_record = path_state
+            .record_publication("operations", "op_path", "{\"step\":1}")
+            .unwrap();
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            "batch_before_canonical_commit",
+        );
+        path_state
+            .save_with_records(&path_repo, &[path_record])
+            .unwrap_err();
+        std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
+        let transaction_root = fs::read_dir(publication_outbox_root(&path_repo))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let manifest_path = transaction_root.join("manifest.json");
+        let manifest = fs::read_to_string(&manifest_path)
+            .unwrap()
+            .replace(".sunlight/operations/op_path.json", "../outside.json");
+        fs::write(&manifest_path, manifest).unwrap();
+        let error = RealRepoState::load(&path_repo).unwrap_err();
+        assert!(matches!(error, RepoStateError::PublicationRecovery { .. }));
+        assert!(manifest_path.exists());
+        assert!(!path_repo.join("outside.json").exists());
+
+        fs::remove_dir_all(repo).unwrap();
+        fs::remove_dir_all(path_repo).unwrap();
+    }
+
+    #[test]
+    fn record_publication_rejects_non_portable_and_windows_device_ids() {
+        let repo = temp_repo("portable-record-names");
+        let state = RealRepoState::ingest(&repo, "repo_record_names").unwrap();
+        for id in [
+            "op:ads",
+            "op.json:ads",
+            "op.name",
+            "op name",
+            "op/name",
+            "op\\name",
+            ".op",
+            "op.",
+            "CON",
+            "con",
+            "PRN",
+            "AUX",
+            "NUL",
+            "COM1",
+            "com9",
+            "LPT1",
+            "lpt9",
+            "native-state",
+        ] {
+            let error = state
+                .record_publication("operations", id, "{}")
+                .unwrap_err();
+            assert!(matches!(error, RepoStateError::InvalidState { .. }), "{id}");
+        }
+        for id in ["op_0001", "operation-ABC-123", "view9"] {
+            state.record_publication("operations", id, "{}").unwrap();
+        }
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn tampered_manifest_rejects_ads_filename_and_retains_evidence() {
+        let _failpoint_guard = FAILPOINT_ENV_LOCK.lock().unwrap();
+        let repo = temp_repo("publication-outbox-ads-tamper");
+        fs::write(repo.join("README.md"), b"# ads tamper\n").unwrap();
+        let mut state = RealRepoState::ingest(&repo, "repo_ads_tamper").unwrap();
+        state.save(&repo).unwrap();
+        state = RealRepoState::load(&repo).unwrap();
+        state.generation_number = 1;
+        let record = state
+            .record_publication("operations", "op_ads", "{\"step\":1}")
+            .unwrap();
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            "batch_before_canonical_commit",
+        );
+        state.save_with_records(&repo, &[record]).unwrap_err();
+        std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
+
+        let transaction_root = fs::read_dir(publication_outbox_root(&repo))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let manifest_path = transaction_root.join("manifest.json");
+        let manifest = fs::read_to_string(&manifest_path)
+            .unwrap()
+            .replace("op_ads.json", "op_ads:stream.json");
+        fs::write(&manifest_path, manifest).unwrap();
+
+        let error = RealRepoState::load(&repo).unwrap_err();
+        assert!(matches!(error, RepoStateError::PublicationRecovery { .. }));
+        assert!(error.to_string().contains("portable"));
+        assert!(manifest_path.exists());
+        assert!(transaction_root.join("staged/0000.json").exists());
+        assert!(!repo
+            .join(".sunlight/operations/op_ads:stream.json")
+            .exists());
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn separately_loaded_states_use_sequence_compare_and_swap() {
+        let repo = temp_repo("publication-sequence-cas");
+        fs::write(repo.join("README.md"), b"# cas\n").unwrap();
+        let state = RealRepoState::ingest(&repo, "repo_cas").unwrap();
+        state.save(&repo).unwrap();
+        let mut winner = RealRepoState::load(&repo).unwrap();
+        let mut loser = RealRepoState::load(&repo).unwrap();
+        assert_eq!(winner.publication_sequence, 1);
+        assert_eq!(loser.publication_sequence, 1);
+
+        winner.generation_number = 1;
+        let winner_record = winner
+            .record_publication("operations", "op_winner", "{\"agent\":1}")
+            .unwrap();
+        winner.save_with_records(&repo, &[winner_record]).unwrap();
+
+        loser.generation_number = 2;
+        let loser_record = loser
+            .record_publication("operations", "op_loser", "{\"agent\":2}")
+            .unwrap();
+        let error = loser
+            .save_with_records(&repo, &[loser_record.clone()])
+            .unwrap_err();
+        assert_eq!(
+            error,
+            RepoStateError::ConcurrentStateUpdate {
+                path: real_state_path(&repo),
+                expected_sequence: 1,
+                actual_sequence: Some(2),
+            }
+        );
+        assert!(!publication_outbox_root(&repo).exists());
+        assert!(!repo.join(".sunlight/operations/op_loser.json").exists());
+
+        let visible = RealRepoState::load(&repo).unwrap();
+        assert_eq!(visible.publication_sequence, 2);
+        assert_eq!(visible.generation_number, 1);
+        assert!(repo.join(".sunlight/operations/op_winner.json").exists());
+
+        let mut retry = visible;
+        retry.generation_number = 2;
+        retry.save_with_records(&repo, &[loser_record]).unwrap();
+        let retried = RealRepoState::load(&repo).unwrap();
+        assert_eq!(retried.publication_sequence, 3);
+        assert_eq!(retried.generation_number, 2);
+        assert!(repo.join(".sunlight/operations/op_loser.json").exists());
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn writer_lock_child_helper() {
+        let Some(repo) = std::env::var_os("SUNLIGHT_TEST_WRITER_LOCK_REPO") else {
+            return;
+        };
+        let repo = PathBuf::from(repo);
+        let _lock = RepositoryWriterLock::acquire(&repo).unwrap();
+        fs::write(repo.join("writer-lock-ready"), b"ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !repo.join("writer-lock-release").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "parent did not release writer lock helper"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn reader_cannot_recover_prepared_batch_while_other_process_holds_writer_lock() {
+        let _failpoint_guard = FAILPOINT_ENV_LOCK.lock().unwrap();
+        let repo = temp_repo("publication-reader-writer-lock");
+        fs::write(repo.join("README.md"), b"# lock\n").unwrap();
+        let mut state = RealRepoState::ingest(&repo, "repo_lock").unwrap();
+        state.save(&repo).unwrap();
+        state = RealRepoState::load(&repo).unwrap();
+        state.generation_number = 1;
+        let record = state
+            .record_publication("operations", "op_prepared", "{\"step\":1}")
+            .unwrap();
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            "batch_before_canonical_commit",
+        );
+        state.save_with_records(&repo, &[record]).unwrap_err();
+        std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
+        let transaction_root = fs::read_dir(publication_outbox_root(&repo))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("repo_state::tests::writer_lock_child_helper")
+            .arg("--nocapture")
+            .env("SUNLIGHT_TEST_WRITER_LOCK_REPO", &repo)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !repo.join("writer-lock-ready").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "writer lock helper did not become ready"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let started = Instant::now();
+        let error = RealRepoState::load(&repo).unwrap_err();
+        assert_eq!(
+            error,
+            RepoStateError::WriterBusy {
+                lock: repo.join(".sunlight/local/command-transaction.lock"),
+                timeout_ms: 0,
+            }
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(transaction_root.join("manifest.json").exists());
+        assert!(transaction_root.join("staged/0000.json").exists());
+
+        fs::write(repo.join("writer-lock-release"), b"release").unwrap();
+        assert!(child.wait().unwrap().success());
+        let loaded = RealRepoState::load(&repo).unwrap();
+        assert_eq!(loaded.publication_sequence, 1);
+        assert!(!publication_outbox_root(&repo).exists());
+        assert!(!repo.join(".sunlight/operations/op_prepared.json").exists());
 
         fs::remove_dir_all(repo).unwrap();
     }

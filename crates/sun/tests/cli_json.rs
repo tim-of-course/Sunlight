@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -333,7 +334,11 @@ fn no_fixture_real_repo_artifact_io_vertical_slice() {
         .output()
         .expect("sun read should run");
     assert_success(&reread);
-    assert!(stdout(&reread).contains("43"));
+    assert!(
+        stdout(&reread).contains("43"),
+        "reread did not contain accepted bytes: {}",
+        stdout(&reread)
+    );
 
     let search = sun()
         .arg("search")
@@ -611,6 +616,14 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
     assert!(promote_stdout.contains("\"command\":\"execution.promote_output\""));
     assert!(promote_stdout.contains("\"execution_provenance\""));
     let promoted_view = json_string_field(&promote_stdout, "resolved_view_id");
+    let promoted_generation = json_string_field(&promote_stdout, "session_generation_id");
+    let promoted_generation_record = fs::read_to_string(
+        repo.path()
+            .join(".sunlight/session-generations")
+            .join(format!("{promoted_generation}.json")),
+    )
+    .unwrap();
+    assert!(promoted_generation_record.contains("\"session_id\":\"session_agent_a\""));
 
     let read = sun()
         .arg("read")
@@ -2632,6 +2645,14 @@ fn no_fixture_compat_project_diff_import_flows_into_native_consumers() {
     let modified_operation = json_string_field(&modified_stdout, "operation_transaction_id");
     let modified_artifact = json_string_field(&modified_stdout, "artifact_id");
     let modified_view = json_string_field(&modified_stdout, "resolved_view_id");
+    let modified_session_generation = json_string_field(&modified_stdout, "session_generation_id");
+    let modified_generation_record = fs::read_to_string(
+        repo.path()
+            .join(".sunlight/session-generations")
+            .join(format!("{modified_session_generation}.json")),
+    )
+    .unwrap();
+    assert!(modified_generation_record.contains("\"session_id\":\"session_agent_a\""));
 
     let read = sun()
         .arg("read")
@@ -10236,6 +10257,501 @@ fn inspect_json_fixture_basic_app_missing_operation_returns_failure_envelope() {
     assert!(stdout.contains("\"object_type\":\"operation\""));
 }
 
+#[test]
+fn no_fixture_same_actor_sessions_keep_distinct_generation_lineages() {
+    let repo = TestRepo::new("real-session-generation-collision");
+    init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+    for topic in ["first", "second"] {
+        assert_success(&run_real_json(
+            &repo,
+            &["topic", "create", topic, "--display-name", topic],
+        ));
+    }
+
+    let first_start = run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "first",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "shared-agent",
+        ],
+    );
+    assert_success(&first_start);
+    let second_start = run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "second",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "shared-agent",
+        ],
+    );
+    assert_success(&second_start);
+    let first_start_generation = json_string_field(&stdout(&first_start), "session_generation_id");
+    let second_start_generation =
+        json_string_field(&stdout(&second_start), "session_generation_id");
+    assert_eq!(first_start_generation, "gen_shared_agent_0001");
+    assert_eq!(second_start_generation, "gen_shared_agent_second_0001");
+    assert_ne!(first_start_generation, second_start_generation);
+
+    let first_refresh = run_real_json(
+        &repo,
+        &[
+            "session",
+            "refresh",
+            "session_shared_agent",
+            "--policy",
+            "manual",
+        ],
+    );
+    assert_success(&first_refresh);
+    let first_generation = json_string_field(&stdout(&first_refresh), "session_generation_id");
+    assert_eq!(first_generation, "gen_shared_agent_0002");
+
+    let content = repo.write_file("second-session.txt", "second session\n");
+    let second_write = run_real_json_os(
+        &repo,
+        &[
+            "write".as_ref(),
+            "second.txt".as_ref(),
+            "--session".as_ref(),
+            "session_shared_agent_second".as_ref(),
+            "--expect-hash".as_ref(),
+            "new".as_ref(),
+            "--content-file".as_ref(),
+            content.as_os_str(),
+            "--classification".as_ref(),
+            "source".as_ref(),
+        ],
+    );
+    assert_success(&second_write);
+    let second_generation = json_string_field(&stdout(&second_write), "session_generation_id");
+    assert_eq!(second_generation, "gen_shared_agent_second_0002");
+    assert_ne!(first_generation, second_generation);
+
+    for (session_id, generation_id, generation_number) in [
+        ("session_shared_agent", first_generation.as_str(), 2),
+        ("session_shared_agent_second", second_generation.as_str(), 2),
+    ] {
+        let status = run_real_json(&repo, &["status", "--session", session_id]);
+        assert_success(&status);
+        assert_eq!(
+            json_string_field(&stdout(&status), "session_generation_id"),
+            generation_id
+        );
+        let inspect = run_real_json(&repo, &["inspect", &format!("session:{session_id}")]);
+        assert_success(&inspect);
+        assert_eq!(
+            json_string_field(&stdout(&inspect), "session_generation_id"),
+            generation_id
+        );
+
+        let record = fs::read_to_string(
+            repo.path()
+                .join(".sunlight/session-generations")
+                .join(format!("{generation_id}.json")),
+        )
+        .unwrap();
+        assert!(record.contains(&format!("\"session_id\":\"{session_id}\"")));
+        assert!(record.contains(&format!("\"session_generation_id\":\"{generation_id}\"")));
+        assert!(record.contains(&format!("\"generation_number\":{generation_number}")));
+    }
+
+    for (session_id, generation_id) in [
+        ("session_shared_agent", first_start_generation),
+        ("session_shared_agent_second", second_start_generation),
+    ] {
+        let record = fs::read_to_string(
+            repo.path()
+                .join(".sunlight/session-generations")
+                .join(format!("{generation_id}.json")),
+        )
+        .unwrap();
+        assert!(record.contains(&format!("\"session_id\":\"{session_id}\"")));
+        assert!(record.contains("\"generation_number\":1"));
+    }
+}
+
+#[test]
+fn no_fixture_session_refresh_persists_frontier_policies_and_write_context() {
+    let repo = TestRepo::new("real-session-refresh");
+    init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "topic",
+            "create",
+            "dependency",
+            "--display-name",
+            "Dependency",
+        ],
+    ));
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "dependency",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "dependency-agent",
+        ],
+    ));
+    let dependency_v1 = repo.write_file("dependency-v1.txt", "dependency v1\n");
+    let dependency_write_v1 = run_real_json_os(
+        &repo,
+        &[
+            "write".as_ref(),
+            "dependency.txt".as_ref(),
+            "--session".as_ref(),
+            "session_dependency_agent".as_ref(),
+            "--expect-hash".as_ref(),
+            "new".as_ref(),
+            "--content-file".as_ref(),
+            dependency_v1.as_os_str(),
+            "--classification".as_ref(),
+            "source".as_ref(),
+        ],
+    );
+    assert_success(&dependency_write_v1);
+    let dependency_revision_v1 =
+        json_string_field(&stdout(&dependency_write_v1), "topic_revision_id");
+
+    assert_success(&run_real_json(
+        &repo,
+        &["topic", "create", "writer", "--display-name", "Writer"],
+    ));
+    let head = run_real_json(&repo, &["view", "resolve"]);
+    assert_success(&head);
+    let head_view = resolved_view_id(&stdout(&head));
+    let writer_start = run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "writer",
+            "--view",
+            &head_view,
+            "--actor",
+            "writer-agent",
+        ],
+    );
+    assert_success(&writer_start);
+    let writer_status = run_real_json(&repo, &["status", "--session", "session_writer_agent"]);
+    assert_success(&writer_status);
+    assert!(stdout(&writer_status).contains(&dependency_revision_v1));
+
+    let dependency_hash = json_string_field(
+        &stdout(&run_real_json(
+            &repo,
+            &[
+                "read",
+                "dependency.txt",
+                "--session",
+                "session_dependency_agent",
+            ],
+        )),
+        "content_hash",
+    );
+    let dependency_v2 = repo.write_file("dependency-v2.txt", "dependency v2\n");
+    let dependency_write_v2 = run_real_json_os(
+        &repo,
+        &[
+            "write".as_ref(),
+            "dependency.txt".as_ref(),
+            "--session".as_ref(),
+            "session_dependency_agent".as_ref(),
+            "--expect-hash".as_ref(),
+            dependency_hash.as_ref(),
+            "--content-file".as_ref(),
+            dependency_v2.as_os_str(),
+            "--classification".as_ref(),
+            "source".as_ref(),
+        ],
+    );
+    assert_success(&dependency_write_v2);
+    let dependency_revision_v2 =
+        json_string_field(&stdout(&dependency_write_v2), "topic_revision_id");
+
+    let before_refresh = run_real_json(&repo, &["status", "--session", "session_writer_agent"]);
+    assert_success(&before_refresh);
+    assert!(stdout(&before_refresh).contains(&format!(
+        "\"available_newer_topic_heads\":{{\"topic_dependency\":\"{dependency_revision_v2}\"}}"
+    )));
+    assert!(stdout(&before_refresh).contains(&dependency_revision_v1));
+
+    let manual = run_real_json(
+        &repo,
+        &[
+            "session",
+            "refresh",
+            "session_writer_agent",
+            "--policy",
+            "manual",
+        ],
+    );
+    assert_success(&manual);
+    let manual_stdout = stdout(&manual);
+    assert!(manual_stdout.contains("\"changed\":true"));
+    assert!(manual_stdout.contains("\"refresh_policy\":\"manual\""));
+    assert!(manual_stdout.contains(&dependency_revision_v2));
+    let manual_generation = json_string_field(&manual_stdout, "session_generation_id");
+    let refreshed_read = run_real_json(
+        &repo,
+        &[
+            "read",
+            "dependency.txt",
+            "--session",
+            "session_writer_agent",
+        ],
+    );
+    assert_success(&refreshed_read);
+    assert!(stdout(&refreshed_read).contains("dependency v2"));
+
+    let follow = run_real_json(
+        &repo,
+        &[
+            "session",
+            "refresh",
+            "session_writer_agent",
+            "--policy",
+            "follow",
+        ],
+    );
+    assert_success(&follow);
+    assert!(stdout(&follow).contains("\"refresh_policy\":\"follow\""));
+    let follow_generation = json_string_field(&stdout(&follow), "session_generation_id");
+    assert_ne!(manual_generation, follow_generation);
+    let follow_noop = run_real_json(
+        &repo,
+        &[
+            "session",
+            "refresh",
+            "session_writer_agent",
+            "--policy",
+            "follow",
+        ],
+    );
+    assert_success(&follow_noop);
+    assert!(stdout(&follow_noop).contains("\"changed\":false"));
+    assert!(stdout(&follow_noop).contains("policy_and_frontier_unchanged"));
+    assert_eq!(
+        json_string_field(&stdout(&follow_noop), "session_generation_id"),
+        follow_generation
+    );
+
+    let dependency_hash_v2 = json_string_field(&stdout(&refreshed_read), "content_hash");
+    let dependency_v3 = repo.write_file("dependency-v3.txt", "dependency v3\n");
+    let dependency_write_v3 = run_real_json_os(
+        &repo,
+        &[
+            "write".as_ref(),
+            "dependency.txt".as_ref(),
+            "--session".as_ref(),
+            "session_dependency_agent".as_ref(),
+            "--expect-hash".as_ref(),
+            dependency_hash_v2.as_ref(),
+            "--content-file".as_ref(),
+            dependency_v3.as_os_str(),
+            "--classification".as_ref(),
+            "source".as_ref(),
+        ],
+    );
+    assert_success(&dependency_write_v3);
+    let dependency_revision_v3 =
+        json_string_field(&stdout(&dependency_write_v3), "topic_revision_id");
+    let own = repo.write_file("writer-after.txt", "writer context\n");
+    let own_write = run_real_json_os(
+        &repo,
+        &[
+            "write".as_ref(),
+            "writer-after.txt".as_ref(),
+            "--session".as_ref(),
+            "session_writer_agent".as_ref(),
+            "--expect-hash".as_ref(),
+            "new".as_ref(),
+            "--content-file".as_ref(),
+            own.as_os_str(),
+            "--classification".as_ref(),
+            "source".as_ref(),
+        ],
+    );
+    assert_success(&own_write);
+    let own_stdout = stdout(&own_write);
+    assert!(own_stdout.contains(&dependency_revision_v2));
+    assert!(!own_stdout.contains(&dependency_revision_v3));
+    assert!(own_stdout.contains("\"refresh_policy\":\"follow\""));
+    let own_operation_id = json_string_field(&own_stdout, "operation_transaction_id");
+    let operation_record = fs::read_to_string(
+        repo.path()
+            .join(".sunlight/operations")
+            .join(format!("{own_operation_id}.json")),
+    )
+    .unwrap();
+    assert!(operation_record.contains(&dependency_revision_v2));
+
+    let none = run_real_json(
+        &repo,
+        &[
+            "session",
+            "refresh",
+            "session_writer_agent",
+            "--policy",
+            "none",
+        ],
+    );
+    assert_success(&none);
+    assert!(stdout(&none).contains("\"refresh_policy\":\"none\""));
+    assert!(stdout(&none).contains(&dependency_revision_v2));
+    assert!(stdout(&none).contains(&dependency_revision_v3));
+    let inspect = run_real_json(&repo, &["inspect", "session:session_writer_agent"]);
+    assert_success(&inspect);
+    assert!(stdout(&inspect).contains("\"refresh_policy\":\"none\""));
+    assert!(stdout(&inspect).contains(&dependency_revision_v2));
+    assert!(stdout(&inspect).contains(&dependency_revision_v3));
+}
+
+#[test]
+fn no_fixture_session_refresh_conflict_keeps_last_good_generation_and_evidence() {
+    let repo = TestRepo::new("real-session-refresh-conflict");
+    init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+    for (topic, actor) in [("right", "right-agent"), ("left", "left-agent")] {
+        assert_success(&run_real_json(
+            &repo,
+            &["topic", "create", topic, "--display-name", topic],
+        ));
+        assert_success(&run_real_json(
+            &repo,
+            &[
+                "session",
+                "start",
+                "--topic",
+                topic,
+                "--view",
+                "view_base_0001",
+                "--actor",
+                actor,
+            ],
+        ));
+    }
+    let right = repo.write_file("right-shared.txt", "right version\n");
+    assert_success(&run_real_json_os(
+        &repo,
+        &[
+            "write".as_ref(),
+            "shared.txt".as_ref(),
+            "--session".as_ref(),
+            "session_right_agent".as_ref(),
+            "--expect-hash".as_ref(),
+            "new".as_ref(),
+            "--content-file".as_ref(),
+            right.as_os_str(),
+            "--classification".as_ref(),
+            "source".as_ref(),
+        ],
+    ));
+    let left_note = repo.write_file("left-note.txt", "left note\n");
+    assert_success(&run_real_json_os(
+        &repo,
+        &[
+            "write".as_ref(),
+            "left.txt".as_ref(),
+            "--session".as_ref(),
+            "session_left_agent".as_ref(),
+            "--expect-hash".as_ref(),
+            "new".as_ref(),
+            "--content-file".as_ref(),
+            left_note.as_os_str(),
+            "--classification".as_ref(),
+            "source".as_ref(),
+        ],
+    ));
+    let head = run_real_json(&repo, &["view", "resolve"]);
+    assert_success(&head);
+    let head_view = resolved_view_id(&stdout(&head));
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "right",
+            "--view",
+            &head_view,
+            "--actor",
+            "review-agent",
+        ],
+    ));
+    let before = run_real_json(&repo, &["status", "--session", "session_review_agent"]);
+    assert_success(&before);
+    let generation_before = json_string_field(&stdout(&before), "session_generation_id");
+    let view_before = json_string_field(&stdout(&before), "resolved_view_id");
+
+    let left_shared = repo.write_file("left-shared.txt", "left version\n");
+    assert_success(&run_real_json_os(
+        &repo,
+        &[
+            "write".as_ref(),
+            "shared.txt".as_ref(),
+            "--session".as_ref(),
+            "session_left_agent".as_ref(),
+            "--expect-hash".as_ref(),
+            "new".as_ref(),
+            "--content-file".as_ref(),
+            left_shared.as_os_str(),
+            "--classification".as_ref(),
+            "source".as_ref(),
+        ],
+    ));
+    let blocked = run_real_json(
+        &repo,
+        &[
+            "session",
+            "refresh",
+            "session_review_agent",
+            "--policy",
+            "manual",
+        ],
+    );
+    assert_failure(&blocked);
+    let blocked_stdout = stdout(&blocked);
+    assert!(blocked_stdout.contains("\"code\":\"session_refresh_blocked\""));
+    assert!(blocked_stdout.contains("\"candidate_resolved_view_id\":"));
+    assert!(blocked_stdout.contains("\"conflict_ids\":[\"conflict_shared_txt_0001\"]"));
+    let after = run_real_json(&repo, &["status", "--session", "session_review_agent"]);
+    assert_success(&after);
+    assert_eq!(
+        json_string_field(&stdout(&after), "session_generation_id"),
+        generation_before
+    );
+    assert_eq!(
+        json_string_field(&stdout(&after), "resolved_view_id"),
+        view_before
+    );
+    let evidence = run_real_json(&repo, &["inspect", "conflict:conflict_shared_txt_0001"]);
+    assert_success(&evidence);
+    assert!(stdout(&evidence).contains("same_artifact_conflict"));
+    assert!(repo
+        .path()
+        .join(".sunlight/conflicts/conflict_shared_txt_0001.json")
+        .is_file());
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -10358,6 +10874,18 @@ fn init_local_git_repo(repo: &TestRepo) -> String {
     git(repo.path(), &["add", "base.txt"]);
     git(repo.path(), &["commit", "-m", "base"]);
     git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string()
+}
+
+fn run_real_json(repo: &TestRepo, args: &[&str]) -> Output {
+    let mut command = sun();
+    command.args(args).arg("--json").current_dir(repo.path());
+    command.output().expect("real Sunlight command should run")
+}
+
+fn run_real_json_os(repo: &TestRepo, args: &[&OsStr]) -> Output {
+    let mut command = sun();
+    command.args(args).arg("--json").current_dir(repo.path());
+    command.output().expect("real Sunlight command should run")
 }
 
 fn start_native_session(repo: &TestRepo, slug: &str) {

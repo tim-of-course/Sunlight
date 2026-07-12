@@ -221,7 +221,7 @@ fn self_hosting_real_repository_acceptance() {
             native_session
         );
         assert!(
-            string(&inspected, &["data", "operation", "authored_context_id"]).starts_with("ctx_")
+            string(&inspected, &["data", "operation", "authored_context_id"]).starts_with("view_")
         );
         assert_eq!(
             string(&inspected, &["data", "operation", "topic_id"]),

@@ -37,6 +37,7 @@ pub struct RealRepoState {
     pub head_revision_id: Option<String>,
     pub topics: Vec<RealTopicRecord>,
     pub sessions: Vec<RealSessionRecord>,
+    pub session_generations: Vec<RealSessionGenerationRecord>,
     pub base_entries: Vec<RealArtifactEntry>,
     pub operations: Vec<RealOperationRecord>,
     pub projections: Vec<RealProjectionSnapshot>,
@@ -67,6 +68,26 @@ pub struct RealSessionRecord {
     pub resolved_view_id: String,
     pub session_generation_id: String,
     pub generation_number: u64,
+    pub topic_frontier: BTreeMap<String, String>,
+    pub refresh_policy: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealSessionGenerationRecord {
+    pub session_generation_id: String,
+    pub session_id: String,
+    pub write_topic_id: String,
+    pub base_resolved_view_id: String,
+    pub resolved_view_id: String,
+    pub topic_frontier: BTreeMap<String, String>,
+    pub generation_number: u64,
+    pub refresh_policy: String,
+    pub created_by: String,
+}
+
+pub fn native_session_generation_id(session_id: &str, generation_number: u64) -> String {
+    let session_identity = session_id.strip_prefix("session_").unwrap_or(session_id);
+    format!("gen_{session_identity}_{generation_number:04}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,6 +397,7 @@ impl RealRepoState {
             head_revision_id: None,
             topics: Vec::new(),
             sessions: Vec::new(),
+            session_generations: Vec::new(),
             base_entries: entries.clone(),
             operations: Vec::new(),
             projections: Vec::new(),
@@ -434,6 +456,10 @@ impl RealRepoState {
             .iter()
             .map(|session| parse_session(session, &path))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut session_generations = optional_array(&object, "session_generations", &path)?
+            .iter()
+            .map(|generation| parse_session_generation(generation, &path))
+            .collect::<Result<Vec<_>, _>>()?;
         let base_entries = match optional_array_field(&object, "base_entries") {
             Some(values) => values
                 .iter()
@@ -488,8 +514,65 @@ impl RealRepoState {
                     actor_id: actor_id.clone().unwrap_or_else(|| "local".to_string()),
                     write_topic_id: legacy_topic_id,
                     resolved_view_id: required_string(&object, "resolved_view_id", &path)?,
-                    session_generation_id: format!("gen_native_{:04}", generation_number.max(1)),
+                    session_generation_id: native_session_generation_id(
+                        "session_native",
+                        generation_number.max(1),
+                    ),
                     generation_number,
+                    topic_frontier: BTreeMap::new(),
+                    refresh_policy: "none".to_string(),
+                });
+            }
+        }
+
+        // Native state written before session frontiers were durable resolved a session from
+        // its write topic head. Snapshot that effective view once while loading so the next save
+        // pins the same context instead of changing legacy behavior.
+        for session in &mut sessions {
+            if session.topic_frontier.is_empty() {
+                if let Some(revision_id) = topics
+                    .iter()
+                    .find(|topic| topic.topic_id == session.write_topic_id)
+                    .and_then(|topic| topic.head_revision_id.clone())
+                {
+                    session
+                        .topic_frontier
+                        .insert(session.write_topic_id.clone(), revision_id);
+                }
+            }
+            if session.refresh_policy == "pinned_except_own_topic" {
+                session.refresh_policy = "none".to_string();
+            }
+            let generation_belongs_to_session = session_generations.iter().any(|generation| {
+                generation.session_generation_id == session.session_generation_id
+                    && generation.session_id == session.session_id
+            });
+            if !generation_belongs_to_session {
+                let generation_id_is_owned_by_another_session =
+                    session_generations.iter().any(|generation| {
+                        generation.session_generation_id == session.session_generation_id
+                            && generation.session_id != session.session_id
+                    });
+                if generation_id_is_owned_by_another_session {
+                    session.session_generation_id = native_session_generation_id(
+                        &session.session_id,
+                        session.generation_number,
+                    );
+                }
+                session_generations.push(RealSessionGenerationRecord {
+                    session_generation_id: session.session_generation_id.clone(),
+                    session_id: session.session_id.clone(),
+                    write_topic_id: session.write_topic_id.clone(),
+                    base_resolved_view_id: required_string(
+                        &object,
+                        "base_resolved_view_id",
+                        &path,
+                    )?,
+                    resolved_view_id: session.resolved_view_id.clone(),
+                    topic_frontier: session.topic_frontier.clone(),
+                    generation_number: session.generation_number,
+                    refresh_policy: session.refresh_policy.clone(),
+                    created_by: "legacy_state_migration".to_string(),
                 });
             }
         }
@@ -510,6 +593,7 @@ impl RealRepoState {
             head_revision_id,
             topics,
             sessions,
+            session_generations,
             base_entries,
             operations,
             projections,
@@ -638,6 +722,15 @@ impl RealRepoState {
         object.insert(
             "sessions".to_string(),
             JsonValue::Array(self.sessions.iter().map(session_json).collect()),
+        );
+        object.insert(
+            "session_generations".to_string(),
+            JsonValue::Array(
+                self.session_generations
+                    .iter()
+                    .map(session_generation_json)
+                    .collect(),
+            ),
         );
         object.insert(
             "base_entries".to_string(),
@@ -778,18 +871,12 @@ impl RealRepoState {
     }
 
     pub fn resolve_session_view(&self, session: &RealSessionRecord) -> RealResolvedRepoView {
-        let frontier = self
-            .topics
+        let frontier = session
+            .topic_frontier
             .iter()
-            .filter(|topic| topic.topic_id == session.write_topic_id)
-            .filter_map(|topic| {
-                topic
-                    .head_revision_id
-                    .as_ref()
-                    .map(|revision| TopicRevisionSelection {
-                        topic_id: topic.topic_id.clone(),
-                        revision_id: revision.clone(),
-                    })
+            .map(|(topic_id, revision_id)| TopicRevisionSelection {
+                topic_id: topic_id.clone(),
+                revision_id: revision_id.clone(),
             })
             .collect();
         self.resolve_view(frontier)
@@ -1917,7 +2004,59 @@ fn parse_session(
         resolved_view_id: required_string(object, "resolved_view_id", state_path)?,
         session_generation_id: required_string(object, "session_generation_id", state_path)?,
         generation_number: required_u64(object, "generation_number", state_path)?,
+        topic_frontier: parse_string_map(object, "topic_frontier", state_path)?,
+        refresh_policy: optional_string(object, "refresh_policy", state_path)?
+            .unwrap_or_else(|| "none".to_string()),
     })
+}
+
+fn parse_session_generation(
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealSessionGenerationRecord, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(
+            state_path,
+            "session generation must be a JSON object",
+        ));
+    };
+    Ok(RealSessionGenerationRecord {
+        session_generation_id: required_string(object, "session_generation_id", state_path)?,
+        session_id: required_string(object, "session_id", state_path)?,
+        write_topic_id: required_string(object, "write_topic_id", state_path)?,
+        base_resolved_view_id: required_string(object, "base_resolved_view_id", state_path)?,
+        resolved_view_id: required_string(object, "resolved_view_id", state_path)?,
+        topic_frontier: parse_string_map(object, "topic_frontier", state_path)?,
+        generation_number: required_u64(object, "generation_number", state_path)?,
+        refresh_policy: required_string(object, "refresh_policy", state_path)?,
+        created_by: required_string(object, "created_by", state_path)?,
+    })
+}
+
+fn parse_string_map(
+    object: &BTreeMap<String, JsonValue>,
+    field: &str,
+    state_path: &Path,
+) -> Result<BTreeMap<String, String>, RepoStateError> {
+    let Some(value) = object.get(field) else {
+        return Ok(BTreeMap::new());
+    };
+    let JsonValue::Object(values) = value else {
+        return Err(invalid_state(
+            state_path,
+            format!("{field} must be a JSON object"),
+        ));
+    };
+    values
+        .iter()
+        .map(|(key, value)| match value {
+            JsonValue::String(value) => Ok((key.clone(), value.clone())),
+            _ => Err(invalid_state(
+                state_path,
+                format!("{field} values must be strings"),
+            )),
+        })
+        .collect()
 }
 
 fn parse_operation(
@@ -2916,7 +3055,65 @@ fn session_json(session: &RealSessionRecord) -> JsonValue {
         "generation_number".to_string(),
         JsonValue::Number(session.generation_number.to_string()),
     );
+    object.insert(
+        "topic_frontier".to_string(),
+        string_map_json(&session.topic_frontier),
+    );
+    object.insert(
+        "refresh_policy".to_string(),
+        JsonValue::String(session.refresh_policy.clone()),
+    );
     JsonValue::Object(object)
+}
+
+fn session_generation_json(generation: &RealSessionGenerationRecord) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert(
+        "session_generation_id".to_string(),
+        JsonValue::String(generation.session_generation_id.clone()),
+    );
+    object.insert(
+        "session_id".to_string(),
+        JsonValue::String(generation.session_id.clone()),
+    );
+    object.insert(
+        "write_topic_id".to_string(),
+        JsonValue::String(generation.write_topic_id.clone()),
+    );
+    object.insert(
+        "base_resolved_view_id".to_string(),
+        JsonValue::String(generation.base_resolved_view_id.clone()),
+    );
+    object.insert(
+        "resolved_view_id".to_string(),
+        JsonValue::String(generation.resolved_view_id.clone()),
+    );
+    object.insert(
+        "topic_frontier".to_string(),
+        string_map_json(&generation.topic_frontier),
+    );
+    object.insert(
+        "generation_number".to_string(),
+        JsonValue::Number(generation.generation_number.to_string()),
+    );
+    object.insert(
+        "refresh_policy".to_string(),
+        JsonValue::String(generation.refresh_policy.clone()),
+    );
+    object.insert(
+        "created_by".to_string(),
+        JsonValue::String(generation.created_by.clone()),
+    );
+    JsonValue::Object(object)
+}
+
+fn string_map_json(values: &BTreeMap<String, String>) -> JsonValue {
+    JsonValue::Object(
+        values
+            .iter()
+            .map(|(key, value)| (key.clone(), JsonValue::String(value.clone())))
+            .collect(),
+    )
 }
 
 fn quarantine_json(entry: &RealQuarantineEntry) -> JsonValue {
@@ -3185,6 +3382,132 @@ mod tests {
     }
 
     #[test]
+    fn legacy_session_state_loads_with_effective_frontier_and_pinned_policy() {
+        let repo = temp_repo("legacy-session-frontier");
+        let mut state = RealRepoState::ingest(&repo, "repo_legacy").unwrap();
+        state.topics.push(RealTopicRecord {
+            topic_id: "topic_legacy".to_string(),
+            slug: "legacy".to_string(),
+            display_name: "Legacy".to_string(),
+            owner_actor_id: "legacy-agent".to_string(),
+            base_checkpoint_id: state.base_checkpoint_id.clone(),
+            head_revision_id: Some("rev_legacy_0001".to_string()),
+            revision_number: 1,
+        });
+        state.sessions.push(RealSessionRecord {
+            session_id: "session_legacy".to_string(),
+            actor_id: "legacy-agent".to_string(),
+            write_topic_id: "topic_legacy".to_string(),
+            resolved_view_id: "view_legacy".to_string(),
+            session_generation_id: "gen_legacy_0001".to_string(),
+            generation_number: 1,
+            topic_frontier: BTreeMap::from([(
+                "topic_legacy".to_string(),
+                "rev_legacy_0001".to_string(),
+            )]),
+            refresh_policy: "none".to_string(),
+        });
+        let mut json = state.to_json_value();
+        let JsonValue::Object(root) = &mut json else {
+            unreachable!()
+        };
+        root.remove("session_generations");
+        let JsonValue::Array(sessions) = root.get_mut("sessions").unwrap() else {
+            unreachable!()
+        };
+        let JsonValue::Object(session) = &mut sessions[0] else {
+            unreachable!()
+        };
+        session.remove("topic_frontier");
+        session.remove("refresh_policy");
+        let path = real_state_path(&repo);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, canonical_json_bytes(&json).unwrap()).unwrap();
+
+        let loaded = RealRepoState::load(&repo).unwrap();
+        let session = loaded.session_by_id("session_legacy").unwrap();
+        assert_eq!(session.refresh_policy, "none");
+        assert_eq!(
+            session
+                .topic_frontier
+                .get("topic_legacy")
+                .map(String::as_str),
+            Some("rev_legacy_0001")
+        );
+        assert_eq!(loaded.session_generations.len(), 1);
+        assert_eq!(
+            loaded.session_generations[0].created_by,
+            "legacy_state_migration"
+        );
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn legacy_actor_scoped_generation_collision_is_relinked_per_session() {
+        let repo = temp_repo("legacy-generation-collision");
+        let mut state = RealRepoState::ingest(&repo, "repo_legacy_collision").unwrap();
+        for topic_id in ["topic_first", "topic_second"] {
+            state.topics.push(RealTopicRecord {
+                topic_id: topic_id.to_string(),
+                slug: topic_id.trim_start_matches("topic_").to_string(),
+                display_name: topic_id.to_string(),
+                owner_actor_id: "shared-agent".to_string(),
+                base_checkpoint_id: state.base_checkpoint_id.clone(),
+                head_revision_id: None,
+                revision_number: 0,
+            });
+        }
+        for (session_id, write_topic_id) in [
+            ("session_shared_agent", "topic_first"),
+            ("session_shared_agent_second", "topic_second"),
+        ] {
+            state.sessions.push(RealSessionRecord {
+                session_id: session_id.to_string(),
+                actor_id: "shared-agent".to_string(),
+                write_topic_id: write_topic_id.to_string(),
+                resolved_view_id: state.base_resolved_view_id.clone(),
+                session_generation_id: "gen_shared_agent_0001".to_string(),
+                generation_number: 1,
+                topic_frontier: BTreeMap::new(),
+                refresh_policy: "none".to_string(),
+            });
+        }
+        state.session_generations.push(RealSessionGenerationRecord {
+            session_generation_id: "gen_shared_agent_0001".to_string(),
+            session_id: "session_shared_agent".to_string(),
+            write_topic_id: "topic_first".to_string(),
+            base_resolved_view_id: state.base_resolved_view_id.clone(),
+            resolved_view_id: state.base_resolved_view_id.clone(),
+            topic_frontier: BTreeMap::new(),
+            generation_number: 1,
+            refresh_policy: "none".to_string(),
+            created_by: "session_start".to_string(),
+        });
+        state.save(&repo).unwrap();
+
+        let loaded = RealRepoState::load(&repo).unwrap();
+        assert_eq!(
+            loaded
+                .session_by_id("session_shared_agent")
+                .unwrap()
+                .session_generation_id,
+            "gen_shared_agent_0001"
+        );
+        let repaired = loaded.session_by_id("session_shared_agent_second").unwrap();
+        assert_eq!(
+            repaired.session_generation_id,
+            "gen_shared_agent_second_0001"
+        );
+        assert!(loaded.session_generations.iter().any(|generation| {
+            generation.session_generation_id == repaired.session_generation_id
+                && generation.session_id == repaired.session_id
+        }));
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
     fn git_ingestion_uses_exclude_standard_ignore_policy() {
         let repo = temp_repo("git-ignore");
         git(&repo, &["init", "-b", "main"]);
@@ -3334,6 +3657,7 @@ mod tests {
             head_revision_id: None,
             topics: Vec::new(),
             sessions: Vec::new(),
+            session_generations: Vec::new(),
             base_entries: entries.clone(),
             operations: Vec::new(),
             projections: Vec::new(),
@@ -3397,6 +3721,7 @@ mod tests {
                 },
             ],
             sessions: Vec::new(),
+            session_generations: Vec::new(),
             base_entries: vec![readme.clone(), lib.clone()],
             operations: vec![
                 operation(

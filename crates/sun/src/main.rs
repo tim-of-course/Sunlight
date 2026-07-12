@@ -83,13 +83,14 @@ use sunlight_core::projection::{
 };
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repo_state::{
-    materialize_real_projection, persist_quarantine_report, real_artifact_id_for_path,
-    real_content_hash, real_tree_hash, scan_real_projection_files_with_quarantine,
-    RealArtifactEntry, RealCheckpointSnapshot, RealExecutionOutputSnapshot,
-    RealExecutionPromotionSnapshot, RealExecutionSnapshot, RealExportMapSnapshot,
-    RealOperationEffect, RealOperationRecord, RealProjectionMaterialization,
+    materialize_real_projection, native_session_generation_id, persist_quarantine_report,
+    real_artifact_id_for_path, real_content_hash, real_tree_hash,
+    scan_real_projection_files_with_quarantine, RealArtifactEntry, RealCheckpointSnapshot,
+    RealExecutionOutputSnapshot, RealExecutionPromotionSnapshot, RealExecutionSnapshot,
+    RealExportMapSnapshot, RealOperationEffect, RealOperationRecord, RealProjectionMaterialization,
     RealProjectionMaterializationRequest, RealProjectionSnapshot, RealProjectionStrategy,
-    RealRepoState, RealResolvedRepoView, RealSessionRecord, RealTopicRecord, RepoStateError,
+    RealRepoState, RealResolvedRepoView, RealSessionGenerationRecord, RealSessionRecord,
+    RealTopicRecord, RepoStateError,
 };
 use sunlight_core::repository::{
     init_repository, resolve_projection_policy, ExecutionPolicy, RepositoryConfig,
@@ -236,6 +237,7 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         }
         [scope, command, ..] if scope == "topic" && command == "create" => topic_create(&ctx),
         [scope, command, ..] if scope == "session" && command == "start" => session_start(&ctx),
+        [scope, command, ..] if scope == "session" && command == "refresh" => session_refresh(&ctx),
         [scope, command, ..] if scope == "view" && command == "resolve" => view_resolve(&ctx),
         [scope, command, ..] if scope == "project" && command == "materialize" => {
             project_materialize(&ctx)
@@ -393,6 +395,11 @@ fn session_start(ctx: &CommandContext) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+fn session_refresh(ctx: &CommandContext) -> Result<(), CliError> {
+    let options = parse_session_refresh_options(ctx)?;
+    real_session_refresh(ctx, options)
 }
 
 fn artifact_read(ctx: &CommandContext) -> Result<(), CliError> {
@@ -1589,6 +1596,11 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
     state.projections[projection_index].last_import_operation_id =
         Some(response.operation.id.clone());
     state.save(&repo_root)?;
+    persist_real_session_generation_record(
+        &state,
+        &response.session_id,
+        &response.session_generation.id,
+    )?;
     let projection_after = state.projections[projection_index].clone();
     persist_real_projection_record(&state, &projection_after)?;
     let operation_record = state.operations.last().expect("accepted operation");
@@ -2085,9 +2097,25 @@ fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Res
     let repo_root = PathBuf::from(".");
     let mut state = RealRepoState::load(&repo_root)?;
     let topic = real_topic(&state, &options.topic)?.clone();
-    if options.view_id != state.resolved_view_id && options.view_id != state.base_resolved_view_id {
-        return Err(object_not_found("view", &options.view_id));
+    let selected = if options.view_id == state.base_resolved_view_id {
+        real_base_resolved_repo_view(&state)
+    } else {
+        let head = state.resolve_head_view();
+        if options.view_id != head.result.resolved_view_id
+            && options.view_id != state.resolved_view_id
+        {
+            return Err(object_not_found("view", &options.view_id));
+        }
+        head
+    };
+    if !selected.result.conflict_free() {
+        return Err(CliError::new(
+            "conflicted_view",
+            "cannot start a session from a conflicted resolved view",
+        )
+        .with_detail("resolved_view_id", selected.result.resolved_view_id));
     }
+    let topic_frontier = selected.result.topic_frontier.clone();
     let actor_slug = options.actor_id.replace('-', "_");
     let base_session_id = format!("session_{actor_slug}");
     let session_id = match state.session_by_id(&base_session_id) {
@@ -2100,24 +2128,47 @@ fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Res
             }
         }
     };
+    if let Some(existing) = state.session_by_id(&session_id) {
+        if ctx.json {
+            println!(
+                "{}",
+                real_session_start_success_envelope(&state, &topic, existing)
+            );
+        } else {
+            println!("started session {session_id}");
+        }
+        return Ok(());
+    }
     let generation_number = state
         .session_by_id(&session_id)
         .map(|session| session.generation_number.max(1))
         .unwrap_or(1);
-    let session_generation_id = format!("gen_{}_{:04}", actor_slug, generation_number);
-    let resolved_view_id = state.resolved_view_id.clone();
-    if let Some(existing) = state.session_by_id_mut(&session_id) {
-        existing.resolved_view_id = resolved_view_id.clone();
-        existing.session_generation_id = session_generation_id.clone();
-        existing.generation_number = generation_number;
-    } else {
-        state.sessions.push(RealSessionRecord {
-            session_id: session_id.clone(),
-            actor_id: options.actor_id.clone(),
-            write_topic_id: topic.topic_id.clone(),
-            resolved_view_id: resolved_view_id.clone(),
+    let session_generation_id = native_session_generation_id(&session_id, generation_number);
+    let resolved_view_id = selected.result.resolved_view_id.clone();
+    state.sessions.push(RealSessionRecord {
+        session_id: session_id.clone(),
+        actor_id: options.actor_id.clone(),
+        write_topic_id: topic.topic_id.clone(),
+        resolved_view_id: resolved_view_id.clone(),
+        session_generation_id: session_generation_id.clone(),
+        generation_number,
+        topic_frontier: topic_frontier.clone(),
+        refresh_policy: "none".to_string(),
+    });
+    if !state.session_generations.iter().any(|generation| {
+        generation.session_generation_id == session_generation_id
+            && generation.session_id == session_id
+    }) {
+        state.session_generations.push(RealSessionGenerationRecord {
             session_generation_id: session_generation_id.clone(),
+            session_id: session_id.clone(),
+            write_topic_id: topic.topic_id.clone(),
+            base_resolved_view_id: state.base_resolved_view_id.clone(),
+            resolved_view_id: resolved_view_id.clone(),
+            topic_frontier: topic_frontier.clone(),
             generation_number,
+            refresh_policy: "none".to_string(),
+            created_by: "session_start".to_string(),
         });
     }
     state.sync_compat_fields();
@@ -2131,10 +2182,17 @@ fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Res
             json_escape(&session_id),
             json_escape(&state.repository_id),
             json_escape(&topic.topic_id),
-            json_escape(&state.resolved_view_id),
+            json_escape(&resolved_view_id),
             json_escape(&session_generation_id),
             json_escape(&options.actor_id),
         ),
+    )?;
+    persist_real_session_generation_record(&state, &session_id, &session_generation_id)?;
+    state.persist_record(
+        &repo_root,
+        "views",
+        &resolved_view_id,
+        &format!("{}\n", resolved_view_record_json(&selected.result)),
     )?;
 
     if ctx.json {
@@ -2145,6 +2203,138 @@ fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Res
         );
     } else {
         println!("started session {session_id}");
+    }
+    Ok(())
+}
+
+fn real_session_refresh(
+    ctx: &CommandContext,
+    options: SessionRefreshOptions,
+) -> Result<(), CliError> {
+    let repo_root = PathBuf::from(".");
+    let mut state = RealRepoState::load(&repo_root)?;
+    let current = real_session(&state, &options.session_id)?.clone();
+    let mut candidate_frontier = current.topic_frontier.clone();
+
+    if matches!(options.policy.as_str(), "manual" | "follow") {
+        for topic_id in current.topic_frontier.keys() {
+            if topic_id == &current.write_topic_id {
+                continue;
+            }
+            if let Some(head) = state
+                .topics
+                .iter()
+                .find(|topic| topic.topic_id == *topic_id)
+                .and_then(|topic| topic.head_revision_id.clone())
+            {
+                candidate_frontier.insert(topic_id.clone(), head);
+            }
+        }
+    }
+
+    if candidate_frontier == current.topic_frontier && options.policy == current.refresh_policy {
+        if ctx.json {
+            println!(
+                "{}",
+                real_session_refresh_success_envelope(
+                    &state,
+                    &current,
+                    false,
+                    Some("policy_and_frontier_unchanged")
+                )
+            );
+        } else {
+            println!("{} unchanged", current.session_generation_id);
+        }
+        return Ok(());
+    }
+
+    let candidate = state.resolve_view(
+        candidate_frontier
+            .iter()
+            .map(|(topic_id, revision_id)| TopicRevisionSelection {
+                topic_id: topic_id.clone(),
+                revision_id: revision_id.clone(),
+            })
+            .collect(),
+    );
+    state.persist_record(
+        &repo_root,
+        "views",
+        &candidate.result.resolved_view_id,
+        &format!("{}\n", resolved_view_record_json(&candidate.result)),
+    )?;
+    for record in &candidate.result.records {
+        state.persist_record(
+            &repo_root,
+            "conflicts",
+            &record.id,
+            &format!("{}\n", resolver_record_json(record)),
+        )?;
+    }
+    if !candidate.result.conflict_free() {
+        let conflict_ids = candidate
+            .result
+            .conflicts()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>();
+        let staleness_ids = candidate
+            .result
+            .staleness()
+            .map(|record| record.id.as_str())
+            .collect::<Vec<_>>();
+        return Err(CliError::new(
+            "session_refresh_blocked",
+            "candidate session refresh is conflicted or stale; current generation is unchanged",
+        )
+        .with_raw_details_json(format!(
+            "{{\"session_id\":\"{}\",\"current_session_generation_id\":\"{}\",\"current_resolved_view_id\":\"{}\",\"candidate_resolved_view_id\":\"{}\",\"conflict_ids\":{},\"staleness_ids\":{}}}",
+            json_escape(&current.session_id),
+            json_escape(&current.session_generation_id),
+            json_escape(&current.resolved_view_id),
+            json_escape(&candidate.result.resolved_view_id),
+            string_array_json(conflict_ids.iter().copied()),
+            string_array_json(staleness_ids.iter().copied()),
+        )));
+    }
+
+    let generation_number = current.generation_number + 1;
+    let generation_id = native_session_generation_id(&current.session_id, generation_number);
+    let generation = RealSessionGenerationRecord {
+        session_generation_id: generation_id.clone(),
+        session_id: current.session_id.clone(),
+        write_topic_id: current.write_topic_id.clone(),
+        base_resolved_view_id: state.base_resolved_view_id.clone(),
+        resolved_view_id: candidate.result.resolved_view_id.clone(),
+        topic_frontier: candidate.result.topic_frontier.clone(),
+        generation_number,
+        refresh_policy: options.policy.clone(),
+        created_by: "session_refresh".to_string(),
+    };
+    state.session_generations.push(generation);
+    let session = state
+        .session_by_id_mut(&current.session_id)
+        .expect("loaded session remains present");
+    session.resolved_view_id = candidate.result.resolved_view_id;
+    session.session_generation_id = generation_id.clone();
+    session.generation_number = generation_number;
+    session.topic_frontier = candidate.result.topic_frontier;
+    session.refresh_policy = options.policy;
+    state.sync_compat_fields();
+    state.save(&repo_root)?;
+    persist_real_session_generation_record(&state, &current.session_id, &generation_id)?;
+    let updated = real_session(&state, &current.session_id)?;
+
+    if ctx.json {
+        println!(
+            "{}",
+            real_session_refresh_success_envelope(&state, updated, true, None)
+        );
+    } else {
+        println!(
+            "{} {}",
+            updated.session_generation_id, updated.resolved_view_id
+        );
     }
     Ok(())
 }
@@ -3864,11 +4054,8 @@ fn real_accept_mutation(
         topic_id.trim_start_matches("topic_"),
         next_topic_revision_number
     );
-    let session_generation_id = format!(
-        "gen_{}_{:04}",
-        session.actor_id.replace('-', "_"),
-        next_session_generation_number
-    );
+    let session_generation_id =
+        native_session_generation_id(&session.session_id, next_session_generation_number);
     if let Some(topic) = state
         .topics
         .iter_mut()
@@ -3877,9 +4064,20 @@ fn real_accept_mutation(
         topic.head_revision_id = Some(revision_id.clone());
         topic.revision_number = next_topic_revision_number;
     }
+    if let Some(session) = state.session_by_id_mut(session_id) {
+        session
+            .topic_frontier
+            .insert(topic_id.clone(), revision_id.clone());
+    }
     let before_hash = before.as_ref().map(|entry| entry.content_hash.clone());
     let after_hash = after.content_hash.clone();
-    let authored_context_id = format!("ctx_native_{:04}", state.revision_number - 1);
+    let authored_context_id = prior_view.resolved_view_id.clone();
+    let dependency_revision_ids = session
+        .topic_frontier
+        .iter()
+        .filter(|(dependency_topic_id, _)| *dependency_topic_id != &topic_id)
+        .map(|(_, revision_id)| revision_id.clone())
+        .collect::<Vec<_>>();
     state.operations.push(RealOperationRecord {
         operation_transaction_id: operation_id.clone(),
         topic_id: topic_id.clone(),
@@ -3891,7 +4089,7 @@ fn real_accept_mutation(
         base_content_hash: before_hash.clone(),
         result_content_hash: after_hash.clone(),
         authored_context_id: authored_context_id.clone(),
-        dependency_revision_ids: Vec::new(),
+        dependency_revision_ids: dependency_revision_ids.clone(),
         classification: after.classification.clone(),
         executable: after.executable,
         tombstone: after.tombstone,
@@ -3996,7 +4194,7 @@ fn real_accept_mutation(
         parent_revision_id,
         operation_transaction_id: operation_id.clone(),
         tree_delta_ref: format!("delta_native_{:04}", state.revision_number),
-        dependency_revision_ids: Vec::new(),
+        dependency_revision_ids,
     };
     let session_generation = SessionGenerationMutationRecord {
         id: session_generation_id.clone(),
@@ -4005,11 +4203,22 @@ fn real_accept_mutation(
         write_topic_id: topic_id.clone(),
         base_resolved_view_id: state.base_resolved_view_id.clone(),
         resolved_view_id: state.resolved_view_id.clone(),
-        topic_frontier: BTreeMap::from([(topic_id, revision_id.clone())]),
+        topic_frontier: real_session(state, session_id)?.topic_frontier.clone(),
         generation_number: next_session_generation_number,
-        refresh_policy: "pinned_except_own_topic".to_string(),
+        refresh_policy: real_session(state, session_id)?.refresh_policy.clone(),
         created_by_operation_id: operation_id,
     };
+    state.session_generations.push(RealSessionGenerationRecord {
+        session_generation_id: session_generation_id.clone(),
+        session_id: session_id.to_string(),
+        write_topic_id: session.write_topic_id.clone(),
+        base_resolved_view_id: state.base_resolved_view_id.clone(),
+        resolved_view_id: state.resolved_view_id.clone(),
+        topic_frontier: real_session(state, session_id)?.topic_frontier.clone(),
+        generation_number: next_session_generation_number,
+        refresh_policy: real_session(state, session_id)?.refresh_policy.clone(),
+        created_by: format!("operation:{}", session_generation.created_by_operation_id),
+    });
     Ok(MutationResponse {
         command: match mutation {
             "patch" => "artifact.patch",
@@ -4065,8 +4274,17 @@ fn finish_real_mutation(
         &state.resolved_view_id,
         &format!(
             "{}\n",
-            resolved_view_record_json(&real_resolved_view(&state))
+            resolved_view_record_json(
+                &state
+                    .resolve_session_view(real_session(&state, &response.session_id)?)
+                    .result
+            )
         ),
+    )?;
+    persist_real_session_generation_record(
+        &state,
+        &response.session_id,
+        &response.session_generation.id,
     )?;
     if ctx.json {
         println!("{}", mutation_success_envelope(&response));
@@ -4087,6 +4305,11 @@ fn finish_real_promotion(
 ) -> Result<(), CliError> {
     let repo_root = PathBuf::from(".");
     state.save(&repo_root)?;
+    persist_real_session_generation_record(
+        &state,
+        &response.session_id,
+        &response.session_generation.id,
+    )?;
     state.persist_record(
         &repo_root,
         "operations",
@@ -4131,6 +4354,35 @@ fn finish_real_promotion(
             response.artifact.path, response.artifact.after_hash
         );
     }
+    Ok(())
+}
+
+fn persist_real_session_generation_record(
+    state: &RealRepoState,
+    session_id: &str,
+    session_generation_id: &str,
+) -> Result<(), CliError> {
+    let generation = state
+        .session_generations
+        .iter()
+        .find(|generation| {
+            generation.session_generation_id == session_generation_id
+                && generation.session_id == session_id
+        })
+        .ok_or_else(|| {
+            CliError::new(
+                "invalid_native_state",
+                "canonical session generation is missing from native state",
+            )
+            .with_detail("session_id", session_id.to_string())
+            .with_detail("session_generation_id", session_generation_id.to_string())
+        })?;
+    state.persist_record(
+        &PathBuf::from("."),
+        "session-generations",
+        session_generation_id,
+        &format!("{}\n", real_session_generation_record_json(generation)),
+    )?;
     Ok(())
 }
 
@@ -4527,7 +4779,7 @@ fn real_session_start_success_envelope(
     session: &RealSessionRecord,
 ) -> String {
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"session.start\",\"repository_id\":\"{}\",\"ids\":{{\"topic_id\":\"{}\",\"session_id\":\"{}\",\"resolved_view_id\":\"{}\",\"session_generation_id\":\"{}\"}},\"view\":{},\"session\":{{\"session_id\":\"{}\",\"actor_id\":\"{}\",\"write_topic_id\":\"{}\",\"resolved_view_id\":\"{}\",\"session_generation_id\":\"{}\",\"refresh_policy\":\"pinned_except_own_topic\",\"capabilities\":{}}},\"topic_frontier\":[{{\"topic_id\":\"{}\",\"revision_id\":{},\"mode\":\"write\"}}]}},\"warnings\":[]}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"session.start\",\"repository_id\":\"{}\",\"ids\":{{\"topic_id\":\"{}\",\"session_id\":\"{}\",\"resolved_view_id\":\"{}\",\"session_generation_id\":\"{}\"}},\"view\":{},\"session\":{{\"session_id\":\"{}\",\"actor_id\":\"{}\",\"write_topic_id\":\"{}\",\"resolved_view_id\":\"{}\",\"session_generation_id\":\"{}\",\"refresh_policy\":\"{}\",\"capabilities\":{}}},\"topic_frontier\":{}}},\"warnings\":[]}}",
         json_escape(&state.repository_id),
         json_escape(&topic.topic_id),
         json_escape(&session.session_id),
@@ -4539,9 +4791,9 @@ fn real_session_start_success_envelope(
         json_escape(&topic.topic_id),
         json_escape(&session.resolved_view_id),
         json_escape(&session.session_generation_id),
+        json_escape(&session.refresh_policy),
         phase1_capabilities_json(),
-        json_escape(&topic.topic_id),
-        optional_string_json(topic.head_revision_id.as_deref()),
+        string_map_object_json(&session.topic_frontier),
     )
 }
 
@@ -5895,8 +6147,19 @@ fn print_real_status_text(
     }
     if let Some(session) = session {
         println!(
-            "session {}  generation {}  view {}",
-            session.session_id, session.session_generation_id, session.resolved_view_id
+            "session {}  generation {}  view {}  refresh-policy {}",
+            session.session_id,
+            session.session_generation_id,
+            session.resolved_view_id,
+            session.refresh_policy
+        );
+        println!(
+            "frontier {}",
+            string_map_object_json(&session.topic_frontier)
+        );
+        println!(
+            "available-newer-heads {}",
+            string_map_object_json(&available_newer_topic_heads(state, session))
         );
     }
     if command == "status.repository" || command == "inspect.repository" {
@@ -6030,8 +6293,18 @@ fn real_status_envelope(
                 .join(",")
         })
         .unwrap_or_default();
+    let session_context = session
+        .map(|session| {
+            format!(
+                ",\"refresh_policy\":\"{}\",\"topic_frontier\":{},\"available_newer_topic_heads\":{}",
+                json_escape(&session.refresh_policy),
+                string_map_object_json(&session.topic_frontier),
+                string_map_object_json(&available_newer_topic_heads(state, session)),
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"quarantined_secret_count\":{},\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"}},\"topic\":{{\"topic_id\":{},\"head_revision_id\":{}}},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]}}{}}},\"warnings\":{}}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"quarantined_secret_count\":{},\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"}},\"topic\":{{\"topic_id\":{},\"head_revision_id\":{}}},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
         command,
         json_escape(&state.repository_id),
         json_escape(&state.repository_id),
@@ -6048,9 +6321,30 @@ fn real_status_envelope(
         optional_string_json(session_id),
         json_escape(session_generation_id),
         compatibility_projections,
+        session_context,
         summary_extension,
         warnings,
     )
+}
+
+fn available_newer_topic_heads(
+    state: &RealRepoState,
+    session: &RealSessionRecord,
+) -> BTreeMap<String, String> {
+    session
+        .topic_frontier
+        .iter()
+        .filter(|(topic_id, _)| *topic_id != &session.write_topic_id)
+        .filter_map(|(topic_id, revision_id)| {
+            state
+                .topics
+                .iter()
+                .find(|topic| topic.topic_id == *topic_id)
+                .and_then(|topic| topic.head_revision_id.as_ref())
+                .filter(|head| *head != revision_id)
+                .map(|head| (topic_id.clone(), head.clone()))
+        })
+        .collect()
 }
 
 fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String, CliError> {
@@ -6215,6 +6509,22 @@ fn real_inspect_envelope(state: &RealRepoState, selector: &str) -> Result<String
                 json_escape(&record.id),
                 json_escape(&record.resolved_view_id),
                 resolver_record_json(record),
+            ));
+        }
+        let path = Path::new(".")
+            .join(".sunlight")
+            .join("conflicts")
+            .join(format!("{conflict}.json"));
+        if let Ok(record) = fs::read_to_string(path) {
+            let record = record.trim();
+            parse_json_record(record.as_bytes()).map_err(|error| {
+                invalid_request(format!("persisted resolver evidence is invalid: {error}"))
+            })?;
+            return Ok(format!(
+                "{{\"ok\":true,\"data\":{{\"command\":\"inspect.conflict\",\"repository_id\":\"{}\",\"ids\":{{\"conflict_id\":\"{}\"}},\"conflict\":{}}},\"warnings\":[]}}",
+                json_escape(&state.repository_id),
+                json_escape(conflict),
+                record,
             ));
         }
     }
@@ -9337,6 +9647,12 @@ struct SessionStartOptions {
 }
 
 #[derive(Debug)]
+struct SessionRefreshOptions {
+    session_id: String,
+    policy: String,
+}
+
+#[derive(Debug)]
 struct ArtifactCommandOptions {
     session_id: String,
     fixture: Option<String>,
@@ -9463,6 +9779,53 @@ fn parse_session_start_options(ctx: &CommandContext) -> Result<SessionStartOptio
             invalid_request("usage: sun session start requires --actor <actor-id>")
         })?,
         fixture,
+    })
+}
+
+fn parse_session_refresh_options(ctx: &CommandContext) -> Result<SessionRefreshOptions, CliError> {
+    let mut session_id = None;
+    let mut policy = None;
+    let mut args = ctx.args.iter().skip(2);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--policy" => {
+                policy = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request(
+                                "usage: sun session refresh <session> --policy manual|follow|none",
+                            )
+                        })?
+                        .clone(),
+                );
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun session refresh"
+                )));
+            }
+            value if session_id.is_none() => session_id = Some(value.to_string()),
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected session refresh argument `{value}`"
+                )));
+            }
+        }
+    }
+    let policy = policy.ok_or_else(|| {
+        invalid_request("usage: sun session refresh <session> --policy manual|follow|none")
+    })?;
+    if !matches!(policy.as_str(), "manual" | "follow" | "none") {
+        return Err(
+            invalid_request("session refresh policy must be manual, follow, or none")
+                .with_detail("policy", policy),
+        );
+    }
+    Ok(SessionRefreshOptions {
+        session_id: session_id.ok_or_else(|| {
+            invalid_request("usage: sun session refresh <session> --policy manual|follow|none")
+        })?,
+        policy,
     })
 }
 
@@ -14461,6 +14824,12 @@ fn promotion_operation_json(
 fn operation_json(response: &MutationResponse) -> String {
     let operation = &response.operation;
     let payload = mutation_payload_json(&operation.mutation_payload);
+    let mut authored_frontier = response.session_generation.topic_frontier.clone();
+    if let Some(parent) = &operation.preconditions.parent_topic_revision_id {
+        authored_frontier.insert(operation.topic_id.clone(), parent.clone());
+    } else {
+        authored_frontier.remove(&operation.topic_id);
+    }
     format!(
         concat!(
             "{{",
@@ -14480,6 +14849,8 @@ fn operation_json(response: &MutationResponse) -> String {
             "\"expected_path\":\"{}\",",
             "\"expected_hash\":\"{}\"",
             "}},",
+            "\"read_set\":{{\"mode\":\"full_authored_context\",\"resolved_view_id\":\"{}\",\"topic_frontier\":{}}},",
+            "\"dependency_revision_ids\":{},",
             "\"write_set\":[{}],",
             "\"payload\":{},",
             "\"before_refs\":{},",
@@ -14500,6 +14871,15 @@ fn operation_json(response: &MutationResponse) -> String {
         json_escape(&operation.preconditions.operation_semantics_version),
         json_escape(&operation.preconditions.expected_path),
         json_escape(operation.preconditions.expected_hash.as_str()),
+        json_escape(&operation.preconditions.resolved_view_id),
+        string_map_object_json(&authored_frontier),
+        string_array_json(
+            response
+                .topic_revision
+                .dependency_revision_ids
+                .iter()
+                .map(String::as_str)
+        ),
         operation
             .write_set
             .iter()
@@ -14707,6 +15087,89 @@ fn session_generation_json(response: &MutationResponse) -> String {
         generation.generation_number,
         json_escape(&generation.refresh_policy),
         json_escape(&generation.created_by_operation_id),
+    )
+}
+
+fn string_map_object_json(values: &BTreeMap<String, String>) -> String {
+    format!(
+        "{{{}}}",
+        values
+            .iter()
+            .map(|(key, value)| format!("\"{}\":\"{}\"", json_escape(key), json_escape(value)))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn real_session_generation_record_json(generation: &RealSessionGenerationRecord) -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"schema_version\":1,",
+            "\"record_type\":\"session_generation\",",
+            "\"id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"session_id\":\"{}\",",
+            "\"write_topic_id\":\"{}\",",
+            "\"base_resolved_view_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"topic_frontier\":{},",
+            "\"generation_number\":{},",
+            "\"refresh_policy\":\"{}\",",
+            "\"created_by\":\"{}\",",
+            "\"privacy_class\":\"local_only\"",
+            "}}"
+        ),
+        json_escape(&generation.session_generation_id),
+        json_escape(&generation.session_generation_id),
+        json_escape(&generation.session_id),
+        json_escape(&generation.write_topic_id),
+        json_escape(&generation.base_resolved_view_id),
+        json_escape(&generation.resolved_view_id),
+        string_map_object_json(&generation.topic_frontier),
+        generation.generation_number,
+        json_escape(&generation.refresh_policy),
+        json_escape(&generation.created_by),
+    )
+}
+
+fn real_session_refresh_success_envelope(
+    state: &RealRepoState,
+    session: &RealSessionRecord,
+    changed: bool,
+    no_op_reason: Option<&str>,
+) -> String {
+    let revision_ids = session.topic_frontier.values().map(String::as_str);
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"session.refresh\",",
+            "\"repository_id\":\"{}\",",
+            "\"changed\":{},",
+            "\"no_op_reason\":{},",
+            "\"ids\":{{",
+            "\"session_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"topic_revision_ids\":{}",
+            "}},",
+            "\"refresh_policy\":\"{}\",",
+            "\"generation_number\":{},",
+            "\"topic_frontier\":{},",
+            "\"available_newer_topic_heads\":{}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&state.repository_id),
+        changed,
+        optional_string_json(no_op_reason),
+        json_escape(&session.session_id),
+        json_escape(&session.session_generation_id),
+        json_escape(&session.resolved_view_id),
+        string_array_json(revision_ids),
+        json_escape(&session.refresh_policy),
+        session.generation_number,
+        string_map_object_json(&session.topic_frontier),
+        string_map_object_json(&available_newer_topic_heads(state, session)),
     )
 }
 
@@ -14931,6 +15394,7 @@ Usage:
   sun init [--repo <path>]
   sun topic create <slug> --display-name <name> [--json]
   sun session start --topic <topic> --view <view> --actor <actor-id> [--json]
+  sun session refresh <session> --policy manual|follow|none [--json]
   sun read|list|search ... --session <session> [--json]
   sun patch|write|move|delete|metadata set ... --session <session> [--json]
   sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]
@@ -14951,7 +15415,7 @@ Usage:
 Commands:
   init       Ingest the repository into persisted Sunlight native state
   topic      Create durable authoring topics
-  session    Start topic-bound authoring sessions over exact views
+  session    Start and explicitly refresh topic-bound sessions over exact views
   read/list/search/inspect
              Query persisted artifacts and provenance
   patch/write/move/delete/metadata
@@ -14988,7 +15452,9 @@ fn print_command_help(command: &str) {
         "status" => println!("sun status\n\nUsage:\n  sun status [--json]\n  sun status --topic <topic> [--json]\n  sun status --session <session> [--json]\n  sun status --view <view> [--json]\n  sun status --projection <projection> [--json]\n  sun status --execution <execution> [--json]\n  sun status --checkpoint <checkpoint> [--json]\n  sun status --export <export-map> [--json]\n\nRepository status is derived from persisted Sunlight state, not git status or the main working tree."),
         "inspect" => println!("sun inspect\n\nUsage:\n  sun inspect repository [--json]\n  sun inspect topic:<topic>|session:<session>|view:<view> [--json]\n  sun inspect artifact:<path>|operation:<id>|conflict:<id> [--json]\n  sun inspect projection:<id>|execution:<id>|checkpoint:<id>|export:<id> [--json]"),
         "topic" | "topic create" => println!("sun topic create\n\nUsage:\n  sun topic create <slug> --display-name <name> [--json]\n\nCreates a durable topic in the initialized repository."),
-        "session" | "session start" => println!("sun session start\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]"),
+        "session" => println!("sun session\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]\n  sun session refresh <session> --policy manual|follow|none [--json]"),
+        "session start" => println!("sun session start\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]"),
+        "session refresh" => println!("sun session refresh\n\nUsage:\n  sun session refresh <session> --policy manual|follow|none [--json]\n\nmanual and follow immediately advance already-selected non-write topics to current heads; none pins them. The write topic always remains at the session revision. An unchanged policy/frontier is an idempotent no-op."),
         "compat" | "compat project" | "compat diff" | "compat import" => println!("sun compat\n\nUsage:\n  sun compat project --session <session> [--json]\n  sun compat diff --projection <projection> [--json]\n  sun compat import --projection <projection> --candidate <candidate> [--json]\n\nCompatibility projections are adapters. Only explicit import creates native operations."),
         "policy" | "policy check-export" | "policy check-commit" | "policy explain" => println!("sun policy\n\nUsage:\n  sun policy check-export --checkpoint <checkpoint> [--branch <ref>] [--json]\n  sun policy check-commit [--paths <path>...] [--json]\n  sun policy explain <validation-report> [--json]"),
         "git" | "git export" => println!("sun git export\n\nUsage:\n  sun git export --checkpoint <checkpoint> --branch <ref> [--write-plan|--execute-local] [--repo <path>] [--json]"),

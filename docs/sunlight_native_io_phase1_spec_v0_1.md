@@ -85,7 +85,26 @@ Purpose: bind an actor to one write topic and one pinned resolved view.
 sun session start --topic <topic> --view <view-selector> --actor <actor-id> --fixture basic-app --json
 ```
 
-Success data includes `session_id`, `write_topic_id`, `resolved_view_id`, `session_generation_id`, `topic_frontier`, `refresh_policy: "pinned_except_own_topic"`, and capabilities for `read`, `list`, `search`, `inspect`, `patch`, `write`, `move`, `delete`, and `metadata`.
+For native repository state, success data includes `session_id`, `write_topic_id`, `resolved_view_id`, `session_generation_id`, the exact `topic_frontier`, `refresh_policy: "none"`, and capabilities for `read`, `list`, `search`, `inspect`, `patch`, `write`, `move`, `delete`, and `metadata`. Generation identity is derived from the unique session ID and a session-local monotonic number; the common first session retains the established `gen_<actor>_<number>` shape, while disambiguated sessions include their session suffix. Older native records without frontier/policy fields load by snapshotting their previously effective write-topic head and mapping `pinned_except_own_topic` to `none`; actor-scoped generation collisions are relinked to the owning session during that migration. The deterministic legacy fixture retains its older vocabulary.
+
+### `sun session refresh`
+
+Purpose: intentionally change the selected context of an existing native session without rewriting any authored operation or prior generation.
+
+```text
+sun session refresh <session> --policy manual|follow|none --json
+```
+
+The current single-repository selector model is deliberately small:
+
+- A session starts with the exact topic revisions in its selected resolved view. Topics absent from that frontier are not implicitly added later.
+- `manual` advances each already-selected non-write topic to that topic's current native head, while retaining the session's exact write-topic revision.
+- `follow` performs the same immediate selection as `manual` and persists the follow preference. There is no background or read-time mutation in the current CLI; later explicit refresh boundaries may use the preference. An accepted own write still advances only the write topic and reports newer unrelated heads separately.
+- `none` persists a fully pinned preference and leaves every unrelated topic revision unchanged.
+
+Changing either the policy or exact frontier creates a monotonic session generation and resolved-view record. Repeating a refresh when both are unchanged is idempotent: the command returns `changed: false`, `no_op_reason: "policy_and_frontier_unchanged"`, and the existing generation/view IDs. Success returns the session, generation, resolved-view, and selected topic-revision IDs.
+
+The resolver evaluates and persists a candidate view before changing the session pointer. Conflicts or staleness return `session_refresh_blocked` with the unchanged current generation/view, candidate view ID, and conflict/staleness IDs. The candidate view and resolver evidence remain inspectable; no session field is partially updated. On success, canonical native state publishes the new session pointer before the separate derived session-generation record.
 
 ### `sun read`, `sun list`, and `sun search`
 
@@ -148,7 +167,9 @@ Pinned default behavior:
 - Accepted own-topic writes advance the session generation atomically.
 - Other topics do not move during a write response.
 - A failed mutation does not advance the session generation.
-- Refresh and multi-topic resolver behavior are Phase 2 unless needed for a clear error.
+- Native session generations persist the full exact frontier and refresh policy. Reads use that frontier, and accepted writes replace only its write-topic entry.
+- `status --session` and `inspect session:<id>` expose the adopted frontier and `available_newer_topic_heads` separately; available heads are not presented as adopted context.
+- Explicit refresh follows the selector and no-op contract above.
 
 ## Fixture Acceptance Tests
 

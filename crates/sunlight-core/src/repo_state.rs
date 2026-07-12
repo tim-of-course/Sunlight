@@ -278,6 +278,7 @@ pub struct RealExecutionSnapshot {
     pub environment_policy: String,
     pub environment_allowlist: Vec<String>,
     pub network_policy: String,
+    pub filesystem_write_policy_requested: String,
     pub filesystem_write_policy: String,
     pub outputs: Vec<RealExecutionOutputSnapshot>,
     pub started_at: String,
@@ -3672,6 +3673,12 @@ fn parse_execution_snapshot(
             .collect::<Result<Vec<_>, _>>()?,
         network_policy: optional_string(object, "network_policy", state_path)?
             .unwrap_or_else(|| "not_enforced".to_string()),
+        filesystem_write_policy_requested: optional_string(
+            object,
+            "filesystem_write_policy_requested",
+            state_path,
+        )?
+        .unwrap_or_else(|| "legacy_unrecorded".to_string()),
         filesystem_write_policy: optional_string(object, "filesystem_write_policy", state_path)?
             .unwrap_or_else(|| "legacy_unrecorded".to_string()),
         outputs,
@@ -4104,6 +4111,10 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
     object.insert(
         "network_policy".to_string(),
         JsonValue::String(execution.network_policy.clone()),
+    );
+    object.insert(
+        "filesystem_write_policy_requested".to_string(),
+        JsonValue::String(execution.filesystem_write_policy_requested.clone()),
     );
     object.insert(
         "filesystem_write_policy".to_string(),

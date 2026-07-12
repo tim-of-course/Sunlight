@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::policy::managed_ignore_block;
 
 pub const CURRENT_CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const PRIVATE_PROJECTION_FILESYSTEM_WRITE_POLICY: &str = "private_projection_isolated";
 pub const CURRENT_STORAGE_SCHEMA_VERSION: u32 = 1;
 pub const CONSERVATIVE_SUNLIGHT_COMMIT_POLICY: &str = "conservative";
 pub const SUPPORTED_UNICODE_NORMALIZATION: &str = "preserve";
@@ -85,6 +86,7 @@ pub struct ExecutionPolicy {
     pub active_process_limit: u32,
     pub environment_inheritance: String,
     pub network_policy: String,
+    pub filesystem_write_policy: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +193,7 @@ impl RepositoryConfig {
                 active_process_limit: DEFAULT_EXECUTION_ACTIVE_PROCESS_LIMIT,
                 environment_inheritance: CONSERVATIVE_ENVIRONMENT_INHERITANCE.to_string(),
                 network_policy: NOT_ENFORCED_NETWORK_POLICY.to_string(),
+                filesystem_write_policy: PRIVATE_PROJECTION_FILESYSTEM_WRITE_POLICY.to_string(),
             },
             git_interop: GitInteropPolicy {
                 sunlight_commit_policy: "conservative".to_string(),
@@ -224,6 +227,7 @@ cpu_time_limit_ms = {}
 active_process_limit = {}
 environment_inheritance = \"{}\"
 network_policy = \"{}\"
+filesystem_write_policy = \"{}\"
 
 [git_interop]
 sunlight_commit_policy = \"{}\"
@@ -245,6 +249,7 @@ sunlight_commit_policy = \"{}\"
             self.execution_policy.active_process_limit,
             escape_toml(&self.execution_policy.environment_inheritance),
             escape_toml(&self.execution_policy.network_policy),
+            escape_toml(&self.execution_policy.filesystem_write_policy),
             escape_toml(&self.git_interop.sunlight_commit_policy),
         )
     }
@@ -359,6 +364,12 @@ sunlight_commit_policy = \"{}\"
                     input,
                     "network_policy",
                     NOT_ENFORCED_NETWORK_POLICY,
+                    &path,
+                )?,
+                filesystem_write_policy: parse_string_key_or_default(
+                    input,
+                    "filesystem_write_policy",
+                    PRIVATE_PROJECTION_FILESYSTEM_WRITE_POLICY,
                     &path,
                 )?,
             },
@@ -495,6 +506,17 @@ sunlight_commit_policy = \"{}\"
                 message: format!(
                     "unsupported execution_policy.network_policy `{}`; supported value is `{NOT_ENFORCED_NETWORK_POLICY}`",
                     self.execution_policy.network_policy
+                ),
+            });
+        }
+        if self.execution_policy.filesystem_write_policy
+            != PRIVATE_PROJECTION_FILESYSTEM_WRITE_POLICY
+        {
+            return Err(RepositoryError::InvalidConfig {
+                path,
+                message: format!(
+                    "unsupported execution_policy.filesystem_write_policy `{}`; supported value is `{PRIVATE_PROJECTION_FILESYSTEM_WRITE_POLICY}`",
+                    self.execution_policy.filesystem_write_policy
                 ),
             });
         }

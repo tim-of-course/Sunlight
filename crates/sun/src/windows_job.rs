@@ -158,8 +158,16 @@ impl Drop for OwnedHandle {
 
 impl ContainedChild {
     pub(crate) fn spawn(
+        command: Command,
+        policy: &ExecutionPolicy,
+    ) -> Result<Self, ContainmentSpawnError> {
+        Self::spawn_with_process_overhead(command, policy, 0)
+    }
+
+    pub(crate) fn spawn_with_process_overhead(
         mut command: Command,
         policy: &ExecutionPolicy,
+        process_overhead: Dword,
     ) -> Result<Self, ContainmentSpawnError> {
         let job = OwnedHandle(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) });
         if job.0.is_null() {
@@ -175,7 +183,8 @@ impl ContainedChild {
                 "create Job Object completion port",
             )));
         }
-        configure_job(job.0, completion_port.0, policy).map_err(ContainmentSpawnError::Setup)?;
+        configure_job(job.0, completion_port.0, policy, process_overhead)
+            .map_err(ContainmentSpawnError::Setup)?;
 
         command.creation_flags(CREATE_SUSPENDED);
         let mut child = command.spawn().map_err(ContainmentSpawnError::Command)?;
@@ -243,7 +252,12 @@ impl ContainedChild {
     }
 }
 
-fn configure_job(job: Handle, completion_port: Handle, policy: &ExecutionPolicy) -> io::Result<()> {
+fn configure_job(
+    job: Handle,
+    completion_port: Handle,
+    policy: &ExecutionPolicy,
+    process_overhead: Dword,
+) -> io::Result<()> {
     let cpu_100ns = policy
         .cpu_time_limit_ms
         .checked_mul(10_000)
@@ -252,7 +266,12 @@ fn configure_job(job: Handle, completion_port: Handle, policy: &ExecutionPolicy)
     let mut limits: JobObjectExtendedLimitInformation = unsafe { zeroed() };
     limits.basic_limit_information.per_process_user_time_limit = cpu_100ns;
     limits.basic_limit_information.per_job_user_time_limit = cpu_100ns;
-    limits.basic_limit_information.active_process_limit = policy.active_process_limit;
+    limits.basic_limit_information.active_process_limit = policy
+        .active_process_limit
+        .checked_add(process_overhead)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "active process limit overflow")
+        })?;
     limits.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
         | JOB_OBJECT_LIMIT_PROCESS_TIME

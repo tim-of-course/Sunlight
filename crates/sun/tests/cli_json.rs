@@ -69,7 +69,11 @@ fn no_fixture_repository_status_clean_initial_and_active_human_journey() {
     assert!(clean.contains("\"topics\":{\"count\":0,\"heads\":[]}"));
     assert!(clean.contains("\"executions\":{\"total\":0"));
     assert!(clean.contains("\"checkpoints\":{\"count\":0,\"unexported\":0,\"records\":[]}"));
-    assert!(clean.contains("\"execution_isolation\":{\"enforced\":false"));
+    assert!(clean.contains(if cfg!(windows) {
+        "\"execution_isolation\":{\"enforced\":true"
+    } else {
+        "\"execution_isolation\":{\"enforced\":false"
+    }));
     assert!(!clean.contains("multi_record_publication_non_atomic"));
 
     let topic = sun()
@@ -993,6 +997,226 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn no_fixture_windows_execution_confines_root_and_descendant_writes_to_private_projection() {
+    let repo = TestRepo::new("windows-filesystem-isolation");
+    repo.write_file("source-sentinel.txt", "source unchanged\n");
+    start_native_session(&repo, "windows-isolation");
+    let sibling = PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(format!(
+        "sunlight-isolation-host-sibling-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&sibling).unwrap();
+    let sibling_sentinel = sibling.join("sibling-sentinel.txt");
+    fs::write(&sibling_sentinel, "sibling unchanged\n").unwrap();
+    let source_sentinel = repo.path().join("source-sentinel.txt");
+    let source_created = repo.path().join("SOURCE_CREATED_BY_RUN");
+    let sibling_created = sibling.join("SIBLING_CREATED_BY_RUN");
+    let child_script = r#"import sys
+from pathlib import Path
+denied=[]
+for target in sys.argv[1:]:
+    try:
+        Path(target).write_text('escaped')
+        denied.append('escaped')
+    except OSError:
+        denied.append('denied')
+Path('descendant-result.txt').write_text(','.join(denied))
+sys.exit(0 if all(x == 'denied' for x in denied) else 9)
+"#;
+    let root_script = r#"import subprocess,sys
+from pathlib import Path
+Path('private-output.txt').write_text('private write works')
+result=subprocess.run([sys.executable,'-c',sys.argv[1],*sys.argv[2:]])
+raise SystemExit(result.returncode)
+"#;
+    let run = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            "python",
+            "-c",
+            root_script,
+            child_script,
+        ])
+        .arg(&source_sentinel)
+        .arg(&source_created)
+        .arg(&sibling_sentinel)
+        .arg(&sibling_created)
+        .current_dir(repo.path())
+        .output()
+        .expect("isolated Windows execution should run");
+    assert_success(&run);
+    let body = stdout(&run);
+    assert_valid_json(&body);
+    assert!(body.contains("\"status\":\"pass\""), "{body}");
+    assert!(body.contains("\"filesystem_writes_requested\":\"private_projection_isolated\""));
+    assert!(body.contains("\"filesystem_writes\":\"windows_low_integrity_private_projection_v1\""));
+    assert!(body.contains("\"output_path\":\"private-output.txt\""));
+    assert!(body.contains("\"output_path\":\"descendant-result.txt\""));
+    assert_eq!(
+        fs::read_to_string(&source_sentinel).unwrap(),
+        "source unchanged\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&sibling_sentinel).unwrap(),
+        "sibling unchanged\n"
+    );
+    assert!(!source_created.exists());
+    assert!(!sibling_created.exists());
+
+    let execution_id = json_string_field(&body, "execution_id");
+    for inspected in [
+        sun()
+            .args(["status", "--execution", &execution_id, "--json"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap(),
+        sun()
+            .args(["inspect", &format!("execution:{execution_id}"), "--json"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap(),
+    ] {
+        assert_success(&inspected);
+        let inspected = stdout(&inspected);
+        assert!(inspected.contains("windows_low_integrity_private_projection_v1"));
+        assert!(inspected.contains("private_projection_isolated"));
+    }
+
+    let state = RealRepoState::load(repo.path()).unwrap();
+    let execution = state
+        .executions
+        .iter()
+        .find(|execution| execution.execution_id == execution_id)
+        .unwrap();
+    let projection = state
+        .projections
+        .iter()
+        .find(|projection| projection.projection_id == execution.projection_id)
+        .unwrap();
+    let projection_root = PathBuf::from(projection.materialized_root.as_ref().unwrap());
+    assert_eq!(
+        fs::read_to_string(projection_root.join("descendant-result.txt")).unwrap(),
+        "denied,denied,denied,denied"
+    );
+    assert!(!projection_root
+        .parent()
+        .unwrap()
+        .join(format!(".{}-private", execution.execution_id))
+        .exists());
+    fs::remove_dir_all(sibling).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_command() {
+    let repo = TestRepo::new("windows-isolation-public-setup-failure");
+    start_native_session(&repo, "windows-setup-failure");
+    let low_signal_root = std::env::temp_dir().join(format!(
+        "sunlight-low-signal-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&low_signal_root).unwrap();
+    let label = Command::new("icacls.exe")
+        .arg(&low_signal_root)
+        .args(["/setintegritylevel", "(OI)(CI)L"])
+        .output()
+        .unwrap();
+    assert!(
+        label.status.success(),
+        "low-integrity signal setup failed: {label:?}"
+    );
+    let command_signal = low_signal_root.join("COMMAND_RAN");
+    let test_exe = std::env::current_exe().unwrap();
+    let failed = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            "python",
+            "-c",
+            "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')",
+        ])
+        .arg(&command_signal)
+        .env(
+            "SUNLIGHT_INTERNAL_TEST_WINDOWS_ISOLATION_FAILPOINT",
+            "prepare_after_runtime_root",
+        )
+        .env(
+            "SUNLIGHT_INTERNAL_TEST_PARENT_PID",
+            std::process::id().to_string(),
+        )
+        .env("SUNLIGHT_INTERNAL_TEST_PARENT_EXE", &test_exe)
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run should report injected setup failure");
+    assert!(
+        !failed.status.success(),
+        "injected setup failure unexpectedly passed"
+    );
+    let body = stdout(&failed);
+    assert_valid_json(&body);
+    assert!(
+        body.contains("\"code\":\"execution_filesystem_isolation_setup_failed\""),
+        "{body}"
+    );
+    assert!(body.contains("\"command_started\":\"false\""), "{body}");
+    assert!(!command_signal.exists(), "restricted command code executed");
+
+    let state = RealRepoState::load(repo.path()).unwrap();
+    assert!(state.executions.is_empty());
+    assert!(state.projections.is_empty());
+    for records in [
+        repo.path().join(".sunlight/executions"),
+        repo.path().join(".sunlight/projections"),
+    ] {
+        assert_eq!(
+            fs::read_dir(&records)
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0,
+            "unpublished record or projection root remained at {}",
+            records.display()
+        );
+    }
+
+    let unscoped = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            "python",
+            "-c",
+            "raise SystemExit(0)",
+        ])
+        .env(
+            "SUNLIGHT_INTERNAL_TEST_WINDOWS_ISOLATION_FAILPOINT",
+            "prepare_after_runtime_root",
+        )
+        .current_dir(repo.path())
+        .output()
+        .expect("unscoped internal failpoint should be ignored");
+    assert_success(&unscoped);
+    fs::remove_dir_all(low_signal_root).unwrap();
+}
+
 #[test]
 fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
     let repo = TestRepo::new("execution-runtime-policy");
@@ -1028,8 +1252,11 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
     assert!(timeout_stdout.contains("\"promotion_candidates\":[]"));
     assert!(timeout_stdout.contains("\"timeout_ms\":2000"));
     assert!(timeout_stdout.contains("\"network\":\"not_enforced\""));
-    assert!(timeout_stdout
-        .contains("\"filesystem_writes\":\"managed_projection_writable_not_isolated\""));
+    assert!(timeout_stdout.contains(if cfg!(windows) {
+        "\"filesystem_writes\":\"windows_low_integrity_private_projection_v1\""
+    } else {
+        "\"filesystem_writes\":\"not_enforced\""
+    }));
     let timeout_execution = json_string_field(&timeout_stdout, "execution_id");
     let persisted_timeout = fs::read_to_string(
         repo.path()

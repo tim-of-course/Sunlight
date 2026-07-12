@@ -9,6 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod mcp;
 #[cfg(windows)]
+mod windows_isolation;
+#[cfg(windows)]
 mod windows_job;
 
 use sha2::{Digest, Sha256};
@@ -115,6 +117,10 @@ const FIXTURE_STALE_COMPATIBILITY_PROJECTION_ID: &str =
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    #[cfg(windows)]
+    if args.first().map(String::as_str) == Some("__sunlight-low-integrity-bootstrap") {
+        windows_isolation::bootstrap(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("mcp") {
         return match mcp::serve_from_args(&args) {
             Ok(()) => ExitCode::SUCCESS,
@@ -2879,7 +2885,7 @@ impl ExecutionChild {
     fn spawn(command: Command, policy: &ExecutionPolicy) -> Result<Self, ProcessRunError> {
         #[cfg(windows)]
         {
-            return windows_job::ContainedChild::spawn(command, policy)
+            return windows_job::ContainedChild::spawn_with_process_overhead(command, policy, 1)
                 .map(|contained| Self { contained })
                 .map_err(|error| match error {
                     windows_job::ContainmentSpawnError::Setup(error) => {
@@ -3018,8 +3024,14 @@ fn run_bounded_process(
     argv: &[String],
     cwd: &Path,
     policy: &ExecutionPolicy,
+    #[cfg(windows)] isolation: &windows_isolation::PreparedIsolation,
 ) -> Result<BoundedProcessOutput, ProcessRunError> {
     let allowlist = execution_environment_allowlist();
+    #[cfg(windows)]
+    let mut command = isolation
+        .bootstrap_command(argv)
+        .map_err(ProcessRunError::ContainmentSetup)?;
+    #[cfg(not(windows))]
     let mut command = Command::new(&argv[0]);
     command
         .args(argv.iter().skip(1))
@@ -3033,6 +3045,8 @@ fn run_bounded_process(
             command.env(name, value);
         }
     }
+    #[cfg(windows)]
+    isolation.configure_environment(&mut command);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -3193,6 +3207,15 @@ fn run_bounded_process(
     } else {
         failed_summary()
     };
+    #[cfg(windows)]
+    if matches!(
+        isolation
+            .verify_bootstrap(status.as_ref().and_then(ExitStatus::code))
+            .map_err(ProcessRunError::ContainmentSetup)?,
+        windows_isolation::BootstrapVerification::FailedAfterCommandMayHaveStarted
+    ) {
+        wait_failed = true;
+    }
     Ok(BoundedProcessOutput {
         status,
         timed_out,
@@ -3235,7 +3258,23 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     );
     let projection_root = projection_policy.execution_root(&projection_id);
     relocate_managed_projection_root(&provisional_root, &projection_root)?;
-    let execution_cwd = real_execution_cwd_path(&projection_root, &relative_cwd, &options.cwd)?;
+    #[cfg(windows)]
+    let isolation =
+        windows_isolation::PreparedIsolation::prepare(&repo_root, &projection_root, &execution_id)
+            .map_err(|error| {
+                remove_unpublished_execution_root(&projection_root);
+                CliError::new(
+                    "execution_filesystem_isolation_setup_failed",
+                    format!("failed to establish Windows filesystem isolation: {error}"),
+                )
+                .with_detail("platform", "windows")
+                .with_detail("command_started", "false")
+            })?;
+    let execution_cwd = real_execution_cwd_path(&projection_root, &relative_cwd, &options.cwd)
+        .map_err(|error| {
+            remove_unpublished_execution_root(&projection_root);
+            error
+        })?;
     let manifest_digest = real_projection_manifest_digest(
         &view_state,
         &projection_id,
@@ -3264,22 +3303,32 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     });
 
     let started_at = real_now_id();
-    let command_output =
-        run_bounded_process(&options.command_argv, &execution_cwd, &execution_policy).map_err(
-            |error| match error {
-                ProcessRunError::Command(error) => CliError::new(
-                    "execution_command_failed",
-                    format!("failed to run command: {error}"),
-                )
-                .with_detail("command", options.command_argv.join(" ")),
-                ProcessRunError::ContainmentSetup(error) => CliError::new(
-                    "execution_containment_setup_failed",
-                    format!("failed to establish execution containment: {error}"),
-                )
-                .with_detail("platform", std::env::consts::OS)
-                .with_detail("command_started", "false"),
-            },
-        )?;
+    let command_output = run_bounded_process(
+        &options.command_argv,
+        &execution_cwd,
+        &execution_policy,
+        #[cfg(windows)]
+        &isolation,
+    )
+    .map_err(|error| match error {
+        ProcessRunError::Command(error) => {
+            remove_unpublished_execution_root(&projection_root);
+            CliError::new(
+                "execution_command_failed",
+                format!("failed to run command: {error}"),
+            )
+            .with_detail("command", options.command_argv.join(" "))
+        }
+        ProcessRunError::ContainmentSetup(error) => {
+            remove_unpublished_execution_root(&projection_root);
+            CliError::new(
+                "execution_filesystem_isolation_setup_failed",
+                format!("failed to establish execution containment: {error}"),
+            )
+            .with_detail("platform", std::env::consts::OS)
+            .with_detail("command_started", "false")
+        }
+    })?;
     let finished_at = real_now_id();
     let mut projected_entries = Vec::new();
     let mut quarantine = Vec::new();
@@ -3368,7 +3417,12 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
             .map(str::to_string)
             .collect(),
         network_policy: execution_policy.network_policy,
-        filesystem_write_policy: "managed_projection_writable_not_isolated".to_string(),
+        filesystem_write_policy_requested: execution_policy.filesystem_write_policy,
+        filesystem_write_policy: if cfg!(windows) {
+            "windows_low_integrity_private_projection_v1".to_string()
+        } else {
+            "not_enforced".to_string()
+        },
         outputs,
         started_at,
         finished_at,
@@ -3396,6 +3450,12 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         println!("{} {}", execution.execution_id, execution.status);
     }
     Ok(())
+}
+
+fn remove_unpublished_execution_root(projection_root: &Path) {
+    if let Some(allocation_root) = projection_root.parent() {
+        let _ = fs::remove_dir_all(allocation_root);
+    }
 }
 
 fn real_execution_relative_cwd(cwd: &str) -> Result<PathBuf, CliError> {
@@ -5479,8 +5539,13 @@ fn real_execution_record(
                 execution.environment_allowlist.join("\n").as_bytes(),
             ),
             network_policy: sunlight_core::execution::NetworkPolicy::NotEnforced,
-            sandbox_writable_policy:
-                sunlight_core::execution::WritablePolicy::ManagedProjectionWritableNotIsolated,
+            sandbox_writable_policy: if execution.filesystem_write_policy
+                == "windows_low_integrity_private_projection_v1"
+            {
+                sunlight_core::execution::WritablePolicy::PrivateProjectionWritableIsolated
+            } else {
+                sunlight_core::execution::WritablePolicy::ManagedProjectionWritableNotIsolated
+            },
             digest: format!("sha256:{}", execution.execution_id),
         },
         projection_id: execution.projection_id.clone(),
@@ -5620,6 +5685,7 @@ fn real_execution_runtime_policy_json(execution: &RealExecutionSnapshot) -> Stri
             "\"enforcement\":{{\"process_tree\":\"{}\",\"cpu\":\"{}\",\"memory\":\"{}\"}},",
             "\"environment\":{{\"inheritance\":\"{}\",\"allowlist\":{},\"values_recorded\":false}},",
             "\"network\":\"{}\",",
+            "\"filesystem_writes_requested\":\"{}\",",
             "\"filesystem_writes\":\"{}\"}}"
         ),
         execution
@@ -5648,6 +5714,7 @@ fn real_execution_runtime_policy_json(execution: &RealExecutionSnapshot) -> Stri
         json_escape(&execution.environment_policy),
         string_array_json(execution.environment_allowlist.iter().map(String::as_str)),
         json_escape(&execution.network_policy),
+        json_escape(&execution.filesystem_write_policy_requested),
         json_escape(&execution.filesystem_write_policy),
     )
 }
@@ -6294,7 +6361,7 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
             "\"checkpoints\":{{\"count\":{},\"unexported\":{},\"records\":[{}]}},",
             "\"exports\":{{\"count\":{},\"maps\":[{}]}},",
             "\"policy\":{{\"reports\":{},\"passed\":{},\"failed\":{},\"invalid_or_tampered\":{},\"missing_export_reports\":{}}},",
-            "\"execution_isolation\":{{\"enforced\":false,\"process_tree\":\"{}\",\"network\":\"unenforced\",\"filesystem_writes\":\"managed_projection_writable_not_isolated\",\"cpu\":\"{}\",\"memory\":\"{}\"}}}}"
+            "\"execution_isolation\":{{\"enforced\":{},\"process_tree\":\"{}\",\"network\":\"unenforced\",\"filesystem_writes_requested\":\"private_projection_isolated\",\"filesystem_writes\":\"{}\",\"cpu\":\"{}\",\"memory\":\"{}\"}}}}"
         ),
         json_escape(&state.repository_id),
         json_escape(&state.base_checkpoint_id),
@@ -6332,7 +6399,9 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
         summary.policy.failed_count,
         summary.policy.invalid_count,
         summary.policy.missing_export_report_count,
+        cfg!(windows),
         if cfg!(windows) { "windows_job_object" } else { "unenforced" },
+        if cfg!(windows) { "windows_low_integrity_private_projection_v1" } else { "not_enforced" },
         if cfg!(windows) { "windows_job_object_cpu_time" } else { "unenforced" },
         if cfg!(windows) { "windows_job_object_process_and_job_memory" } else { "unenforced" },
     )
@@ -15746,7 +15815,7 @@ fn print_command_help(command: &str) {
         "policy" | "policy check-export" | "policy check-commit" | "policy explain" => println!("sun policy\n\nUsage:\n  sun policy check-export --checkpoint <checkpoint> [--branch <ref>] [--json]\n  sun policy check-commit [--paths <path>...] [--json]\n  sun policy explain <validation-report> [--json]"),
         "git" | "git export" => println!("sun git export\n\nUsage:\n  sun git export --checkpoint <checkpoint> --branch <ref> [--write-plan|--execute-local] [--repo <path>] [--json]"),
         "checkpoint" | "checkpoint create" => println!("sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--json]"),
-        "run" => println!("sun run\n\nUsage:\n  sun run --view <resolved-view-id> -- <command> [args...]\n\nRuntime bounds come from [execution_policy] in .sunlight/config.toml. Windows no-fixture runs enforce process-tree, CPU-time, process/job-memory, and active-process limits with a dedicated Job Object. Non-Windows records those dimensions as unenforced. Network and broad filesystem-write isolation remain explicitly unenforced."),
+        "run" => println!("sun run\n\nUsage:\n  sun run --view <resolved-view-id> -- <command> [args...]\n\nRuntime bounds come from [execution_policy] in .sunlight/config.toml. Windows no-fixture runs use a restricted low-integrity token and private low-labeled projection/runtime roots for filesystem-write isolation, plus a dedicated Job Object for process-tree and resource containment. Non-Windows records unavailable dimensions as unenforced. Network isolation remains explicitly unenforced."),
         "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => println!("sun artifact operations\n\nUsage:\n  sun read <path> --session <session> [--json]\n  sun list [path-prefix] --session <session> [--json]\n  sun search <query> --session <session> [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification <class> [--json]"),
         "view" | "view resolve" => println!("sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nResolves persisted topic selections; conflicts and staleness remain inspectable records."),
         "project" | "project materialize" | "projection" | "projection create" => println!("sun project materialize\n\nUsage:\n  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export [--strategy copy|reflink|hardlink_readonly|overlay_copyup] [--no-copy-fallback] [--projection-root <path>] [--json]\n\nManaged projections adapt persisted views for filesystem tools and are not source truth. Automatic selection prefers safe Windows block cloning and falls back to full copy; --no-copy-fallback makes the requested strategy required."),

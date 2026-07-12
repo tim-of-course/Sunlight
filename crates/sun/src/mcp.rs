@@ -819,6 +819,7 @@ fn spawn_contained(command: Command) -> Result<Contained, ToolFailure> {
             active_process_limit: 128,
             environment_inheritance: "mcp_parent".to_string(),
             network_policy: "not_enforced".to_string(),
+            filesystem_write_policy: "private_projection_isolated".to_string(),
         };
         super::windows_job::ContainedChild::spawn(command, &policy)
             .map(|child| Contained { child })

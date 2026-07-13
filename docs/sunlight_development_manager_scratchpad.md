@@ -35,7 +35,8 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - Current implementation reality: fixture prototype plus a substantial repo-backed product path with durable authoring/resolution/projection/execution/checkpoint/export/policy/compatibility features, no-fixture self-hosting acceptance, and a repository-confined local MCP transport; still not the full v0.3 product.
 - Rename-plus-edit remains unresolved because compatibility projections expose no reliable identity signal; fuzzy inference is intentionally excluded.
 - Windows executions enforce process-tree, CPU, memory, process-count, and filesystem-write isolation. Explicit `disabled` network mode uses a capability-less AppContainer; the default `not_enforced` mode preserves ordinary local toolchains, and requested/effective policy is recorded. Pre-existing unrelated low-integrity host paths remain outside the write boundary.
-- Main product gaps: reusable cross-platform projection scaling/cache reuse and a shared in-process engine/daemon boundary beyond the transitional MCP subprocess adapter.
+- Reusable verified projection cache entries now avoid rebuilding immutable input trees and preserve private writable outputs; Windows ReFS block cloning is used when proven, while NTFS and non-Windows hosts retain truthful full-copy fallback. Physical allocation measurement and stale staging GC remain open.
+- Main product gaps: a shared in-process engine/daemon boundary beyond the transitional MCP subprocess adapter, plus remaining platform-specific projection scaling beyond the measured full-copy fallback.
 
 ## Workstreams
 
@@ -78,11 +79,13 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | repo-backed-local-mcp | Windows Codex CLI cell `202` | Windows commit `e8565f0` | Completed | Add a repo-confined persistent stdio MCP server exposing the full no-fixture workflow through typed tools. | Protocol lifecycle, 26 typed tools, path/argv/content confinement, bounded contained children, malformed recovery, real Git-repo journey, self-hosting, and all 383 workspace tests passed. |
 | repo-backed-windows-filesystem-isolation | Windows Codex CLI processes `31244`, correction `54744` | Windows commit `766b450` | Completed | Enforce fail-closed Windows execution filesystem-write confinement while preserving private outputs, evidence, and promotion. | Restricted low-integrity token/private labels and Job inheritance block root/descendant host writes; source labels are read-only validated, setup rollback is proven through public CLI with no records, promotion/self-hosting/release/full workspace pass after manager correction. |
 | repo-backed-windows-network-isolation | Windows Codex CLI thread `019f5a5a-4839-78f3-8a2e-787dd54a9eb8` | Windows commit `78ad0dd` | Completed | Add fail-closed per-execution Windows network denial without global firewall or host ACL side effects. | Explicit AppContainer denial and compatible default mode, persisted policy/evidence, crash cleanup, external managed-root recovery, distinct setup taxonomy, real listener/root/descendant tests, self-hosting, release, and all 395 workspace tests passed after manager review. |
+| repo-backed-projection-cache | Windows Codex CLI thread `019f5ae6-8023-7903-943f-c66cb1b9e070` | Windows commit `c4cea74` | Completed | Add durable reusable projection caching to the real repo-backed materializer without unsafe writable aliases or false zero-copy claims. | Atomic semantic-key cache, full integrity revalidation/quarantine, private copy/ReFS clone materialization, persisted hit/miss/amplification metrics, external-root and concurrency tests, release, self-hosting, and all 401 workspace tests passed. NTFS copy fallback, physical allocation query, and stale staging GC remain open. |
+| repo-backed-shared-engine | Windows Codex CLI thread `019f5b70-fe18-7190-acb6-324263b5d735` | `main`, log `C:\tmp\sunlight-shared-engine.jsonl` | Active 2026-07-13 | Replace MCP-to-sun subprocess delegation with one explicit repo-rooted in-process engine shared by CLI and MCP. | Complete no-fixture MCP vocabulary, contract equivalence, no-respawn proof, cross-repo confinement, malformed recovery, execution isolation, self-hosting, release, and full workspace verification required. |
 
 ## Delegation Queue
 
-1. Add reusable projection cache and cross-platform scaling with truthful amplification and corruption resistance.
-2. Replace the MCP subprocess adapter with a shared in-process engine/daemon boundary.
+1. Replace the MCP subprocess adapter with a shared in-process engine/daemon boundary.
+2. Audit and close remaining v0.3 acceptance gaps, including measured platform projection limits, without relabeling fallback as completion.
 3. Keep fixture tests only when they directly support removing fixture dependency.
 
 

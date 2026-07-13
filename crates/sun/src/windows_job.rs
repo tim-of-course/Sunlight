@@ -157,13 +157,6 @@ impl Drop for OwnedHandle {
 }
 
 impl ContainedChild {
-    pub(crate) fn spawn(
-        command: Command,
-        policy: &ExecutionPolicy,
-    ) -> Result<Self, ContainmentSpawnError> {
-        Self::spawn_with_process_overhead(command, policy, 0)
-    }
-
     pub(crate) fn spawn_with_process_overhead(
         mut command: Command,
         policy: &ExecutionPolicy,

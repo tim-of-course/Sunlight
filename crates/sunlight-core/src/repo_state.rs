@@ -1657,6 +1657,7 @@ pub fn real_state_path(repo_root: &Path) -> PathBuf {
         .join("native-state.json")
 }
 
+#[cfg(debug_assertions)]
 const STATE_PUBLICATION_FAILPOINT_ENV: &str = "SUNLIGHT_TEST_FAILPOINT";
 const PUBLICATION_OUTBOX_SCHEMA_VERSION: u64 = 1;
 const WRITER_LOCK_TIMEOUT_MS: u64 = 0;
@@ -2644,20 +2645,43 @@ fn remove_dir_if_empty(path: &Path) -> Result<(), RepoStateError> {
     }
 }
 
-fn trigger_failpoint(name: &str, path: &Path) -> Result<(), RepoStateError> {
-    let scoped_name = format!("{name}|{}", path.display());
-    let selected = std::env::var(STATE_PUBLICATION_FAILPOINT_ENV).ok();
-    if cfg!(debug_assertions)
-        && selected
-            .as_deref()
-            .is_some_and(|selected| selected == name || selected == scoped_name)
+fn trigger_failpoint(_name: &str, _path: &Path) -> Result<(), RepoStateError> {
+    #[cfg(debug_assertions)]
     {
-        return Err(RepoStateError::Io {
-            path: path.to_path_buf(),
-            message: format!("deterministic test failpoint `{name}`"),
-        });
+        let name = _name;
+        let path = _path;
+        let normalized_path = normalize_failpoint_target(path);
+        let scoped_name = format!("{name}|{}", normalized_path.display());
+        if std::env::var(STATE_PUBLICATION_FAILPOINT_ENV).as_deref() == Ok(scoped_name.as_str()) {
+            return Err(RepoStateError::Io {
+                path: path.to_path_buf(),
+                message: format!("deterministic test failpoint `{name}`"),
+            });
+        }
     }
     Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn normalize_failpoint_target(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut normalized) = fs::canonicalize(ancestor) {
+            for component in suffix.iter().rev() {
+                normalized.push(component);
+            }
+            return normalized;
+        }
+        let Some(name) = ancestor.file_name() else {
+            return path.to_path_buf();
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return path.to_path_buf();
+        };
+        ancestor = parent;
+    }
 }
 
 #[cfg(windows)]
@@ -5599,6 +5623,28 @@ mod tests {
         root
     }
 
+    fn select_publication_failpoint(name: &str, path: &Path) {
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            format!("{name}|{}", normalize_failpoint_target(path).display()),
+        );
+    }
+
+    fn completion_marker_path(repo: &Path, state: &RealRepoState) -> PathBuf {
+        let mut published = state.clone();
+        published.publication_sequence += 1;
+        let body = canonical_json_bytes(&published.to_json_value()).unwrap();
+        let digest = sha256_digest(&body);
+        let transaction_id = format!(
+            "publication-{}-{}",
+            published.publication_sequence,
+            &digest.strip_prefix("sha256:").unwrap_or(&digest)[..16]
+        );
+        publication_outbox_root(repo)
+            .join(transaction_id)
+            .join("completed.json")
+    }
+
     fn git(repo: &Path, args: &[&str]) {
         let output = Command::new("git")
             .arg("-C")
@@ -5613,6 +5659,30 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn bare_publication_failpoint_name_is_ignored() {
+        let _failpoint_guard = FAILPOINT_ENV_LOCK.lock().unwrap();
+        let repo = temp_repo("bare-failpoint-ignored");
+        fs::write(repo.join("README.md"), b"# bare failpoint\n").unwrap();
+        let mut state = RealRepoState::ingest(&repo, "repo_bare_failpoint").unwrap();
+        state.save(&repo).unwrap();
+        state = RealRepoState::load(&repo).unwrap();
+        state.generation_number = 1;
+        let record = state
+            .record_publication("operations", "op_bare", "{\"step\":1}")
+            .unwrap();
+
+        std::env::set_var(
+            STATE_PUBLICATION_FAILPOINT_ENV,
+            "batch_after_completion_marker",
+        );
+        let result = state.save_with_records(&repo, &[record]);
+        std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
+
+        result.expect("bare failpoint names must not affect repository publication");
+        assert!(repo.join(".sunlight/operations/op_bare.json").is_file());
     }
 
     #[test]
@@ -5652,10 +5722,7 @@ mod tests {
         assert_eq!(state.publication_sequence, 1);
 
         state.generation_number = 1;
-        std::env::set_var(
-            STATE_PUBLICATION_FAILPOINT_ENV,
-            format!("state_after_prepare|{}", canonical.display()),
-        );
+        select_publication_failpoint("state_after_prepare", &canonical);
         let error = state.save(&repo).unwrap_err();
         std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
         assert!(error.to_string().contains("state_after_prepare"));
@@ -5672,10 +5739,7 @@ mod tests {
 
         let mut next = recovered.clone();
         next.generation_number = 2;
-        std::env::set_var(
-            STATE_PUBLICATION_FAILPOINT_ENV,
-            format!("state_after_replace|{}", canonical.display()),
-        );
+        select_publication_failpoint("state_after_replace", &canonical);
         let error = next.save(&repo).unwrap_err();
         std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
         assert!(error.to_string().contains("state_after_replace"));
@@ -5696,10 +5760,7 @@ mod tests {
             .join(".sunlight")
             .join("operations")
             .join("op_atomic.json");
-        std::env::set_var(
-            STATE_PUBLICATION_FAILPOINT_ENV,
-            format!("derived_record_after_prepare|{}", record_path.display()),
-        );
+        select_publication_failpoint("derived_record_after_prepare", &record_path);
         let error = recovered
             .persist_record(&repo, "operations", "op_atomic", "{\"new\":true}")
             .unwrap_err();
@@ -5749,10 +5810,7 @@ mod tests {
             Some(&JsonValue::String("session_generation".to_string()))
         );
 
-        std::env::set_var(
-            STATE_PUBLICATION_FAILPOINT_ENV,
-            format!("state_after_prepare|{}", canonical.display()),
-        );
+        select_publication_failpoint("state_after_prepare", &canonical);
         let mut interrupted = with_generation.clone();
         interrupted.generation_number = 9;
         interrupted.save(&repo).unwrap_err();
@@ -5782,10 +5840,7 @@ mod tests {
         let before_record = state
             .record_publication("operations", "op_before", "{\"step\":1}")
             .unwrap();
-        std::env::set_var(
-            STATE_PUBLICATION_FAILPOINT_ENV,
-            "batch_before_canonical_commit",
-        );
+        select_publication_failpoint("batch_before_canonical_commit", &canonical);
         assert!(state
             .save_with_records(&repo, &[before_record])
             .unwrap_err()
@@ -5818,10 +5873,7 @@ mod tests {
         let after_record = after
             .record_publication("operations", "op_after", "{\"step\":2}")
             .unwrap();
-        std::env::set_var(
-            STATE_PUBLICATION_FAILPOINT_ENV,
-            "batch_after_canonical_commit",
-        );
+        select_publication_failpoint("batch_after_canonical_commit", &canonical);
         assert!(after
             .save_with_records(&repo, &[after_record])
             .unwrap_err()
@@ -5848,9 +5900,9 @@ mod tests {
                 .record_publication("views", "view_middle", "{\"step\":3}")
                 .unwrap(),
         ];
-        std::env::set_var(
-            STATE_PUBLICATION_FAILPOINT_ENV,
+        select_publication_failpoint(
             "batch_mid_derived_publication",
+            &repo.join(".sunlight/operations/op_middle.json"),
         );
         assert!(middle
             .save_with_records(&repo, &middle_records)
@@ -5869,9 +5921,9 @@ mod tests {
         let completed_record = completed
             .record_publication("operations", "op_completed", "{\"step\":4}")
             .unwrap();
-        std::env::set_var(
-            STATE_PUBLICATION_FAILPOINT_ENV,
+        select_publication_failpoint(
             "batch_after_completion_marker",
+            &completion_marker_path(&repo, &completed),
         );
         assert!(completed
             .save_with_records(&repo, &[completed_record])
@@ -5894,10 +5946,7 @@ mod tests {
         let corrupt_record = corrupt
             .record_publication("operations", "op_corrupt", "{\"step\":5}")
             .unwrap();
-        std::env::set_var(
-            STATE_PUBLICATION_FAILPOINT_ENV,
-            "batch_after_canonical_commit",
-        );
+        select_publication_failpoint("batch_after_canonical_commit", &canonical);
         corrupt
             .save_with_records(&repo, &[corrupt_record])
             .unwrap_err();
@@ -5927,9 +5976,9 @@ mod tests {
         let path_record = path_state
             .record_publication("operations", "op_path", "{\"step\":1}")
             .unwrap();
-        std::env::set_var(
-            STATE_PUBLICATION_FAILPOINT_ENV,
+        select_publication_failpoint(
             "batch_before_canonical_commit",
+            &real_state_path(&path_repo),
         );
         path_state
             .save_with_records(&path_repo, &[path_record])
@@ -6002,10 +6051,7 @@ mod tests {
         let record = state
             .record_publication("operations", "op_ads", "{\"step\":1}")
             .unwrap();
-        std::env::set_var(
-            STATE_PUBLICATION_FAILPOINT_ENV,
-            "batch_before_canonical_commit",
-        );
+        select_publication_failpoint("batch_before_canonical_commit", &real_state_path(&repo));
         state.save_with_records(&repo, &[record]).unwrap_err();
         std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
 
@@ -6114,10 +6160,7 @@ mod tests {
         let record = state
             .record_publication("operations", "op_prepared", "{\"step\":1}")
             .unwrap();
-        std::env::set_var(
-            STATE_PUBLICATION_FAILPOINT_ENV,
-            "batch_before_canonical_commit",
-        );
+        select_publication_failpoint("batch_before_canonical_commit", &real_state_path(&repo));
         state.save_with_records(&repo, &[record]).unwrap_err();
         std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
         let transaction_root = fs::read_dir(publication_outbox_root(&repo))

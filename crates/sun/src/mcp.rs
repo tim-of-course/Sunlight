@@ -1,24 +1,21 @@
-//! Transitional local MCP transport over the production `sun --json` contracts.
+//! Persistent local MCP transport over the shared in-process command engine.
 //!
-//! This module deliberately owns no repository semantics. Every tool builds a
-//! validated argv vector and invokes this same executable with the canonical
-//! repository root as its cwd, preserving the CLI's transaction, writer-lock,
-//! CAS, projection, execution-containment, and Git-export behavior.
+//! This module owns protocol framing and typed argument validation, but no
+//! repository semantics. Every tool calls the same explicit, repository-rooted
+//! engine boundary as the CLI.
 
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
-#[cfg(windows)]
-use sunlight_core::repository::ExecutionPolicy;
+use super::{execute_engine, EngineCommandInput, EngineContext, EngineOutputFormat, EngineRequest};
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
@@ -27,8 +24,6 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
-const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(120);
-const RUN_CALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 pub(crate) fn serve_from_args(args: &[String]) -> Result<(), String> {
     if args == ["mcp", "--help"] || args == ["mcp", "serve", "--help"] {
@@ -53,10 +48,9 @@ pub(crate) fn serve_from_args(args: &[String]) -> Result<(), String> {
             repo.display()
         ));
     }
-    let executable = std::env::current_exe()
-        .map_err(|error| format!("cannot locate the running sun executable: {error}"))?;
+    let engine = EngineContext::new(&repo)?;
     let temp = PrivateTemp::new(&repo)?;
-    serve(repo, executable, temp)
+    serve(repo, engine, temp)
 }
 
 struct PrivateTemp {
@@ -148,7 +142,7 @@ impl Drop for ActiveCall {
     }
 }
 
-fn serve(repo: PathBuf, executable: PathBuf, temp: Arc<PrivateTemp>) -> Result<(), String> {
+fn serve(repo: PathBuf, engine: EngineContext, temp: Arc<PrivateTemp>) -> Result<(), String> {
     let (input_tx, input_rx) = mpsc::channel();
     let reader = thread::spawn(move || read_input(io::stdin().lock(), input_tx));
     let mut stdout = io::BufWriter::new(io::stdout().lock());
@@ -186,7 +180,7 @@ fn serve(repo: PathBuf, executable: PathBuf, temp: Arc<PrivateTemp>) -> Result<(
                 handle_message(
                     message,
                     &repo,
-                    &executable,
+                    &engine,
                     &temp,
                     &mut initialized,
                     &mut active,
@@ -226,7 +220,7 @@ fn serve(repo: PathBuf, executable: PathBuf, temp: Arc<PrivateTemp>) -> Result<(
                     handle_message(
                         message,
                         &repo,
-                        &executable,
+                        &engine,
                         &temp,
                         &mut initialized,
                         &mut active,
@@ -273,7 +267,7 @@ fn serve(repo: PathBuf, executable: PathBuf, temp: Arc<PrivateTemp>) -> Result<(
 fn handle_message(
     message: Value,
     repo: &Path,
-    executable: &Path,
+    engine: &EngineContext,
     temp: &Arc<PrivateTemp>,
     initialized: &mut bool,
     active: &mut Option<ActiveCall>,
@@ -410,7 +404,7 @@ fn handle_message(
                 );
             }
             let repo = repo.to_path_buf();
-            let executable = executable.to_path_buf();
+            let engine = engine.clone();
             let name = name.to_string();
             let temp = Arc::clone(temp);
             let cancel = Arc::new(AtomicBool::new(false));
@@ -418,9 +412,7 @@ fn handle_message(
             let (tx, rx) = mpsc::channel();
             let join = thread::spawn(move || {
                 let result = match build_invocation(&name, &arguments, &repo, &temp) {
-                    Ok(invocation) => {
-                        execute_invocation(&executable, &repo, invocation, &worker_cancel)
-                    }
+                    Ok(invocation) => execute_invocation(&engine, invocation, &worker_cancel),
                     Err(error) => tool_failure_result(error),
                 };
                 let _ = tx.send(result);
@@ -617,7 +609,6 @@ fn cancelled_id(value: &Value) -> Option<&Value> {
 struct Invocation {
     argv: Vec<String>,
     staged: Vec<StagedFile>,
-    timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -647,237 +638,66 @@ fn tool_failure_result(error: ToolFailure) -> Value {
 }
 
 fn execute_invocation(
-    executable: &Path,
-    repo: &Path,
+    engine: &EngineContext,
     invocation: Invocation,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
 ) -> Value {
     let Invocation {
-        mut argv,
+        argv,
         staged: _staged,
-        timeout,
     } = invocation;
-    argv.push("--json".to_string());
-    let output = match run_bounded(executable, repo, &argv, timeout, cancel) {
-        Ok(output) => output,
-        Err(error) => return tool_failure_result(error),
-    };
-    let parsed: Value = match serde_json::from_slice(&output.stdout) {
+    if cancel.load(Ordering::Acquire) {
+        return tool_failure_result(ToolFailure::new(
+            "request_cancelled",
+            "tool call was cancelled",
+        ));
+    }
+    let response = execute_engine(
+        &engine.clone().with_cancellation(Arc::clone(cancel)),
+        EngineRequest {
+            command: EngineCommandInput::Arguments(argv),
+            output_format: EngineOutputFormat::Json,
+            max_stdout_bytes: Some(MAX_STDOUT_BYTES),
+            max_stderr_bytes: Some(MAX_STDERR_BYTES),
+        },
+    );
+    if response.stdout_overflowed {
+        return tool_failure_result(
+            ToolFailure::new(
+                "mcp_stdout_too_large",
+                "engine response exceeded the MCP response limit",
+            )
+            .detail("max_bytes", MAX_STDOUT_BYTES as u64),
+        );
+    }
+    if response.stderr_overflowed {
+        return tool_failure_result(
+            ToolFailure::new(
+                "mcp_stderr_too_large",
+                "engine diagnostics exceeded the MCP diagnostic limit",
+            )
+            .detail("max_bytes", MAX_STDERR_BYTES as u64),
+        );
+    }
+    let parsed: Value = match serde_json::from_str(&response.stdout) {
         Ok(value) => value,
         Err(error) => {
             return tool_failure_result(
                 ToolFailure::new(
-                    "mcp_invalid_cli_contract",
-                    "sun subprocess did not return one valid JSON contract",
+                    "mcp_invalid_engine_contract",
+                    "command engine did not return one valid JSON contract",
                 )
                 .detail("source", error.to_string())
-                .detail(
-                    "stderr",
-                    String::from_utf8_lossy(&output.stderr).to_string(),
-                ),
+                .detail("stderr", response.stderr),
             );
         }
     };
-    let is_error = !output.success || parsed.get("ok").and_then(Value::as_bool) == Some(false);
+    let is_error = !response.success || parsed.get("ok").and_then(Value::as_bool) == Some(false);
     json!({
         "content":[{"type":"text","text":parsed.to_string()}],
         "structuredContent":parsed,
         "isError":is_error
     })
-}
-
-struct BoundedOutput {
-    success: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-fn run_bounded(
-    executable: &Path,
-    repo: &Path,
-    argv: &[String],
-    timeout: Duration,
-    cancel: &AtomicBool,
-) -> Result<BoundedOutput, ToolFailure> {
-    let mut command = Command::new(executable);
-    command
-        .args(argv)
-        .current_dir(repo)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = spawn_contained(command)?;
-    let stdout = child
-        .stdout()
-        .ok_or_else(|| ToolFailure::new("mcp_subprocess_io", "cannot capture sun stdout"))?;
-    let stderr = child
-        .stderr()
-        .ok_or_else(|| ToolFailure::new("mcp_subprocess_io", "cannot capture sun stderr"))?;
-    let stdout_reader = thread::spawn(move || read_bounded(stdout, MAX_STDOUT_BYTES));
-    let stderr_reader = thread::spawn(move || read_bounded(stderr, MAX_STDERR_BYTES));
-    let started = Instant::now();
-    let status = loop {
-        if cancel.load(Ordering::Acquire) {
-            child.terminate();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(ToolFailure::new(
-                "request_cancelled",
-                "tool call was cancelled",
-            ));
-        }
-        if started.elapsed() >= timeout {
-            child.terminate();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(ToolFailure::new(
-                "mcp_subprocess_timeout",
-                "sun subprocess exceeded the MCP call timeout",
-            )
-            .detail("timeout_ms", timeout.as_millis() as u64));
-        }
-        match child
-            .try_wait()
-            .map_err(|error| ToolFailure::new("mcp_subprocess_wait", error.to_string()))?
-        {
-            Some(status) => break status,
-            None => thread::sleep(Duration::from_millis(10)),
-        }
-    };
-    let (stdout, stdout_exceeded) = stdout_reader
-        .join()
-        .map_err(|_| ToolFailure::new("mcp_subprocess_io", "stdout collector panicked"))?;
-    let (stderr, stderr_exceeded) = stderr_reader
-        .join()
-        .map_err(|_| ToolFailure::new("mcp_subprocess_io", "stderr collector panicked"))?;
-    if stdout_exceeded {
-        return Err(ToolFailure::new(
-            "mcp_stdout_too_large",
-            "sun subprocess stdout exceeded the MCP response limit",
-        )
-        .detail("max_bytes", MAX_STDOUT_BYTES as u64));
-    }
-    if stderr_exceeded {
-        return Err(ToolFailure::new(
-            "mcp_stderr_too_large",
-            "sun subprocess stderr exceeded the MCP diagnostic limit",
-        )
-        .detail("max_bytes", MAX_STDERR_BYTES as u64));
-    }
-    Ok(BoundedOutput {
-        success: status.success(),
-        stdout,
-        stderr,
-    })
-}
-
-fn read_bounded(mut input: impl Read, limit: usize) -> (Vec<u8>, bool) {
-    let mut kept = Vec::new();
-    let mut buffer = [0; 8192];
-    let mut exceeded = false;
-    loop {
-        match input.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
-            Ok(count) => {
-                let room = limit.saturating_sub(kept.len());
-                kept.extend_from_slice(&buffer[..count.min(room)]);
-                exceeded |= count > room;
-            }
-        }
-    }
-    (kept, exceeded)
-}
-
-#[cfg(not(windows))]
-struct Contained {
-    child: std::process::Child,
-}
-#[cfg(windows)]
-struct Contained {
-    child: super::windows_job::ContainedChild,
-}
-
-fn spawn_contained(command: Command) -> Result<Contained, ToolFailure> {
-    #[cfg(not(windows))]
-    {
-        command
-            .spawn()
-            .map(|child| Contained { child })
-            .map_err(|error| ToolFailure::new("mcp_subprocess_spawn", error.to_string()))
-    }
-    #[cfg(windows)]
-    {
-        let policy = ExecutionPolicy {
-            timeout_ms: RUN_CALL_TIMEOUT.as_millis() as u64,
-            stdout_limit_bytes: MAX_STDOUT_BYTES as u64,
-            stderr_limit_bytes: MAX_STDERR_BYTES as u64,
-            process_memory_limit_bytes: 4 * 1024 * 1024 * 1024,
-            job_memory_limit_bytes: 8 * 1024 * 1024 * 1024,
-            cpu_time_limit_ms: RUN_CALL_TIMEOUT.as_millis() as u64,
-            active_process_limit: 128,
-            environment_inheritance: "mcp_parent".to_string(),
-            network_policy: "not_enforced".to_string(),
-            filesystem_write_policy: "private_projection_isolated".to_string(),
-        };
-        super::windows_job::ContainedChild::spawn(command, &policy)
-            .map(|child| Contained { child })
-            .map_err(|error| ToolFailure::new("mcp_subprocess_containment", format!("{error:?}")))
-    }
-}
-
-impl Contained {
-    fn stdout(&mut self) -> Option<std::process::ChildStdout> {
-        #[cfg(not(windows))]
-        {
-            self.child.stdout.take()
-        }
-        #[cfg(windows)]
-        {
-            self.child.child.stdout.take()
-        }
-    }
-    fn stderr(&mut self) -> Option<std::process::ChildStderr> {
-        #[cfg(not(windows))]
-        {
-            self.child.stderr.take()
-        }
-        #[cfg(windows)]
-        {
-            self.child.child.stderr.take()
-        }
-    }
-    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
-        #[cfg(not(windows))]
-        {
-            self.child.try_wait()
-        }
-        #[cfg(windows)]
-        {
-            self.child.child.try_wait()
-        }
-    }
-    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
-        #[cfg(not(windows))]
-        {
-            self.child.wait()
-        }
-        #[cfg(windows)]
-        {
-            self.child.child.wait()
-        }
-    }
-    fn terminate(&mut self) {
-        #[cfg(not(windows))]
-        {
-            let _ = self.child.kill();
-        }
-        #[cfg(windows)]
-        {
-            let _ = self.child.terminate();
-        }
-    }
 }
 
 fn build_invocation(
@@ -1054,15 +874,9 @@ fn build_invocation(
             "generated command violated the MCP delegation boundary",
         ));
     }
-    let timeout = if name == "execution_run" {
-        RUN_CALL_TIMEOUT
-    } else {
-        DEFAULT_CALL_TIMEOUT
-    };
     Ok(Invocation {
         argv: std::mem::take(&mut argv),
         staged,
-        timeout,
     })
 }
 

@@ -194,7 +194,8 @@ fn no_fixture_interrupted_state_publication_recovers_and_continues() {
         .join("records")
         .join("native-state.json");
     let old = fs::read(&canonical).unwrap();
-    let process_canonical = PathBuf::from(".")
+    let process_canonical = fs::canonicalize(repo.path())
+        .unwrap()
         .join(".sunlight")
         .join("records")
         .join("native-state.json");
@@ -292,6 +293,9 @@ fn no_fixture_native_mutation_outbox_recovers_every_declared_record_and_continue
     init_local_git_repo(&repo);
     start_native_session(&repo, "outbox-native");
     let canonical = repo.path().join(".sunlight/records/native-state.json");
+    let process_canonical = fs::canonicalize(repo.path())
+        .unwrap()
+        .join(".sunlight/records/native-state.json");
     let old = fs::read(&canonical).unwrap();
     let content = repo.write_file("outbox-native.txt", "published through outbox\n");
     let interrupted = sun()
@@ -306,7 +310,13 @@ fn no_fixture_native_mutation_outbox_recovers_every_declared_record_and_continue
         ])
         .arg(content)
         .args(["--classification", "source", "--json"])
-        .env("SUNLIGHT_TEST_FAILPOINT", "batch_after_canonical_commit")
+        .env(
+            "SUNLIGHT_TEST_FAILPOINT",
+            format!(
+                "batch_after_canonical_commit|{}",
+                process_canonical.display()
+            ),
+        )
         .current_dir(repo.path())
         .output()
         .unwrap();
@@ -394,6 +404,9 @@ fn no_fixture_compat_import_outbox_recovers_mid_batch_and_continues() {
     .unwrap();
     let diff = real_compat_diff(&repo, &projection_id);
     let candidate_id = candidate_id_for_path(&diff, "src/lib.rs");
+    let first_derived_path = fs::canonicalize(repo.path())
+        .unwrap()
+        .join(".sunlight/session-generations/gen_agent_a_0002.json");
     let interrupted = sun()
         .args([
             "compat",
@@ -406,7 +419,13 @@ fn no_fixture_compat_import_outbox_recovers_mid_batch_and_continues() {
             &generation_id,
             "--json",
         ])
-        .env("SUNLIGHT_TEST_FAILPOINT", "batch_mid_derived_publication")
+        .env(
+            "SUNLIGHT_TEST_FAILPOINT",
+            format!(
+                "batch_mid_derived_publication|{}",
+                first_derived_path.display()
+            ),
+        )
         .current_dir(repo.path())
         .output()
         .unwrap();

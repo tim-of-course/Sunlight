@@ -7,6 +7,55 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 #[test]
+fn stdio_mcp_bounds_large_engine_output_and_remains_usable() {
+    let temp = TempDir::new("sun-mcp-large-output");
+    let repo = temp.path().join("repository");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("large.txt"), vec![b'x'; 8 * 1024 * 1024 + 1024]).unwrap();
+
+    let mut mcp = Mcp::start(&repo);
+    let initialized = mcp.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-11-25",
+            "capabilities":{},
+            "clientInfo":{"name":"sun-output-bound-test","version":"1"}
+        }),
+    );
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    mcp.notify("notifications/initialized", json!({}));
+
+    assert_eq!(mcp.call(2, "repository_init", json!({}))["ok"], true);
+    mcp.call(
+        3,
+        "topic_create",
+        json!({"slug":"large-output","display_name":"Large output"}),
+    );
+    let session = mcp.call(
+        4,
+        "session_start",
+        json!({"topic":"large-output","view":"view_base_0001","actor":"large-agent"}),
+    );
+    let session_id = session["data"]["ids"]["session_id"].as_str().unwrap();
+    let error = mcp.call_error(
+        5,
+        "artifact_read",
+        json!({"path":"large.txt","session":session_id}),
+    );
+    assert_eq!(error["error"]["code"], "mcp_stdout_too_large");
+    assert_eq!(
+        error["error"]["message"],
+        "engine response exceeded the MCP response limit"
+    );
+    assert_eq!(error["error"]["details"]["max_bytes"], 8 * 1024 * 1024);
+
+    let status = mcp.call(6, "repository_status", json!({}));
+    assert_eq!(status["data"]["command"], "status.repository");
+    mcp.shutdown();
+}
+
+#[test]
 fn stdio_mcp_real_repository_journey_and_recovery() {
     let temp = TempDir::new("sun-mcp");
     let repo = temp.path().join("repository");
@@ -165,10 +214,192 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
     assert_eq!(parse_error["error"]["code"], -32700);
     let pong = mcp.request(16, "ping", json!({}));
     assert_eq!(pong["result"], json!({}));
+    let recovered = mcp.call(17, "repository_status", json!({}));
+    assert_eq!(recovered["data"]["command"], "status.repository");
     let sent = mcp.sent.join("\n");
     assert!(!sent.contains("--fixture"));
     assert!(!sent.contains("\"fixture\""));
     mcp.shutdown();
+}
+
+#[test]
+fn stdio_mcp_domain_calls_do_not_respawn_the_server_executable() {
+    let temp = TempDir::new("sun-mcp-no-respawn");
+    let repo = temp.path().join("repository");
+    fs::create_dir_all(&repo).unwrap();
+    fs::write(repo.join("README.md"), "# no respawn\n").unwrap();
+
+    let server_executable = temp.path().join(if cfg!(windows) {
+        "sun-mcp-server.exe"
+    } else {
+        "sun-mcp-server"
+    });
+    fs::copy(env!("CARGO_BIN_EXE_sun"), &server_executable).unwrap();
+    let mut mcp = Mcp::start_with_executable(&server_executable, &repo);
+    let initialized = mcp.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-11-25",
+            "capabilities":{},
+            "clientInfo":{"name":"sun-no-respawn-test","version":"1"}
+        }),
+    );
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    mcp.notify("notifications/initialized", json!({}));
+
+    let unavailable = server_executable.with_extension("unavailable");
+    fs::rename(&server_executable, &unavailable)
+        .expect("the running test server executable should become unavailable for respawn");
+
+    let initialized_repo = mcp.call(2, "repository_init", json!({}));
+    assert_eq!(initialized_repo["data"]["command"], "repository.init");
+    let status = mcp.call(3, "repository_status", json!({}));
+    assert_eq!(status["data"]["command"], "status.repository");
+    mcp.shutdown();
+}
+
+#[test]
+fn cli_and_mcp_share_read_mutation_and_error_contracts() {
+    let temp = TempDir::new("sun-engine-contract-equivalence");
+    let cli_repo = temp.path().join("cli-repository");
+    let mcp_repo = temp.path().join("mcp-repository");
+    for repo in [&cli_repo, &mcp_repo] {
+        fs::create_dir_all(repo).unwrap();
+        fs::write(repo.join("README.md"), "# equivalent repository\n").unwrap();
+    }
+
+    let _ = sun_json(&cli_repo, &["init"]);
+    let _ = sun_json(
+        &cli_repo,
+        &[
+            "topic",
+            "create",
+            "equivalence",
+            "--display-name",
+            "Equivalence",
+        ],
+    );
+    let cli_session = sun_json(
+        &cli_repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "equivalence",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "contract-agent",
+        ],
+    );
+    let cli_session_id = cli_session["data"]["ids"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cli_read = sun_json(
+        &cli_repo,
+        &["read", "README.md", "--session", &cli_session_id],
+    );
+    fs::write(cli_repo.join("content.tmp"), "shared engine mutation\n").unwrap();
+    let cli_write = sun_json(
+        &cli_repo,
+        &[
+            "write",
+            "notes/equivalent.txt",
+            "--session",
+            &cli_session_id,
+            "--expect-hash",
+            "new",
+            "--content-file",
+            "content.tmp",
+            "--classification",
+            "source",
+        ],
+    );
+    let cli_error = sun_json_error(
+        &cli_repo,
+        &[
+            "write",
+            "notes/equivalent.txt",
+            "--session",
+            &cli_session_id,
+            "--expect-hash",
+            "new",
+            "--content-file",
+            "content.tmp",
+            "--classification",
+            "source",
+        ],
+    );
+
+    let mut mcp = Mcp::start(&mcp_repo);
+    let _ = mcp.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-11-25",
+            "capabilities":{},
+            "clientInfo":{"name":"sun-contract-test","version":"1"}
+        }),
+    );
+    mcp.notify("notifications/initialized", json!({}));
+    let _ = mcp.call(2, "repository_init", json!({}));
+    let _ = mcp.call(
+        3,
+        "topic_create",
+        json!({"slug":"equivalence","display_name":"Equivalence"}),
+    );
+    let mcp_session = mcp.call(
+        4,
+        "session_start",
+        json!({"topic":"equivalence","view":"view_base_0001","actor":"contract-agent"}),
+    );
+    let mcp_session_id = mcp_session["data"]["ids"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mcp_read = mcp.call(
+        5,
+        "artifact_read",
+        json!({"path":"README.md","session":mcp_session_id}),
+    );
+    let mcp_write = mcp.call(
+        6,
+        "artifact_write",
+        json!({
+            "path":"notes/equivalent.txt",
+            "session":mcp_session_id,
+            "expect_hash":"new",
+            "content":"shared engine mutation\n",
+            "classification":"source"
+        }),
+    );
+    let mcp_error = mcp.call_error(
+        7,
+        "artifact_write",
+        json!({
+            "path":"notes/equivalent.txt",
+            "session":mcp_session_id,
+            "expect_hash":"new",
+            "content":"shared engine mutation\n",
+            "classification":"source"
+        }),
+    );
+    mcp.shutdown();
+
+    assert_eq!(
+        normalize_repository_identity(cli_read),
+        normalize_repository_identity(mcp_read)
+    );
+    assert_eq!(
+        normalize_repository_identity(cli_write),
+        normalize_repository_identity(mcp_write)
+    );
+    assert_eq!(
+        normalize_repository_identity(cli_error),
+        normalize_repository_identity(mcp_error)
+    );
 }
 
 struct Mcp {
@@ -180,7 +411,11 @@ struct Mcp {
 
 impl Mcp {
     fn start(repo: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_sun"))
+        Self::start_with_executable(Path::new(env!("CARGO_BIN_EXE_sun")), repo)
+    }
+
+    fn start_with_executable(executable: &Path, repo: &Path) -> Self {
+        let mut child = Command::new(executable)
             .args(["mcp", "serve", "--repo"])
             .arg(repo)
             .stdin(Stdio::piped())
@@ -216,6 +451,16 @@ impl Mcp {
         assert_ne!(result["isError"], true, "tool error: {result}");
         result["structuredContent"].clone()
     }
+    fn call_error(&mut self, id: u64, name: &str, arguments: Value) -> Value {
+        let response = self.request(id, "tools/call", json!({"name":name,"arguments":arguments}));
+        assert!(
+            response.get("error").is_none(),
+            "protocol error: {response}"
+        );
+        let result = &response["result"];
+        assert_eq!(result["isError"], true, "expected tool error: {result}");
+        result["structuredContent"].clone()
+    }
     fn send(&mut self, value: Value) {
         self.raw(&value.to_string());
     }
@@ -236,6 +481,52 @@ impl Mcp {
         let status = self.child.as_mut().unwrap().wait().unwrap();
         assert!(status.success());
     }
+}
+
+fn sun_json(repo: &Path, args: &[&str]) -> Value {
+    sun_json_result(repo, args, true)
+}
+
+fn sun_json_error(repo: &Path, args: &[&str]) -> Value {
+    sun_json_result(repo, args, false)
+}
+
+fn sun_json_result(repo: &Path, args: &[&str], success: bool) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_sun"))
+        .args(args)
+        .arg("--json")
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.success(),
+        success,
+        "sun {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn normalize_repository_identity(mut value: Value) -> Value {
+    fn visit(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    if key == "repository_id" {
+                        *value = Value::String("<repository>".to_string());
+                    } else if key == "resolved_view_id" || key == "authored_context_id" {
+                        *value = Value::String("<view>".to_string());
+                    } else {
+                        visit(value);
+                    }
+                }
+            }
+            Value::Array(values) => values.iter_mut().for_each(visit),
+            _ => {}
+        }
+    }
+    visit(&mut value);
+    value
 }
 
 impl Drop for Mcp {

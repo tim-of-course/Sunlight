@@ -14,6 +14,7 @@ $p = "docs/sunlight_development_manager_scratchpad.md"; $n = (Get-Content -Raw -
 
 - Work directly in the Windows checkout for implementation, review, test, commit, and push.
 - Do not use WSL2 Codex CLI for new slices unless the user explicitly redirects work back to WSL.
+- Never modify or delete sibling repositories or unrelated external files. Disposable test state may use workspace-local paths, `C:\tmp`, system temp, or WSL temp; cleanup must be limited to a uniquely slice-created directory after resolving and verifying the exact target.
 - Keep a development-manager stance: plan slices, keep changes coherent, review before committing, and redirect if a path blocks.
 - Commit coherent progress checkpoints as work lands.
 - Keep moving until the v0.3 local MVP is complete; if one slice blocks, switch to another useful slice.
@@ -81,6 +82,7 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | repo-backed-windows-network-isolation | Windows Codex CLI thread `019f5a5a-4839-78f3-8a2e-787dd54a9eb8` | Windows commit `78ad0dd` | Completed | Add fail-closed per-execution Windows network denial without global firewall or host ACL side effects. | Explicit AppContainer denial and compatible default mode, persisted policy/evidence, crash cleanup, external managed-root recovery, distinct setup taxonomy, real listener/root/descendant tests, self-hosting, release, and all 395 workspace tests passed after manager review. |
 | repo-backed-projection-cache | Windows Codex CLI thread `019f5ae6-8023-7903-943f-c66cb1b9e070` | Windows commit `c4cea74` | Completed | Add durable reusable projection caching to the real repo-backed materializer without unsafe writable aliases or false zero-copy claims. | Atomic semantic-key cache, full integrity revalidation/quarantine, private copy/ReFS clone materialization, persisted hit/miss/amplification metrics, external-root and concurrency tests, release, self-hosting, and all 401 workspace tests passed. NTFS copy fallback, physical allocation query, and stale staging GC remain open. |
 | repo-backed-shared-engine | Windows Codex CLI correction thread `019f5bf8-baff-7652-bad9-0cfc6f8d823a` | Windows commit `2af9d6f` | Completed | Replace MCP-to-sun subprocess delegation with one explicit repo-rooted in-process engine shared by CLI and MCP. | Explicit roots, no-respawn, CLI/MCP equivalence, cancellation, bounded retained output, and path-scoped failpoints passed focused checks, three worker default-parallel workspace runs, one manager default-parallel workspace run, release, formatting, and self-hosting verification. |
+| repo-backed-v0.3-gap-closure | Windows desktop task `019f5c83-9a12-7b70-af56-bfec8f2492eb` | `main`, uncommitted source changes | Active 2026-07-13 | Audit every local v0.3 criterion against no-fixture behavior and implement the highest-priority real production gap. | Bounded status read timed out while source and no-fixture test changes were present; leave the task running and review once at the next heartbeat. |
 
 ## Delegation Queue
 

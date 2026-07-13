@@ -448,7 +448,7 @@ fn self_hosting_real_repository_acceptance() {
         "command_exit"
     );
     assert_eq!(
-        string(&run, &["data", "runtime_policy", "network"]),
+        string(&run, &["data", "runtime_policy", "network", "requested"]),
         "not_enforced"
     );
     assert_eq!(

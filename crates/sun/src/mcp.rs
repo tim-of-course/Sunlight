@@ -1428,9 +1428,17 @@ fn run_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFailure> {
         identifier(args, "view")?,
         "--cwd".into(),
         cwd,
-        "--".into(),
-        program,
     ];
+    if let Some(network) = optional_identifier(args, "network")? {
+        if !["disabled", "not_enforced"].contains(&network.as_str()) {
+            return Err(ToolFailure::new(
+                "invalid_request",
+                "execution network must be disabled or not_enforced",
+            ));
+        }
+        v.extend(["--network".into(), network]);
+    }
+    v.extend(["--".into(), program]);
     if args.contains_key("args") {
         v.extend(string_array(args, "args", 256)?)
     }
@@ -1508,7 +1516,7 @@ fn allowed_fields(name: &str) -> &'static [&'static str] {
         "compat_project" => &["session"],
         "compat_diff" => &["projection"],
         "compat_import" => &["projection", "candidates", "session_generation"],
-        "execution_run" => &["view", "program", "args", "cwd"],
+        "execution_run" => &["view", "program", "args", "cwd", "network"],
         "execution_promote_output" => &["execution", "path", "session", "classification"],
         "checkpoint_create" => &["view"],
         "policy_check_export" => &["checkpoint", "branch"],
@@ -1688,7 +1696,7 @@ fn tools() -> Vec<Value> {
         tool(
             "execution_run",
             "Run one bare non-shell program with structured arguments against an exact view.",
-            json!({"view":s(),"program":{"type":"string","description":"Bare executable name; shells and host paths are rejected."},"args":{"type":"array","maxItems":256,"items":{"type":"string","maxLength":16384}},"cwd":{"type":"string","description":"Repository-relative projection cwd.","default":"."}}),
+            json!({"view":s(),"program":{"type":"string","description":"Bare executable name; shells and host paths are rejected."},"args":{"type":"array","maxItems":256,"items":{"type":"string","maxLength":16384}},"cwd":{"type":"string","description":"Repository-relative projection cwd.","default":"."},"network":{"type":"string","enum":["disabled","not_enforced"],"description":"Optional per-run network policy override."}}),
             &["view", "program"],
             true,
         ),

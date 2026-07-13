@@ -253,6 +253,7 @@ pub struct RealExecutionSnapshot {
     pub working_directory: String,
     pub exit_code: Option<i32>,
     pub status: String,
+    pub command_started: bool,
     pub timed_out: bool,
     pub termination_reason: Option<String>,
     pub termination_failed: bool,
@@ -277,6 +278,7 @@ pub struct RealExecutionSnapshot {
     pub memory_policy: String,
     pub environment_policy: String,
     pub environment_allowlist: Vec<String>,
+    pub network_policy_requested: String,
     pub network_policy: String,
     pub filesystem_write_policy_requested: String,
     pub filesystem_write_policy: String,
@@ -3610,6 +3612,7 @@ fn parse_execution_snapshot(
         working_directory: required_string(object, "working_directory", state_path)?,
         exit_code: optional_i32(object, "exit_code", state_path)?,
         status: required_string(object, "status", state_path)?,
+        command_started: optional_bool(object, "command_started", state_path)?.unwrap_or(true),
         timed_out: optional_bool(object, "timed_out", state_path)?.unwrap_or_else(|| {
             required_string(object, "status", state_path).is_ok_and(|value| value == "timeout")
         }),
@@ -3671,8 +3674,10 @@ fn parse_execution_snapshot(
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?,
+        network_policy_requested: optional_string(object, "network_policy_requested", state_path)?
+            .unwrap_or_else(|| "legacy_unrecorded".to_string()),
         network_policy: optional_string(object, "network_policy", state_path)?
-            .unwrap_or_else(|| "not_enforced".to_string()),
+            .unwrap_or_else(|| "legacy_unrecorded".to_string()),
         filesystem_write_policy_requested: optional_string(
             object,
             "filesystem_write_policy_requested",
@@ -3997,6 +4002,10 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
         JsonValue::String(execution.status.clone()),
     );
     object.insert(
+        "command_started".to_string(),
+        JsonValue::Bool(execution.command_started),
+    );
+    object.insert(
         "timed_out".to_string(),
         JsonValue::Bool(execution.timed_out),
     );
@@ -4107,6 +4116,10 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
                 .map(|name| JsonValue::String(name.clone()))
                 .collect(),
         ),
+    );
+    object.insert(
+        "network_policy_requested".to_string(),
+        JsonValue::String(execution.network_policy_requested.clone()),
     );
     object.insert(
         "network_policy".to_string(),

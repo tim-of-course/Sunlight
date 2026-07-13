@@ -100,7 +100,8 @@ use sunlight_core::repo_state::{
 };
 use sunlight_core::repository::{
     init_repository, resolve_projection_policy, ExecutionPolicy, RepositoryConfig,
-    ResolvedProjectionPolicy, CURRENT_STORAGE_SCHEMA_VERSION,
+    ResolvedProjectionPolicy, CURRENT_STORAGE_SCHEMA_VERSION, DISABLED_NETWORK_POLICY,
+    NOT_ENFORCED_NETWORK_POLICY,
 };
 use sunlight_core::resolver::{
     fixture_auth_revision, fixture_base_entries, fixture_overlapping_auth_revision,
@@ -2872,6 +2873,10 @@ struct BoundedProcessOutput {
 enum ProcessRunError {
     Command(io::Error),
     ContainmentSetup(io::Error),
+    #[cfg(windows)]
+    FilesystemIsolationSetup(io::Error),
+    #[cfg(windows)]
+    NetworkIsolationSetup(io::Error),
 }
 
 struct ExecutionChild {
@@ -3208,10 +3213,19 @@ fn run_bounded_process(
         failed_summary()
     };
     #[cfg(windows)]
+    let bootstrap_verification = isolation
+        .verify_bootstrap(status.as_ref().and_then(ExitStatus::code))
+        .map_err(|error| match isolation.setup_dimension() {
+            windows_isolation::IsolationSetupDimension::Filesystem => {
+                ProcessRunError::FilesystemIsolationSetup(error)
+            }
+            windows_isolation::IsolationSetupDimension::Network => {
+                ProcessRunError::NetworkIsolationSetup(error)
+            }
+        })?;
+    #[cfg(windows)]
     if matches!(
-        isolation
-            .verify_bootstrap(status.as_ref().and_then(ExitStatus::code))
-            .map_err(ProcessRunError::ContainmentSetup)?,
+        bootstrap_verification,
         windows_isolation::BootstrapVerification::FailedAfterCommandMayHaveStarted
     ) {
         wait_failed = true;
@@ -3230,8 +3244,21 @@ fn run_bounded_process(
 fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Result<(), CliError> {
     let repo_root = PathBuf::from(".");
     let config = require_repository_config(repo_root.clone())?;
-    let execution_policy = config.execution_policy.clone();
-    let projection_policy = require_projection_policy(&repo_root)?;
+    let projection_policy = resolve_required_projection_policy(&repo_root, &config)?;
+    #[cfg(windows)]
+    windows_isolation::recover_stale_app_containers(&repo_root, &projection_policy.managed_root)
+        .map_err(|error| {
+            CliError::new(
+                "execution_network_isolation_cleanup_failed",
+                format!("failed to recover stale Windows isolation state: {error}"),
+            )
+            .with_detail("platform", "windows")
+            .with_detail("command_started", "false")
+        })?;
+    let mut execution_policy = config.execution_policy.clone();
+    if let Some(network_policy) = options.network_policy {
+        execution_policy.network_policy = network_policy.as_str().to_string();
+    }
     let mut state = RealRepoState::load(&repo_root)?;
     let relative_cwd = real_execution_relative_cwd(&options.cwd)?;
     let resolved = real_resolve_view_by_id(&state, &options.view_id)?;
@@ -3259,17 +3286,42 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     let projection_root = projection_policy.execution_root(&projection_id);
     relocate_managed_projection_root(&provisional_root, &projection_root)?;
     #[cfg(windows)]
-    let isolation =
-        windows_isolation::PreparedIsolation::prepare(&repo_root, &projection_root, &execution_id)
-            .map_err(|error| {
-                remove_unpublished_execution_root(&projection_root);
-                CliError::new(
-                    "execution_filesystem_isolation_setup_failed",
-                    format!("failed to establish Windows filesystem isolation: {error}"),
-                )
-                .with_detail("platform", "windows")
-                .with_detail("command_started", "false")
-            })?;
+    let mut isolation = windows_isolation::PreparedIsolation::prepare(
+        &repo_root,
+        &projection_root,
+        &execution_id,
+        execution_policy.network_policy == DISABLED_NETWORK_POLICY,
+    )
+    .map_err(|error| {
+        remove_unpublished_execution_root(&projection_root);
+        let (code, dimension) = match error.dimension() {
+            windows_isolation::IsolationSetupDimension::Network => {
+                ("execution_network_isolation_setup_failed", "network")
+            }
+            windows_isolation::IsolationSetupDimension::Filesystem => {
+                ("execution_filesystem_isolation_setup_failed", "filesystem")
+            }
+        };
+        CliError::new(
+            code,
+            format!("failed to establish Windows {dimension} isolation: {error}"),
+        )
+        .with_detail("platform", "windows")
+        .with_detail("command_started", "false")
+    })?;
+    #[cfg(windows)]
+    isolation
+        .validate_command_compatibility(&options.command_argv)
+        .map_err(|error| {
+            remove_unpublished_execution_root(&projection_root);
+            CliError::new(
+                "execution_network_isolation_incompatible_toolchain",
+                error.to_string(),
+            )
+            .with_detail("platform", "windows")
+            .with_detail("network_policy_requested", "disabled")
+            .with_detail("command_started", "false")
+        })?;
     let execution_cwd = real_execution_cwd_path(&projection_root, &relative_cwd, &options.cwd)
         .map_err(|error| {
             remove_unpublished_execution_root(&projection_root);
@@ -3322,10 +3374,30 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         ProcessRunError::ContainmentSetup(error) => {
             remove_unpublished_execution_root(&projection_root);
             CliError::new(
-                "execution_filesystem_isolation_setup_failed",
+                "execution_containment_setup_failed",
                 format!("failed to establish execution containment: {error}"),
             )
             .with_detail("platform", std::env::consts::OS)
+            .with_detail("command_started", "false")
+        }
+        #[cfg(windows)]
+        ProcessRunError::FilesystemIsolationSetup(error) => {
+            remove_unpublished_execution_root(&projection_root);
+            CliError::new(
+                "execution_filesystem_isolation_setup_failed",
+                format!("failed to establish Windows filesystem isolation: {error}"),
+            )
+            .with_detail("platform", "windows")
+            .with_detail("command_started", "false")
+        }
+        #[cfg(windows)]
+        ProcessRunError::NetworkIsolationSetup(error) => {
+            remove_unpublished_execution_root(&projection_root);
+            CliError::new(
+                "execution_network_isolation_setup_failed",
+                format!("failed to establish Windows network isolation: {error}"),
+            )
+            .with_detail("platform", "windows")
             .with_detail("command_started", "false")
         }
     })?;
@@ -3340,7 +3412,16 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     )?;
     projected_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let outputs = real_execution_outputs(&view_state.entries, &projected_entries);
-    let status = if command_output.resource_termination.is_some() {
+    #[cfg(windows)]
+    let cleanup_error = isolation.finish().err().map(|error| error.to_string());
+    #[cfg(not(windows))]
+    let cleanup_error: Option<String> = None;
+    if cleanup_error.is_some() {
+        if let Some(projection) = state.projections.last_mut() {
+            projection.retention_state = "quarantined".to_string();
+        }
+    }
+    let status = if command_output.resource_termination.is_some() || cleanup_error.is_some() {
         "policy_blocked"
     } else if command_output.stdout.capture_failed
         || command_output.stderr.capture_failed
@@ -3355,19 +3436,23 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     } else {
         "fail"
     };
-    let termination_reason = command_output.resource_termination.clone().or_else(|| {
-        if command_output.timed_out {
-            Some("wall_clock_timeout".to_string())
-        } else if command_output.stdout.capture_failed
-            || command_output.stderr.capture_failed
-            || command_output.termination_failed
-            || command_output.wait_failed
-        {
-            Some("runner_failure".to_string())
-        } else {
-            Some("command_exit".to_string())
-        }
-    });
+    let termination_reason = cleanup_error
+        .as_ref()
+        .map(|_| "execution_network_isolation_cleanup_failed".to_string())
+        .or_else(|| command_output.resource_termination.clone())
+        .or_else(|| {
+            if command_output.timed_out {
+                Some("wall_clock_timeout".to_string())
+            } else if command_output.stdout.capture_failed
+                || command_output.stderr.capture_failed
+                || command_output.termination_failed
+                || command_output.wait_failed
+            {
+                Some("runner_failure".to_string())
+            } else {
+                Some("command_exit".to_string())
+            }
+        });
     let execution = RealExecutionSnapshot {
         execution_id: execution_id.clone(),
         projection_id: projection_id.clone(),
@@ -3377,6 +3462,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         working_directory: options.cwd,
         exit_code: command_output.status.and_then(|status| status.code()),
         status: status.to_string(),
+        command_started: true,
         timed_out: command_output.timed_out,
         termination_reason,
         termination_failed: command_output.termination_failed,
@@ -3416,7 +3502,14 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
             .into_iter()
             .map(str::to_string)
             .collect(),
-        network_policy: execution_policy.network_policy,
+        network_policy_requested: execution_policy.network_policy.clone(),
+        network_policy: if cfg!(windows)
+            && execution_policy.network_policy == DISABLED_NETWORK_POLICY
+        {
+            "windows_appcontainer_no_network_capabilities_v1".to_string()
+        } else {
+            "not_enforced".to_string()
+        },
         filesystem_write_policy_requested: execution_policy.filesystem_write_policy,
         filesystem_write_policy: if cfg!(windows) {
             "windows_low_integrity_private_projection_v1".to_string()
@@ -3441,6 +3534,15 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         )?,
     ];
     state.save_with_records(&PathBuf::from("."), &records)?;
+    if let Some(cleanup_error) = cleanup_error {
+        return Err(CliError::new(
+            "execution_network_isolation_cleanup_failed",
+            format!("failed to clean up Windows execution isolation: {cleanup_error}"),
+        )
+        .with_detail("platform", "windows")
+        .with_detail("command_started", "true")
+        .with_detail("execution_id", execution.execution_id));
+    }
     if ctx.json {
         println!(
             "{}",
@@ -4114,11 +4216,12 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
                     println!("{}", real_execution_status_envelope(&state, execution));
                 } else {
                     println!(
-                        "execution {} status={} promotion={} view={} isolation=unenforced",
+                        "execution {} status={} promotion={} view={} network={}",
                         execution.execution_id,
                         execution.status,
                         real_execution_promotion_status(&state, execution),
-                        execution.resolved_view_id
+                        execution.resolved_view_id,
+                        execution.network_policy
                     );
                 }
                 return Ok(true);
@@ -5538,7 +5641,13 @@ fn real_execution_record(
             redacted_env_allowlist_digest: real_content_hash(
                 execution.environment_allowlist.join("\n").as_bytes(),
             ),
-            network_policy: sunlight_core::execution::NetworkPolicy::NotEnforced,
+            network_policy: if execution.network_policy
+                == "windows_appcontainer_no_network_capabilities_v1"
+            {
+                sunlight_core::execution::NetworkPolicy::Disabled
+            } else {
+                sunlight_core::execution::NetworkPolicy::NotEnforced
+            },
             sandbox_writable_policy: if execution.filesystem_write_policy
                 == "windows_low_integrity_private_projection_v1"
             {
@@ -5669,8 +5778,9 @@ fn real_execution_snapshot_record_json(
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{{},\"runtime_policy\":{},\"output_capture\":{},\"output_files\":[{}],\"raw_output_policy\":\"not_persisted\",\"source_truth\":\"sunlight_persisted_execution\"}}",
+        "{{{},\"command_started\":{},\"runtime_policy\":{},\"output_capture\":{},\"output_files\":[{}],\"raw_output_policy\":\"not_persisted\",\"source_truth\":\"sunlight_persisted_execution\"}}",
         execution_record_json(&record).trim_start_matches('{').trim_end_matches('}'),
+        execution.command_started,
         real_execution_runtime_policy_json(execution),
         real_execution_output_capture_json(execution),
         output_paths,
@@ -5684,7 +5794,7 @@ fn real_execution_runtime_policy_json(execution: &RealExecutionSnapshot) -> Stri
             "\"limits\":{{\"process_memory_bytes\":{},\"job_memory_bytes\":{},\"cpu_time_ms\":{},\"active_processes\":{}}},",
             "\"enforcement\":{{\"process_tree\":\"{}\",\"cpu\":\"{}\",\"memory\":\"{}\"}},",
             "\"environment\":{{\"inheritance\":\"{}\",\"allowlist\":{},\"values_recorded\":false}},",
-            "\"network\":\"{}\",",
+            "\"network\":{{\"requested\":\"{}\",\"effective\":\"{}\"}},",
             "\"filesystem_writes_requested\":\"{}\",",
             "\"filesystem_writes\":\"{}\"}}"
         ),
@@ -5713,6 +5823,7 @@ fn real_execution_runtime_policy_json(execution: &RealExecutionSnapshot) -> Stri
         json_escape(&execution.memory_policy),
         json_escape(&execution.environment_policy),
         string_array_json(execution.environment_allowlist.iter().map(String::as_str)),
+        json_escape(&execution.network_policy_requested),
         json_escape(&execution.network_policy),
         json_escape(&execution.filesystem_write_policy_requested),
         json_escape(&execution.filesystem_write_policy),
@@ -5939,6 +6050,10 @@ fn real_execution_warnings_json(
     let mut warnings = Vec::new();
     if execution.status == "timeout" {
         warnings.push("{\"code\":\"execution_timeout\",\"message\":\"inspect the timeout and rerun with an appropriate bounded policy\",\"details\":{}}".to_string());
+    } else if execution.termination_reason.as_deref()
+        == Some("execution_network_isolation_cleanup_failed")
+    {
+        warnings.push("{\"code\":\"execution_network_isolation_cleanup_failed\",\"message\":\"execution ran, but Windows isolation cleanup requires attention and retry\",\"details\":{\"command_started\":true}}".to_string());
     } else if execution.status == "policy_blocked" {
         warnings.push(format!(
             "{{\"code\":\"execution_resource_policy_blocked\",\"message\":\"the execution was terminated by a configured resource limit\",\"details\":{{\"termination_reason\":{}}}}}",
@@ -6361,7 +6476,7 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
             "\"checkpoints\":{{\"count\":{},\"unexported\":{},\"records\":[{}]}},",
             "\"exports\":{{\"count\":{},\"maps\":[{}]}},",
             "\"policy\":{{\"reports\":{},\"passed\":{},\"failed\":{},\"invalid_or_tampered\":{},\"missing_export_reports\":{}}},",
-            "\"execution_isolation\":{{\"enforced\":{},\"process_tree\":\"{}\",\"network\":\"unenforced\",\"filesystem_writes_requested\":\"private_projection_isolated\",\"filesystem_writes\":\"{}\",\"cpu\":\"{}\",\"memory\":\"{}\"}}}}"
+            "\"execution_isolation\":{{\"enforced\":{},\"process_tree\":\"{}\",\"network\":{{\"requested\":\"{}\",\"effective\":\"{}\"}},\"filesystem_writes_requested\":\"private_projection_isolated\",\"filesystem_writes\":\"{}\",\"cpu\":\"{}\",\"memory\":\"{}\"}}}}"
         ),
         json_escape(&state.repository_id),
         json_escape(&state.base_checkpoint_id),
@@ -6401,6 +6516,8 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
         summary.policy.missing_export_report_count,
         cfg!(windows),
         if cfg!(windows) { "windows_job_object" } else { "unenforced" },
+        state.executions.last().map_or("not_enforced", |execution| execution.network_policy_requested.as_str()),
+        state.executions.last().map_or("not_enforced", |execution| execution.network_policy.as_str()),
         if cfg!(windows) { "windows_low_integrity_private_projection_v1" } else { "not_enforced" },
         if cfg!(windows) { "windows_job_object_cpu_time" } else { "unenforced" },
         if cfg!(windows) { "windows_job_object_process_and_job_memory" } else { "unenforced" },
@@ -6983,6 +7100,33 @@ struct ExecutionRunOptions {
     command_argv: Vec<String>,
     cwd: String,
     integrity_fixture: Option<StoreIntegrityFixture>,
+    network_policy: Option<ExecutionNetworkPolicy>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionNetworkPolicy {
+    Disabled,
+    NotEnforced,
+}
+
+impl ExecutionNetworkPolicy {
+    fn parse(value: &str) -> Result<Self, CliError> {
+        match value {
+            DISABLED_NETWORK_POLICY => Ok(Self::Disabled),
+            NOT_ENFORCED_NETWORK_POLICY => Ok(Self::NotEnforced),
+            _ => Err(
+                invalid_request("sun run --network must be disabled or not_enforced")
+                    .with_detail("network", value),
+            ),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => DISABLED_NETWORK_POLICY,
+            Self::NotEnforced => NOT_ENFORCED_NETWORK_POLICY,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -7788,6 +7932,7 @@ fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptio
     let mut view_id = None;
     let mut cwd = ".".to_string();
     let mut integrity_fixture = None;
+    let mut network_policy = None;
     let mut command_argv = Vec::new();
     let mut args = ctx.args.iter().skip(1);
 
@@ -7834,6 +7979,12 @@ fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptio
                 })?;
                 integrity_fixture = Some(parse_store_integrity_fixture(value)?);
             }
+            "--network" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun run --network disabled|not_enforced")
+                })?;
+                network_policy = Some(ExecutionNetworkPolicy::parse(value)?);
+            }
             "--" => {
                 command_argv.extend(args.cloned());
                 break;
@@ -7865,6 +8016,7 @@ fn parse_execution_run_options(ctx: &CommandContext) -> Result<ExecutionRunOptio
         command_argv,
         cwd,
         integrity_fixture,
+        network_policy,
     })
 }
 
@@ -9909,6 +10061,13 @@ fn require_projection_policy(
 ) -> Result<ResolvedProjectionPolicy, CliError> {
     let repo_root = repo_root.into();
     let config = require_repository_config(repo_root.clone())?;
+    resolve_required_projection_policy(&repo_root, &config)
+}
+
+fn resolve_required_projection_policy(
+    repo_root: &Path,
+    config: &RepositoryConfig,
+) -> Result<ResolvedProjectionPolicy, CliError> {
     resolve_projection_policy(&repo_root, &config).map_err(|error| {
         CliError::new(
             "invalid_repository_config",
@@ -15815,7 +15974,7 @@ fn print_command_help(command: &str) {
         "policy" | "policy check-export" | "policy check-commit" | "policy explain" => println!("sun policy\n\nUsage:\n  sun policy check-export --checkpoint <checkpoint> [--branch <ref>] [--json]\n  sun policy check-commit [--paths <path>...] [--json]\n  sun policy explain <validation-report> [--json]"),
         "git" | "git export" => println!("sun git export\n\nUsage:\n  sun git export --checkpoint <checkpoint> --branch <ref> [--write-plan|--execute-local] [--repo <path>] [--json]"),
         "checkpoint" | "checkpoint create" => println!("sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--json]"),
-        "run" => println!("sun run\n\nUsage:\n  sun run --view <resolved-view-id> -- <command> [args...]\n\nRuntime bounds come from [execution_policy] in .sunlight/config.toml. Windows no-fixture runs use a restricted low-integrity token and private low-labeled projection/runtime roots for filesystem-write isolation, plus a dedicated Job Object for process-tree and resource containment. Non-Windows records unavailable dimensions as unenforced. Network isolation remains explicitly unenforced."),
+        "run" => println!("sun run\n\nUsage:\n  sun run --view <resolved-view-id> [--network disabled|not_enforced] -- <command> [args...]\n\nRuntime bounds come from [execution_policy] in .sunlight/config.toml. Windows runs always use restricted low-integrity filesystem isolation and a dedicated Job Object. Network disabled adds a capability-less per-execution AppContainer; not_enforced retains compatibility with ordinary user toolchains."),
         "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => println!("sun artifact operations\n\nUsage:\n  sun read <path> --session <session> [--json]\n  sun list [path-prefix] --session <session> [--json]\n  sun search <query> --session <session> [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification <class> [--json]"),
         "view" | "view resolve" => println!("sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nResolves persisted topic selections; conflicts and staleness remain inspectable records."),
         "project" | "project materialize" | "projection" | "projection create" => println!("sun project materialize\n\nUsage:\n  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export [--strategy copy|reflink|hardlink_readonly|overlay_copyup] [--no-copy-fallback] [--projection-root <path>] [--json]\n\nManaged projections adapt persisted views for filesystem tools and are not source truth. Automatic selection prefers safe Windows block cloning and falls back to full copy; --no-copy-fallback makes the requested strategy required."),

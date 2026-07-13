@@ -188,6 +188,15 @@ impl ContainedChild {
 
         command.creation_flags(CREATE_SUSPENDED);
         let mut child = command.spawn().map_err(ContainmentSpawnError::Command)?;
+        if super::windows_isolation::test_failure_requested("job_before_assign") {
+            let error = io::Error::new(
+                io::ErrorKind::Other,
+                "injected Windows Job Object containment setup failure",
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ContainmentSpawnError::Setup(error));
+        }
         let process_handle = child.as_raw_handle() as Handle;
         if unsafe { AssignProcessToJobObject(job.0, process_handle) } == 0 {
             let error = last_error("assign suspended process to Windows Job Object");

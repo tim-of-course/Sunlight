@@ -132,9 +132,13 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
     let execution = mcp.call(
         13,
         "execution_run",
-        json!({"view":view,"program":"git","args":["--version"],"cwd":"."}),
+        json!({"view":view,"program":"git","args":["--version"],"cwd":".","network":"not_enforced"}),
     );
     assert_eq!(execution["data"]["command"], "execution.run");
+    assert_eq!(
+        execution["data"]["runtime_policy"]["network"]["requested"],
+        "not_enforced"
+    );
     let checkpoint = mcp.call(14, "checkpoint_create", json!({"view":view}));
     assert_eq!(checkpoint["data"]["command"], "checkpoint.create");
     let checkpoint_id = checkpoint["data"]["checkpoint"]["id"]

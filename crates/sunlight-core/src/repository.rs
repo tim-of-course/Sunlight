@@ -25,6 +25,11 @@ pub const DEFAULT_EXECUTION_CPU_TIME_LIMIT_MS: u64 = 300_000;
 pub const DEFAULT_EXECUTION_ACTIVE_PROCESS_LIMIT: u32 = 32;
 pub const CONSERVATIVE_ENVIRONMENT_INHERITANCE: &str = "minimal_os_allowlist";
 pub const NOT_ENFORCED_NETWORK_POLICY: &str = "not_enforced";
+pub const DISABLED_NETWORK_POLICY: &str = "disabled";
+
+pub const fn default_local_network_policy() -> &'static str {
+    NOT_ENFORCED_NETWORK_POLICY
+}
 
 const MAX_EXECUTION_TIMEOUT_MS: u64 = 86_400_000;
 const MAX_EXECUTION_OUTPUT_LIMIT_BYTES: u64 = 67_108_864;
@@ -192,7 +197,7 @@ impl RepositoryConfig {
                 cpu_time_limit_ms: DEFAULT_EXECUTION_CPU_TIME_LIMIT_MS,
                 active_process_limit: DEFAULT_EXECUTION_ACTIVE_PROCESS_LIMIT,
                 environment_inheritance: CONSERVATIVE_ENVIRONMENT_INHERITANCE.to_string(),
-                network_policy: NOT_ENFORCED_NETWORK_POLICY.to_string(),
+                network_policy: default_local_network_policy().to_string(),
                 filesystem_write_policy: PRIVATE_PROJECTION_FILESYSTEM_WRITE_POLICY.to_string(),
             },
             git_interop: GitInteropPolicy {
@@ -363,7 +368,7 @@ sunlight_commit_policy = \"{}\"
                 network_policy: parse_string_key_or_default(
                     input,
                     "network_policy",
-                    NOT_ENFORCED_NETWORK_POLICY,
+                    default_local_network_policy(),
                     &path,
                 )?,
                 filesystem_write_policy: parse_string_key_or_default(
@@ -500,12 +505,14 @@ sunlight_commit_policy = \"{}\"
                 ),
             });
         }
-        if self.execution_policy.network_policy != NOT_ENFORCED_NETWORK_POLICY {
+        if ![NOT_ENFORCED_NETWORK_POLICY, DISABLED_NETWORK_POLICY]
+            .contains(&self.execution_policy.network_policy.as_str())
+        {
             return Err(RepositoryError::InvalidConfig {
                 path,
                 message: format!(
-                    "unsupported execution_policy.network_policy `{}`; supported value is `{NOT_ENFORCED_NETWORK_POLICY}`",
-                    self.execution_policy.network_policy
+                    "unsupported execution_policy.network_policy `{}`; supported values are `{NOT_ENFORCED_NETWORK_POLICY}` and `{DISABLED_NETWORK_POLICY}`",
+                    self.execution_policy.network_policy,
                 ),
             });
         }
@@ -566,6 +573,7 @@ pub fn resolve_projection_policy(
     let config_path = repo_root.join(SUNLIGHT_DIR).join(CONFIG_FILE);
     config.validate(&config_path)?;
     let configured = Path::new(&config.projection_policy.default_root);
+    let configured_is_absolute = configured.is_absolute();
     let mut normalized = PathBuf::new();
     for component in configured.components() {
         match component {
@@ -584,11 +592,14 @@ pub fn resolve_projection_policy(
                     "must not contain parent traversal",
                 ));
             }
+            Component::RootDir | Component::Prefix(_) if configured_is_absolute => {
+                normalized.push(component.as_os_str());
+            }
             Component::RootDir | Component::Prefix(_) => {
                 return Err(invalid_projection_root(
                     &config_path,
                     &config.projection_policy.default_root,
-                    "must be repository-relative, not absolute",
+                    "contains an invalid path prefix",
                 ));
             }
         }
@@ -604,48 +615,106 @@ pub fn resolve_projection_policy(
             "must not be empty",
         ));
     }
-    if components
-        .iter()
-        .any(|component| component.eq_ignore_ascii_case(".git"))
-    {
-        return Err(invalid_projection_root(
-            &config_path,
-            &config.projection_policy.default_root,
-            "must not overlap `.git`",
-        ));
-    }
-    if components.first().map(String::as_str) != Some(SUNLIGHT_DIR) || components.len() < 2 {
-        return Err(invalid_projection_root(
-            &config_path,
-            &config.projection_policy.default_root,
-            "must be a descendant of `.sunlight` and must not overlap the source tree",
-        ));
-    }
-    let protected = AUTHORITATIVE_DIRS.iter().copied().chain([
-        "local",
-        "quarantine",
-        CONFIG_FILE,
-        GITIGNORE_FILE,
-        "index.sqlite",
-    ]);
-    if protected.into_iter().any(|name| components[1] == name) {
-        return Err(invalid_projection_root(
-            &config_path,
-            &config.projection_policy.default_root,
-            "must not overlap authoritative or quarantine state",
-        ));
-    }
-
     let repo_root = fs::canonicalize(repo_root).map_err(|source| RepositoryError::Io {
         path: repo_root.to_path_buf(),
         source,
     })?;
-    let managed_root = repo_root.join(&normalized);
-    reject_symlinked_managed_components(&repo_root, &normalized, &config_path)?;
+    let managed_root = if configured_is_absolute {
+        reject_reparse_path_components(&normalized, &config_path)?;
+        let managed_root = fs::canonicalize(&normalized).map_err(|source| RepositoryError::Io {
+            path: normalized.clone(),
+            source,
+        })?;
+        if managed_root == repo_root
+            || managed_root.starts_with(&repo_root)
+            || repo_root.starts_with(&managed_root)
+        {
+            return Err(invalid_projection_root(
+                &config_path,
+                &config.projection_policy.default_root,
+                "absolute managed root must be disjoint from the repository source tree",
+            ));
+        }
+        managed_root
+    } else {
+        if components
+            .iter()
+            .any(|component| component.eq_ignore_ascii_case(".git"))
+        {
+            return Err(invalid_projection_root(
+                &config_path,
+                &config.projection_policy.default_root,
+                "must not overlap `.git`",
+            ));
+        }
+        if components.first().map(String::as_str) != Some(SUNLIGHT_DIR) || components.len() < 2 {
+            return Err(invalid_projection_root(
+                &config_path,
+                &config.projection_policy.default_root,
+                "must be a descendant of `.sunlight` and must not overlap the source tree",
+            ));
+        }
+        let protected = AUTHORITATIVE_DIRS.iter().copied().chain([
+            "local",
+            "quarantine",
+            CONFIG_FILE,
+            GITIGNORE_FILE,
+            "index.sqlite",
+        ]);
+        if protected.into_iter().any(|name| components[1] == name) {
+            return Err(invalid_projection_root(
+                &config_path,
+                &config.projection_policy.default_root,
+                "must not overlap authoritative or quarantine state",
+            ));
+        }
+        reject_symlinked_managed_components(&repo_root, &normalized, &config_path)?;
+        repo_root.join(&normalized)
+    };
     Ok(ResolvedProjectionPolicy {
         managed_root,
         managed_root_relative: normalized,
     })
+}
+
+fn reject_reparse_path_components(path: &Path, config_path: &Path) -> Result<(), RepositoryError> {
+    for current in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        let metadata = fs::symlink_metadata(current).map_err(|source| RepositoryError::Io {
+            path: current.to_path_buf(),
+            source,
+        })?;
+        if metadata_is_reparse_point(&metadata) {
+            return Err(RepositoryError::InvalidConfig {
+                path: config_path.to_path_buf(),
+                message: format!(
+                    "unsafe projection_policy.default_root: managed path component `{}` is a reparse point",
+                    current.display()
+                ),
+            });
+        }
+        if !metadata.is_dir() {
+            return Err(RepositoryError::InvalidConfig {
+                path: config_path.to_path_buf(),
+                message: format!(
+                    "unsafe projection_policy.default_root: managed path component `{}` is not a directory",
+                    current.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_attributes() & 0x0000_0400 != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn reject_symlinked_managed_components(
@@ -911,7 +980,10 @@ mod tests {
         assert!(config.contains("cpu_time_limit_ms = 300000"));
         assert!(config.contains("active_process_limit = 32"));
         assert!(config.contains("environment_inheritance = \"minimal_os_allowlist\""));
-        assert!(config.contains("network_policy = \"not_enforced\""));
+        assert!(config.contains(&format!(
+            "network_policy = \"{}\"",
+            default_local_network_policy()
+        )));
 
         let gitignore = fs::read_to_string(repo.path().join(".sunlight/.gitignore")).unwrap();
         assert!(gitignore.contains("/local/"));
@@ -973,6 +1045,7 @@ mod tests {
                         | "active_process_limit = 32"
                         | "environment_inheritance = \"minimal_os_allowlist\""
                         | "network_policy = \"not_enforced\""
+                        | "network_policy = \"disabled\""
                 )
             })
             .collect::<Vec<_>>()
@@ -1009,6 +1082,33 @@ mod tests {
         );
         assert_eq!(
             config.execution_policy.network_policy,
+            default_local_network_policy()
+        );
+    }
+
+    #[test]
+    fn explicit_network_policies_are_preserved() {
+        let input = RepositoryConfig::new("repo_test".to_string())
+            .to_toml()
+            .replace(
+                "network_policy = \"not_enforced\"",
+                "network_policy = \"disabled\"",
+            );
+
+        let config = RepositoryConfig::from_toml(&input, ".sunlight/config.toml").unwrap();
+
+        assert_eq!(
+            config.execution_policy.network_policy,
+            DISABLED_NETWORK_POLICY
+        );
+
+        let input = input.replace(
+            "network_policy = \"disabled\"",
+            "network_policy = \"not_enforced\"",
+        );
+        let config = RepositoryConfig::from_toml(&input, ".sunlight/config.toml").unwrap();
+        assert_eq!(
+            config.execution_policy.network_policy,
             NOT_ENFORCED_NETWORK_POLICY
         );
     }
@@ -1031,11 +1131,6 @@ mod tests {
                 "environment_inheritance = \"minimal_os_allowlist\"",
                 "environment_inheritance = \"all\"",
                 "execution_policy.environment_inheritance",
-            ),
-            (
-                "network_policy = \"not_enforced\"",
-                "network_policy = \"disabled\"",
-                "execution_policy.network_policy",
             ),
             (
                 "stderr_limit_bytes = 1048576",
@@ -1119,6 +1214,7 @@ mod tests {
     #[test]
     fn projection_policy_resolves_safe_custom_root_and_rejects_unsafe_roots() {
         let repo = TestRepo::new("projection-policy");
+        let external = TestRepo::new("projection-policy-external");
         fs::create_dir_all(repo.path().join(".sunlight")).unwrap();
         let mut config = RepositoryConfig::new("repo_test".to_string());
         config.projection_policy.default_root = ".sunlight/custom-projections".to_string();
@@ -1139,6 +1235,14 @@ mod tests {
             resolved.managed_root.join("projection_2/root")
         );
 
+        config.projection_policy.default_root = external.path().display().to_string();
+        let resolved = resolve_projection_policy(repo.path(), &config).unwrap();
+        assert_eq!(
+            resolved.managed_root,
+            fs::canonicalize(external.path()).unwrap()
+        );
+        assert!(resolved.managed_root_relative.is_absolute());
+
         for root in [
             "",
             ".sunlight/../outside",
@@ -1157,9 +1261,9 @@ mod tests {
                 "root {root:?}: {error}"
             );
         }
-        config.projection_policy.default_root = repo.path().join("outside").display().to_string();
+        config.projection_policy.default_root = repo.path().display().to_string();
         let error = resolve_projection_policy(repo.path(), &config).unwrap_err();
-        assert!(error.to_string().contains("not absolute"));
+        assert!(error.to_string().contains("disjoint"));
     }
 
     struct TestRepo {

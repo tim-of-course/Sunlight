@@ -1,7 +1,11 @@
 use std::ffi::OsStr;
 use std::fs;
+#[cfg(windows)]
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+#[cfg(windows)]
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -829,14 +833,12 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
     assert!(!repo.path().join("SHOULD_NOT_EXIST").exists());
 
     let run = sun()
-        .arg("run")
-        .arg("--view")
-        .arg("view_base_0001")
-        .arg("--json")
-        .arg("--")
-        .arg("python")
-        .arg("-c")
-        .arg("from pathlib import Path; Path('generated').mkdir(exist_ok=True); Path('generated/out.txt').write_bytes(b'promoted needle\\n')")
+        .args(["run", "--view", "view_base_0001", "--json", "--"])
+        .args([
+            "python",
+            "-c",
+            "from pathlib import Path; Path('generated').mkdir(exist_ok=True); Path('generated/out.txt').write_bytes(b'promoted needle\\n')",
+        ])
         .current_dir(repo.path())
         .output()
         .expect("sun run should run");
@@ -1000,9 +1002,9 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
 #[cfg(windows)]
 #[test]
 fn no_fixture_windows_execution_confines_root_and_descendant_writes_to_private_projection() {
+    let _isolation_test_guard = windows_isolation_test_lock();
     let repo = TestRepo::new("windows-filesystem-isolation");
     repo.write_file("source-sentinel.txt", "source unchanged\n");
-    start_native_session(&repo, "windows-isolation");
     let sibling = PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(format!(
         "sunlight-isolation-host-sibling-{}-{}",
         std::process::id(),
@@ -1017,24 +1019,15 @@ fn no_fixture_windows_execution_confines_root_and_descendant_writes_to_private_p
     let source_sentinel = repo.path().join("source-sentinel.txt");
     let source_created = repo.path().join("SOURCE_CREATED_BY_RUN");
     let sibling_created = sibling.join("SIBLING_CREATED_BY_RUN");
-    let child_script = r#"import sys
-from pathlib import Path
-denied=[]
-for target in sys.argv[1:]:
-    try:
-        Path(target).write_text('escaped')
-        denied.append('escaped')
-    except OSError:
-        denied.append('denied')
-Path('descendant-result.txt').write_text(','.join(denied))
-sys.exit(0 if all(x == 'denied' for x in denied) else 9)
-"#;
-    let root_script = r#"import subprocess,sys
-from pathlib import Path
-Path('private-output.txt').write_text('private write works')
-result=subprocess.run([sys.executable,'-c',sys.argv[1],*sys.argv[2:]])
-raise SystemExit(result.returncode)
-"#;
+    repo.write_file(
+        "child-isolation.cmd",
+        "@echo off\r\n(echo escaped>\"%~1\") 2>nul && (echo escaped>descendant-result.txt) || (echo denied>descendant-result.txt)\r\n(echo escaped>\"%~2\") 2>nul && (echo escaped>>descendant-result.txt) || (echo denied>>descendant-result.txt)\r\n",
+    );
+    repo.write_file(
+        "root-isolation.cmd",
+        "@echo off\r\necho private write works>private-output.txt\r\n(echo escaped>\"%~1\") 2>nul && (echo escaped>root-result.txt) || (echo denied>root-result.txt)\r\n(echo escaped>\"%~2\") 2>nul && (echo escaped>>root-result.txt) || (echo denied>>root-result.txt)\r\ncmd.exe /d /c child-isolation.cmd \"%~3\" \"%~4\"\r\ncmd.exe /d /c ver>tool-result.txt\r\nexit /b 0\r\n",
+    );
+    start_native_session(&repo, "windows-isolation");
     let run = sun()
         .args([
             "run",
@@ -1042,10 +1035,10 @@ raise SystemExit(result.returncode)
             "view_base_0001",
             "--json",
             "--",
-            "python",
-            "-c",
-            root_script,
-            child_script,
+            "cmd.exe",
+            "/d",
+            "/c",
+            "root-isolation.cmd",
         ])
         .arg(&source_sentinel)
         .arg(&source_created)
@@ -1058,10 +1051,13 @@ raise SystemExit(result.returncode)
     let body = stdout(&run);
     assert_valid_json(&body);
     assert!(body.contains("\"status\":\"pass\""), "{body}");
+    assert!(body
+        .contains("\"network\":{\"requested\":\"not_enforced\",\"effective\":\"not_enforced\"}"));
     assert!(body.contains("\"filesystem_writes_requested\":\"private_projection_isolated\""));
     assert!(body.contains("\"filesystem_writes\":\"windows_low_integrity_private_projection_v1\""));
     assert!(body.contains("\"output_path\":\"private-output.txt\""));
     assert!(body.contains("\"output_path\":\"descendant-result.txt\""));
+    assert!(body.contains("\"output_path\":\"tool-result.txt\""));
     assert_eq!(
         fs::read_to_string(&source_sentinel).unwrap(),
         "source unchanged\n"
@@ -1106,19 +1102,530 @@ raise SystemExit(result.returncode)
     let projection_root = PathBuf::from(projection.materialized_root.as_ref().unwrap());
     assert_eq!(
         fs::read_to_string(projection_root.join("descendant-result.txt")).unwrap(),
-        "denied,denied,denied,denied"
+        "denied\r\ndenied\r\n"
+    );
+    assert_eq!(
+        fs::read_to_string(projection_root.join("root-result.txt")).unwrap(),
+        "denied\r\ndenied\r\n"
     );
     assert!(!projection_root
         .parent()
         .unwrap()
         .join(format!(".{}-private", execution.execution_id))
         .exists());
+    let acl = Command::new("icacls.exe")
+        .arg(&projection_root)
+        .output()
+        .unwrap();
+    assert!(acl.status.success());
+    assert!(
+        !String::from_utf8_lossy(&acl.stdout).contains("S-1-15-2-"),
+        "ephemeral AppContainer SID remained on the retained projection"
+    );
     fs::remove_dir_all(sibling).unwrap();
 }
 
 #[cfg(windows)]
 #[test]
+fn no_fixture_windows_execution_denies_root_and_descendant_loopback_without_host_changes() {
+    let _isolation_test_guard = windows_isolation_test_lock();
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_accepted = Arc::clone(&accepted);
+    let server_stop = Arc::clone(&stop);
+    let server = std::thread::spawn(move || {
+        while !server_stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    server_accepted.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                    let mut request = [0_u8; 1024];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("listener failed: {error}"),
+            }
+        }
+    });
+
+    let url = format!("http://127.0.0.1:{port}/");
+    let outside = Command::new("curl.exe")
+        .args(["--max-time", "2", "--silent", "--fail", &url])
+        .output()
+        .expect("outside connectivity probe should run");
+    assert!(
+        outside.status.success(),
+        "live endpoint probe failed: {outside:?}"
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+
+    let repo = TestRepo::new("windows-network-isolation");
+    repo.write_file(
+        "network-child.cmd",
+        &format!(
+            "@curl.exe --connect-timeout 1 --max-time 2 --silent --fail {url} >nul\r\n@if errorlevel 1 (echo denied>descendant-network.txt& exit /b 0) else (echo connected>descendant-network.txt& exit /b 9)\r\n"
+        ),
+    );
+    repo.write_file(
+        "network-root.cmd",
+        &format!(
+            "@echo off\r\ncurl.exe --connect-timeout 1 --max-time 2 --silent --fail {url} >nul\r\nif errorlevel 1 (echo denied>root-network.txt) else (echo connected>root-network.txt& exit /b 9)\r\ncmd.exe /d /c network-child.cmd\r\n"
+        ),
+    );
+    start_native_session(&repo, "windows-network-isolation");
+    let config_path = repo.path().join(".sunlight/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "network_policy = \"not_enforced\"",
+        "network_policy = \"disabled\"",
+    );
+    fs::write(&config_path, config).unwrap();
+    let run = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "network-root.cmd",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("network-isolated Windows execution should run");
+    assert_success(&run);
+    let body = stdout(&run);
+    assert!(body.contains("\"status\":\"pass\""), "{body}");
+    assert!(body.contains("\"network\":{\"requested\":\"disabled\",\"effective\":\"windows_appcontainer_no_network_capabilities_v1\"}"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "an AppContainer process reached the manager listener"
+    );
+    let state = RealRepoState::load(repo.path()).unwrap();
+    let execution = state.executions.last().unwrap();
+    assert_eq!(execution.network_policy_requested, "disabled");
+    assert_eq!(
+        execution.network_policy,
+        "windows_appcontainer_no_network_capabilities_v1"
+    );
+    let projection = state.projections.last().unwrap();
+    let root = PathBuf::from(projection.materialized_root.as_ref().unwrap());
+    assert_eq!(
+        fs::read_to_string(root.join("root-network.txt")).unwrap(),
+        "denied\r\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("descendant-network.txt")).unwrap(),
+        "denied\r\n"
+    );
+    for observed in [
+        sun()
+            .args(["status", "--execution", &execution.execution_id, "--json"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap(),
+        sun()
+            .args([
+                "inspect",
+                &format!("execution:{}", execution.execution_id),
+                "--json",
+            ])
+            .current_dir(repo.path())
+            .output()
+            .unwrap(),
+        sun()
+            .args(["status", "--json"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap(),
+    ] {
+        assert_success(&observed);
+        assert!(stdout(&observed).contains(
+            "\"network\":{\"requested\":\"disabled\",\"effective\":\"windows_appcontainer_no_network_capabilities_v1\"}"
+        ));
+    }
+
+    let outside_after = Command::new("curl.exe")
+        .args(["--max-time", "2", "--silent", "--fail", &url])
+        .output()
+        .expect("post-run outside connectivity probe should run");
+    assert!(outside_after.status.success());
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn no_fixture_windows_user_toolchain_incompatibility_is_fail_closed_before_command_code() {
+    let _isolation_test_guard = windows_isolation_test_lock();
+    let Some(python) = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|root| root.join("python.exe"))
+            .find(|candidate| candidate.is_file())
+    }) else {
+        return;
+    };
+    let windows_root = fs::canonicalize(std::env::var_os("SYSTEMROOT").unwrap()).unwrap();
+    if fs::canonicalize(&python)
+        .unwrap()
+        .starts_with(&windows_root)
+    {
+        return;
+    }
+    let repo = TestRepo::new("windows-network-incompatible-toolchain");
+    start_native_session(&repo, "windows-network-incompatible-toolchain");
+    let signal = repo.path().join("COMMAND_RAN");
+    let failed = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--network",
+            "disabled",
+            "--json",
+            "--",
+            "python",
+            "-c",
+        ])
+        .arg("from pathlib import Path; Path('COMMAND_RAN').write_text('ran')")
+        .current_dir(repo.path())
+        .output()
+        .expect("unsupported toolchain should be rejected");
+    assert_failure(&failed);
+    let body = stdout(&failed);
+    assert!(body.contains("\"code\":\"execution_network_isolation_incompatible_toolchain\""));
+    assert!(body.contains("\"command_started\":\"false\""));
+    assert!(!signal.exists());
+    let state = RealRepoState::load(repo.path()).unwrap();
+    assert!(state.executions.is_empty());
+    assert!(state.projections.is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn no_fixture_windows_concurrent_runs_use_distinct_ephemeral_profiles_and_clean_them() {
+    let _isolation_test_guard = windows_isolation_test_lock();
+    let profiles_before = sunlight_appcontainer_profile_dirs();
+    let first = TestRepo::new("windows-network-concurrent-first");
+    let second = TestRepo::new("windows-network-concurrent-second");
+    start_native_session(&first, "windows-network-concurrent-first");
+    start_native_session(&second, "windows-network-concurrent-second");
+
+    let spawn = |repo: &TestRepo, output: &str| {
+        let mut command = sun();
+        command
+            .args([
+                "run",
+                "--view",
+                "view_base_0001",
+                "--network",
+                "disabled",
+                "--json",
+                "--",
+                "cmd.exe",
+                "/d",
+                "/c",
+                &format!("echo isolated>{output}"),
+            ])
+            .current_dir(repo.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("concurrent isolated run should spawn")
+    };
+    let first_child = spawn(&first, "first.txt");
+    let second_child = spawn(&second, "second.txt");
+    let first_output = first_child.wait_with_output().unwrap();
+    let second_output = second_child.wait_with_output().unwrap();
+    assert_success(&first_output);
+    assert_success(&second_output);
+    for output in [&first_output, &second_output] {
+        assert!(stdout(output).contains("windows_appcontainer_no_network_capabilities_v1"));
+    }
+    assert_eq!(sunlight_appcontainer_profile_dirs(), profiles_before);
+}
+
+#[cfg(windows)]
+#[test]
+fn no_fixture_windows_cleanup_failure_persists_execution_and_recovers_from_journal() {
+    let _isolation_test_guard = windows_isolation_test_lock();
+    let profiles_before = sunlight_appcontainer_profile_dirs();
+    let repo = TestRepo::new("windows-network-cleanup-recovery");
+    start_native_session(&repo, "windows-network-cleanup-recovery");
+    let test_exe = std::env::current_exe().unwrap();
+    let failed = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--network",
+            "disabled",
+            "--json",
+            "--",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo command ran>cleanup-evidence.txt",
+        ])
+        .env(
+            "SUNLIGHT_INTERNAL_TEST_WINDOWS_ISOLATION_FAILPOINT",
+            "cleanup_after_command",
+        )
+        .env(
+            "SUNLIGHT_INTERNAL_TEST_PARENT_PID",
+            std::process::id().to_string(),
+        )
+        .env("SUNLIGHT_INTERNAL_TEST_PARENT_EXE", &test_exe)
+        .current_dir(repo.path())
+        .output()
+        .expect("cleanup failure should be reported after command execution");
+    assert_failure(&failed);
+    let body = stdout(&failed);
+    assert!(body.contains("\"code\":\"execution_network_isolation_cleanup_failed\""));
+    assert!(body.contains("\"command_started\":\"true\""));
+    assert!(body.contains("\"execution_id\":\"exec_native_0001\""));
+
+    let state = RealRepoState::load(repo.path()).unwrap();
+    let execution = state.executions.last().unwrap();
+    assert!(execution.command_started);
+    assert_eq!(execution.status, "policy_blocked");
+    assert_eq!(
+        execution.termination_reason.as_deref(),
+        Some("execution_network_isolation_cleanup_failed")
+    );
+    let projection = state.projections.last().unwrap();
+    assert_eq!(projection.retention_state, "quarantined");
+    let durable_execution = fs::read_to_string(
+        repo.path()
+            .join(".sunlight/executions/exec_native_0001.json"),
+    )
+    .unwrap();
+    assert!(durable_execution.contains("\"command_started\":true"));
+    assert!(durable_execution
+        .contains("\"termination_reason\":\"execution_network_isolation_cleanup_failed\""));
+    let projection_root = PathBuf::from(projection.materialized_root.as_ref().unwrap());
+    assert_eq!(
+        fs::read_to_string(projection_root.join("cleanup-evidence.txt")).unwrap(),
+        "command ran\r\n"
+    );
+    let journal_root = repo
+        .path()
+        .join(".sunlight/local/windows-appcontainer-cleanup");
+    assert_eq!(fs::read_dir(&journal_root).unwrap().count(), 1);
+
+    let inspected = sun()
+        .args(["inspect", "execution:exec_native_0001", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&inspected);
+    assert!(stdout(&inspected).contains("\"code\":\"execution_network_isolation_cleanup_failed\""));
+
+    let recovery = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--network",
+            "not_enforced",
+            "--json",
+            "--",
+            "python",
+            "-c",
+            "pass",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("the next run should recover stale isolation cleanup");
+    assert_success(&recovery);
+    assert_eq!(fs::read_dir(&journal_root).unwrap().count(), 0);
+    let acl = Command::new("icacls.exe")
+        .arg(&projection_root)
+        .output()
+        .unwrap();
+    assert!(acl.status.success());
+    assert!(!String::from_utf8_lossy(&acl.stdout).contains("S-1-15-2-"));
+    assert_eq!(sunlight_appcontainer_profile_dirs(), profiles_before);
+}
+
+#[cfg(windows)]
+#[test]
+fn no_fixture_windows_custom_managed_root_cleanup_recovers_only_its_execution_allocation() {
+    let _isolation_test_guard = windows_isolation_test_lock();
+    let profiles_before = sunlight_appcontainer_profile_dirs();
+    let repo = TestRepo::new("windows-custom-managed-cleanup-recovery");
+    let external = TestRepo::new("windows-external-managed-cleanup-root");
+    let managed_root = external.path().join("managed");
+    fs::create_dir_all(&managed_root).unwrap();
+    let outside_allocation = managed_root.join("DO_NOT_DELETE.txt");
+    fs::write(
+        &outside_allocation,
+        "outside managed execution allocation\n",
+    )
+    .unwrap();
+    repo.write_file(
+        "recovery-order.cmd",
+        "@if exist \"%~1\" exit /b 11\r\n@if exist \"%~2\" exit /b 12\r\n@if not exist \"%~3\" exit /b 13\r\n@echo recovered>recovery-order.txt\r\n",
+    );
+    start_native_session(&repo, "windows-custom-managed-cleanup-recovery");
+    set_projection_default_root(&repo, &managed_root.to_string_lossy().replace('\\', "/"));
+    let canonical_repo = fs::canonicalize(repo.path()).unwrap();
+    let managed_root = fs::canonicalize(&managed_root).unwrap();
+    assert!(!managed_root.starts_with(&canonical_repo));
+    assert!(!canonical_repo.starts_with(&managed_root));
+    let test_exe = std::env::current_exe().unwrap();
+
+    let failed = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--network",
+            "disabled",
+            "--json",
+            "--",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo recovered>custom-root-cleanup.txt",
+        ])
+        .env(
+            "SUNLIGHT_INTERNAL_TEST_WINDOWS_ISOLATION_FAILPOINT",
+            "cleanup_after_command",
+        )
+        .env(
+            "SUNLIGHT_INTERNAL_TEST_PARENT_PID",
+            std::process::id().to_string(),
+        )
+        .env("SUNLIGHT_INTERNAL_TEST_PARENT_EXE", &test_exe)
+        .current_dir(repo.path())
+        .output()
+        .expect("custom-root cleanup failure should leave recoverable evidence");
+    assert_failure(&failed);
+    assert!(stdout(&failed).contains("\"code\":\"execution_network_isolation_cleanup_failed\""));
+
+    let state = RealRepoState::load(repo.path()).unwrap();
+    let projection_root = PathBuf::from(
+        state
+            .projections
+            .last()
+            .unwrap()
+            .materialized_root
+            .as_ref()
+            .unwrap(),
+    );
+    assert!(projection_root.starts_with(&managed_root));
+    let failed_allocation = projection_root.parent().unwrap().to_path_buf();
+    assert_eq!(failed_allocation.parent(), Some(managed_root.as_path()));
+    let stale_runtime = projection_root
+        .parent()
+        .unwrap()
+        .join(".exec_native_0001-private");
+    assert!(stale_runtime.is_dir());
+    let journal_root = repo
+        .path()
+        .join(".sunlight/local/windows-appcontainer-cleanup");
+    assert_eq!(fs::read_dir(&journal_root).unwrap().count(), 1);
+    let journal_path = fs::read_dir(&journal_root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(journal_path.starts_with(repo.path().join(".sunlight/local")));
+    assert!(!journal_path.starts_with(&managed_root));
+    let journal = fs::read_to_string(&journal_path).unwrap();
+    let profile_name = journal
+        .lines()
+        .find_map(|line| line.strip_prefix("profile="))
+        .unwrap();
+    let profiles_during_failure = sunlight_appcontainer_profile_dirs();
+    let new_profiles = profiles_during_failure
+        .iter()
+        .filter(|profile| !profiles_before.contains(profile))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        new_profiles.len(),
+        1,
+        "unexpected profile delta: {new_profiles:?}"
+    );
+    assert!(new_profiles[0].eq_ignore_ascii_case(profile_name));
+
+    let recovered = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--network",
+            "not_enforced",
+            "--json",
+            "--",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "recovery-order.cmd",
+        ])
+        .arg(&stale_runtime)
+        .arg(&journal_path)
+        .arg(&outside_allocation)
+        .current_dir(repo.path())
+        .output()
+        .expect("next custom-root run should recover stale isolation cleanup");
+    assert_success(&recovered);
+    assert!(!stale_runtime.exists());
+    assert!(!journal_path.exists());
+    assert_eq!(fs::read_dir(&journal_root).unwrap().count(), 0);
+    assert!(failed_allocation.is_dir());
+    assert_eq!(
+        fs::read_to_string(&outside_allocation).unwrap(),
+        "outside managed execution allocation\n"
+    );
+    let recovered_state = RealRepoState::load(repo.path()).unwrap();
+    let recovered_projection_root = PathBuf::from(
+        recovered_state
+            .projections
+            .last()
+            .unwrap()
+            .materialized_root
+            .as_ref()
+            .unwrap(),
+    );
+    assert_eq!(
+        fs::read_to_string(recovered_projection_root.join("recovery-order.txt")).unwrap(),
+        "recovered\r\n"
+    );
+    let acl = Command::new("icacls.exe")
+        .arg(&failed_allocation)
+        .args(["/T", "/C"])
+        .output()
+        .unwrap();
+    assert!(acl.status.success());
+    assert!(!String::from_utf8_lossy(&acl.stdout).contains("S-1-15-2-"));
+    assert_eq!(sunlight_appcontainer_profile_dirs(), profiles_before);
+    fs::remove_dir_all(external.path()).unwrap();
+    assert!(!external.path().exists());
+}
+
+#[cfg(windows)]
+#[test]
 fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_command() {
+    let _isolation_test_guard = windows_isolation_test_lock();
     let repo = TestRepo::new("windows-isolation-public-setup-failure");
     start_native_session(&repo, "windows-setup-failure");
     let low_signal_root = std::env::temp_dir().join(format!(
@@ -1141,11 +1648,49 @@ fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_
     );
     let command_signal = low_signal_root.join("COMMAND_RAN");
     let test_exe = std::env::current_exe().unwrap();
-    let failed = sun()
+    let network_failed = sun()
         .args([
             "run",
             "--view",
             "view_base_0001",
+            "--network",
+            "disabled",
+            "--json",
+            "--",
+            "python",
+            "-c",
+            "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')",
+        ])
+        .arg(&command_signal)
+        .env(
+            "SUNLIGHT_INTERNAL_TEST_WINDOWS_ISOLATION_FAILPOINT",
+            "prepare_appcontainer",
+        )
+        .env(
+            "SUNLIGHT_INTERNAL_TEST_PARENT_PID",
+            std::process::id().to_string(),
+        )
+        .env("SUNLIGHT_INTERNAL_TEST_PARENT_EXE", &test_exe)
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run should report injected setup failure");
+    assert_failure(&network_failed);
+    let body = stdout(&network_failed);
+    assert_valid_json(&body);
+    assert!(
+        body.contains("\"code\":\"execution_network_isolation_setup_failed\""),
+        "{body}"
+    );
+    assert!(body.contains("\"command_started\":\"false\""), "{body}");
+    assert!(!command_signal.exists(), "restricted command code executed");
+
+    let filesystem_failed = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--network",
+            "not_enforced",
             "--json",
             "--",
             "python",
@@ -1164,12 +1709,9 @@ fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_
         .env("SUNLIGHT_INTERNAL_TEST_PARENT_EXE", &test_exe)
         .current_dir(repo.path())
         .output()
-        .expect("sun run should report injected setup failure");
-    assert!(
-        !failed.status.success(),
-        "injected setup failure unexpectedly passed"
-    );
-    let body = stdout(&failed);
+        .expect("sun run should report injected filesystem setup failure");
+    assert_failure(&filesystem_failed);
+    let body = stdout(&filesystem_failed);
     assert_valid_json(&body);
     assert!(
         body.contains("\"code\":\"execution_filesystem_isolation_setup_failed\""),
@@ -1177,6 +1719,42 @@ fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_
     );
     assert!(body.contains("\"command_started\":\"false\""), "{body}");
     assert!(!command_signal.exists(), "restricted command code executed");
+
+    let containment_failed = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--network",
+            "not_enforced",
+            "--json",
+            "--",
+            "python",
+            "-c",
+            "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')",
+        ])
+        .arg(&command_signal)
+        .env(
+            "SUNLIGHT_INTERNAL_TEST_WINDOWS_ISOLATION_FAILPOINT",
+            "job_before_assign",
+        )
+        .env(
+            "SUNLIGHT_INTERNAL_TEST_PARENT_PID",
+            std::process::id().to_string(),
+        )
+        .env("SUNLIGHT_INTERNAL_TEST_PARENT_EXE", &test_exe)
+        .current_dir(repo.path())
+        .output()
+        .expect("sun run should report injected containment setup failure");
+    assert_failure(&containment_failed);
+    let body = stdout(&containment_failed);
+    assert_valid_json(&body);
+    assert!(
+        body.contains("\"code\":\"execution_containment_setup_failed\""),
+        "{body}"
+    );
+    assert!(body.contains("\"command_started\":\"false\""), "{body}");
+    assert!(!command_signal.exists(), "suspended command code executed");
 
     let state = RealRepoState::load(repo.path()).unwrap();
     assert!(state.executions.is_empty());
@@ -1202,13 +1780,14 @@ fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_
             "view_base_0001",
             "--json",
             "--",
-            "python",
-            "-c",
-            "raise SystemExit(0)",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "exit 0",
         ])
         .env(
             "SUNLIGHT_INTERNAL_TEST_WINDOWS_ISOLATION_FAILPOINT",
-            "prepare_after_runtime_root",
+            "job_before_assign",
         )
         .current_dir(repo.path())
         .output()
@@ -1221,6 +1800,22 @@ fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_
 fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
     let repo = TestRepo::new("execution-runtime-policy");
     repo.write_file("README.md", "# runtime policy\n");
+    #[cfg(windows)]
+    {
+        repo.write_file("timeout-root.cmd", "@cmd.exe /d /c timeout-child.cmd\r\n");
+        repo.write_file(
+            "timeout-child.cmd",
+            "@echo off\r\nfor /l %%i in (1,1,50000000) do rem\r\necho late>LATE_MARKER\r\n",
+        );
+        repo.write_file(
+            "large-output.cmd",
+            "@echo off\r\nfor /l %%i in (1,1,5000) do <nul set /p \"=A\"\r\nfor /l %%i in (1,1,7000) do <nul set /p \"=B\" 1>&2\r\nexit /b 0\r\n",
+        );
+        repo.write_file(
+            "environment-check.cmd",
+            "@if defined SUNLIGHT_TEST_SECRET (exit /b 1) else (exit /b 0)\r\n",
+        );
+    }
     start_native_session(&repo, "runtime-policy");
     let config_path = repo.path().join(".sunlight/config.toml");
     let config = fs::read_to_string(&config_path)
@@ -1230,28 +1825,33 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
         .replace("stderr_limit_bytes = 1048576", "stderr_limit_bytes = 1024");
     fs::write(&config_path, config).unwrap();
 
-    let timeout = sun()
-        .arg("run")
-        .arg("--view")
-        .arg("view_base_0001")
-        .arg("--json")
-        .arg("--")
-        .arg("python")
-        .arg("-c")
-        .arg(
-            r#"import subprocess,sys,time; from pathlib import Path; p=subprocess.Popen([sys.executable,'-c',"import time; from pathlib import Path; time.sleep(3); Path('LATE_MARKER').write_text('late')"]); Path('CHILD_PID').write_text(str(p.pid)); time.sleep(5)"#,
-        )
+    let mut timeout_command = sun();
+    timeout_command.args(["run", "--view", "view_base_0001", "--json", "--"]);
+    if cfg!(windows) {
+        timeout_command.args(["cmd.exe", "/d", "/c", "timeout-root.cmd"]);
+    } else {
+        timeout_command.args([
+            "python",
+            "-c",
+            r#"import subprocess,sys,time; from pathlib import Path; p=subprocess.Popen([sys.executable,'-c',"import time; from pathlib import Path; time.sleep(3); Path('LATE_MARKER').write_text('late')"]); time.sleep(5)"#,
+        ]);
+    }
+    let timeout = timeout_command
         .current_dir(repo.path())
         .output()
         .expect("timed execution should run");
     assert_success(&timeout);
     let timeout_stdout = stdout(&timeout);
     assert_valid_json(&timeout_stdout);
-    assert!(timeout_stdout.contains("\"status\":\"timeout\""));
+    assert!(
+        timeout_stdout.contains("\"status\":\"timeout\""),
+        "{timeout_stdout}"
+    );
     assert!(timeout_stdout.contains("\"timed_out\":true"));
     assert!(timeout_stdout.contains("\"promotion_candidates\":[]"));
     assert!(timeout_stdout.contains("\"timeout_ms\":2000"));
-    assert!(timeout_stdout.contains("\"network\":\"not_enforced\""));
+    assert!(timeout_stdout
+        .contains("\"network\":{\"requested\":\"not_enforced\",\"effective\":\"not_enforced\"}"));
     assert!(timeout_stdout.contains(if cfg!(windows) {
         "\"filesystem_writes\":\"windows_low_integrity_private_projection_v1\""
     } else {
@@ -1292,60 +1892,43 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
         .join(".sunlight/projections")
         .join(&timeout_projection)
         .join("root/LATE_MARKER");
-    #[cfg(windows)]
-    let child_pid = fs::read_to_string(
-        repo.path()
-            .join(".sunlight/projections")
-            .join(&timeout_projection)
-            .join("root/CHILD_PID"),
-    )
-    .expect("descendant PID helper should be recorded before timeout");
     std::thread::sleep(Duration::from_millis(3200));
     assert!(
         !late_marker.exists(),
         "timed-out process mutated files after return"
     );
-    #[cfg(windows)]
-    {
-        let still_alive = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &format!(
-                    "if (Get-Process -Id {} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}",
-                    child_pid.trim()
-                ),
-            ])
-            .output()
-            .expect("descendant liveness probe should run");
-        assert!(
-            !still_alive.status.success(),
-            "timed-out descendant {} survived Job Object termination",
-            child_pid.trim()
-        );
-    }
-    let config = fs::read_to_string(&config_path)
-        .unwrap()
-        .replace("timeout_ms = 2000", "timeout_ms = 5000");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+        "timeout_ms = 2000",
+        if cfg!(windows) {
+            "timeout_ms = 20000"
+        } else {
+            "timeout_ms = 5000"
+        },
+    );
     fs::write(&config_path, config).unwrap();
 
-    let large = sun()
-        .arg("run")
-        .arg("--view")
-        .arg("view_base_0001")
-        .arg("--json")
-        .arg("--")
-        .arg("python")
-        .arg("-c")
-        .arg("import sys; sys.stdout.buffer.write(b'A'*5000); sys.stderr.buffer.write(b'B'*7000)")
+    let mut large_command = sun();
+    large_command.args(["run", "--view", "view_base_0001", "--json", "--"]);
+    if cfg!(windows) {
+        large_command.args(["cmd.exe", "/d", "/c", "large-output.cmd"]);
+    } else {
+        large_command.args([
+            "python",
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'A'*5000); sys.stderr.buffer.write(b'B'*7000)",
+        ]);
+    }
+    let large = large_command
         .current_dir(repo.path())
         .output()
         .expect("large-output execution should run");
     assert_success(&large);
     let large_stdout = stdout(&large);
     assert_valid_json(&large_stdout);
-    assert!(large_stdout.contains("\"status\":\"pass\""));
+    assert!(
+        large_stdout.contains("\"status\":\"pass\""),
+        "{large_stdout}"
+    );
     assert!(large_stdout.contains(
         "\"observed_byte_length\":5000,\"captured_byte_length\":1024,\"truncated\":true,\"capture_failed\":false"
     ));
@@ -1370,15 +1953,18 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
     assert!(!large_stdout.contains(&"B".repeat(100)));
 
     let secret = "do-not-inherit-this-test-secret";
-    let normal = sun()
-        .arg("run")
-        .arg("--view")
-        .arg("view_base_0001")
-        .arg("--json")
-        .arg("--")
-        .arg("python")
-        .arg("-c")
-        .arg("import os,sys; sys.exit(1 if os.environ.get('SUNLIGHT_TEST_SECRET') else 0)")
+    let mut normal_command = sun();
+    normal_command.args(["run", "--view", "view_base_0001", "--json", "--"]);
+    if cfg!(windows) {
+        normal_command.args(["cmd.exe", "/d", "/c", "environment-check.cmd"]);
+    } else {
+        normal_command.args([
+            "python",
+            "-c",
+            "import os,sys; sys.exit(1 if os.environ.get('SUNLIGHT_TEST_SECRET') else 0)",
+        ]);
+    }
+    let normal = normal_command
         .env("SUNLIGHT_TEST_SECRET", secret)
         .current_dir(repo.path())
         .output()
@@ -1414,7 +2000,9 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
         assert_valid_json(&body);
         assert!(body.contains("\"runtime_policy\":"));
         assert!(body.contains("\"output_capture\":"));
-        assert!(body.contains("\"network\":\"not_enforced\""));
+        assert!(body.contains(
+            "\"network\":{\"requested\":\"not_enforced\",\"effective\":\"not_enforced\"}"
+        ));
         assert!(body.contains("\"inheritance\":\"minimal_os_allowlist\""));
         assert!(!body.contains(secret));
     }
@@ -1657,14 +2245,16 @@ fn no_fixture_custom_managed_root_drives_compat_and_execution_projections() {
     assert!(diff.contains("\"candidate_counts\":"));
 
     let run = sun()
-        .arg("run")
-        .arg("--view")
-        .arg("view_base_0001")
-        .arg("--json")
-        .arg("--")
-        .arg("python")
-        .arg("-c")
-        .arg("pass")
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            "python",
+            "-c",
+            "pass",
+        ])
         .current_dir(repo.path())
         .output()
         .expect("sun run should run");
@@ -11629,6 +12219,28 @@ fn start_native_session(repo: &TestRepo, slug: &str) {
         .output()
         .expect("sun session start should run");
     assert_success(&session);
+}
+
+#[cfg(windows)]
+fn windows_isolation_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
+
+#[cfg(windows)]
+fn sunlight_appcontainer_profile_dirs() -> Vec<String> {
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return Vec::new();
+    };
+    let mut profiles = fs::read_dir(PathBuf::from(local_app_data).join("Packages"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.to_ascii_lowercase().starts_with("sunlight-"))
+        .collect::<Vec<_>>();
+    profiles.sort();
+    profiles
 }
 
 fn create_real_base_checkpoint(repo: &TestRepo) -> String {

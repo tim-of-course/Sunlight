@@ -34,8 +34,8 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - Critical handoff correction: previous fixture-backed acceptance is not product completion.
 - Current implementation reality: fixture prototype plus a substantial repo-backed product path with durable authoring/resolution/projection/execution/checkpoint/export/policy/compatibility features, no-fixture self-hosting acceptance, and a repository-confined local MCP transport; still not the full v0.3 product.
 - Rename-plus-edit remains unresolved because compatibility projections expose no reliable identity signal; fuzzy inference is intentionally excluded.
-- Windows executions enforce process-tree, CPU, memory, process-count, and filesystem-write isolation with Job Objects plus restricted low-integrity tokens/private roots; network isolation remains explicitly unenforced. Pre-existing unrelated low-integrity host paths are outside the write boundary.
-- Main product gaps: Windows execution network isolation, reusable cross-platform projection scaling/cache reuse, and a shared in-process engine/daemon boundary beyond the transitional MCP subprocess adapter.
+- Windows executions enforce process-tree, CPU, memory, process-count, and filesystem-write isolation. Explicit `disabled` network mode uses a capability-less AppContainer; the default `not_enforced` mode preserves ordinary local toolchains, and requested/effective policy is recorded. Pre-existing unrelated low-integrity host paths remain outside the write boundary.
+- Main product gaps: reusable cross-platform projection scaling/cache reuse and a shared in-process engine/daemon boundary beyond the transitional MCP subprocess adapter.
 
 ## Workstreams
 
@@ -77,14 +77,13 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | repo-backed-windows-execution-containment | Windows Codex CLI cell `188` | Windows commit `40f73bc` | Completed | Enforce Windows process-tree, CPU, memory, and process-count limits with fail-closed Job Objects. | Suspended assign-before-resume launch, resource attribution, descendant cleanup, fail-closed setup, promotion, self-hosting, and full workspace passed under normal Windows permissions. |
 | repo-backed-local-mcp | Windows Codex CLI cell `202` | Windows commit `e8565f0` | Completed | Add a repo-confined persistent stdio MCP server exposing the full no-fixture workflow through typed tools. | Protocol lifecycle, 26 typed tools, path/argv/content confinement, bounded contained children, malformed recovery, real Git-repo journey, self-hosting, and all 383 workspace tests passed. |
 | repo-backed-windows-filesystem-isolation | Windows Codex CLI processes `31244`, correction `54744` | Windows commit `766b450` | Completed | Enforce fail-closed Windows execution filesystem-write confinement while preserving private outputs, evidence, and promotion. | Restricted low-integrity token/private labels and Job inheritance block root/descendant host writes; source labels are read-only validated, setup rollback is proven through public CLI with no records, promotion/self-hosting/release/full workspace pass after manager correction. |
-| repo-backed-windows-network-isolation | Windows Codex CLI thread `019f5a5a-4839-78f3-8a2e-787dd54a9eb8` | `main`, log `C:\tmp\sunlight-network-isolation-final-review-v2.jsonl` | Second review correction active 2026-07-13 | Add fail-closed per-execution Windows network denial without global firewall or host ACL side effects. | Dual modes and full suite pass. Fresh correctly rooted worker is proving external managed-root recovery and deterministic public Job setup-failure taxonomy; resumed prior thread restored an obsolete checkout and made no changes. |
+| repo-backed-windows-network-isolation | Windows Codex CLI thread `019f5a5a-4839-78f3-8a2e-787dd54a9eb8` | Windows commit `78ad0dd` | Completed | Add fail-closed per-execution Windows network denial without global firewall or host ACL side effects. | Explicit AppContainer denial and compatible default mode, persisted policy/evidence, crash cleanup, external managed-root recovery, distinct setup taxonomy, real listener/root/descendant tests, self-hosting, release, and all 395 workspace tests passed after manager review. |
 
 ## Delegation Queue
 
-1. Enforce fail-closed per-execution Windows network denial with truthful evidence and no broad host firewall side effects or silent fallback.
-2. Add reusable projection cache/cross-platform scaling, then replace the MCP subprocess adapter with a shared engine/daemon boundary.
+1. Add reusable projection cache and cross-platform scaling with truthful amplification and corruption resistance.
+2. Replace the MCP subprocess adapter with a shared in-process engine/daemon boundary.
 3. Keep fixture tests only when they directly support removing fixture dependency.
-
 
 
 ## Heartbeat Procedure

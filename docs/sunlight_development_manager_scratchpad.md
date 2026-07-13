@@ -32,11 +32,11 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - Management lane changed on 2026-07-06: work directly in the Windows checkout at `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2`.
 - Older WSL clone rows below are historical checkpoints only; do not treat them as the active work lane.
 - Critical handoff correction: previous fixture-backed acceptance is not product completion.
-- Current implementation reality: fixture prototype plus a substantial repo-backed product path with durable authoring/resolution/projection/execution/checkpoint/export/policy/compatibility features, no-fixture self-hosting acceptance, and a repository-confined local MCP transport; still not the full v0.3 product.
+- Current implementation reality: fixture prototype plus a substantial repo-backed product path with durable authoring/resolution/projection/execution/checkpoint/export/policy/compatibility features, no-fixture self-hosting acceptance, and a repository-confined persistent MCP transport over the same in-process engine as the CLI; still not yet certified as the full v0.3 product.
 - Rename-plus-edit remains unresolved because compatibility projections expose no reliable identity signal; fuzzy inference is intentionally excluded.
 - Windows executions enforce process-tree, CPU, memory, process-count, and filesystem-write isolation. Explicit `disabled` network mode uses a capability-less AppContainer; the default `not_enforced` mode preserves ordinary local toolchains, and requested/effective policy is recorded. Pre-existing unrelated low-integrity host paths remain outside the write boundary.
 - Reusable verified projection cache entries now avoid rebuilding immutable input trees and preserve private writable outputs; Windows ReFS block cloning is used when proven, while NTFS and non-Windows hosts retain truthful full-copy fallback. Physical allocation measurement and stale staging GC remain open.
-- Main product gaps: a shared in-process engine/daemon boundary beyond the transitional MCP subprocess adapter, plus remaining platform-specific projection scaling beyond the measured full-copy fallback.
+- Main product gaps: a fresh criterion-by-criterion v0.3 production audit and closure of any uncovered no-fixture behavior, plus remaining platform-specific projection scaling beyond the measured full-copy fallback.
 
 ## Workstreams
 
@@ -80,13 +80,13 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | repo-backed-windows-filesystem-isolation | Windows Codex CLI processes `31244`, correction `54744` | Windows commit `766b450` | Completed | Enforce fail-closed Windows execution filesystem-write confinement while preserving private outputs, evidence, and promotion. | Restricted low-integrity token/private labels and Job inheritance block root/descendant host writes; source labels are read-only validated, setup rollback is proven through public CLI with no records, promotion/self-hosting/release/full workspace pass after manager correction. |
 | repo-backed-windows-network-isolation | Windows Codex CLI thread `019f5a5a-4839-78f3-8a2e-787dd54a9eb8` | Windows commit `78ad0dd` | Completed | Add fail-closed per-execution Windows network denial without global firewall or host ACL side effects. | Explicit AppContainer denial and compatible default mode, persisted policy/evidence, crash cleanup, external managed-root recovery, distinct setup taxonomy, real listener/root/descendant tests, self-hosting, release, and all 395 workspace tests passed after manager review. |
 | repo-backed-projection-cache | Windows Codex CLI thread `019f5ae6-8023-7903-943f-c66cb1b9e070` | Windows commit `c4cea74` | Completed | Add durable reusable projection caching to the real repo-backed materializer without unsafe writable aliases or false zero-copy claims. | Atomic semantic-key cache, full integrity revalidation/quarantine, private copy/ReFS clone materialization, persisted hit/miss/amplification metrics, external-root and concurrency tests, release, self-hosting, and all 401 workspace tests passed. NTFS copy fallback, physical allocation query, and stale staging GC remain open. |
-| repo-backed-shared-engine | Windows Codex CLI correction thread `019f5bf8-baff-7652-bad9-0cfc6f8d823a` | `main`, logs `C:\tmp\sunlight-shared-engine.jsonl` and `C:\tmp\sunlight-shared-engine-correction.jsonl` | Manager review correction active 2026-07-13 | Replace MCP-to-sun subprocess delegation with one explicit repo-rooted in-process engine shared by CLI and MCP. | In-process dispatch, explicit roots, no-respawn, equivalence, cancellation, and serialized suite pass. Hold: bound engine output before allocation and eliminate unscoped process-global publication failpoints; require three default-parallel workspace passes before commit. |
+| repo-backed-shared-engine | Windows Codex CLI correction thread `019f5bf8-baff-7652-bad9-0cfc6f8d823a` | Windows commit `2af9d6f` | Completed | Replace MCP-to-sun subprocess delegation with one explicit repo-rooted in-process engine shared by CLI and MCP. | Explicit roots, no-respawn, CLI/MCP equivalence, cancellation, bounded retained output, and path-scoped failpoints passed focused checks, three worker default-parallel workspace runs, one manager default-parallel workspace run, release, formatting, and self-hosting verification. |
 
 ## Delegation Queue
 
-1. Replace the MCP subprocess adapter with a shared in-process engine/daemon boundary.
-2. Audit and close remaining v0.3 acceptance gaps, including measured platform projection limits, without relabeling fallback as completion.
-3. Keep fixture tests only when they directly support removing fixture dependency.
+1. Audit every v0.3 acceptance criterion against real no-fixture commands, records, and tests; implement the highest-priority uncovered production behavior rather than declaring closure from fixture coverage.
+2. Close remaining measured platform projection limitations where they materially affect production use, without relabeling fallback as zero-copy completion.
+3. Keep fixture tests only when they directly support the repo-backed product path.
 
 
 ## Heartbeat Procedure
@@ -101,4 +101,4 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 ## Open Management Decisions
 
 - Production-like validation repository selected: Sunlight itself via isolated local clone.
-- Decide the default Git export shape before Phase 4 implementation locks it in.
+- Do not certify MVP completion until a fresh architecture-to-product audit proves every local v0.3 acceptance criterion through real repo-backed behavior.

@@ -16,6 +16,16 @@ pub const REQUIRED_MANAGED_IGNORE_ENTRIES: &[&str] = &[
     ".sunlight/executions/**/sandbox/",
     ".sunlight/executions/**/raw-logs/",
 ];
+const SUNLIGHT_LOCAL_GITIGNORE_ENTRIES: &[&str] = &[
+    "/local/",
+    "/cache/",
+    "/projections/",
+    "/tmp/",
+    "/quarantine/",
+    "/index.sqlite",
+    "/executions/**/sandbox/",
+    "/executions/**/raw-logs/",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PolicyCheck {
@@ -118,6 +128,10 @@ pub fn managed_ignore_block() -> String {
         block.push('\n');
     }
     for entry in REQUIRED_MANAGED_IGNORE_ENTRIES {
+        block.push_str(entry);
+        block.push('\n');
+    }
+    for entry in SUNLIGHT_LOCAL_GITIGNORE_ENTRIES {
         block.push_str(entry);
         block.push('\n');
     }

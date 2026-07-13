@@ -1,16 +1,20 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
 use crate::artifacts::{
     PathPolicy, FILE_OPERATION_SEMANTICS_VERSION, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
+};
+use crate::projection::{
+    ProjectionCacheKey, ProjectionPurpose, ProjectionStrategy, WritablePolicy,
 };
 use crate::records::{canonical_json_bytes, parse_json_record, JsonValue, RecordError};
 use crate::resolver::{
@@ -20,6 +24,12 @@ use crate::resolver::{
 };
 
 pub const REPO_STATE_SCHEMA_VERSION: u32 = 1;
+
+const PROJECTION_CACHE_SCHEMA_VERSION: u32 = 1;
+const PROJECTION_CACHE_ROOT: &str = ".sunlight/cache/projections/v1";
+const PROJECTION_CACHE_MANIFEST_FILE: &str = "manifest.json";
+const PROJECTION_CACHE_CONTENT_ROOT: &str = "root";
+static PROJECTION_CACHE_NONCE: AtomicU64 = AtomicU64::new(1);
 
 const DERIVED_RECORD_NAMESPACES: &[&str] = &[
     "checkpoints",
@@ -191,6 +201,7 @@ pub struct RealProjectionSnapshot {
     pub session_generation_id: Option<String>,
     pub path_policy_id: String,
     pub operation_semantics_version: String,
+    pub cache_key: String,
     pub strategy: String,
     pub materialization: Option<RealProjectionMaterializationMetrics>,
     pub retention_state: String,
@@ -233,12 +244,17 @@ impl RealProjectionStrategy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealProjectionMaterializationRequest {
+    pub purpose: ProjectionPurpose,
+    pub writable_policy: WritablePolicy,
+    pub path_policy_id: String,
+    pub operation_semantics_version: String,
     pub required_strategy: Option<RealProjectionStrategy>,
     pub fallback_to_copy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealProjectionMaterialization {
+    pub cache_key: String,
     pub strategy: RealProjectionStrategy,
     pub metrics: RealProjectionMaterializationMetrics,
 }
@@ -387,6 +403,11 @@ pub enum RepoStateError {
         path: PathBuf,
         reason: String,
     },
+    ProjectionCacheIntegrity {
+        cache_key: String,
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 impl Display for RepoStateError {
@@ -451,6 +472,15 @@ impl Display for RepoStateError {
             } => write!(
                 f,
                 "projection strategy `{strategy}` is unsupported at {}: {reason}",
+                path.display()
+            ),
+            Self::ProjectionCacheIntegrity {
+                cache_key,
+                path,
+                reason,
+            } => write!(
+                f,
+                "projection cache integrity failure for `{cache_key}` at {}: {reason}",
                 path.display()
             ),
         }
@@ -2836,6 +2866,10 @@ pub fn materialize_real_files(state: &RealRepoState, root: &Path) -> Result<(), 
         state,
         root,
         &RealProjectionMaterializationRequest {
+            purpose: ProjectionPurpose::Export,
+            writable_policy: WritablePolicy::ExportMaterializationOnly,
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
             required_strategy: Some(RealProjectionStrategy::Copy),
             fallback_to_copy: false,
         },
@@ -2849,8 +2883,27 @@ pub fn materialize_real_projection(
     root: &Path,
     request: &RealProjectionMaterializationRequest,
 ) -> Result<RealProjectionMaterialization, RepoStateError> {
-    validate_real_projection_root(state, root)?;
+    validate_real_projection_root(state, root, &request.path_policy_id)?;
+    if state.repository_id.is_empty() || real_tree_hash(&state.entries) != state.tree_hash {
+        return Err(RepoStateError::InvalidState {
+            path: root.to_path_buf(),
+            message: "resolved projection source does not match its repository/tree identity"
+                .to_string(),
+        });
+    }
     let started = Instant::now();
+    let cache_key = ProjectionCacheKey {
+        repository_id: state.repository_id.clone(),
+        resolved_view_id: state.resolved_view_id.clone(),
+        tree_hash: state.tree_hash.clone(),
+        path_policy_id: request.path_policy_id.clone(),
+        operation_semantics_version: request.operation_semantics_version.clone(),
+        purpose: request.purpose,
+        strategy: ProjectionStrategy::Copy,
+        writable_policy: request.writable_policy,
+    }
+    .stable_string();
+    let cache = ensure_real_projection_cache_entry(repo_root, state, request, &cache_key)?;
     let preferred = request
         .required_strategy
         .unwrap_or(RealProjectionStrategy::Reflink);
@@ -2868,7 +2921,8 @@ pub fn materialize_real_projection(
         fs::create_dir_all(&staging).map_err(|error| {
             io_error(&staging, "failed to create projection staging root", error)
         })?;
-        let result = materialize_real_projection_strategy(repo_root, state, &staging, strategy);
+        let result =
+            materialize_real_projection_strategy(&cache.content_root, state, &staging, strategy);
         match result {
             Ok(attempt) => {
                 if let Err(error) = publish_projection_staging(root, &staging) {
@@ -2887,11 +2941,15 @@ pub fn materialize_real_projection(
                     .filter(|entry| !entry.tombstone)
                     .count() as u64;
                 let physically_materialized_bytes = match strategy {
-                    RealProjectionStrategy::Copy => Some(logical_bytes),
-                    RealProjectionStrategy::Reflink => Some(attempt.bytes_copied),
+                    RealProjectionStrategy::Copy | RealProjectionStrategy::Reflink => Some(
+                        cache
+                            .physically_materialized_bytes
+                            .saturating_add(attempt.bytes_copied),
+                    ),
                     _ => None,
                 };
                 return Ok(RealProjectionMaterialization {
+                    cache_key,
                     strategy,
                     metrics: RealProjectionMaterializationMetrics {
                         elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -2899,8 +2957,8 @@ pub fn materialize_real_projection(
                         physically_materialized_bytes,
                         physical_allocation_bytes: None,
                         file_count,
-                        cache_hit: false,
-                        reuse: "created".to_string(),
+                        cache_hit: cache.cache_hit,
+                        reuse: cache.reuse,
                         integrity_revalidated: true,
                         storage_amplification_millionths: if logical_bytes == 0 {
                             None
@@ -2929,8 +2987,729 @@ pub fn materialize_real_projection(
     })
 }
 
-fn validate_real_projection_root(state: &RealRepoState, root: &Path) -> Result<(), RepoStateError> {
-    let path_policy = PathPolicy::posix_case_sensitive();
+struct RealProjectionCacheEntry {
+    content_root: PathBuf,
+    cache_hit: bool,
+    reuse: String,
+    physically_materialized_bytes: u64,
+}
+
+fn ensure_real_projection_cache_entry(
+    repo_root: &Path,
+    state: &RealRepoState,
+    request: &RealProjectionMaterializationRequest,
+    cache_key: &str,
+) -> Result<RealProjectionCacheEntry, RepoStateError> {
+    let cache_root = repo_root.join(PROJECTION_CACHE_ROOT);
+    ensure_safe_projection_cache_root(repo_root, &cache_root, cache_key)?;
+    let key_digest = format!("{:x}", Sha256::digest(cache_key.as_bytes()));
+    let entry_root = cache_root.join(&key_digest);
+    let expected_manifest = real_projection_cache_manifest_bytes(state, request, cache_key)?;
+    let mut rebuilt_after_quarantine = false;
+
+    for _ in 0..3 {
+        if projection_cache_path_exists(&entry_root)? {
+            match validate_real_projection_cache_entry(&entry_root, state, &expected_manifest) {
+                Ok(()) => {
+                    return Ok(RealProjectionCacheEntry {
+                        content_root: entry_root.join(PROJECTION_CACHE_CONTENT_ROOT),
+                        cache_hit: true,
+                        reuse: "reused".to_string(),
+                        physically_materialized_bytes: 0,
+                    });
+                }
+                Err(reason) => {
+                    quarantine_real_projection_cache_entry(
+                        repo_root,
+                        &entry_root,
+                        cache_key,
+                        &reason,
+                    )?;
+                    rebuilt_after_quarantine = true;
+                }
+            }
+        }
+
+        let staging = cache_root.join(format!(
+            ".staging-{key_digest}-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0),
+            PROJECTION_CACHE_NONCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        let content_root = staging.join(PROJECTION_CACHE_CONTENT_ROOT);
+        fs::create_dir(&staging).map_err(|error| {
+            io_error(
+                &staging,
+                "failed to create projection cache staging root",
+                error,
+            )
+        })?;
+        let build_result =
+            build_real_projection_cache_entry(state, &staging, &content_root, &expected_manifest);
+        if let Err(error) = build_result {
+            cleanup_projection_staging(&staging);
+            return Err(error);
+        }
+        if let Err(reason) =
+            validate_real_projection_cache_entry(&staging, state, &expected_manifest)
+        {
+            cleanup_projection_staging(&staging);
+            return Err(RepoStateError::ProjectionCacheIntegrity {
+                cache_key: cache_key.to_string(),
+                path: staging,
+                reason,
+            });
+        }
+
+        match fs::rename(&staging, &entry_root) {
+            Ok(()) => {
+                return Ok(RealProjectionCacheEntry {
+                    content_root: entry_root.join(PROJECTION_CACHE_CONTENT_ROOT),
+                    cache_hit: false,
+                    reuse: if rebuilt_after_quarantine {
+                        "rebuilt_after_quarantine".to_string()
+                    } else {
+                        "created".to_string()
+                    },
+                    physically_materialized_bytes: state_logical_bytes(state),
+                });
+            }
+            Err(error) if projection_cache_path_exists(&entry_root)? => {
+                cleanup_projection_staging(&staging);
+                match validate_real_projection_cache_entry(&entry_root, state, &expected_manifest) {
+                    Ok(()) => {
+                        return Ok(RealProjectionCacheEntry {
+                            content_root: entry_root.join(PROJECTION_CACHE_CONTENT_ROOT),
+                            cache_hit: true,
+                            reuse: "reused_concurrent_publication".to_string(),
+                            physically_materialized_bytes: 0,
+                        });
+                    }
+                    Err(reason) => {
+                        quarantine_real_projection_cache_entry(
+                            repo_root,
+                            &entry_root,
+                            cache_key,
+                            &format!("concurrent publication failed validation: {reason}; rename error: {error}"),
+                        )?;
+                        rebuilt_after_quarantine = true;
+                    }
+                }
+            }
+            Err(error) => {
+                cleanup_projection_staging(&staging);
+                return Err(io_error(
+                    &entry_root,
+                    "failed to publish projection cache entry atomically",
+                    error,
+                ));
+            }
+        }
+    }
+
+    Err(RepoStateError::ProjectionCacheIntegrity {
+        cache_key: cache_key.to_string(),
+        path: entry_root,
+        reason: "cache entry could not be published after concurrent integrity retries".to_string(),
+    })
+}
+
+fn state_logical_bytes(state: &RealRepoState) -> u64 {
+    state
+        .entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .map(|entry| entry.bytes.len() as u64)
+        .sum()
+}
+
+fn ensure_safe_projection_cache_root(
+    repo_root: &Path,
+    cache_root: &Path,
+    cache_key: &str,
+) -> Result<(), RepoStateError> {
+    let mut current = repo_root.to_path_buf();
+    for component in Path::new(PROJECTION_CACHE_ROOT).components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if projection_metadata_is_reparse(&metadata) || !metadata.is_dir() => {
+                return Err(RepoStateError::ProjectionCacheIntegrity {
+                    cache_key: cache_key.to_string(),
+                    path: current,
+                    reason: "repository-local projection cache storage is not a safe directory"
+                        .to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+                            io_error(
+                                &current,
+                                "failed to validate concurrently created projection cache",
+                                error,
+                            )
+                        })?;
+                        if projection_metadata_is_reparse(&metadata) || !metadata.is_dir() {
+                            return Err(RepoStateError::ProjectionCacheIntegrity {
+                                cache_key: cache_key.to_string(),
+                                path: current,
+                                reason: "concurrently created projection cache storage is unsafe"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        return Err(io_error(
+                            &current,
+                            "failed to create repository-local projection cache",
+                            error,
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(io_error(
+                    &current,
+                    "failed to inspect repository-local projection cache",
+                    error,
+                ));
+            }
+        }
+    }
+    if current != cache_root {
+        return Err(RepoStateError::ProjectionCacheIntegrity {
+            cache_key: cache_key.to_string(),
+            path: cache_root.to_path_buf(),
+            reason: "projection cache root normalization mismatch".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn real_projection_cache_manifest_bytes(
+    state: &RealRepoState,
+    request: &RealProjectionMaterializationRequest,
+    cache_key: &str,
+) -> Result<Vec<u8>, RepoStateError> {
+    let mut entries = Vec::new();
+    for entry in state.entries.iter().filter(|entry| !entry.tombstone) {
+        let mut object = BTreeMap::new();
+        object.insert("path".to_string(), JsonValue::String(entry.path.clone()));
+        object.insert(
+            "artifact_id".to_string(),
+            JsonValue::String(entry.artifact_id.clone()),
+        );
+        object.insert(
+            "content_hash".to_string(),
+            JsonValue::String(entry.content_hash.clone()),
+        );
+        object.insert(
+            "byte_length".to_string(),
+            JsonValue::Number(entry.bytes.len().to_string()),
+        );
+        object.insert("executable".to_string(), JsonValue::Bool(entry.executable));
+        object.insert(
+            "classification".to_string(),
+            JsonValue::String(entry.classification.clone()),
+        );
+        entries.push(JsonValue::Object(object));
+    }
+    let mut tree_identity = BTreeMap::new();
+    tree_identity.insert(
+        "repository_id".to_string(),
+        JsonValue::String(state.repository_id.clone()),
+    );
+    tree_identity.insert(
+        "tree_hash".to_string(),
+        JsonValue::String(state.tree_hash.clone()),
+    );
+    let mut object = BTreeMap::new();
+    object.insert(
+        "schema_version".to_string(),
+        JsonValue::Number(PROJECTION_CACHE_SCHEMA_VERSION.to_string()),
+    );
+    object.insert(
+        "record_type".to_string(),
+        JsonValue::String("projection_cache_manifest".to_string()),
+    );
+    object.insert(
+        "cache_key".to_string(),
+        JsonValue::String(cache_key.to_string()),
+    );
+    object.insert(
+        "resolved_view_id".to_string(),
+        JsonValue::String(state.resolved_view_id.clone()),
+    );
+    object.insert(
+        "tree_identity".to_string(),
+        JsonValue::Object(tree_identity),
+    );
+    object.insert(
+        "purpose".to_string(),
+        JsonValue::String(request.purpose.as_str().to_string()),
+    );
+    object.insert(
+        "writable_policy".to_string(),
+        JsonValue::String(request.writable_policy.as_str().to_string()),
+    );
+    object.insert(
+        "path_policy_id".to_string(),
+        JsonValue::String(request.path_policy_id.clone()),
+    );
+    object.insert(
+        "operation_semantics_version".to_string(),
+        JsonValue::String(request.operation_semantics_version.clone()),
+    );
+    object.insert(
+        "cache_materialization_strategy".to_string(),
+        JsonValue::String(ProjectionStrategy::Copy.as_str().to_string()),
+    );
+    object.insert("entries".to_string(), JsonValue::Array(entries));
+    canonical_json_bytes(&JsonValue::Object(object)).map_err(RepoStateError::from)
+}
+
+fn build_real_projection_cache_entry(
+    state: &RealRepoState,
+    staging: &Path,
+    content_root: &Path,
+    manifest: &[u8],
+) -> Result<(), RepoStateError> {
+    fs::create_dir(content_root).map_err(|error| {
+        io_error(
+            content_root,
+            "failed to create projection cache content root",
+            error,
+        )
+    })?;
+    for entry in state.entries.iter().filter(|entry| !entry.tombstone) {
+        if real_content_hash(&entry.bytes) != entry.content_hash {
+            return Err(RepoStateError::InvalidState {
+                path: real_blob_path(Path::new("."), &entry.content_hash),
+                message: format!(
+                    "source content for `{}` failed digest verification before cache publication",
+                    entry.path
+                ),
+            });
+        }
+        let path = content_root.join(&entry.path);
+        write_flushed_file(&path, &entry.bytes)?;
+        set_cache_file_permissions(&path, entry.executable)?;
+    }
+    let manifest_path = staging.join(PROJECTION_CACHE_MANIFEST_FILE);
+    write_flushed_file(&manifest_path, manifest)?;
+    set_cache_file_permissions(&manifest_path, false)?;
+    set_cache_directory_permissions(content_root)?;
+    Ok(())
+}
+
+fn validate_real_projection_cache_entry(
+    entry_root: &Path,
+    state: &RealRepoState,
+    expected_manifest: &[u8],
+) -> Result<(), String> {
+    let root_metadata = fs::symlink_metadata(entry_root)
+        .map_err(|error| format!("cache entry root is unavailable: {error}"))?;
+    if projection_metadata_is_reparse(&root_metadata) || !root_metadata.is_dir() {
+        return Err("cache entry root is not a safe directory".to_string());
+    }
+    let manifest_path = entry_root.join(PROJECTION_CACHE_MANIFEST_FILE);
+    let manifest_metadata = fs::symlink_metadata(&manifest_path)
+        .map_err(|error| format!("cache manifest is unavailable: {error}"))?;
+    if projection_metadata_is_reparse(&manifest_metadata)
+        || !manifest_metadata.is_file()
+        || !cache_file_permissions_are_immutable(&manifest_metadata, false)
+    {
+        return Err("cache manifest type or permissions are unsafe".to_string());
+    }
+    let manifest = fs::read(&manifest_path)
+        .map_err(|error| format!("cache manifest could not be read: {error}"))?;
+    if manifest != expected_manifest {
+        return Err("cache manifest identity or entries do not match semantic inputs".to_string());
+    }
+
+    let content_root = entry_root.join(PROJECTION_CACHE_CONTENT_ROOT);
+    let content_metadata = fs::symlink_metadata(&content_root)
+        .map_err(|error| format!("cache content root is unavailable: {error}"))?;
+    if projection_metadata_is_reparse(&content_metadata) || !content_metadata.is_dir() {
+        return Err("cache content root is not a safe directory".to_string());
+    }
+    let expected_files = state
+        .entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .map(|entry| (PathBuf::from(&entry.path), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut expected_dirs = BTreeSet::new();
+    for path in expected_files.keys() {
+        let mut parent = path.parent();
+        while let Some(value) = parent {
+            if value.as_os_str().is_empty() {
+                break;
+            }
+            expected_dirs.insert(value.to_path_buf());
+            parent = value.parent();
+        }
+    }
+    let mut seen_files = BTreeSet::new();
+    validate_real_projection_cache_directory(
+        &content_root,
+        &content_root,
+        &expected_files,
+        &expected_dirs,
+        &mut seen_files,
+    )?;
+    if seen_files.len() != expected_files.len() {
+        return Err("cache content tree is missing manifest files".to_string());
+    }
+    Ok(())
+}
+
+fn validate_real_projection_cache_directory(
+    root: &Path,
+    current: &Path,
+    expected_files: &BTreeMap<PathBuf, &RealArtifactEntry>,
+    expected_dirs: &BTreeSet<PathBuf>,
+    seen_files: &mut BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(current)
+        .map_err(|error| format!("cache directory is unavailable: {error}"))?;
+    if projection_metadata_is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(format!(
+            "cache path `{}` is not a safe directory",
+            current.display()
+        ));
+    }
+    for item in fs::read_dir(current)
+        .map_err(|error| format!("cache directory could not be read: {error}"))?
+    {
+        let item = item.map_err(|error| format!("cache directory entry failed: {error}"))?;
+        let path = item.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| "cache path escaped its content root".to_string())?
+            .to_path_buf();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("cache path metadata failed: {error}"))?;
+        if projection_metadata_is_reparse(&metadata) {
+            return Err(format!(
+                "cache path `{}` is a reparse point or symlink",
+                relative.display()
+            ));
+        }
+        if metadata.is_dir() {
+            if !expected_dirs.contains(&relative) {
+                return Err(format!(
+                    "cache contains unexpected directory `{}`",
+                    relative.display()
+                ));
+            }
+            validate_real_projection_cache_directory(
+                root,
+                &path,
+                expected_files,
+                expected_dirs,
+                seen_files,
+            )?;
+            continue;
+        }
+        let Some(expected) = expected_files.get(&relative) else {
+            return Err(format!(
+                "cache contains unexpected file `{}`",
+                relative.display()
+            ));
+        };
+        if !metadata.is_file()
+            || metadata.len() != expected.bytes.len() as u64
+            || !cache_file_permissions_are_immutable(&metadata, expected.executable)
+        {
+            return Err(format!(
+                "cache file `{}` has unsafe type, length, or permissions",
+                relative.display()
+            ));
+        }
+        let bytes = fs::read(&path).map_err(|error| {
+            format!(
+                "cache file `{}` could not be read: {error}",
+                relative.display()
+            )
+        })?;
+        if real_content_hash(&bytes) != expected.content_hash {
+            return Err(format!(
+                "cache file `{}` failed digest verification",
+                relative.display()
+            ));
+        }
+        seen_files.insert(relative);
+    }
+    Ok(())
+}
+
+fn quarantine_real_projection_cache_entry(
+    repo_root: &Path,
+    entry_root: &Path,
+    cache_key: &str,
+    reason: &str,
+) -> Result<(), RepoStateError> {
+    if !projection_cache_path_exists(entry_root)? {
+        return Ok(());
+    }
+    let quarantine_root = repo_root.join(".sunlight/quarantine/projection-cache");
+    ensure_safe_projection_cache_quarantine_root(repo_root, &quarantine_root, cache_key)?;
+    let name = entry_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("cache-entry");
+    let nonce = PROJECTION_CACHE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let quarantined = quarantine_root.join(format!("{name}-{nonce}"));
+    fs::rename(entry_root, &quarantined).map_err(|error| {
+        RepoStateError::ProjectionCacheIntegrity {
+            cache_key: cache_key.to_string(),
+            path: entry_root.to_path_buf(),
+            reason: format!("failed to quarantine invalid cache entry: {error}"),
+        }
+    })?;
+    let mut report = BTreeMap::new();
+    report.insert(
+        "record_type".to_string(),
+        JsonValue::String("projection_cache_quarantine".to_string()),
+    );
+    report.insert(
+        "cache_key".to_string(),
+        JsonValue::String(cache_key.to_string()),
+    );
+    report.insert("reason".to_string(), JsonValue::String(reason.to_string()));
+    report.insert(
+        "quarantined_entry".to_string(),
+        JsonValue::String(quarantined.display().to_string()),
+    );
+    let report_bytes = canonical_json_bytes(&JsonValue::Object(report))?;
+    let report_path = quarantine_root.join(format!("{name}-{nonce}.json"));
+    write_flushed_file(&report_path, &report_bytes)?;
+    Ok(())
+}
+
+fn projection_cache_path_exists(path: &Path) -> Result<bool, RepoStateError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error(
+            path,
+            "failed to inspect projection cache path",
+            error,
+        )),
+    }
+}
+
+fn ensure_safe_projection_cache_quarantine_root(
+    repo_root: &Path,
+    quarantine_root: &Path,
+    cache_key: &str,
+) -> Result<(), RepoStateError> {
+    let relative = Path::new(".sunlight/quarantine/projection-cache");
+    let mut current = repo_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if projection_metadata_is_reparse(&metadata) || !metadata.is_dir() => {
+                return Err(RepoStateError::ProjectionCacheIntegrity {
+                    cache_key: cache_key.to_string(),
+                    path: current,
+                    reason: "projection cache quarantine storage is not a safe directory"
+                        .to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+                            io_error(
+                                &current,
+                                "failed to validate concurrently created cache quarantine root",
+                                error,
+                            )
+                        })?;
+                        if projection_metadata_is_reparse(&metadata) || !metadata.is_dir() {
+                            return Err(RepoStateError::ProjectionCacheIntegrity {
+                                cache_key: cache_key.to_string(),
+                                path: current,
+                                reason: "concurrently created cache quarantine storage is unsafe"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        return Err(io_error(
+                            &current,
+                            "failed to create projection cache quarantine root",
+                            error,
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(io_error(
+                    &current,
+                    "failed to inspect projection cache quarantine root",
+                    error,
+                ));
+            }
+        }
+    }
+    if current != quarantine_root {
+        return Err(RepoStateError::ProjectionCacheIntegrity {
+            cache_key: cache_key.to_string(),
+            path: quarantine_root.to_path_buf(),
+            reason: "projection cache quarantine root normalization mismatch".to_string(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn projection_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x0000_0400 != 0
+}
+
+#[cfg(not(windows))]
+fn projection_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(unix)]
+fn set_cache_file_permissions(path: &Path, executable: bool) -> Result<(), RepoStateError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if executable { 0o555 } else { 0o444 };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| {
+        io_error(
+            path,
+            "failed to make projection cache file immutable",
+            error,
+        )
+    })
+}
+
+#[cfg(windows)]
+fn set_cache_file_permissions(path: &Path, _executable: bool) -> Result<(), RepoStateError> {
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| {
+            io_error(
+                path,
+                "failed to inspect projection cache permissions",
+                error,
+            )
+        })?
+        .permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions).map_err(|error| {
+        io_error(
+            path,
+            "failed to make projection cache file immutable",
+            error,
+        )
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_cache_file_permissions(path: &Path, _executable: bool) -> Result<(), RepoStateError> {
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| {
+            io_error(
+                path,
+                "failed to inspect projection cache permissions",
+                error,
+            )
+        })?
+        .permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions).map_err(|error| {
+        io_error(
+            path,
+            "failed to make projection cache file immutable",
+            error,
+        )
+    })
+}
+
+#[cfg(unix)]
+fn set_cache_directory_permissions(root: &Path) -> Result<(), RepoStateError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut directories = Vec::new();
+    collect_projection_cache_directories(root, &mut directories)?;
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in directories {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).map_err(|error| {
+            io_error(
+                &path,
+                "failed to make projection cache directory immutable",
+                error,
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_cache_directory_permissions(_root: &Path) -> Result<(), RepoStateError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn collect_projection_cache_directories(
+    current: &Path,
+    directories: &mut Vec<PathBuf>,
+) -> Result<(), RepoStateError> {
+    directories.push(current.to_path_buf());
+    for item in fs::read_dir(current).map_err(|error| {
+        io_error(
+            current,
+            "failed to inspect projection cache directories",
+            error,
+        )
+    })? {
+        let path = item
+            .map_err(|error| io_error(current, "failed to inspect projection cache entry", error))?
+            .path();
+        if path.is_dir() {
+            collect_projection_cache_directories(&path, directories)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn cache_file_permissions_are_immutable(metadata: &fs::Metadata, executable: bool) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = metadata.permissions().mode();
+    mode & 0o222 == 0 && (mode & 0o111 != 0) == executable
+}
+
+#[cfg(windows)]
+fn cache_file_permissions_are_immutable(metadata: &fs::Metadata, _executable: bool) -> bool {
+    metadata.permissions().readonly()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn cache_file_permissions_are_immutable(metadata: &fs::Metadata, _executable: bool) -> bool {
+    metadata.permissions().readonly()
+}
+
+fn validate_real_projection_root(
+    state: &RealRepoState,
+    root: &Path,
+    path_policy_id: &str,
+) -> Result<(), RepoStateError> {
+    let path_policy = PathPolicy {
+        id: path_policy_id.to_string(),
+    };
     for entry in state.entries.iter().filter(|entry| !entry.tombstone) {
         path_policy
             .validate(&entry.path)
@@ -2943,10 +3722,10 @@ fn validate_real_projection_root(state: &RealRepoState, root: &Path) -> Result<(
             })?;
     }
     match fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
+        Ok(metadata) if projection_metadata_is_reparse(&metadata) => {
             return Err(RepoStateError::InvalidState {
                 path: root.to_path_buf(),
-                message: "projection root cannot be a symlink".to_string(),
+                message: "projection root cannot be a reparse point or symlink".to_string(),
             });
         }
         Ok(metadata) if !metadata.is_dir() => {
@@ -2986,7 +3765,7 @@ struct StrategyAttemptMetrics {
 }
 
 fn materialize_real_projection_strategy(
-    repo_root: &Path,
+    cache_content_root: &Path,
     state: &RealRepoState,
     root: &Path,
     strategy: RealProjectionStrategy,
@@ -3013,30 +3792,28 @@ fn materialize_real_projection_strategy(
                 ))
             })?;
         }
+        let source = cache_content_root.join(&entry.path);
         match strategy {
             RealProjectionStrategy::Copy => {
-                fs::write(&path, &entry.bytes).map_err(|error| {
+                fs::copy(&source, &path).map_err(|error| {
                     StrategyAttemptError::State(io_error(
                         &path,
-                        "failed to write full-copy projection file",
+                        "failed to copy immutable cache file into private projection",
                         error,
                     ))
                 })?;
                 bytes_copied = bytes_copied.saturating_add(entry.bytes.len() as u64);
             }
             RealProjectionStrategy::Reflink => {
-                let cloned = clone_file_cow(
-                    &real_blob_path(repo_root, &entry.content_hash),
-                    &path,
-                    entry.bytes.len() as u64,
-                )
-                .map_err(StrategyAttemptError::Unsupported)?;
+                let cloned = clone_file_cow(&source, &path, entry.bytes.len() as u64)
+                    .map_err(StrategyAttemptError::Unsupported)?;
                 bytes_cloned = bytes_cloned.saturating_add(cloned);
                 bytes_copied = bytes_copied.saturating_add(entry.bytes.len() as u64 - cloned);
             }
             _ => unreachable!(),
         }
-        set_projection_executable(&path, entry.executable).map_err(StrategyAttemptError::State)?;
+        set_private_projection_permissions(&path, entry.executable)
+            .map_err(StrategyAttemptError::State)?;
         let materialized = fs::read(&path).map_err(|error| {
             StrategyAttemptError::State(io_error(&path, "failed to verify projection file", error))
         })?;
@@ -3054,6 +3831,49 @@ fn materialize_real_projection_strategy(
         ));
     }
     Ok(StrategyAttemptMetrics { bytes_copied })
+}
+
+#[cfg(unix)]
+fn set_private_projection_permissions(path: &Path, executable: bool) -> Result<(), RepoStateError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = if executable { 0o755 } else { 0o644 };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| {
+        io_error(
+            path,
+            "failed to make private projection file writable",
+            error,
+        )
+    })
+}
+
+#[cfg(windows)]
+fn set_private_projection_permissions(
+    path: &Path,
+    _executable: bool,
+) -> Result<(), RepoStateError> {
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| {
+            io_error(
+                path,
+                "failed to inspect private projection permissions",
+                error,
+            )
+        })?
+        .permissions();
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions).map_err(|error| {
+        io_error(
+            path,
+            "failed to make private projection file writable",
+            error,
+        )
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_private_projection_permissions(path: &Path, executable: bool) -> Result<(), RepoStateError> {
+    set_projection_executable(path, executable)
 }
 
 fn projection_staging_path(root: &Path) -> PathBuf {
@@ -3237,24 +4057,7 @@ fn clone_file_cow(_source: &Path, _destination: &Path, _length: u64) -> Result<u
     Err("this build has no platform COW clone implementation".to_string())
 }
 
-#[cfg(unix)]
-fn set_projection_executable(path: &Path, executable: bool) -> Result<(), RepoStateError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = fs::metadata(path)
-        .map_err(|error| io_error(path, "failed to inspect projection permissions", error))?
-        .permissions();
-    let mode = permissions.mode();
-    permissions.set_mode(if executable {
-        mode | 0o111
-    } else {
-        mode & !0o111
-    });
-    fs::set_permissions(path, permissions)
-        .map_err(|error| io_error(path, "failed to preserve projection executable bit", error))
-}
-
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn set_projection_executable(_path: &Path, _executable: bool) -> Result<(), RepoStateError> {
     Ok(())
 }
@@ -3536,6 +4339,7 @@ fn parse_projection_snapshot(
             state_path,
         )?
         .unwrap_or_else(|| FILE_OPERATION_SEMANTICS_VERSION.to_string()),
+        cache_key: optional_string(object, "cache_key", state_path)?.unwrap_or_default(),
         strategy: optional_string(object, "strategy", state_path)?
             .unwrap_or_else(|| "copy".to_string()),
         materialization: parse_projection_materialization_metrics(object, state_path)?,
@@ -3877,6 +4681,10 @@ fn projection_snapshot_json(projection: &RealProjectionSnapshot) -> JsonValue {
     object.insert(
         "operation_semantics_version".to_string(),
         JsonValue::String(projection.operation_semantics_version.clone()),
+    );
+    object.insert(
+        "cache_key".to_string(),
+        JsonValue::String(projection.cache_key.clone()),
     );
     object.insert(
         "strategy".to_string(),
@@ -4774,7 +5582,7 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
 mod tests {
     use super::*;
     use std::process::Command;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -5903,5 +6711,122 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| entry.path == "README.md" && entry.tombstone));
+    }
+
+    #[test]
+    fn real_projection_cache_publishes_once_concurrently_and_keys_semantic_policy() {
+        let repo = temp_repo("projection-cache-concurrent");
+        fs::write(repo.join("source.txt"), b"source truth\n").unwrap();
+        let state = Arc::new(RealRepoState::ingest(&repo, "repo_projection_cache").unwrap());
+        let request = RealProjectionMaterializationRequest {
+            purpose: ProjectionPurpose::Inspection,
+            writable_policy: WritablePolicy::ReadOnly,
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            required_strategy: Some(RealProjectionStrategy::Copy),
+            fallback_to_copy: false,
+        };
+        let barrier = Arc::new(Barrier::new(2));
+        let mut workers = Vec::new();
+        for suffix in ["a", "b"] {
+            let repo = repo.clone();
+            let state = Arc::clone(&state);
+            let request = request.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                materialize_real_projection(
+                    &repo,
+                    &state,
+                    &repo.join(format!("projection-{suffix}")),
+                    &request,
+                )
+                .unwrap()
+            }));
+        }
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results[0].cache_key, results[1].cache_key);
+        assert!(results.iter().any(|result| !result.metrics.cache_hit));
+        assert!(results.iter().any(|result| result.metrics.cache_hit));
+        assert_eq!(published_projection_cache_entries(&repo), 1);
+        assert_eq!(
+            fs::read(repo.join("projection-a/source.txt")).unwrap(),
+            b"source truth\n"
+        );
+        assert_eq!(
+            fs::read(repo.join("projection-b/source.txt")).unwrap(),
+            b"source truth\n"
+        );
+        let interrupted = repo
+            .join(PROJECTION_CACHE_ROOT)
+            .join(".staging-interrupted-publication");
+        fs::create_dir(&interrupted).unwrap();
+        fs::write(interrupted.join("partial"), b"must never be reused").unwrap();
+        let after_interruption = materialize_real_projection(
+            &repo,
+            &state,
+            &repo.join("projection-after-interruption"),
+            &request,
+        )
+        .unwrap();
+        assert!(after_interruption.metrics.cache_hit);
+        assert_eq!(
+            fs::read(repo.join("projection-after-interruption/source.txt")).unwrap(),
+            b"source truth\n"
+        );
+        assert_eq!(published_projection_cache_entries(&repo), 1);
+
+        let mut changed_policy = request.clone();
+        changed_policy.operation_semantics_version = "file_ops_test_v2".to_string();
+        let policy_result = materialize_real_projection(
+            &repo,
+            &state,
+            &repo.join("projection-policy"),
+            &changed_policy,
+        )
+        .unwrap();
+        assert!(!policy_result.metrics.cache_hit);
+
+        let changed_purpose = RealProjectionMaterializationRequest {
+            purpose: ProjectionPurpose::Export,
+            writable_policy: WritablePolicy::ExportMaterializationOnly,
+            ..request.clone()
+        };
+        let purpose_result = materialize_real_projection(
+            &repo,
+            &state,
+            &repo.join("projection-purpose"),
+            &changed_purpose,
+        )
+        .unwrap();
+        assert!(!purpose_result.metrics.cache_hit);
+
+        let mut changed_tree = (*state).clone();
+        changed_tree.entries[0] = artifact_entry("source.txt", b"changed tree\n");
+        changed_tree.tree_hash = real_tree_hash(&changed_tree.entries);
+        changed_tree.resolved_view_id = "view_changed_tree".to_string();
+        let tree_result = materialize_real_projection(
+            &repo,
+            &changed_tree,
+            &repo.join("projection-tree"),
+            &request,
+        )
+        .unwrap();
+        assert!(!tree_result.metrics.cache_hit);
+        assert_eq!(published_projection_cache_entries(&repo), 4);
+    }
+
+    fn published_projection_cache_entries(repo: &Path) -> usize {
+        fs::read_dir(repo.join(PROJECTION_CACHE_ROOT))
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry.path().is_dir()
+                    && !entry.file_name().to_string_lossy().starts_with(".staging-")
+            })
+            .count()
     }
 }

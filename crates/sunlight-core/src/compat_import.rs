@@ -2356,6 +2356,7 @@ mod tests {
                 session_generation_id: Some("gen_test_0001".to_string()),
                 path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
                 operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+                cache_key: "projection-cache:test".to_string(),
                 strategy: "copy".to_string(),
                 materialization: None,
                 retention_state: "active".to_string(),

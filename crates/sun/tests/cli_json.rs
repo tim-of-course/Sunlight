@@ -2261,6 +2261,8 @@ fn no_fixture_custom_managed_root_drives_compat_and_execution_projections() {
     assert_success(&run);
     let run_stdout = stdout(&run);
     assert!(run_stdout.contains("\"materialization\":{"));
+    assert!(run_stdout.contains("\"cache_key\":\"projection-cache:"));
+    assert!(run_stdout.contains("\"cache_hit\":false"));
     let execution_id = json_string_field(&run_stdout, "execution_id");
     let execution_projection_id = json_string_field(&run_stdout, "projection_id");
     let execution_root = repo
@@ -2319,6 +2321,8 @@ fn no_fixture_custom_managed_root_drives_compat_and_execution_projections() {
     assert_success(&execution_status);
     assert_valid_json(&stdout(&execution_status));
     assert!(stdout(&execution_status).contains("custom-managed"));
+    assert!(stdout(&execution_status).contains("\"cache_key\":\"projection-cache:"));
+    assert!(stdout(&execution_status).contains("\"materialization\":{"));
     let execution_inspect = sun()
         .arg("inspect")
         .arg(format!("execution:{execution_id}"))
@@ -2329,6 +2333,8 @@ fn no_fixture_custom_managed_root_drives_compat_and_execution_projections() {
     assert_success(&execution_inspect);
     assert_valid_json(&stdout(&execution_inspect));
     assert!(stdout(&execution_inspect).contains("custom-managed"));
+    assert!(stdout(&execution_inspect).contains("\"cache_key\":\"projection-cache:"));
+    assert!(stdout(&execution_inspect).contains("\"materialization\":{"));
 }
 
 #[test]
@@ -2360,13 +2366,14 @@ fn no_fixture_forced_copy_reports_truthful_metrics_and_isolates_store_mutation()
     assert_valid_json(&body);
     assert!(body.contains("\"selected_strategy\":\"copy\""));
     assert!(body.contains("\"logical_bytes\":5"));
-    assert!(body.contains("\"physically_materialized_bytes\":5"));
+    assert!(body.contains("\"physically_materialized_bytes\":10"));
     assert!(body.contains("\"physical_allocation_bytes\":null"));
     assert!(body.contains("\"file_count\":1"));
     assert!(body.contains("\"cache_hit\":false"));
     assert!(body.contains("\"reuse\":\"created\""));
     assert!(body.contains("\"integrity_revalidated\":true"));
-    assert!(body.contains("\"storage_amplification\":1.000000"));
+    assert!(body.contains("\"storage_amplification\":2.000000"));
+    assert!(body.contains("\"cache_key\":\"projection-cache:"));
 
     fs::write(root.join("base.txt"), "projection mutation\n").unwrap();
     let digest = format!("{:x}", Sha256::digest(b"base\n"));
@@ -2399,7 +2406,234 @@ fn no_fixture_forced_copy_reports_truthful_metrics_and_isolates_store_mutation()
         let persisted = stdout(&output);
         assert!(persisted.contains("\"strategy\":\"copy\""));
         assert!(persisted.contains("\"logical_bytes\":5"));
+        assert!(persisted.contains("\"cache_key\":\"projection-cache:"));
     }
+}
+
+#[test]
+fn no_fixture_repeated_exact_view_reuses_one_durable_projection_cache_entry() {
+    let repo = TestRepo::new("projection-cache-reuse");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "projection-cache-reuse");
+
+    let first = materialize_real_projection_copy(
+        &repo,
+        "view_base_0001",
+        "inspection",
+        &repo.path().join("projection-cache-first"),
+    );
+    assert_success(&first);
+    let first_body = stdout(&first);
+    assert!(first_body.contains("\"cache_hit\":false"));
+    assert!(first_body.contains("\"reuse\":\"created\""));
+    assert!(first_body.contains("\"physically_materialized_bytes\":10"));
+
+    let second = materialize_real_projection_copy(
+        &repo,
+        "view_base_0001",
+        "inspection",
+        &repo.path().join("projection-cache-second"),
+    );
+    assert_success(&second);
+    let second_body = stdout(&second);
+    assert!(second_body.contains("\"cache_hit\":true"));
+    assert!(second_body.contains("\"reuse\":\"reused\""));
+    assert!(second_body.contains("\"physically_materialized_bytes\":5"));
+    assert!(second_body.contains("\"storage_amplification\":1.000000"));
+    assert_eq!(
+        json_string_field(&first_body, "cache_key"),
+        json_string_field(&second_body, "cache_key")
+    );
+    assert_eq!(projection_cache_entry_roots(&repo).len(), 1);
+    let cached_manifest = projection_cache_entry_roots(&repo)[0]
+        .join("manifest.json")
+        .strip_prefix(repo.path())
+        .unwrap()
+        .to_path_buf();
+    let cache_git_status = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["check-ignore", "-q"])
+        .arg(&cached_manifest)
+        .output()
+        .unwrap();
+    assert!(cache_git_status.status.success());
+
+    let export = materialize_real_projection_copy(
+        &repo,
+        "view_base_0001",
+        "export",
+        &repo.path().join("projection-cache-export"),
+    );
+    assert_success(&export);
+    let export_body = stdout(&export);
+    assert!(export_body.contains("\"cache_hit\":false"));
+    assert_ne!(
+        json_string_field(&first_body, "cache_key"),
+        json_string_field(&export_body, "cache_key")
+    );
+    assert_eq!(projection_cache_entry_roots(&repo).len(), 2);
+}
+
+#[test]
+fn no_fixture_corrupt_cache_is_quarantined_rebuilt_without_source_truth_damage() {
+    let repo = TestRepo::new("projection-cache-corruption");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "projection-cache-corruption");
+    let first_root = repo.path().join("corruption-first");
+    let first =
+        materialize_real_projection_copy(&repo, "view_base_0001", "inspection", &first_root);
+    assert_success(&first);
+    let cache_entry = projection_cache_entry_roots(&repo).pop().unwrap();
+    let cache_file = cache_entry.join("root/base.txt");
+    make_test_file_writable(&cache_file);
+    fs::write(&cache_file, b"evil!\n").unwrap();
+
+    let second_root = repo.path().join("corruption-second");
+    let second =
+        materialize_real_projection_copy(&repo, "view_base_0001", "inspection", &second_root);
+    assert_success(&second);
+    let body = stdout(&second);
+    assert!(body.contains("\"cache_hit\":false"));
+    assert!(body.contains("\"reuse\":\"rebuilt_after_quarantine\""));
+    assert_eq!(fs::read(second_root.join("base.txt")).unwrap(), b"base\n");
+    assert_eq!(fs::read(first_root.join("base.txt")).unwrap(), b"base\n");
+    let digest = format!("{:x}", Sha256::digest(b"base\n"));
+    assert_eq!(
+        fs::read(
+            repo.path()
+                .join(".sunlight/objects/blobs/sha256")
+                .join(digest)
+        )
+        .unwrap(),
+        b"base\n"
+    );
+    let quarantine = repo.path().join(".sunlight/quarantine/projection-cache");
+    assert!(fs::read_dir(&quarantine).unwrap().count() >= 2);
+    assert_eq!(projection_cache_entry_roots(&repo).len(), 1);
+}
+
+#[test]
+fn no_fixture_writable_compat_projection_never_aliases_cached_or_peer_bytes() {
+    let repo = TestRepo::new("projection-cache-writable-isolation");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "projection-cache-writable");
+    let (_, first_root, _) = create_real_compat_projection(&repo);
+    let (_, second_root, _) = create_real_compat_projection(&repo);
+    let cache_entry = projection_cache_entry_roots(&repo).pop().unwrap();
+    let cache_file = cache_entry.join("root/base.txt");
+    assert_eq!(fs::read(&cache_file).unwrap(), b"base\n");
+
+    fs::write(first_root.join("base.txt"), b"private mutation\n").unwrap();
+    assert_eq!(
+        fs::read(first_root.join("base.txt")).unwrap(),
+        b"private mutation\n"
+    );
+    assert_eq!(fs::read(second_root.join("base.txt")).unwrap(), b"base\n");
+    assert_eq!(fs::read(&cache_file).unwrap(), b"base\n");
+    assert_eq!(projection_cache_entry_roots(&repo).len(), 1);
+}
+
+#[test]
+fn no_fixture_external_managed_roots_reuse_repository_local_projection_cache() {
+    let repo = TestRepo::new("projection-cache-external-repo");
+    let external = TestRepo::new("projection-cache-external-managed");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "projection-cache-external");
+    set_projection_default_root(&repo, &external.path().to_string_lossy().replace('\\', "/"));
+
+    let first = sun()
+        .args([
+            "project",
+            "materialize",
+            "--view",
+            "view_base_0001",
+            "--purpose",
+            "inspection",
+            "--strategy",
+            "copy",
+            "--no-copy-fallback",
+            "--json",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&first);
+    assert!(stdout(&first).contains("\"cache_hit\":false"));
+    let second = sun()
+        .args([
+            "project",
+            "materialize",
+            "--view",
+            "view_base_0001",
+            "--purpose",
+            "inspection",
+            "--strategy",
+            "copy",
+            "--no-copy-fallback",
+            "--json",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&second);
+    assert!(stdout(&second).contains("\"cache_hit\":true"));
+    assert_eq!(projection_cache_entry_roots(&repo).len(), 1);
+    assert!(!external.path().join(".sunlight/cache").exists());
+    assert!(
+        fs::read_dir(external.path().join("inspection"))
+            .unwrap()
+            .count()
+            >= 2
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn no_fixture_cache_reparse_point_is_quarantined_before_reuse() {
+    let repo = TestRepo::new("projection-cache-reparse");
+    let outside = TestRepo::new("projection-cache-reparse-outside");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "projection-cache-reparse");
+    let first = materialize_real_projection_copy(
+        &repo,
+        "view_base_0001",
+        "inspection",
+        &repo.path().join("reparse-first"),
+    );
+    assert_success(&first);
+    let cache_entry = projection_cache_entry_roots(&repo).pop().unwrap();
+    let content_root = cache_entry.join("root");
+    fs::rename(&content_root, cache_entry.join("displaced-root")).unwrap();
+    outside.write_file("base.txt", "malicious outside bytes\n");
+    let junction_command = format!(
+        "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
+        content_root.display(),
+        outside.path().display()
+    );
+    let junction = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        .arg(junction_command)
+        .output()
+        .unwrap();
+    assert!(
+        junction.status.success(),
+        "stdout={} stderr={}",
+        stdout(&junction),
+        String::from_utf8_lossy(&junction.stderr)
+    );
+
+    let second_root = repo.path().join("reparse-second");
+    let second =
+        materialize_real_projection_copy(&repo, "view_base_0001", "inspection", &second_root);
+    assert_success(&second);
+    let body = stdout(&second);
+    assert!(body.contains("\"reuse\":\"rebuilt_after_quarantine\""));
+    assert_eq!(fs::read(second_root.join("base.txt")).unwrap(), b"base\n");
+    assert_eq!(
+        fs::read(outside.path().join("base.txt")).unwrap(),
+        b"malicious outside bytes\n"
+    );
 }
 
 #[test]
@@ -2498,9 +2732,9 @@ fn no_fixture_automatic_strategy_reports_real_volume_result_without_assuming_cow
         "unexpected strategy: {strategy}"
     );
     if strategy == "reflink" {
-        assert!(!body.contains("\"physically_materialized_bytes\":8197"));
+        assert!(!body.contains("\"physically_materialized_bytes\":16394"));
     } else {
-        assert!(body.contains("\"physically_materialized_bytes\":8197"));
+        assert!(body.contains("\"physically_materialized_bytes\":16394"));
     }
     fs::write(root.join("aligned.bin"), "private write").unwrap();
     assert_eq!(
@@ -12287,6 +12521,57 @@ fn create_real_compat_projection_at(
         .join("root");
     assert!(root.is_dir());
     (projection_id, root, generation)
+}
+
+fn materialize_real_projection_copy(
+    repo: &TestRepo,
+    view_id: &str,
+    purpose: &str,
+    projection_root: &Path,
+) -> Output {
+    sun()
+        .args([
+            "project",
+            "materialize",
+            "--view",
+            view_id,
+            "--purpose",
+            purpose,
+            "--strategy",
+            "copy",
+            "--no-copy-fallback",
+            "--projection-root",
+        ])
+        .arg(projection_root)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("real projection materialization should run")
+}
+
+fn projection_cache_entry_roots(repo: &TestRepo) -> Vec<PathBuf> {
+    let mut entries = fs::read_dir(repo.path().join(".sunlight/cache/projections/v1"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry.path().is_dir() && !entry.file_name().to_string_lossy().starts_with(".staging-")
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
+fn make_test_file_writable(path: &Path) {
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    #[cfg(windows)]
+    permissions.set_readonly(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o644);
+    }
+    fs::set_permissions(path, permissions).unwrap();
 }
 
 fn set_projection_default_root(repo: &TestRepo, root: &str) {

@@ -83,7 +83,7 @@ use sunlight_core::projection::{
     ProjectionMaterializationRequest, ProjectionPurpose, ProjectionQuarantineLocalCleanup,
     ProjectionRecord, ProjectionRootRef, ProjectionStoreIntegrityReasonCode,
     ProjectionStoreIntegrityResult, ProjectionStoreIntegrityStatus, ProjectionStrategy,
-    ProjectionValidationError, FIXTURE_COMPATIBILITY_PROJECTION_ID,
+    ProjectionValidationError, WritablePolicy, FIXTURE_COMPATIBILITY_PROJECTION_ID,
     FIXTURE_EXECUTION_PROJECTION_ID, FIXTURE_EXPORT_PROJECTION_ID,
     FIXTURE_INSPECTION_PROJECTION_ID,
 };
@@ -250,6 +250,17 @@ impl From<RepoStateError> for CliError {
                 "required projection materialization strategy is unsupported",
             )
             .with_detail("strategy", strategy)
+            .with_detail("path", path.display().to_string())
+            .with_detail("reason", reason),
+            RepoStateError::ProjectionCacheIntegrity {
+                cache_key,
+                path,
+                reason,
+            } => CliError::new(
+                "projection_cache_integrity_failed",
+                "projection cache integrity validation or quarantine failed",
+            )
+            .with_detail("cache_key", cache_key)
             .with_detail("path", path.display().to_string())
             .with_detail("reason", reason),
         }
@@ -1363,8 +1374,14 @@ fn real_compat_project(
     );
     let provisional_root = projection_policy.compatibility_root(&provisional_projection_id);
     let view_state = real_view_state(&state, &resolved);
-    let materialization =
-        materialize_repo_projection(&repo_root, &view_state, &provisional_root, None, true)?;
+    let materialization = materialize_repo_projection(
+        &repo_root,
+        &view_state,
+        &provisional_root,
+        ProjectionPurpose::Compatibility,
+        None,
+        true,
+    )?;
     let projection_id = selected_real_projection_id(
         ProjectionPurpose::Compatibility,
         materialization.strategy,
@@ -1394,6 +1411,7 @@ fn real_compat_project(
         session_generation_id: Some(session.session_generation_id.clone()),
         path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
         operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+        cache_key: materialization.cache_key.clone(),
         strategy: materialization.strategy.as_str().to_string(),
         materialization: Some(materialization.metrics),
         retention_state: "active".to_string(),
@@ -2789,6 +2807,7 @@ fn real_project_materialize(
         &repo_root,
         &view_state,
         &provisional_root,
+        options.purpose,
         options.strategy,
         options.fallback_to_copy,
     )?;
@@ -2820,6 +2839,7 @@ fn real_project_materialize(
         session_generation_id: None,
         path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
         operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+        cache_key: materialization.cache_key.clone(),
         strategy: materialization.strategy.as_str().to_string(),
         materialization: Some(materialization.metrics.clone()),
         retention_state: "active".to_string(),
@@ -3276,8 +3296,14 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     );
     let execution_id = format!("exec_native_{:04}", state.executions.len() + 1);
     let provisional_root = projection_policy.execution_root(&provisional_projection_id);
-    let materialization =
-        materialize_repo_projection(&repo_root, &view_state, &provisional_root, None, true)?;
+    let materialization = materialize_repo_projection(
+        &repo_root,
+        &view_state,
+        &provisional_root,
+        ProjectionPurpose::Execution,
+        None,
+        true,
+    )?;
     let projection_id = selected_real_projection_id(
         ProjectionPurpose::Execution,
         materialization.strategy,
@@ -3346,6 +3372,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         session_generation_id: None,
         path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
         operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+        cache_key: materialization.cache_key.clone(),
         strategy: materialization.strategy.as_str().to_string(),
         materialization: Some(materialization.metrics),
         retention_state: "active".to_string(),
@@ -4988,6 +5015,7 @@ fn materialize_repo_projection(
     repo_root: &Path,
     state: &RealRepoState,
     root: &Path,
+    purpose: ProjectionPurpose,
     strategy: Option<ProjectionStrategy>,
     fallback_to_copy: bool,
 ) -> Result<RealProjectionMaterialization, CliError> {
@@ -4996,6 +5024,15 @@ fn materialize_repo_projection(
         state,
         root,
         &RealProjectionMaterializationRequest {
+            purpose,
+            writable_policy: match purpose {
+                ProjectionPurpose::Execution => WritablePolicy::ReadOnlySourcePrivateOutputs,
+                ProjectionPurpose::Compatibility => WritablePolicy::WritableWithExplicitImport,
+                ProjectionPurpose::Inspection => WritablePolicy::ReadOnly,
+                ProjectionPurpose::Export => WritablePolicy::ExportMaterializationOnly,
+            },
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
             required_strategy: strategy.map(real_projection_strategy),
             fallback_to_copy,
         },
@@ -5191,7 +5228,7 @@ fn real_projection_materialized_envelope(
     materialization: &RealProjectionMaterialization,
 ) -> String {
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"projection.materialize\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"view\":{{\"resolved_view_id\":\"{}\",\"tree_identity\":{}}},\"projection_id\":\"{}\",\"purpose\":\"{}\",\"selected_strategy\":\"{}\",\"strategy\":\"{}\",\"tree_identity\":{},\"source\":\"resolved_content_tree\",\"projection_root\":\"{}\",\"materialization\":{},\"files_written\":{},\"bytes_written\":{},\"retention_state\":\"local_only\"}},\"warnings\":[]}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"projection.materialize\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"view\":{{\"resolved_view_id\":\"{}\",\"tree_identity\":{}}},\"projection_id\":\"{}\",\"purpose\":\"{}\",\"selected_strategy\":\"{}\",\"strategy\":\"{}\",\"tree_identity\":{},\"source\":\"resolved_content_tree\",\"cache_key\":\"{}\",\"projection_root\":\"{}\",\"materialization\":{},\"files_written\":{},\"bytes_written\":{},\"retention_state\":\"local_only\"}},\"warnings\":[]}}",
         json_escape(&state.repository_id),
         json_escape(projection_id),
         json_escape(&state.resolved_view_id),
@@ -5202,6 +5239,7 @@ fn real_projection_materialized_envelope(
         materialization.strategy.as_str(),
         materialization.strategy.as_str(),
         single_repo_tree_json(&SingleRepoTree { repository_id: state.repository_id.clone(), tree_hash: state.tree_hash.clone() }),
+        json_escape(&materialization.cache_key),
         json_escape(&root.display().to_string()),
         real_materialization_metrics_json(&materialization.metrics),
         materialization.metrics.file_count,
@@ -5252,6 +5290,7 @@ fn real_projection_snapshot_json(
             "\"session_generation_id\":{},",
             "\"path_policy_id\":\"{}\",",
             "\"operation_semantics_version\":\"{}\",",
+            "\"cache_key\":\"{}\",",
             "\"strategy\":\"{}\",",
             "\"materialization\":{},",
             "\"retention_state\":\"{}\",",
@@ -5277,6 +5316,7 @@ fn real_projection_snapshot_json(
         optional_string_json(projection.session_generation_id.as_deref()),
         json_escape(&projection.path_policy_id),
         json_escape(&projection.operation_semantics_version),
+        json_escape(&projection.cache_key),
         json_escape(&projection.strategy),
         projection
             .materialization

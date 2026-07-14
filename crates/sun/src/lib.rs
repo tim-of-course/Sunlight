@@ -32,9 +32,9 @@ use sunlight_core::artifacts::{
     FIXTURE_WRITE_TOPIC_ID, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
 };
 use sunlight_core::checkpoint::{
-    fixture_checkpoint_from_resolved_view, CheckpointRecord, CheckpointValidationError,
-    EvidenceRef, GitExportMapRecord, FIXTURE_CHECKPOINT_ID, FIXTURE_CREATED_AT,
-    FIXTURE_EXPORTED_GIT_REF, FIXTURE_EXPORT_MAP_ID, FIXTURE_GIT_COMMIT_ID,
+    fixture_checkpoint_from_resolved_view, validated_execution_evidence, CheckpointRecord,
+    CheckpointValidationError, EvidenceRef, GitExportMapRecord, FIXTURE_CHECKPOINT_ID,
+    FIXTURE_CREATED_AT, FIXTURE_EXPORTED_GIT_REF, FIXTURE_EXPORT_MAP_ID, FIXTURE_GIT_COMMIT_ID,
     FIXTURE_VALIDATION_REPORT_ID,
 };
 use sunlight_core::compat_import::{
@@ -4101,7 +4101,27 @@ fn real_checkpoint_create(
     }
     let view_state = real_view_state(&state, &resolved);
     reject_real_export_blocked_entries(&view_state)?;
-    let checkpoint = real_checkpoint(&view_state);
+    let evidence_refs = match options.execution_id.as_deref() {
+        Some(execution_id) => {
+            let execution = state
+                .executions
+                .iter()
+                .find(|execution| execution.execution_id == execution_id)
+                .ok_or_else(|| object_not_found("execution", execution_id))?;
+            let execution = real_execution_record(&state, execution);
+            let tree_identity = resolved
+                .result
+                .tree_identity
+                .as_ref()
+                .expect("conflict-free persisted view has a tree identity");
+            vec![
+                validated_execution_evidence(&resolved.result, tree_identity, &execution)
+                    .map_err(checkpoint_error)?,
+            ]
+        }
+        None => Vec::new(),
+    };
+    let checkpoint = real_checkpoint(&view_state, evidence_refs);
     if !state
         .checkpoints
         .iter()
@@ -4116,6 +4136,7 @@ fn real_checkpoint_create(
                 .iter()
                 .map(|entry| (entry.topic_id.clone(), entry.topic_revision_id.clone()))
                 .collect(),
+            evidence_refs: checkpoint.evidence_refs.clone(),
             created_at: checkpoint.created_at.clone(),
             entries: view_state.entries.clone(),
         });
@@ -4263,7 +4284,7 @@ fn real_persisted_checkpoint_export_context(
         .ok_or_else(|| object_not_found("checkpoint", checkpoint_id))?;
     let resolved = real_checkpoint_snapshot_resolved_view(state, snapshot);
     let view_state = real_view_state(state, &resolved);
-    let mut checkpoint = real_checkpoint(&view_state);
+    let mut checkpoint = real_checkpoint(&view_state, snapshot.evidence_refs.clone());
     checkpoint.id = snapshot.checkpoint_id.clone();
     checkpoint.resolved_view_id = snapshot.resolved_view_id.clone();
     checkpoint.created_at = snapshot.created_at.clone();
@@ -5221,17 +5242,38 @@ fn real_mutation_ref(
     }
 }
 
-fn real_checkpoint(state: &RealRepoState) -> CheckpointRecord {
+fn real_checkpoint(state: &RealRepoState, evidence_refs: Vec<EvidenceRef>) -> CheckpointRecord {
+    let tree_component = state
+        .tree_hash
+        .trim_start_matches("tree_")
+        .chars()
+        .take(16)
+        .collect::<String>();
+    let id = if evidence_refs.is_empty() {
+        format!("checkpoint_{tree_component}")
+    } else {
+        let evidence_identity = evidence_refs
+            .iter()
+            .map(|evidence| match evidence {
+                EvidenceRef::Execution(execution) => format!(
+                    "{}\0{}\0{}\0{}",
+                    execution.execution_id,
+                    execution.result.as_str(),
+                    execution.resolved_view_id,
+                    execution.tree_identity.tree_hash
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join("\0");
+        let evidence_component = real_content_hash(evidence_identity.as_bytes())
+            .trim_start_matches("sha256:")
+            .chars()
+            .take(12)
+            .collect::<String>();
+        format!("checkpoint_{tree_component}_{evidence_component}")
+    };
     CheckpointRecord {
-        id: format!(
-            "checkpoint_{}",
-            state
-                .tree_hash
-                .trim_start_matches("tree_")
-                .chars()
-                .take(16)
-                .collect::<String>()
-        ),
+        id,
         repository_id: state.repository_id.clone(),
         resolved_view_id: state.resolved_view_id.clone(),
         tree_identity: SingleRepoTree {
@@ -5250,7 +5292,7 @@ fn real_checkpoint(state: &RealRepoState) -> CheckpointRecord {
                 })
             })
             .collect(),
-        evidence_refs: Vec::new(),
+        evidence_refs,
         conflict_free: true,
         created_by: sunlight_core::checkpoint::CreatedBy {
             actor_id: state
@@ -6405,6 +6447,7 @@ fn real_checkpoint_snapshot_json(
             "\"resolved_view_id\":\"{}\",",
             "\"tree_identity\":{},",
             "\"topic_frontier\":{},",
+            "\"evidence_refs\":[{}],",
             "\"entry_count\":{},",
             "\"created_at\":\"{}\",",
             "\"source_truth\":\"sunlight_persisted_checkpoint\",",
@@ -6420,6 +6463,12 @@ fn real_checkpoint_snapshot_json(
             tree_hash: checkpoint.tree_hash.clone(),
         }),
         real_topic_frontier_pairs_json(&checkpoint.topic_frontier),
+        checkpoint
+            .evidence_refs
+            .iter()
+            .map(evidence_ref_json)
+            .collect::<Vec<_>>()
+            .join(","),
         checkpoint
             .entries
             .iter()
@@ -7512,6 +7561,7 @@ impl ExecutionNetworkPolicy {
 struct CheckpointCreateOptions {
     fixture: Option<String>,
     view_id: String,
+    execution_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -7929,6 +7979,7 @@ fn parse_checkpoint_create_options(
 ) -> Result<CheckpointCreateOptions, CliError> {
     let mut fixture = None;
     let mut view_id = None;
+    let mut execution_id = None;
     let mut args = ctx.args.iter().skip(2);
 
     while let Some(arg) = args.next() {
@@ -7947,6 +7998,14 @@ fn parse_checkpoint_create_options(
                 })?;
                 view_id = Some(value.clone());
             }
+            "--execution" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun checkpoint create --execution requires <execution-id>",
+                    )
+                })?;
+                execution_id = Some(value.clone());
+            }
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
                     "unknown flag `{flag}` for sun checkpoint create"
@@ -7963,11 +8022,15 @@ fn parse_checkpoint_create_options(
 
     let view_id = view_id.ok_or_else(|| {
         invalid_request(
-            "usage: sun checkpoint create --view <resolved-view-id> [--fixture basic-app]",
+            "usage: sun checkpoint create --view <resolved-view-id> [--execution <execution-id>] [--fixture basic-app]",
         )
     })?;
 
-    Ok(CheckpointCreateOptions { fixture, view_id })
+    Ok(CheckpointCreateOptions {
+        fixture,
+        view_id,
+        execution_id,
+    })
 }
 
 fn parse_git_export_options(ctx: &CommandContext) -> Result<GitExportOptions, CliError> {
@@ -16315,7 +16378,7 @@ Usage:
   sun compat import --projection <projection> --candidate <candidate> [--json]
   sun run --view <view> [runtime policy options] -- <command> [args...]
   sun execution promote-output <execution> --path <path> --session <session> --classification <class> [--json]
-  sun checkpoint create --view <view> [--json]
+  sun checkpoint create --view <view> [--execution <execution>] [--json]
   sun policy check-export --checkpoint <checkpoint> [--branch <ref>] [--json]
   sun policy check-commit [--paths <path>...] [--json]
   sun policy explain <validation-report> [--json]
@@ -16371,7 +16434,7 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
         "compat" | "compat project" | "compat diff" | "compat import" => outputln!(ctx, "sun compat\n\nUsage:\n  sun compat project --session <session> [--json]\n  sun compat diff --projection <projection> [--json]\n  sun compat import --projection <projection> --candidate <candidate> [--json]\n\nCompatibility projections are adapters. Only explicit import creates native operations."),
         "policy" | "policy check-export" | "policy check-commit" | "policy explain" => outputln!(ctx, "sun policy\n\nUsage:\n  sun policy check-export --checkpoint <checkpoint> [--branch <ref>] [--json]\n  sun policy check-commit [--paths <path>...] [--json]\n  sun policy explain <validation-report> [--json]"),
         "git" | "git export" => outputln!(ctx, "sun git export\n\nUsage:\n  sun git export --checkpoint <checkpoint> --branch <ref> [--write-plan|--execute-local] [--repo <path>] [--json]"),
-        "checkpoint" | "checkpoint create" => outputln!(ctx, "sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--json]"),
+        "checkpoint" | "checkpoint create" => outputln!(ctx, "sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--execution <passing-execution-id>] [--json]\n\nWhen supplied, execution evidence must pass and exactly match the resolved view and tree."),
         "run" => outputln!(ctx, "sun run\n\nUsage:\n  sun run --view <resolved-view-id> [--network disabled|not_enforced] -- <command> [args...]\n\nRuntime bounds come from [execution_policy] in .sunlight/config.toml. Windows runs always use restricted low-integrity filesystem isolation and a dedicated Job Object. Network disabled adds a capability-less per-execution AppContainer; not_enforced retains compatibility with ordinary user toolchains."),
         "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => outputln!(ctx, "sun artifact operations\n\nUsage:\n  sun read <path> --session <session> [--json]\n  sun list [path-prefix] --session <session> [--json]\n  sun search <query> --session <session> [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification <class> [--json]"),
         "view" | "view resolve" => outputln!(ctx, "sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nResolves persisted topic selections; conflicts and staleness remain inspectable records."),

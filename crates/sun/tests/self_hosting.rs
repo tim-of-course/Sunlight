@@ -536,6 +536,9 @@ fn self_hosting_real_repository_acceptance() {
         "bounded execution output\n"
     );
 
+    let checkpoint_execution = run_execution(&clone, &promoted_view);
+    let checkpoint_execution_id =
+        string(&checkpoint_execution, &["data", "execution_id"]).to_string();
     let checkpoint = sun_json_owned(
         &clone,
         vec![
@@ -543,8 +546,19 @@ fn self_hosting_real_repository_acceptance() {
             "create".into(),
             "--view".into(),
             promoted_view,
+            "--execution".into(),
+            checkpoint_execution_id.clone(),
             "--json".into(),
         ],
+    );
+    assert_eq!(
+        string_at_path(
+            &checkpoint,
+            &["data", "checkpoint", "evidence_refs"],
+            0,
+            &["execution_id"]
+        ),
+        checkpoint_execution_id
     );
     let checkpoint_id = string(&checkpoint, &["data", "checkpoint_id"]).to_string();
     let branch = "refs/heads/sunlight/self-hosting-acceptance";

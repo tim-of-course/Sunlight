@@ -1089,6 +1089,117 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
     );
 }
 
+#[test]
+fn no_fixture_checkpoint_persists_and_exports_validated_execution_evidence() {
+    let repo = TestRepo::new("real-checkpoint-execution-evidence");
+    init_local_git_repo(&repo);
+
+    let init = run_real_json(&repo, &["init"]);
+    assert_success(&init);
+
+    let passing_run = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            "git",
+            "--version",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("passing execution should run");
+    assert_success(&passing_run);
+    let passing_stdout = stdout(&passing_run);
+    assert!(passing_stdout.contains("\"status\":\"pass\""));
+    let passing_execution_id = json_string_field(&passing_stdout, "execution_id");
+
+    let checkpoint = run_real_json(
+        &repo,
+        &[
+            "checkpoint",
+            "create",
+            "--view",
+            "view_base_0001",
+            "--execution",
+            &passing_execution_id,
+        ],
+    );
+    assert_success(&checkpoint);
+    let checkpoint_stdout = stdout(&checkpoint);
+    let checkpoint_id = json_string_field(&checkpoint_stdout, "checkpoint_id");
+    assert!(checkpoint_stdout.contains(&format!(
+        "\"evidence_refs\":[{{\"kind\":\"execution\",\"execution_id\":\"{passing_execution_id}\",\"result\":\"pass\""
+    )));
+
+    let checkpoint_record = fs::read_to_string(
+        repo.path()
+            .join(".sunlight/checkpoints")
+            .join(format!("{checkpoint_id}.json")),
+    )
+    .expect("checkpoint record should be durable");
+    assert!(checkpoint_record.contains(&format!("\"execution_id\":\"{passing_execution_id}\"")));
+    let native_state = fs::read_to_string(repo.path().join(".sunlight/records/native-state.json"))
+        .expect("native state should be durable");
+    assert!(native_state.contains(&format!("\"execution_id\":\"{passing_execution_id}\"")));
+
+    let inspect = run_real_json(&repo, &["inspect", &format!("checkpoint:{checkpoint_id}")]);
+    assert_success(&inspect);
+    assert!(stdout(&inspect).contains(&format!("\"execution_id\":\"{passing_execution_id}\"")));
+
+    let policy = run_real_json(
+        &repo,
+        &[
+            "policy",
+            "check-export",
+            "--checkpoint",
+            &checkpoint_id,
+            "--branch",
+            "sunlight/evidence",
+        ],
+    );
+    assert_success(&policy);
+    assert!(stdout(&policy).contains("\"ok\":true"));
+
+    let failing_run = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            "git",
+            "rev-parse",
+            "--verify",
+            "refs/heads/sunlight-no-such-ref",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("failing execution should still produce evidence");
+    assert_success(&failing_run);
+    let failing_stdout = stdout(&failing_run);
+    assert!(failing_stdout.contains("\"status\":\"fail\""));
+    let failing_execution_id = json_string_field(&failing_stdout, "execution_id");
+    let rejected = run_real_json(
+        &repo,
+        &[
+            "checkpoint",
+            "create",
+            "--view",
+            "view_base_0001",
+            "--execution",
+            &failing_execution_id,
+        ],
+    );
+    assert_failure(&rejected);
+    assert!(stdout(&rejected).contains("\"code\":\"checkpoint_evidence_failed\""));
+
+    let status = run_real_json(&repo, &["status"]);
+    assert_success(&status);
+    assert!(stdout(&status).contains("\"checkpoints\":{\"count\":1"));
+}
+
 #[cfg(windows)]
 #[test]
 fn no_fixture_windows_execution_confines_root_and_descendant_writes_to_private_projection() {

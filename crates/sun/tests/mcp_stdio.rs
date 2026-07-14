@@ -188,8 +188,19 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
         execution["data"]["runtime_policy"]["network"]["requested"],
         "not_enforced"
     );
-    let checkpoint = mcp.call(14, "checkpoint_create", json!({"view":view}));
+    let execution_id = execution["data"]["execution_id"]
+        .as_str()
+        .expect("execution response should identify execution");
+    let checkpoint = mcp.call(
+        14,
+        "checkpoint_create",
+        json!({"view":view,"execution":execution_id}),
+    );
     assert_eq!(checkpoint["data"]["command"], "checkpoint.create");
+    assert_eq!(
+        checkpoint["data"]["checkpoint"]["evidence_refs"][0]["execution_id"],
+        execution_id
+    );
     let checkpoint_id = checkpoint["data"]["checkpoint"]["id"]
         .as_str()
         .or_else(|| checkpoint["data"]["checkpoint_id"].as_str())

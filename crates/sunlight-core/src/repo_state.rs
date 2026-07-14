@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use crate::artifacts::{
     PathPolicy, FILE_OPERATION_SEMANTICS_VERSION, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
 };
+use crate::checkpoint::{EvidenceRef, ExecutionEvidenceRef};
+use crate::execution::ExecutionStatus;
 use crate::projection::{
     ProjectionCacheKey, ProjectionPurpose, ProjectionStrategy, WritablePolicy,
 };
@@ -334,6 +336,7 @@ pub struct RealCheckpointSnapshot {
     pub resolved_view_id: String,
     pub tree_hash: String,
     pub topic_frontier: Vec<(String, String)>,
+    pub evidence_refs: Vec<EvidenceRef>,
     pub created_at: String,
     pub entries: Vec<RealArtifactEntry>,
 }
@@ -4595,14 +4598,62 @@ fn parse_checkpoint_snapshot(
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let evidence_refs = optional_array(object, "evidence_refs", state_path)?
+        .iter()
+        .map(|value| parse_checkpoint_evidence(value, state_path))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(RealCheckpointSnapshot {
         checkpoint_id: required_string(object, "checkpoint_id", state_path)?,
         resolved_view_id: required_string(object, "resolved_view_id", state_path)?,
         tree_hash: required_string(object, "tree_hash", state_path)?,
         topic_frontier,
+        evidence_refs,
         created_at: required_string(object, "created_at", state_path)?,
         entries,
     })
+}
+
+fn parse_checkpoint_evidence(
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<EvidenceRef, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(
+            state_path,
+            "checkpoint evidence_refs entries must be objects",
+        ));
+    };
+    let kind = required_string(object, "kind", state_path)?;
+    if kind != "execution" {
+        return Err(invalid_state(
+            state_path,
+            format!("unsupported checkpoint evidence kind `{kind}`"),
+        ));
+    }
+    let result = match required_string(object, "result", state_path)?.as_str() {
+        "pass" => ExecutionStatus::Pass,
+        "fail" => ExecutionStatus::Fail,
+        "timeout" => ExecutionStatus::Timeout,
+        "canceled" => ExecutionStatus::Canceled,
+        "flaky" => ExecutionStatus::Flaky,
+        "unknown" => ExecutionStatus::Unknown,
+        "policy_blocked" => ExecutionStatus::PolicyBlocked,
+        value => {
+            return Err(invalid_state(
+                state_path,
+                format!("unsupported checkpoint execution result `{value}`"),
+            ));
+        }
+    };
+    Ok(EvidenceRef::Execution(ExecutionEvidenceRef {
+        execution_id: required_string(object, "execution_id", state_path)?,
+        result,
+        resolved_view_id: required_string(object, "resolved_view_id", state_path)?,
+        tree_identity: SingleRepoTree {
+            repository_id: required_string(object, "repository_id", state_path)?,
+            tree_hash: required_string(object, "tree_hash", state_path)?,
+        },
+    }))
 }
 
 fn parse_export_map_snapshot(
@@ -5094,6 +5145,16 @@ fn checkpoint_snapshot_json(checkpoint: &RealCheckpointSnapshot) -> JsonValue {
         ),
     );
     object.insert(
+        "evidence_refs".to_string(),
+        JsonValue::Array(
+            checkpoint
+                .evidence_refs
+                .iter()
+                .map(checkpoint_evidence_json)
+                .collect(),
+        ),
+    );
+    object.insert(
         "created_at".to_string(),
         JsonValue::String(checkpoint.created_at.clone()),
     );
@@ -5102,6 +5163,39 @@ fn checkpoint_snapshot_json(checkpoint: &RealCheckpointSnapshot) -> JsonValue {
         JsonValue::Array(checkpoint.entries.iter().map(entry_json).collect()),
     );
     JsonValue::Object(object)
+}
+
+fn checkpoint_evidence_json(evidence: &EvidenceRef) -> JsonValue {
+    match evidence {
+        EvidenceRef::Execution(execution) => {
+            let mut object = BTreeMap::new();
+            object.insert(
+                "kind".to_string(),
+                JsonValue::String("execution".to_string()),
+            );
+            object.insert(
+                "execution_id".to_string(),
+                JsonValue::String(execution.execution_id.clone()),
+            );
+            object.insert(
+                "result".to_string(),
+                JsonValue::String(execution.result.as_str().to_string()),
+            );
+            object.insert(
+                "resolved_view_id".to_string(),
+                JsonValue::String(execution.resolved_view_id.clone()),
+            );
+            object.insert(
+                "repository_id".to_string(),
+                JsonValue::String(execution.tree_identity.repository_id.clone()),
+            );
+            object.insert(
+                "tree_hash".to_string(),
+                JsonValue::String(execution.tree_identity.tree_hash.clone()),
+            );
+            JsonValue::Object(object)
+        }
+    }
 }
 
 fn export_map_snapshot_json(export_map: &RealExportMapSnapshot) -> JsonValue {

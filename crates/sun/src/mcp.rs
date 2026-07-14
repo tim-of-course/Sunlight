@@ -843,12 +843,18 @@ fn build_invocation(
             "--classification".into(),
             classification(args)?,
         ],
-        "checkpoint_create" => vec![
-            "checkpoint".into(),
-            "create".into(),
-            "--view".into(),
-            identifier(args, "view")?,
-        ],
+        "checkpoint_create" => {
+            let mut argv = vec![
+                "checkpoint".into(),
+                "create".into(),
+                "--view".into(),
+                identifier(args, "view")?,
+            ];
+            if let Some(execution) = optional_identifier(args, "execution")? {
+                argv.extend(["--execution".into(), execution]);
+            }
+            argv
+        }
         "policy_check_export" => policy_export_argv(args)?,
         "policy_check_commit" => policy_commit_argv(args)?,
         "policy_explain" => vec![
@@ -1332,7 +1338,7 @@ fn allowed_fields(name: &str) -> &'static [&'static str] {
         "compat_import" => &["projection", "candidates", "session_generation"],
         "execution_run" => &["view", "program", "args", "cwd", "network"],
         "execution_promote_output" => &["execution", "path", "session", "classification"],
-        "checkpoint_create" => &["view"],
+        "checkpoint_create" => &["view", "execution"],
         "policy_check_export" => &["checkpoint", "branch"],
         "policy_check_commit" => &["paths"],
         "policy_explain" => &["validation_report"],
@@ -1523,8 +1529,8 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "checkpoint_create",
-            "Freeze an exact resolved view and eligible evidence.",
-            json!({"view":s()}),
+            "Freeze an exact resolved view with optional validated passing execution evidence.",
+            json!({"view":s(),"execution":s()}),
             &["view"],
             true,
         ),

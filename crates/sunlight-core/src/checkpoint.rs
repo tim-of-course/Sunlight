@@ -267,7 +267,7 @@ fn checkpointable_tree_identity(
         })
 }
 
-fn validated_execution_evidence(
+pub fn validated_execution_evidence(
     view: &ResolvedViewResult,
     tree_identity: &SingleRepoTree,
     execution: &ExecutionRecord,

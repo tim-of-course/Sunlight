@@ -156,6 +156,77 @@ fn no_fixture_repository_status_clean_initial_and_active_human_journey() {
 }
 
 #[test]
+fn no_fixture_repository_status_warns_about_external_git_working_tree_changes() {
+    let repo = TestRepo::new("repository-status-git-working-tree-warning");
+    init_local_git_repo(&repo);
+
+    let init = sun()
+        .args(["init", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&init);
+
+    let native_state_path = repo.path().join(".sunlight/records/native-state.json");
+    let native_state_before = fs::read(&native_state_path).unwrap();
+    let index_path = repo.path().join(".git/index");
+    let index_before = fs::read(&index_path).unwrap();
+    let index_lock_path = repo.path().join(".git/index.lock");
+    assert!(!index_lock_path.exists());
+
+    write_nested_file(
+        repo.path(),
+        ".sunlight/local/diagnostic-only.txt",
+        "root Sunlight metadata only\n",
+    );
+    for args in [
+        &["status", "--json"][..],
+        &["inspect", "repository", "--json"][..],
+        &["status"][..],
+        &["inspect", "repository"][..],
+    ] {
+        let output = sun().args(args).current_dir(repo.path()).output().unwrap();
+        assert_success(&output);
+        assert!(!stdout(&output).contains("git_working_tree_changed"));
+    }
+
+    repo.write_file("base.txt", "changed outside Sunlight\n");
+    repo.write_file("untracked.txt", "also outside Sunlight\n");
+
+    for args in [
+        &["status", "--json"][..],
+        &["inspect", "repository", "--json"][..],
+    ] {
+        let output = sun().args(args).current_dir(repo.path()).output().unwrap();
+        assert_success(&output);
+        let body = stdout(&output);
+        assert_valid_json(&body);
+        assert!(body.contains("{\"code\":\"git_working_tree_changed\",\"message\":\"the Git working tree changed outside Sunlight; native Sunlight state remains authoritative\",\"details\":{}}"));
+        assert!(!body.contains("base.txt"));
+        assert!(!body.contains("untracked.txt"));
+        assert!(!body.contains(&repo.path().to_string_lossy().replace('\\', "\\\\")));
+    }
+
+    for args in [&["status"][..], &["inspect", "repository"][..]] {
+        let output = sun().args(args).current_dir(repo.path()).output().unwrap();
+        assert_success(&output);
+        let body = stdout(&output);
+        assert!(body.contains("warning[git_working_tree_changed]: the Git working tree changed outside Sunlight; native Sunlight state remains authoritative"));
+        assert!(!body.contains("base.txt"));
+        assert!(!body.contains("untracked.txt"));
+        assert!(!body.contains(&repo.path().to_string_lossy().into_owned()));
+    }
+
+    assert_eq!(fs::read(&index_path).unwrap(), index_before);
+    assert!(!index_lock_path.exists());
+    assert_eq!(fs::read(&native_state_path).unwrap(), native_state_before);
+
+    let cleanup_path = repo.path().to_path_buf();
+    drop(repo);
+    assert!(!cleanup_path.exists());
+}
+
+#[test]
 fn init_json_returns_repository_success_envelope() {
     let repo = TestRepo::new("init-json");
 

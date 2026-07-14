@@ -6565,6 +6565,7 @@ struct RealPolicyStatus {
 #[derive(Debug, Default)]
 struct RealOperationalSummary {
     recovery_rollback_evidence: bool,
+    git_working_tree_changed: bool,
     artifact_count: usize,
     quarantined_count: usize,
     conflict_count: usize,
@@ -6592,6 +6593,7 @@ fn real_operational_summary(repo_root: &Path, state: &RealRepoState) -> RealOper
                 .flatten()
                 .any(|entry| entry.file_name().to_string_lossy().starts_with("evidence-"))
         }),
+        git_working_tree_changed: git_working_tree_changed_outside_sunlight(repo_root),
         artifact_count: state
             .entries
             .iter()
@@ -6849,9 +6851,14 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
 fn real_operational_warnings_json(
     state: &RealRepoState,
     summary: &RealOperationalSummary,
-    _command: &str,
+    command: &str,
 ) -> String {
     let mut warnings = Vec::new();
+    if matches!(command, "status.repository" | "inspect.repository")
+        && summary.git_working_tree_changed
+    {
+        warnings.push("{\"code\":\"git_working_tree_changed\",\"message\":\"the Git working tree changed outside Sunlight; native Sunlight state remains authoritative\",\"details\":{}}".to_string());
+    }
     if summary.recovery_rollback_evidence {
         warnings.push("{\"code\":\"state_recovery_rolled_back\",\"message\":\"an interrupted malformed publication was rolled back to the newest fully valid state\",\"details\":{\"evidence_root\":\"local://.sunlight/local/recovery/native-state\"}}".to_string());
     }
@@ -6999,6 +7006,11 @@ fn print_real_status_text(
             ctx,
             "execution isolation: process-tree/cpu/memory/network/filesystem-write unenforced"
         );
+    }
+    if matches!(command, "status.repository" | "inspect.repository")
+        && summary.git_working_tree_changed
+    {
+        outputln!(ctx, "warning[git_working_tree_changed]: the Git working tree changed outside Sunlight; native Sunlight state remains authoritative");
     }
     if summary.recovery_rollback_evidence {
         outputln!(ctx, "warning[state_recovery_rolled_back]: inspect .sunlight/local/recovery/native-state before the next successful state publication cleans the evidence");
@@ -11183,6 +11195,25 @@ fn run_git_capture(repo_root: &PathBuf, args: &[&str]) -> Result<String, String>
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("git {} failed: {}", args.join(" "), stderr.trim()))
     }
+}
+
+fn git_working_tree_changed_outside_sunlight(repo_root: &Path) -> bool {
+    Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+            "--",
+            ".",
+            ":(top,glob,exclude).sunlight/**",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
 }
 
 fn fixture_base_git_commit_id() -> String {

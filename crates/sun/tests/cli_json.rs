@@ -24,7 +24,7 @@ fn global_and_primary_help_describe_repo_backed_operator_workflow() {
     let help = stdout(&output);
     for expected in [
         "sun init",
-        "sun topic create <slug> --display-name <name> [--json]",
+        "sun topic create <slug> --display-name <name> [--owner <actor>]",
         "sun compat import --projection <projection> --candidate <candidate>",
         "sun run --view <view>",
         "sun policy check-export --checkpoint <checkpoint>",
@@ -46,6 +46,196 @@ fn global_and_primary_help_describe_repo_backed_operator_workflow() {
         assert_success(&output);
         assert!(!stdout(&output).contains("--fixture basic-app"));
     }
+}
+
+#[test]
+fn no_fixture_topic_intent_metadata_is_durable_inspectable_validated_and_export_gated() {
+    let repo = TestRepo::new("topic-intent-metadata");
+    init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+
+    let created = run_real_json(
+        &repo,
+        &[
+            "topic",
+            "create",
+            "private-intent",
+            "--display-name",
+            "Private intent",
+            "--owner",
+            "agent-owner",
+            "--visibility",
+            "private",
+            "--acceptance-criterion",
+            "tests pass",
+            "--acceptance-criterion",
+            "review complete",
+        ],
+    );
+    assert_success(&created);
+    let created_json: serde_json::Value = serde_json::from_str(&stdout(&created)).unwrap();
+    let topic = &created_json["data"]["topic"];
+    assert_eq!(topic["owner_actor_id"], "agent-owner");
+    assert_eq!(topic["visibility"], "private");
+    assert_eq!(
+        topic["acceptance_criteria"],
+        serde_json::json!(["tests pass", "review complete"])
+    );
+    assert_eq!(topic["base_checkpoint_id"], "checkpoint_base_0001");
+
+    let reloaded = RealRepoState::load(repo.path()).unwrap();
+    let persisted = reloaded.topic_by_id_or_slug("private-intent").unwrap();
+    assert_eq!(persisted.owner_actor_id, "agent-owner");
+    assert_eq!(persisted.visibility, "private");
+    assert_eq!(
+        persisted.acceptance_criteria,
+        ["tests pass", "review complete"]
+    );
+    assert_eq!(persisted.base_checkpoint_id, reloaded.base_checkpoint_id);
+    let derived = fs::read_to_string(
+        repo.path()
+            .join(".sunlight/topics/topic_private_intent.json"),
+    )
+    .unwrap();
+    assert!(derived.contains("\"owner_actor_id\":\"agent-owner\""));
+    assert!(derived.contains("\"visibility\":\"private\""));
+    assert!(derived.contains("\"acceptance_criteria\":[\"tests pass\",\"review complete\"]"));
+    assert!(derived.contains("\"base_checkpoint_id\":\"checkpoint_base_0001\""));
+
+    for args in [
+        vec!["status", "--topic", "private-intent"],
+        vec!["inspect", "topic:private-intent"],
+    ] {
+        let output = run_real_json(&repo, &args);
+        assert_success(&output);
+        let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(value["data"]["topic"], *topic);
+    }
+    let human = sun()
+        .args(["inspect", "topic:private-intent"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&human);
+    let human = stdout(&human);
+    assert!(human.contains("owner=agent-owner visibility=private base=checkpoint_base_0001"));
+    assert!(human.contains("acceptance: tests pass"));
+
+    let before_rejection =
+        fs::read(repo.path().join(".sunlight/records/native-state.json")).unwrap();
+    let invalid = run_real_json(
+        &repo,
+        &[
+            "topic",
+            "create",
+            "invalid-intent",
+            "--display-name",
+            "Invalid intent",
+            "--visibility",
+            "public",
+        ],
+    );
+    assert_failure(&invalid);
+    assert!(stdout(&invalid).contains("topic visibility must be one of: local, private"));
+    assert_eq!(
+        fs::read(repo.path().join(".sunlight/records/native-state.json")).unwrap(),
+        before_rejection
+    );
+    assert!(!repo
+        .path()
+        .join(".sunlight/topics/topic_invalid_intent.json")
+        .exists());
+
+    let defaults = run_real_json(
+        &repo,
+        &[
+            "topic",
+            "create",
+            "default-intent",
+            "--display-name",
+            "Default intent",
+        ],
+    );
+    assert_success(&defaults);
+    let defaults: serde_json::Value = serde_json::from_str(&stdout(&defaults)).unwrap();
+    assert_eq!(defaults["data"]["topic"]["owner_actor_id"], "local");
+    assert_eq!(defaults["data"]["topic"]["visibility"], "local");
+    assert_eq!(
+        defaults["data"]["topic"]["acceptance_criteria"],
+        serde_json::json!([])
+    );
+
+    let session = run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "private-intent",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "private-writer",
+        ],
+    );
+    assert_success(&session);
+    let content = repo.write_file("private-content.tmp", "private topic output\n");
+    let write = sun()
+        .args([
+            "write",
+            "private-output.txt",
+            "--session",
+            "session_private_writer",
+            "--expect-hash",
+            "new",
+            "--content-file",
+        ])
+        .arg(content)
+        .args(["--classification", "source", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&write);
+    let write_json: serde_json::Value = serde_json::from_str(&stdout(&write)).unwrap();
+    let view = write_json["data"]["view"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let checkpoint = run_real_json(&repo, &["checkpoint", "create", "--view", &view]);
+    assert_success(&checkpoint);
+    let checkpoint_id = json_string_field(&stdout(&checkpoint), "checkpoint_id");
+    let policy = run_real_json(
+        &repo,
+        &[
+            "policy",
+            "check-export",
+            "--checkpoint",
+            &checkpoint_id,
+            "--branch",
+            "refs/heads/private-intent",
+        ],
+    );
+    assert_failure(&policy);
+    let policy_text = stdout(&policy);
+    assert!(
+        policy_text.contains("\"code\":\"private_topic\""),
+        "{policy_text}"
+    );
+    assert!(policy_text.contains("\"check\":\"topic_visibility\""));
+    let export = run_real_json(
+        &repo,
+        &[
+            "git",
+            "export",
+            "--checkpoint",
+            &checkpoint_id,
+            "--branch",
+            "refs/heads/private-intent",
+            "--write-plan",
+        ],
+    );
+    assert_failure(&export);
+    assert!(stdout(&export).contains("\"code\":\"private_topic\""));
 }
 
 #[test]

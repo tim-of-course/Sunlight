@@ -7,6 +7,73 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 #[test]
+fn stdio_mcp_topic_create_matches_cli_durable_intent_metadata() {
+    let temp = TempDir::new("sun-mcp-topic-metadata");
+    let cli_repo = temp.path().join("cli");
+    let mcp_repo = temp.path().join("mcp");
+    for repo in [&cli_repo, &mcp_repo] {
+        fs::create_dir_all(repo).unwrap();
+        git(repo, &["init", "--quiet"]);
+        git(repo, &["config", "user.name", "Sun MCP Test"]);
+        git(repo, &["config", "user.email", "sun-mcp@example.invalid"]);
+        fs::write(repo.join("README.md"), "# Topic metadata\n").unwrap();
+        git(repo, &["add", "README.md"]);
+        git(repo, &["commit", "--quiet", "-m", "base"]);
+    }
+
+    let _ = sun_json(&cli_repo, &["init"]);
+    let cli = sun_json(
+        &cli_repo,
+        &[
+            "topic",
+            "create",
+            "typed-intent",
+            "--display-name",
+            "Typed intent",
+            "--owner",
+            "intent-agent",
+            "--visibility",
+            "private",
+            "--acceptance-criterion",
+            "first criterion",
+            "--acceptance-criterion",
+            "second criterion",
+        ],
+    );
+
+    let mut mcp = Mcp::start(&mcp_repo);
+    let _ = mcp.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-11-25",
+            "capabilities":{},
+            "clientInfo":{"name":"sun-topic-contract-test","version":"1"}
+        }),
+    );
+    mcp.notify("notifications/initialized", json!({}));
+    let _ = mcp.call(2, "repository_init", json!({}));
+    let mcp_created = mcp.call(
+        3,
+        "topic_create",
+        json!({
+            "slug":"typed-intent",
+            "display_name":"Typed intent",
+            "owner":"intent-agent",
+            "visibility":"private",
+            "acceptance_criteria":["first criterion", "second criterion"]
+        }),
+    );
+    assert_eq!(
+        normalize_repository_identity(cli["data"]["topic"].clone()),
+        normalize_repository_identity(mcp_created["data"]["topic"].clone())
+    );
+    let inspected = mcp.call(4, "inspect", json!({"selector":"topic:typed-intent"}));
+    assert_eq!(inspected["data"]["topic"], mcp_created["data"]["topic"]);
+    mcp.shutdown();
+}
+
+#[test]
 fn stdio_mcp_bounds_large_engine_output_and_remains_usable() {
     let temp = TempDir::new("sun-mcp-large-output");
     let repo = temp.path().join("repository");

@@ -123,6 +123,7 @@ pub enum GitExportValidationCheck {
     ExecutionRawExclusion,
     GeneratedPolicy,
     ReportIntegrity,
+    TopicVisibility,
 }
 
 impl GitExportValidationCheck {
@@ -140,6 +141,7 @@ impl GitExportValidationCheck {
             Self::ExecutionRawExclusion => "execution_raw_exclusion",
             Self::GeneratedPolicy => "generated_policy",
             Self::ReportIntegrity => "report_integrity",
+            Self::TopicVisibility => "topic_visibility",
         }
     }
 }
@@ -162,6 +164,9 @@ pub enum GitExportValidationFailureCode {
     SecretOrLocalOnlyRecord,
     GeneratedOutputRequiresPromotion,
     ValidationReportMissing,
+    PrivateTopic,
+    TopicMetadataMissing,
+    UnsupportedTopicVisibility,
 }
 
 impl GitExportValidationFailureCode {
@@ -183,6 +188,9 @@ impl GitExportValidationFailureCode {
             Self::SecretOrLocalOnlyRecord => "secret_or_local_only_record",
             Self::GeneratedOutputRequiresPromotion => "generated_output_requires_promotion",
             Self::ValidationReportMissing => "validation_report_missing",
+            Self::PrivateTopic => "private_topic",
+            Self::TopicMetadataMissing => "topic_metadata_missing",
+            Self::UnsupportedTopicVisibility => "unsupported_topic_visibility",
         }
     }
 }
@@ -1173,6 +1181,41 @@ pub fn validate_persisted_git_export(
             "checkpoint export requires a conflict-free, non-stale resolved view",
         ));
     }
+    for frontier_entry in &checkpoint.topic_frontier {
+        let topic_id = &frontier_entry.topic_id;
+        match input
+            .state
+            .topics
+            .iter()
+            .find(|topic| topic.topic_id == *topic_id)
+        {
+            Some(topic) if topic.visibility == "local" => {}
+            Some(topic) if topic.visibility == "private" => report.failures.push(failure(
+                GitExportValidationCheck::TopicVisibility,
+                GitExportValidationFailureCode::PrivateTopic,
+                Some("checkpoint.topic_frontier[].topic_id"),
+                Some(topic_id.clone()),
+                "private topic state cannot be disclosed through Git export",
+            )),
+            Some(topic) => report.failures.push(failure(
+                GitExportValidationCheck::TopicVisibility,
+                GitExportValidationFailureCode::UnsupportedTopicVisibility,
+                Some("checkpoint.topic_frontier[].topic_id"),
+                Some(topic_id.clone()),
+                &format!(
+                    "topic has unsupported persisted visibility `{}` and cannot be exported",
+                    topic.visibility
+                ),
+            )),
+            None => report.failures.push(failure(
+                GitExportValidationCheck::Reachability,
+                GitExportValidationFailureCode::TopicMetadataMissing,
+                Some("checkpoint.topic_frontier[].topic_id"),
+                Some(topic_id.clone()),
+                "checkpoint frontier topic metadata is missing from persisted repository state",
+            )),
+        }
+    }
     if view.path_policy_id != POSIX_CASE_SENSITIVE_PATH_POLICY_ID
         || !input.config.path_policy.case_sensitive
     {
@@ -1683,6 +1726,7 @@ fn parse_validation_report_failure(
         "execution_raw_exclusion" => GitExportValidationCheck::ExecutionRawExclusion,
         "generated_policy" => GitExportValidationCheck::GeneratedPolicy,
         "report_integrity" => GitExportValidationCheck::ReportIntegrity,
+        "topic_visibility" => GitExportValidationCheck::TopicVisibility,
         value => return report_invalid(path, &format!("unknown validation check `{value}`")),
     };
     let code = match report_string(path, object, "code")? {
@@ -1708,6 +1752,11 @@ fn parse_validation_report_failure(
             GitExportValidationFailureCode::GeneratedOutputRequiresPromotion
         }
         "validation_report_missing" => GitExportValidationFailureCode::ValidationReportMissing,
+        "private_topic" => GitExportValidationFailureCode::PrivateTopic,
+        "topic_metadata_missing" => GitExportValidationFailureCode::TopicMetadataMissing,
+        "unsupported_topic_visibility" => {
+            GitExportValidationFailureCode::UnsupportedTopicVisibility
+        }
         value => {
             return report_invalid(path, &format!("unknown validation failure code `{value}`"))
         }
@@ -2349,6 +2398,7 @@ mod tests {
         FIXTURE_CHECKPOINT_ID,
     };
     use crate::execution::ExecutionStatus;
+    use crate::repo_state::RealTopicRecord;
     use crate::resolver::{
         fixture_auth_revision, fixture_base_entries, fixture_profile_revision,
         fixture_resolver_input, resolve_fixture_view, TopicRevisionSelection,
@@ -2394,6 +2444,65 @@ mod tests {
             Err(GitExportValidationReportStoreError::Invalid { .. })
         ));
     }
+
+    #[test]
+    fn persisted_export_accepts_local_topics_and_blocks_private_topics() {
+        let local = persisted_topic_report(&[
+            ("topic_auth_nullability", "local"),
+            ("topic_profile_ui", "local"),
+        ]);
+        assert!(local.ok);
+        assert!(local.failures.is_empty());
+
+        let private = persisted_topic_report(&[
+            ("topic_auth_nullability", "private"),
+            ("topic_profile_ui", "local"),
+        ]);
+        assert!(!private.ok);
+        assert!(private.failures.iter().any(|failure| {
+            failure.check == GitExportValidationCheck::TopicVisibility
+                && failure.code == GitExportValidationFailureCode::PrivateTopic
+                && failure.value.as_deref() == Some("topic_auth_nullability")
+        }));
+    }
+
+    #[test]
+    fn persisted_export_blocks_unsupported_topic_visibility_without_mislabeling_it_private() {
+        let report = persisted_topic_report(&[
+            ("topic_auth_nullability", "shared"),
+            ("topic_profile_ui", "local"),
+        ]);
+
+        assert!(!report.ok);
+        assert!(report.failures.iter().any(|failure| {
+            failure.check == GitExportValidationCheck::TopicVisibility
+                && failure.code == GitExportValidationFailureCode::UnsupportedTopicVisibility
+                && failure.value.as_deref() == Some("topic_auth_nullability")
+        }));
+        assert!(!report
+            .failures
+            .iter()
+            .any(|failure| failure.code == GitExportValidationFailureCode::PrivateTopic));
+        assert_validation_report_round_trips(&report);
+    }
+
+    #[test]
+    fn persisted_export_blocks_missing_frontier_topic_metadata() {
+        let report = persisted_topic_report(&[("topic_profile_ui", "local")]);
+
+        assert!(!report.ok);
+        assert!(report.failures.iter().any(|failure| {
+            failure.check == GitExportValidationCheck::Reachability
+                && failure.code == GitExportValidationFailureCode::TopicMetadataMissing
+                && failure.value.as_deref() == Some("topic_auth_nullability")
+        }));
+        assert!(!report
+            .failures
+            .iter()
+            .any(|failure| failure.code == GitExportValidationFailureCode::PrivateTopic));
+        assert_validation_report_round_trips(&report);
+    }
+
     #[test]
     fn validates_policy_approved_metadata_only_export() {
         let checkpoint = fixture_checkpoint();
@@ -2586,6 +2695,14 @@ mod tests {
         assert_eq!(
             GitExportValidationFailureCode::GeneratedOutputRequiresPromotion.as_str(),
             "generated_output_requires_promotion"
+        );
+        assert_eq!(
+            GitExportValidationFailureCode::TopicMetadataMissing.as_str(),
+            "topic_metadata_missing"
+        );
+        assert_eq!(
+            GitExportValidationFailureCode::UnsupportedTopicVisibility.as_str(),
+            "unsupported_topic_visibility"
         );
         assert_eq!(GitExportValidationCheck::GitRef.as_str(), "git_ref");
         assert_eq!(
@@ -3569,6 +3686,61 @@ mod tests {
 
     fn fixture_checkpoint() -> CheckpointRecord {
         fixture_checkpoint_from_resolved_view(&conflict_free_view(), None).unwrap()
+    }
+
+    fn persisted_topic_report(topic_visibilities: &[(&str, &str)]) -> GitExportValidationReport {
+        let repo = TestTempDir::new();
+        let mut view = conflict_free_view();
+        let tree_hash = real_tree_hash(&[]);
+        view.tree_identity.as_mut().unwrap().tree_hash = tree_hash.clone();
+        let mut checkpoint = fixture_checkpoint_from_resolved_view(&view, None).unwrap();
+        checkpoint.tree_identity.tree_hash = tree_hash;
+        let request = GitExportRequest::from_checkpoint(&checkpoint);
+        let mut state = RealRepoState::ingest(repo.path(), &checkpoint.repository_id).unwrap();
+        state.topics = topic_visibilities
+            .iter()
+            .map(|(topic_id, visibility)| RealTopicRecord {
+                topic_id: (*topic_id).to_string(),
+                slug: topic_id.trim_start_matches("topic_").replace('_', "-"),
+                display_name: (*topic_id).to_string(),
+                owner_actor_id: "agent-a".to_string(),
+                visibility: (*visibility).to_string(),
+                acceptance_criteria: Vec::new(),
+                base_checkpoint_id: FIXTURE_BASE_CHECKPOINT_ID.to_string(),
+                head_revision_id: checkpoint
+                    .topic_frontier
+                    .iter()
+                    .find(|entry| entry.topic_id == *topic_id)
+                    .map(|entry| entry.topic_revision_id.clone()),
+                revision_number: 1,
+            })
+            .collect();
+        let config = RepositoryConfig::new(checkpoint.repository_id.clone());
+
+        validate_persisted_git_export(PersistedGitExportValidationInput {
+            config: &config,
+            request: &request,
+            resolved_view: &view,
+            entries: &[],
+            state: &state,
+        })
+    }
+
+    fn assert_validation_report_round_trips(report: &GitExportValidationReport) {
+        let repo = TestTempDir::new();
+        persist_git_export_validation_report(
+            repo.path(),
+            &report.tree_identity.repository_id,
+            report,
+        )
+        .unwrap();
+        let loaded = load_git_export_validation_report(
+            repo.path(),
+            &report.tree_identity.repository_id,
+            &report.id,
+        )
+        .unwrap();
+        assert_eq!(loaded, *report);
     }
 
     fn conflict_free_view() -> crate::resolver::ResolvedViewResult {

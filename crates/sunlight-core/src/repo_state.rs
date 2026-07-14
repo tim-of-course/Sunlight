@@ -91,9 +91,62 @@ pub struct RealTopicRecord {
     pub slug: String,
     pub display_name: String,
     pub owner_actor_id: String,
+    pub visibility: String,
+    pub acceptance_criteria: Vec<String>,
     pub base_checkpoint_id: String,
     pub head_revision_id: Option<String>,
     pub revision_number: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopicMetadataValidationError {
+    InvalidOwner,
+    UnsupportedVisibility,
+    InvalidAcceptanceCriteria,
+}
+
+impl Display for TopicMetadataValidationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidOwner => write!(
+                f,
+                "topic owner must be a non-empty actor identifier of at most 128 characters"
+            ),
+            Self::UnsupportedVisibility => {
+                write!(f, "topic visibility must be one of: local, private")
+            }
+            Self::InvalidAcceptanceCriteria => write!(
+                f,
+                "each acceptance criterion must be non-empty, at most 1024 characters, and at most 64 criteria may be supplied"
+            ),
+        }
+    }
+}
+
+pub fn validate_topic_metadata(
+    owner_actor_id: &str,
+    visibility: &str,
+    acceptance_criteria: &[String],
+) -> Result<(), TopicMetadataValidationError> {
+    if owner_actor_id.trim().is_empty()
+        || owner_actor_id.len() > 128
+        || owner_actor_id.chars().any(char::is_control)
+    {
+        return Err(TopicMetadataValidationError::InvalidOwner);
+    }
+    if !matches!(visibility, "local" | "private") {
+        return Err(TopicMetadataValidationError::UnsupportedVisibility);
+    }
+    if acceptance_criteria.len() > 64
+        || acceptance_criteria.iter().any(|criterion| {
+            criterion.trim().is_empty()
+                || criterion.len() > 1024
+                || criterion.chars().any(char::is_control)
+        })
+    {
+        return Err(TopicMetadataValidationError::InvalidAcceptanceCriteria);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -630,15 +683,26 @@ impl RealRepoState {
 
         if topics.is_empty() {
             if let Some(legacy_topic_id) = topic_id.clone() {
-                topics.push(RealTopicRecord {
+                let legacy_topic = RealTopicRecord {
                     topic_id: legacy_topic_id,
                     slug: topic_slug.clone().unwrap_or_default(),
                     display_name: topic_display_name.clone().unwrap_or_default(),
                     owner_actor_id: actor_id.clone().unwrap_or_else(|| "local".to_string()),
+                    visibility: "local".to_string(),
+                    acceptance_criteria: Vec::new(),
                     base_checkpoint_id: required_string(&object, "base_checkpoint_id", &path)?,
                     head_revision_id: head_revision_id.clone(),
                     revision_number,
-                });
+                };
+                validate_topic_metadata(
+                    &legacy_topic.owner_actor_id,
+                    &legacy_topic.visibility,
+                    &legacy_topic.acceptance_criteria,
+                )
+                .map_err(|error| {
+                    invalid_state(&path, format!("invalid topic metadata: {error}"))
+                })?;
+                topics.push(legacy_topic);
             }
         }
         if sessions.is_empty() {
@@ -4166,15 +4230,34 @@ fn parse_topic(value: &JsonValue, state_path: &Path) -> Result<RealTopicRecord, 
     let JsonValue::Object(object) = value else {
         return Err(invalid_state(state_path, "topic must be a JSON object"));
     };
-    Ok(RealTopicRecord {
+    let topic = RealTopicRecord {
         topic_id: required_string(object, "topic_id", state_path)?,
         slug: required_string(object, "slug", state_path)?,
         display_name: required_string(object, "display_name", state_path)?,
         owner_actor_id: required_string(object, "owner_actor_id", state_path)?,
+        visibility: optional_string(object, "visibility", state_path)?
+            .unwrap_or_else(|| "local".to_string()),
+        acceptance_criteria: optional_array(object, "acceptance_criteria", state_path)?
+            .iter()
+            .map(|value| match value {
+                JsonValue::String(criterion) => Ok(criterion.clone()),
+                _ => Err(invalid_state(
+                    state_path,
+                    "topic acceptance_criteria entries must be strings",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         base_checkpoint_id: required_string(object, "base_checkpoint_id", state_path)?,
         head_revision_id: optional_string(object, "head_revision_id", state_path)?,
         revision_number: required_u64(object, "revision_number", state_path)?,
-    })
+    };
+    validate_topic_metadata(
+        &topic.owner_actor_id,
+        &topic.visibility,
+        &topic.acceptance_criteria,
+    )
+    .map_err(|error| invalid_state(state_path, format!("invalid topic metadata: {error}")))?;
+    Ok(topic)
 }
 
 fn parse_session(
@@ -5370,6 +5453,21 @@ fn topic_json(topic: &RealTopicRecord) -> JsonValue {
         JsonValue::String(topic.owner_actor_id.clone()),
     );
     object.insert(
+        "visibility".to_string(),
+        JsonValue::String(topic.visibility.clone()),
+    );
+    object.insert(
+        "acceptance_criteria".to_string(),
+        JsonValue::Array(
+            topic
+                .acceptance_criteria
+                .iter()
+                .cloned()
+                .map(JsonValue::String)
+                .collect(),
+        ),
+    );
+    object.insert(
         "base_checkpoint_id".to_string(),
         JsonValue::String(topic.base_checkpoint_id.clone()),
     );
@@ -6304,6 +6402,66 @@ mod tests {
     }
 
     #[test]
+    fn persisted_topic_metadata_rejects_unsupported_visibility() {
+        let repo = temp_repo("topic-visibility-load-validation");
+        let mut state = RealRepoState::ingest(&repo, "repo_topic_validation").unwrap();
+        let topic = test_topic("shared");
+        let parse_error =
+            parse_topic(&topic_json(&topic), Path::new("native-state.json")).unwrap_err();
+        assert!(matches!(
+            parse_error,
+            RepoStateError::InvalidState { ref message, .. }
+                if message == "invalid topic metadata: topic visibility must be one of: local, private"
+        ));
+        state.topics.push(topic);
+        write_state_json(&repo, state.to_json_value());
+
+        let error = RealRepoState::load(&repo).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                RepoStateError::Recovery { ref message, .. }
+                    if message.contains("canonical state is malformed")
+            ),
+            "unexpected load error: {error:?}"
+        );
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn persisted_topic_metadata_rejects_invalid_owner_and_acceptance_criteria() {
+        for (name, owner, criteria, expected) in [
+            (
+                "owner",
+                "",
+                Vec::new(),
+                "invalid topic metadata: topic owner must be a non-empty actor identifier of at most 128 characters",
+            ),
+            (
+                "criteria",
+                "agent-a",
+                vec![" ".to_string()],
+                "invalid topic metadata: each acceptance criterion must be non-empty, at most 1024 characters, and at most 64 criteria may be supplied",
+            ),
+        ] {
+            let mut topic = test_topic("local");
+            topic.owner_actor_id = owner.to_string();
+            topic.acceptance_criteria = criteria;
+
+            let error =
+                parse_topic(&topic_json(&topic), Path::new("native-state.json")).unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    RepoStateError::InvalidState { ref message, .. } if message == expected
+                ),
+                "unexpected {name} parse error: {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn legacy_session_state_loads_with_effective_frontier_and_pinned_policy() {
         let repo = temp_repo("legacy-session-frontier");
         let mut state = RealRepoState::ingest(&repo, "repo_legacy").unwrap();
@@ -6312,6 +6470,8 @@ mod tests {
             slug: "legacy".to_string(),
             display_name: "Legacy".to_string(),
             owner_actor_id: "legacy-agent".to_string(),
+            visibility: "local".to_string(),
+            acceptance_criteria: Vec::new(),
             base_checkpoint_id: state.base_checkpoint_id.clone(),
             head_revision_id: Some("rev_legacy_0001".to_string()),
             revision_number: 1,
@@ -6334,6 +6494,14 @@ mod tests {
             unreachable!()
         };
         root.remove("session_generations");
+        let JsonValue::Array(topics) = root.get_mut("topics").unwrap() else {
+            unreachable!()
+        };
+        let JsonValue::Object(topic) = &mut topics[0] else {
+            unreachable!()
+        };
+        topic.remove("visibility");
+        topic.remove("acceptance_criteria");
         let JsonValue::Array(sessions) = root.get_mut("sessions").unwrap() else {
             unreachable!()
         };
@@ -6347,6 +6515,9 @@ mod tests {
         fs::write(&path, canonical_json_bytes(&json).unwrap()).unwrap();
 
         let loaded = RealRepoState::load(&repo).unwrap();
+        let topic = loaded.topic_by_id_or_slug("topic_legacy").unwrap();
+        assert_eq!(topic.visibility, "local");
+        assert!(topic.acceptance_criteria.is_empty());
         let session = loaded.session_by_id("session_legacy").unwrap();
         assert_eq!(session.refresh_policy, "none");
         assert_eq!(
@@ -6365,6 +6536,26 @@ mod tests {
         fs::remove_dir_all(repo).unwrap();
     }
 
+    fn test_topic(visibility: &str) -> RealTopicRecord {
+        RealTopicRecord {
+            topic_id: "topic_validation".to_string(),
+            slug: "validation".to_string(),
+            display_name: "Validation".to_string(),
+            owner_actor_id: "agent-a".to_string(),
+            visibility: visibility.to_string(),
+            acceptance_criteria: vec!["focused behavior is verified".to_string()],
+            base_checkpoint_id: "checkpoint_base_0001".to_string(),
+            head_revision_id: None,
+            revision_number: 0,
+        }
+    }
+
+    fn write_state_json(repo: &Path, value: JsonValue) {
+        let path = real_state_path(repo);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, canonical_json_bytes(&value).unwrap()).unwrap();
+    }
+
     #[test]
     fn legacy_actor_scoped_generation_collision_is_relinked_per_session() {
         let repo = temp_repo("legacy-generation-collision");
@@ -6375,6 +6566,8 @@ mod tests {
                 slug: topic_id.trim_start_matches("topic_").to_string(),
                 display_name: topic_id.to_string(),
                 owner_actor_id: "shared-agent".to_string(),
+                visibility: "local".to_string(),
+                acceptance_criteria: Vec::new(),
                 base_checkpoint_id: state.base_checkpoint_id.clone(),
                 head_revision_id: None,
                 revision_number: 0,
@@ -6630,6 +6823,8 @@ mod tests {
                     slug: "docs".to_string(),
                     display_name: "Docs".to_string(),
                     owner_actor_id: "agent-a".to_string(),
+                    visibility: "local".to_string(),
+                    acceptance_criteria: Vec::new(),
                     base_checkpoint_id: "checkpoint_base_0001".to_string(),
                     head_revision_id: Some("rev_docs_0001".to_string()),
                     revision_number: 1,
@@ -6639,6 +6834,8 @@ mod tests {
                     slug: "code".to_string(),
                     display_name: "Code".to_string(),
                     owner_actor_id: "agent-b".to_string(),
+                    visibility: "local".to_string(),
+                    acceptance_criteria: Vec::new(),
                     base_checkpoint_id: "checkpoint_base_0001".to_string(),
                     head_revision_id: Some("rev_code_0001".to_string()),
                     revision_number: 1,
@@ -6702,6 +6899,8 @@ mod tests {
             slug: "alt-code".to_string(),
             display_name: "Alt Code".to_string(),
             owner_actor_id: "agent-c".to_string(),
+            visibility: "local".to_string(),
+            acceptance_criteria: Vec::new(),
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             head_revision_id: Some("rev_alt_code_0001".to_string()),
             revision_number: 1,

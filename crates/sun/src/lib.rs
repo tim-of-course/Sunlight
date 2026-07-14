@@ -97,12 +97,13 @@ use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue}
 use sunlight_core::repo_state::{
     materialize_real_projection, native_session_generation_id, quarantine_report_publication,
     real_artifact_id_for_path, real_content_hash, real_tree_hash,
-    scan_real_projection_files_with_quarantine, DerivedRecordPublication, RealArtifactEntry,
-    RealCheckpointSnapshot, RealExecutionOutputSnapshot, RealExecutionPromotionSnapshot,
-    RealExecutionSnapshot, RealExportMapSnapshot, RealOperationEffect, RealOperationRecord,
-    RealProjectionMaterialization, RealProjectionMaterializationRequest, RealProjectionSnapshot,
-    RealProjectionStrategy, RealRepoState, RealResolvedRepoView, RealSessionGenerationRecord,
-    RealSessionRecord, RealTopicRecord, RepoStateError,
+    scan_real_projection_files_with_quarantine, validate_topic_metadata, DerivedRecordPublication,
+    RealArtifactEntry, RealCheckpointSnapshot, RealExecutionOutputSnapshot,
+    RealExecutionPromotionSnapshot, RealExecutionSnapshot, RealExportMapSnapshot,
+    RealOperationEffect, RealOperationRecord, RealProjectionMaterialization,
+    RealProjectionMaterializationRequest, RealProjectionSnapshot, RealProjectionStrategy,
+    RealRepoState, RealResolvedRepoView, RealSessionGenerationRecord, RealSessionRecord,
+    RealTopicRecord, RepoStateError, TopicMetadataValidationError,
 };
 use sunlight_core::repository::{
     init_repository, resolve_projection_policy, ExecutionPolicy, RepositoryConfig,
@@ -2305,6 +2306,21 @@ fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Resul
     TopicSlug::new(options.slug.clone()).map_err(|error| {
         invalid_request(error.to_string()).with_detail("slug", options.slug.clone())
     })?;
+    validate_topic_metadata(
+        &options.owner_actor_id,
+        &options.visibility,
+        &options.acceptance_criteria,
+    )
+    .map_err(|error| match error {
+        TopicMetadataValidationError::InvalidOwner => invalid_request(error.to_string())
+            .with_detail("owner_actor_id", options.owner_actor_id.clone()),
+        TopicMetadataValidationError::UnsupportedVisibility => {
+            invalid_request(error.to_string()).with_detail("visibility", options.visibility.clone())
+        }
+        TopicMetadataValidationError::InvalidAcceptanceCriteria => {
+            invalid_request(error.to_string())
+        }
+    })?;
     let repo_root = ctx.repo_root.clone();
     let mut state = RealRepoState::load(&repo_root)?;
     let topic_id = format!("topic_{}", options.slug.replace('-', "_"));
@@ -2322,7 +2338,9 @@ fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Resul
         topic_id: topic_id.clone(),
         slug: options.slug.clone(),
         display_name: options.display_name.clone(),
-        owner_actor_id: "local".to_string(),
+        owner_actor_id: options.owner_actor_id.clone(),
+        visibility: options.visibility.clone(),
+        acceptance_criteria: options.acceptance_criteria.clone(),
         base_checkpoint_id: state.base_checkpoint_id.clone(),
         head_revision_id: None,
         revision_number: 0,
@@ -2332,11 +2350,14 @@ fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Resul
         "topics",
         &topic_id,
         &format!(
-            "{{\"record_type\":\"topic\",\"id\":\"{}\",\"repository_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":null}}\n",
+            "{{\"record_type\":\"topic\",\"id\":\"{}\",\"repository_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"owner_actor_id\":\"{}\",\"visibility\":\"{}\",\"acceptance_criteria\":{},\"base_checkpoint_id\":\"{}\",\"head_revision_id\":null}}\n",
             json_escape(&topic_id),
             json_escape(&state.repository_id),
             json_escape(&options.slug),
             json_escape(&options.display_name),
+            json_escape(&options.owner_actor_id),
+            json_escape(&options.visibility),
+            string_array_json(options.acceptance_criteria.iter().map(String::as_str)),
             json_escape(&state.base_checkpoint_id),
         ),
     )?];
@@ -2345,7 +2366,14 @@ fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Resul
     if ctx.json {
         outputln!(ctx, "{}", real_topic_create_success_envelope(&state));
     } else {
-        outputln!(ctx, "created topic {topic_id}");
+        outputln!(
+            ctx,
+            "created topic {topic_id} owner={} visibility={} base={} acceptance-criteria={}",
+            options.owner_actor_id,
+            options.visibility,
+            state.base_checkpoint_id,
+            options.acceptance_criteria.len()
+        );
     }
     Ok(())
 }
@@ -4651,12 +4679,18 @@ fn print_real_inspect_text(
         let topic = real_topic(state, value)?;
         outputln!(
             ctx,
-            "topic {} ({}) head={} revisions={}",
+            "topic {} ({}) head={} revisions={} owner={} visibility={} base={}",
             topic.topic_id,
             topic.slug,
             topic.head_revision_id.as_deref().unwrap_or("none"),
-            topic.revision_number
+            topic.revision_number,
+            topic.owner_actor_id,
+            topic.visibility,
+            topic.base_checkpoint_id,
         );
+        for criterion in &topic.acceptance_criteria {
+            outputln!(ctx, "acceptance: {criterion}");
+        }
         return Ok(());
     }
     if let Some(value) = selector.strip_prefix("session:") {
@@ -5508,15 +5542,31 @@ fn media_type_for_path(path: &str) -> &'static str {
 }
 
 fn real_topic_create_success_envelope(state: &RealRepoState) -> String {
+    let topic = state
+        .topic_id
+        .as_deref()
+        .and_then(|topic_id| state.topic_by_id_or_slug(topic_id))
+        .expect("created topic is present after compatibility fields synchronize");
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"topic.create\",\"repository_id\":\"{}\",\"ids\":{{\"topic_id\":\"{}\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":null}},\"view\":null,\"topic\":{{\"topic_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"status\":\"open\",\"lifecycle\":\"open\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":null,\"owner_actor_id\":\"local\",\"visibility\":\"local\"}}}},\"warnings\":[]}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"topic.create\",\"repository_id\":\"{}\",\"ids\":{{\"topic_id\":\"{}\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":null}},\"view\":null,\"topic\":{}}},\"warnings\":[]}}",
         json_escape(&state.repository_id),
-        json_escape(state.topic_id.as_deref().unwrap_or("")),
-        json_escape(&state.base_checkpoint_id),
-        json_escape(state.topic_id.as_deref().unwrap_or("")),
-        json_escape(state.topic_slug.as_deref().unwrap_or("")),
-        json_escape(state.topic_display_name.as_deref().unwrap_or("")),
-        json_escape(&state.base_checkpoint_id),
+        json_escape(&topic.topic_id),
+        json_escape(&topic.base_checkpoint_id),
+        real_topic_metadata_json(topic),
+    )
+}
+
+fn real_topic_metadata_json(topic: &RealTopicRecord) -> String {
+    format!(
+        "{{\"topic_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"status\":\"open\",\"lifecycle\":\"open\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":{},\"owner_actor_id\":\"{}\",\"visibility\":\"{}\",\"acceptance_criteria\":{}}}",
+        json_escape(&topic.topic_id),
+        json_escape(&topic.slug),
+        json_escape(&topic.display_name),
+        json_escape(&topic.base_checkpoint_id),
+        optional_string_json(topic.head_revision_id.as_deref()),
+        json_escape(&topic.owner_actor_id),
+        json_escape(&topic.visibility),
+        string_array_json(topic.acceptance_criteria.iter().map(String::as_str)),
     )
 }
 
@@ -6978,11 +7028,17 @@ fn print_real_status_text(
     if let Some(topic) = topic {
         outputln!(
             ctx,
-            "topic {} ({})  head {}",
+            "topic {} ({})  head {}  owner {}  visibility {}  base {}",
             topic.topic_id,
             topic.slug,
-            topic.head_revision_id.as_deref().unwrap_or("none")
+            topic.head_revision_id.as_deref().unwrap_or("none"),
+            topic.owner_actor_id,
+            topic.visibility,
+            topic.base_checkpoint_id,
         );
+        for criterion in &topic.acceptance_criteria {
+            outputln!(ctx, "  acceptance: {criterion}");
+        }
     }
     if let Some(session) = session {
         outputln!(
@@ -7147,7 +7203,9 @@ fn real_status_envelope(
         String::new()
     };
     let topic_id = topic.map(|topic| topic.topic_id.as_str());
-    let head_revision_id = topic.and_then(|topic| topic.head_revision_id.as_deref());
+    let topic_json = topic
+        .map(real_topic_metadata_json)
+        .unwrap_or_else(|| "{\"topic_id\":null,\"head_revision_id\":null}".to_string());
     let session_id = session.map(|session| session.session_id.as_str());
     let fallback_view = real_view(state);
     let session_generation_id = session
@@ -7189,7 +7247,7 @@ fn real_status_envelope(
         })
         .unwrap_or_default();
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"quarantined_secret_count\":{},\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"}},\"topic\":{{\"topic_id\":{},\"head_revision_id\":{}}},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"quarantined_secret_count\":{},\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"}},\"topic\":{},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
         command,
         json_escape(&state.repository_id),
         json_escape(&state.repository_id),
@@ -7201,8 +7259,7 @@ fn real_status_envelope(
         json_escape(&state.tree_hash),
         json_escape(&state.base_checkpoint_id),
         state.quarantine.len(),
-        optional_string_json(topic_id),
-        optional_string_json(head_revision_id),
+        topic_json,
         optional_string_json(session_id),
         json_escape(session_generation_id),
         compatibility_projections,
@@ -10583,6 +10640,9 @@ fn unimplemented_command(command: &'static str, message: impl Into<String>) -> C
 struct TopicCreateOptions {
     slug: String,
     display_name: String,
+    owner_actor_id: String,
+    visibility: String,
+    acceptance_criteria: Vec<String>,
     fixture: Option<String>,
 }
 
@@ -10630,6 +10690,9 @@ struct ExecutionPromoteOutputOptions {
 
 fn parse_topic_create_options(ctx: &CommandContext) -> Result<TopicCreateOptions, CliError> {
     let mut display_name = None;
+    let mut owner_actor_id = None;
+    let mut visibility = None;
+    let mut acceptance_criteria = Vec::new();
     let mut fixture = None;
     let mut operands = Vec::new();
     let mut args = ctx.args.iter().skip(2);
@@ -10641,6 +10704,26 @@ fn parse_topic_create_options(ctx: &CommandContext) -> Result<TopicCreateOptions
                     invalid_request("usage: sun topic create requires --display-name <name>")
                 })?;
                 display_name = Some(value.clone());
+            }
+            "--owner" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun topic create requires --owner <actor>")
+                })?;
+                owner_actor_id = Some(value.clone());
+            }
+            "--visibility" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun topic create requires --visibility local|private")
+                })?;
+                visibility = Some(value.clone());
+            }
+            "--acceptance-criterion" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun topic create requires --acceptance-criterion <text>",
+                    )
+                })?;
+                acceptance_criteria.push(value.clone());
             }
             "--fixture" => {
                 let value = args.next().ok_or_else(|| {
@@ -10668,6 +10751,9 @@ fn parse_topic_create_options(ctx: &CommandContext) -> Result<TopicCreateOptions
         display_name: display_name.ok_or_else(|| {
             invalid_request("usage: sun topic create requires --display-name <name>")
         })?,
+        owner_actor_id: owner_actor_id.unwrap_or_else(|| "local".to_string()),
+        visibility: visibility.unwrap_or_else(|| "local".to_string()),
+        acceptance_criteria,
         fixture,
     })
 }
@@ -16366,7 +16452,7 @@ sun - local-first source artifact management
 
 Usage:
   sun init [--repo <path>]
-  sun topic create <slug> --display-name <name> [--json]
+  sun topic create <slug> --display-name <name> [--owner <actor>] [--visibility local|private] [--acceptance-criterion <text>...] [--json]
   sun session start --topic <topic> --view <view> --actor <actor-id> [--json]
   sun session refresh <session> --policy manual|follow|none [--json]
   sun read|list|search ... --session <session> [--json]
@@ -16427,7 +16513,7 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
     match command {
         "status" => outputln!(ctx, "sun status\n\nUsage:\n  sun status [--json]\n  sun status --topic <topic> [--json]\n  sun status --session <session> [--json]\n  sun status --view <view> [--json]\n  sun status --projection <projection> [--json]\n  sun status --execution <execution> [--json]\n  sun status --checkpoint <checkpoint> [--json]\n  sun status --export <export-map> [--json]\n\nRepository status is derived from persisted Sunlight state, not git status or the main working tree."),
         "inspect" => outputln!(ctx, "sun inspect\n\nUsage:\n  sun inspect repository [--json]\n  sun inspect topic:<topic>|session:<session>|view:<view> [--json]\n  sun inspect artifact:<path>|operation:<id>|conflict:<id> [--json]\n  sun inspect projection:<id>|execution:<id>|checkpoint:<id>|export:<id> [--json]"),
-        "topic" | "topic create" => outputln!(ctx, "sun topic create\n\nUsage:\n  sun topic create <slug> --display-name <name> [--json]\n\nCreates a durable topic in the initialized repository."),
+        "topic" | "topic create" => outputln!(ctx, "sun topic create\n\nUsage:\n  sun topic create <slug> --display-name <name> [--owner <actor>] [--visibility local|private] [--acceptance-criterion <text>...] [--json]\n\nCreates a durable topic in the initialized repository. Defaults: owner=local, visibility=local."),
         "session" => outputln!(ctx, "sun session\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]\n  sun session refresh <session> --policy manual|follow|none [--json]"),
         "session start" => outputln!(ctx, "sun session start\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]"),
         "session refresh" => outputln!(ctx, "sun session refresh\n\nUsage:\n  sun session refresh <session> --policy manual|follow|none [--json]\n\nmanual and follow immediately advance already-selected non-write topics to current heads; none pins them. The write topic always remains at the session revision. An unchanged policy/frontier is an idempotent no-op."),

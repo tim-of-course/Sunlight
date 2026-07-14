@@ -712,13 +712,42 @@ fn build_invocation(
     let mut argv = match name {
         "repository_init" => vec!["init".into(), "--repo".into(), repo.display().to_string()],
         "repository_status" => status_argv(args)?,
-        "topic_create" => vec![
-            "topic".into(),
-            "create".into(),
-            identifier(args, "slug")?,
-            "--display-name".into(),
-            text(args, "display_name")?,
-        ],
+        "topic_create" => {
+            let mut v = vec![
+                "topic".into(),
+                "create".into(),
+                identifier(args, "slug")?,
+                "--display-name".into(),
+                text(args, "display_name")?,
+            ];
+            if args.contains_key("owner") {
+                v.extend(["--owner".into(), identifier(args, "owner")?]);
+            }
+            if args.contains_key("visibility") {
+                v.extend([
+                    "--visibility".into(),
+                    enumeration(args, "visibility", &["local", "private"])?,
+                ]);
+            }
+            if let Some(criteria) = args.get("acceptance_criteria") {
+                let criteria = criteria.as_array().ok_or_else(|| {
+                    ToolFailure::new(
+                        "invalid_request",
+                        "`acceptance_criteria` must be an array of strings",
+                    )
+                })?;
+                for criterion in criteria {
+                    let criterion = criterion.as_str().ok_or_else(|| {
+                        ToolFailure::new(
+                            "invalid_request",
+                            "`acceptance_criteria` entries must be strings",
+                        )
+                    })?;
+                    v.extend(["--acceptance-criterion".into(), criterion.to_string()]);
+                }
+            }
+            v
+        }
         "session_start" => vec![
             "session".into(),
             "start".into(),
@@ -1314,7 +1343,13 @@ fn allowed_fields(name: &str) -> &'static [&'static str] {
     match name {
         "repository_init" => &[],
         "repository_status" => &["scope", "id"],
-        "topic_create" => &["slug", "display_name"],
+        "topic_create" => &[
+            "slug",
+            "display_name",
+            "owner",
+            "visibility",
+            "acceptance_criteria",
+        ],
         "session_start" => &["topic", "view", "actor"],
         "session_refresh" => &["session", "policy"],
         "artifact_read" => &["path", "session"],
@@ -1398,7 +1433,7 @@ fn tools() -> Vec<Value> {
         tool(
             "topic_create",
             "Create a durable authoring topic.",
-            json!({"slug":s(),"display_name":s()}),
+            json!({"slug":s(),"display_name":s(),"owner":s(),"visibility":{"type":"string","enum":["local","private"],"default":"local"},"acceptance_criteria":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":1024}}}),
             &["slug", "display_name"],
             true,
         ),

@@ -865,7 +865,7 @@ fn no_fixture_real_repo_artifact_io_vertical_slice() {
     let readme_hash = json_string_field(&stdout(&readme), "content_hash");
     let readme_patch = repo.write_file(
         "readme.patch",
-        "--- a/README.md\n+++ b/README.md\n@@\n-needle\n+needle patched\n",
+        "--- a/README.md\n+++ b/README.md\n@@ -3,1 +3,1 @@\n-needle\n+needle patched\n",
     );
     let patch = sun()
         .arg("patch")
@@ -6112,6 +6112,169 @@ fn write_json_fixture_basic_app_existing_with_new_returns_precondition_failure()
     assert!(stdout.contains("\"resolved_view_id\":\"view_base_0001\""));
     assert!(!stdout.contains("operation_transaction_id"));
     assert!(!stdout.contains("topic_revision_id"));
+}
+
+#[test]
+fn resolved_view_reads_are_agent_usable_without_creating_a_session() {
+    let repo = TestRepo::new("resolved-view-read-only");
+    init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "topic",
+            "create",
+            "direct-view",
+            "--display-name",
+            "Direct view",
+        ],
+    ));
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "direct-view",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "view-reader",
+        ],
+    ));
+
+    let content = repo.write_file(
+        "direct-view-content.txt",
+        "first line\nagent-visible marker\n",
+    );
+    let write = sun()
+        .args([
+            "write",
+            "notes/direct.txt",
+            "--session",
+            "session_view_reader",
+            "--expect-hash",
+            "new",
+            "--content-file",
+        ])
+        .arg(content)
+        .args(["--classification", "source", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&write);
+    let write_json: serde_json::Value = serde_json::from_str(&stdout(&write)).unwrap();
+    let revision = write_json["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let include = format!("topic_direct_view:{revision}");
+    let resolved = run_real_json(
+        &repo,
+        &[
+            "view",
+            "resolve",
+            "--base",
+            "checkpoint_base_0001",
+            "--include",
+            &include,
+        ],
+    );
+    assert_success(&resolved);
+    let resolved_json: serde_json::Value = serde_json::from_str(&stdout(&resolved)).unwrap();
+    let view_id = resolved_json["data"]["ids"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let state_before = fs::read(&state_path).unwrap();
+    let session_count_before = RealRepoState::load(repo.path()).unwrap().sessions.len();
+
+    let read = run_real_json(&repo, &["read", "notes/direct.txt", "--view", &view_id]);
+    assert_success(&read);
+    let read_json: serde_json::Value = serde_json::from_str(&stdout(&read)).unwrap();
+    assert_eq!(read_json["data"]["access_mode"], "read_only_view");
+    assert_eq!(
+        read_json["data"]["ids"]["resolved_view_id"],
+        view_id.as_str()
+    );
+    assert_eq!(
+        read_json["data"]["content"]["bytes"],
+        "first line\nagent-visible marker\n"
+    );
+    assert!(read_json["data"]["ids"].get("session_id").is_none());
+
+    let list = run_real_json(&repo, &["list", "notes", "--view", &view_id]);
+    assert_success(&list);
+    let list_json: serde_json::Value = serde_json::from_str(&stdout(&list)).unwrap();
+    assert_eq!(
+        list_json["data"]["artifacts"][0]["path"],
+        "notes/direct.txt"
+    );
+
+    let search = run_real_json(&repo, &["search", "agent-visible", "--view", &view_id]);
+    assert_success(&search);
+    let search_json: serde_json::Value = serde_json::from_str(&stdout(&search)).unwrap();
+    assert_eq!(
+        search_json["data"]["matches"][0]["path"],
+        "notes/direct.txt"
+    );
+    assert_eq!(search_json["data"]["matches"][0]["line"], 2);
+
+    assert_eq!(
+        RealRepoState::load(repo.path()).unwrap().sessions.len(),
+        session_count_before
+    );
+    assert_eq!(fs::read(state_path).unwrap(), state_before);
+}
+
+#[test]
+fn view_resolve_repeated_include_flags_preserve_every_exact_selection() {
+    let repo = TestRepo::new("view-resolve-repeated-includes");
+    let output = sun()
+        .arg("view")
+        .arg("resolve")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--include")
+        .arg("topic_auth_nullability:rev_auth_nullability_0001")
+        .arg("--include")
+        .arg("topic_profile_ui:rev_profile_ui_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun view resolve should run");
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    let exact = "\"topic_auth_nullability\":\"rev_auth_nullability_0001\",\"topic_profile_ui\":\"rev_profile_ui_0001\"";
+    assert!(stdout.contains(&format!("\"requested_frontier\":{{{exact}}}")));
+    assert!(stdout.contains(&format!("\"normalized_frontier\":{{{exact}}}")));
+    assert!(stdout.contains("\"staleness_ids\":[]"));
+}
+
+#[test]
+fn view_resolve_duplicate_topic_selection_is_explicitly_rejected() {
+    let repo = TestRepo::new("view-resolve-duplicate-topic");
+    let output = sun()
+        .arg("view")
+        .arg("resolve")
+        .arg("--fixture")
+        .arg("basic-app")
+        .arg("--include")
+        .arg("topic_auth_nullability:rev_auth_nullability_0001")
+        .arg("--include")
+        .arg("topic_auth_nullability:rev_auth_nullability_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun view resolve should run");
+
+    assert_failure(&output);
+    let stdout = stdout(&output);
+    assert!(stdout.contains("\"code\":\"duplicate_topic_selection\""));
+    assert!(stdout.contains("\"topic_id\":\"topic_auth_nullability\""));
 }
 
 #[test]
@@ -12783,6 +12946,67 @@ fn no_fixture_session_refresh_conflict_keeps_last_good_generation_and_evidence()
         .path()
         .join(".sunlight/conflicts/conflict_shared_txt_0001.json")
         .is_file());
+}
+
+#[test]
+fn no_fixture_patch_applies_standard_multi_hunk_diff_and_reports_envelope_errors() {
+    let repo = TestRepo::new("real-standard-unified-patch");
+    init_local_git_repo(&repo);
+    repo.write_file("src.txt", "alpha\nbeta\ngamma\ndelta\nepsilon\n");
+    git(repo.path(), &["add", "src.txt"]);
+    git(repo.path(), &["commit", "-m", "add patch source"]);
+    start_native_session(&repo, "patch-standard");
+
+    let read = run_real_json(&repo, &["read", "src.txt", "--session", "session_agent_a"]);
+    assert_success(&read);
+    let hash = json_string_field(&stdout(&read), "content_hash");
+    let patch = repo.write_file(
+        "change.diff",
+        "@@ -1,2 +1,2 @@\n alpha\n-beta\n+BETA\n@@ -4,2 +4,2 @@\n delta\n-epsilon\n+EPSILON\n",
+    );
+    let applied = run_real_json_os(
+        &repo,
+        &[
+            "patch".as_ref(),
+            "src.txt".as_ref(),
+            "--session".as_ref(),
+            "session_agent_a".as_ref(),
+            "--expect-hash".as_ref(),
+            hash.as_ref(),
+            "--patch-file".as_ref(),
+            patch.as_os_str(),
+        ],
+    );
+    assert_success(&applied);
+
+    let after = run_real_json(&repo, &["read", "src.txt", "--session", "session_agent_a"]);
+    assert_success(&after);
+    assert!(stdout(&after).contains("alpha\\nBETA\\ngamma\\ndelta\\nEPSILON\\n"));
+
+    let current_hash = json_string_field(&stdout(&after), "content_hash");
+    let envelope = repo.write_file(
+        "invalid-envelope.diff",
+        "*** Begin Patch\n*** Update File: src.txt\n@@\n-alpha\n+ALPHA\n*** End Patch\n",
+    );
+    let rejected = run_real_json_os(
+        &repo,
+        &[
+            "patch".as_ref(),
+            "src.txt".as_ref(),
+            "--session".as_ref(),
+            "session_agent_a".as_ref(),
+            "--expect-hash".as_ref(),
+            current_hash.as_ref(),
+            "--patch-file".as_ref(),
+            envelope.as_os_str(),
+        ],
+    );
+    assert_failure(&rejected);
+    let rejected = stdout(&rejected);
+    assert!(rejected.contains("\"code\":\"patch_parse_failed\""));
+    assert!(rejected.contains("remove the *** Begin Patch and *** End Patch wrapper"));
+    assert!(rejected.contains("\"failed_hunk\":\"0\""));
+    assert!(rejected.contains("\"patch_line\":\"1\""));
 }
 
 fn assert_success(output: &Output) {

@@ -98,6 +98,7 @@ pub struct RealTopicRecord {
     pub acceptance_criteria: Vec<String>,
     pub base_checkpoint_id: String,
     pub head_revision_id: Option<String>,
+    pub completed_revision_id: Option<String>,
     pub revision_number: u64,
 }
 
@@ -714,6 +715,7 @@ impl RealRepoState {
                     acceptance_criteria: Vec::new(),
                     base_checkpoint_id: required_string(&object, "base_checkpoint_id", &path)?,
                     head_revision_id: head_revision_id.clone(),
+                    completed_revision_id: None,
                     revision_number,
                 };
                 validate_topic_metadata(
@@ -1643,6 +1645,122 @@ fn ingest_real_repo_path(
     Ok(())
 }
 
+fn looks_like_secret_value(value: &str, quoted: bool) -> bool {
+    let value = value
+        .trim()
+        .trim_end_matches(|character| matches!(character, ',' | ';'))
+        .trim();
+    let unquoted = value.trim_matches(|character| matches!(character, '\'' | '"'));
+    if unquoted.len() < 4 {
+        return false;
+    }
+    let lowered = unquoted.to_ascii_lowercase();
+    let placeholders = [
+        "example",
+        "sample",
+        "placeholder",
+        "changeme",
+        "change-me",
+        "password",
+        "secret",
+        "redacted",
+        "masked",
+        "your_",
+        "your-",
+        "todo",
+        "none",
+        "null",
+        "undefined",
+        "string",
+    ];
+    if placeholders
+        .iter()
+        .any(|placeholder| lowered == *placeholder || lowered.starts_with(placeholder))
+        || lowered.starts_with('<')
+        || lowered.starts_with("${")
+        || lowered.starts_with("process.env")
+        || lowered.starts_with("import.meta.env")
+        || lowered.starts_with("os.environ")
+        || lowered.starts_with("env.")
+    {
+        return false;
+    }
+    if !quoted
+        && lowered.contains('.')
+        && lowered
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '.'))
+    {
+        return false;
+    }
+    true
+}
+
+fn contains_secret_assignment(text: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "api_key",
+        "apikey",
+        "access_token",
+        "auth_token",
+        "secret_key",
+        "client_secret",
+        "private_key",
+        "password",
+    ];
+    for line in text.lines() {
+        let lowered = line.to_ascii_lowercase();
+        for key in KEYS {
+            let mut offset = 0usize;
+            while let Some(relative) = lowered[offset..].find(key) {
+                let start = offset + relative;
+                let end = start + key.len();
+                let before = lowered[..start].chars().next_back();
+                let after = lowered[end..].chars().next();
+                let boundary = |character: Option<char>| {
+                    character.is_none_or(|character| {
+                        !character.is_ascii_alphanumeric() && character != '_'
+                    })
+                };
+                if boundary(before) && boundary(after) {
+                    let tail = line[end..].trim_start_matches(|character: char| {
+                        character.is_ascii_whitespace() || matches!(character, '\'' | '"')
+                    });
+                    let Some(rest) = tail.strip_prefix('=').or_else(|| tail.strip_prefix(':'))
+                    else {
+                        offset = end;
+                        continue;
+                    };
+                    let value = rest.trim_start();
+                    let quoted = matches!(value.chars().next(), Some('\'' | '"'));
+                    if looks_like_secret_value(value, quoted) {
+                        return true;
+                    }
+                }
+                offset = end;
+            }
+        }
+    }
+    false
+}
+
+fn contains_recognizable_secret_token(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    lowered.contains("-----begin private key-----")
+        || lowered.contains("-----begin rsa private key-----")
+        || text
+            .split(|character: char| {
+                character.is_ascii_whitespace() || matches!(character, '\'' | '"' | ',' | ';')
+            })
+            .any(|token| {
+                (token.starts_with("sk-") && token.len() >= 24)
+                    || (token.starts_with("ghp_") && token.len() >= 24)
+                    || (token.starts_with("AKIA") && token.len() == 20)
+                    || (token.starts_with("eyJ")
+                        && token.matches('.').count() == 2
+                        && token.len() >= 40)
+            })
+}
+
 pub fn detect_secret_reasons(path: &str, bytes: &[u8]) -> Vec<String> {
     let mut reasons = Vec::new();
     let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
@@ -1665,22 +1783,7 @@ pub fn detect_secret_reasons(path: &str, bytes: &[u8]) -> Vec<String> {
     }
 
     if let Ok(text) = std::str::from_utf8(bytes) {
-        let lowered = text.to_ascii_lowercase();
-        let token_secret = [
-            "api_key",
-            "apikey",
-            "access_token",
-            "auth_token",
-            "secret_key",
-            "client_secret",
-            "private_key",
-            "password",
-            "-----begin private key-----",
-            "-----begin rsa private key-----",
-        ]
-        .iter()
-        .any(|needle| lowered.contains(needle));
-        if token_secret {
+        if contains_secret_assignment(text) || contains_recognizable_secret_token(text) {
             reasons.push("secret_token".to_string());
         }
     }
@@ -4482,6 +4585,7 @@ fn parse_topic(value: &JsonValue, state_path: &Path) -> Result<RealTopicRecord, 
             .collect::<Result<Vec<_>, _>>()?,
         base_checkpoint_id: required_string(object, "base_checkpoint_id", state_path)?,
         head_revision_id: optional_string(object, "head_revision_id", state_path)?,
+        completed_revision_id: optional_string(object, "completed_revision_id", state_path)?,
         revision_number: required_u64(object, "revision_number", state_path)?,
     };
     validate_topic_metadata(
@@ -5892,6 +5996,10 @@ fn topic_json(topic: &RealTopicRecord) -> JsonValue {
         optional_json(&topic.head_revision_id),
     );
     object.insert(
+        "completed_revision_id".to_string(),
+        optional_json(&topic.completed_revision_id),
+    );
+    object.insert(
         "revision_number".to_string(),
         JsonValue::Number(topic.revision_number.to_string()),
     );
@@ -6966,6 +7074,7 @@ mod tests {
             acceptance_criteria: Vec::new(),
             base_checkpoint_id: state.base_checkpoint_id.clone(),
             head_revision_id: Some("rev_legacy_0001".to_string()),
+            completed_revision_id: None,
             revision_number: 1,
         });
         state.sessions.push(RealSessionRecord {
@@ -7038,6 +7147,7 @@ mod tests {
             acceptance_criteria: vec!["focused behavior is verified".to_string()],
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             head_revision_id: None,
+            completed_revision_id: None,
             revision_number: 0,
         }
     }
@@ -7062,6 +7172,7 @@ mod tests {
                 acceptance_criteria: Vec::new(),
                 base_checkpoint_id: state.base_checkpoint_id.clone(),
                 head_revision_id: None,
+                completed_revision_id: None,
                 revision_number: 0,
             });
         }
@@ -7187,6 +7298,34 @@ mod tests {
         assert!(!report.contains("super-secret-value-that-must-not-persist"));
 
         fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn secret_detection_distinguishes_identifiers_and_documentation_from_values() {
+        for content in [
+            "type Credentials = { password: string };\n",
+            "const password = form.password;\n",
+            "The password field is submitted to the server.\n",
+            "function resetPassword(password: string) { return password.length; }\n",
+            "client_secret = process.env.CLIENT_SECRET\n",
+        ] {
+            assert!(
+                detect_secret_reasons("src/example.ts", content.as_bytes()).is_empty(),
+                "false positive for {content:?}"
+            );
+        }
+
+        assert_eq!(
+            detect_secret_reasons("config/app.toml", b"client_secret = \"abc123\"\n"),
+            vec!["secret_token"]
+        );
+        assert_eq!(
+            detect_secret_reasons(
+                "src/config.ts",
+                b"const api_key = \"sk-123456789012345678901234\";\n"
+            ),
+            vec!["secret_token"]
+        );
     }
 
     #[test]
@@ -7319,6 +7458,7 @@ mod tests {
                     acceptance_criteria: Vec::new(),
                     base_checkpoint_id: "checkpoint_base_0001".to_string(),
                     head_revision_id: Some("rev_docs_0001".to_string()),
+                    completed_revision_id: None,
                     revision_number: 1,
                 },
                 RealTopicRecord {
@@ -7330,6 +7470,7 @@ mod tests {
                     acceptance_criteria: Vec::new(),
                     base_checkpoint_id: "checkpoint_base_0001".to_string(),
                     head_revision_id: Some("rev_code_0001".to_string()),
+                    completed_revision_id: None,
                     revision_number: 1,
                 },
             ],
@@ -7395,6 +7536,7 @@ mod tests {
             acceptance_criteria: Vec::new(),
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             head_revision_id: Some("rev_alt_code_0001".to_string()),
+            completed_revision_id: None,
             revision_number: 1,
         });
         state.operations.push(operation(

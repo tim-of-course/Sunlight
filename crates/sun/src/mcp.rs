@@ -343,7 +343,7 @@ fn handle_message(
                             "version": env!("CARGO_PKG_VERSION"),
                             "description": "Repository-confined Sunlight v0.3 authoring and operation tools"
                         },
-                        "instructions": "All tools are bound to the canonical repository supplied when this server started. Use returned native IDs and hashes as preconditions; no fixture tools or arbitrary host paths are available."
+                        "instructions": "All tools are bound to the canonical repository supplied when this server started. Typical authoring lifecycle: repository_status, topic_create, session_start, artifact_read/search, artifact_patch/write, topic_complete, then view_resolve, execution_run, and checkpoint_create. artifact_read/list/search accept exactly one scope: session for the authoring frontier or view for session-free read-only access to an exact resolved view. Transient repository writer and state-sequence races are retried automatically for safe native and read commands; commands that can replay external side effects are never automatically retried. Use exact IDs and sha256 hashes returned by tools. artifact_write uses expect_hash \"new\" only when the path must be absent. Sessions have fixed topic scope: session_refresh advances only non-write topics already in that session frontier and does not discover newly created topics. No fixture tools or arbitrary host paths are available."
                     }),
                 ),
             )
@@ -748,6 +748,22 @@ fn build_invocation(
             }
             v
         }
+        "topic_complete" => {
+            let mut v = vec![
+                "topic".into(),
+                "complete".into(),
+                "--topic".into(),
+                identifier(args, "topic")?,
+                "--revision".into(),
+                identifier(args, "revision")?,
+                "--session".into(),
+                identifier(args, "session")?,
+            ];
+            if args.contains_key("summary") {
+                v.extend(["--summary".into(), text(args, "summary")?]);
+            }
+            v
+        }
         "session_start" => vec![
             "session".into(),
             "start".into(),
@@ -765,26 +781,24 @@ fn build_invocation(
             "--policy".into(),
             enumeration(args, "policy", &["manual", "follow", "none"])?,
         ],
-        "artifact_read" => vec![
-            "read".into(),
-            artifact_path(args, "path", false)?,
-            "--session".into(),
-            identifier(args, "session")?,
-        ],
+        "artifact_read" => {
+            let mut v = vec!["read".into(), artifact_path(args, "path", false)?];
+            v.extend(artifact_read_scope_argv(args)?);
+            v
+        }
         "artifact_list" => {
             let mut v = vec!["list".into()];
             if let Some(path) = optional_artifact_path(args, "prefix", true)? {
                 v.push(path)
             }
-            v.extend(["--session".into(), identifier(args, "session")?]);
+            v.extend(artifact_read_scope_argv(args)?);
             v
         }
-        "artifact_search" => vec![
-            "search".into(),
-            text(args, "query")?,
-            "--session".into(),
-            identifier(args, "session")?,
-        ],
+        "artifact_search" => {
+            let mut v = vec!["search".into(), text(args, "query")?];
+            v.extend(artifact_read_scope_argv(args)?);
+            v
+        }
         "artifact_patch" => {
             let file = temp.stage("patch", required_string(args, "patch")?)?;
             let path = file.path.display().to_string();
@@ -1090,6 +1104,19 @@ fn string_array(
         .collect()
 }
 
+fn artifact_read_scope_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFailure> {
+    match (args.contains_key("session"), args.contains_key("view")) {
+        (true, false) => Ok(vec!["--session".into(), identifier(args, "session")?]),
+        (false, true) => Ok(vec!["--view".into(), identifier(args, "view")?]),
+        _ => Err(ToolFailure::new(
+            "artifact_read_scope_invalid",
+            "provide exactly one of `session` or `view`",
+        )
+        .detail("session_supplied", args.contains_key("session"))
+        .detail("view_supplied", args.contains_key("view"))),
+    }
+}
+
 fn status_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFailure> {
     let mut v = vec!["status".into()];
     if let Some(scope_value) = args.get("scope") {
@@ -1350,11 +1377,12 @@ fn allowed_fields(name: &str) -> &'static [&'static str] {
             "visibility",
             "acceptance_criteria",
         ],
+        "topic_complete" => &["topic", "revision", "session", "summary"],
         "session_start" => &["topic", "view", "actor"],
         "session_refresh" => &["session", "policy"],
-        "artifact_read" => &["path", "session"],
-        "artifact_list" => &["prefix", "session"],
-        "artifact_search" => &["query", "session"],
+        "artifact_read" => &["path", "session", "view"],
+        "artifact_list" => &["prefix", "session", "view"],
+        "artifact_search" => &["query", "session", "view"],
         "artifact_patch" => &["path", "session", "expect_hash", "patch"],
         "artifact_write" => &[
             "path",
@@ -1388,6 +1416,7 @@ fn tool_names() -> &'static [&'static str] {
         "repository_init",
         "repository_status",
         "topic_create",
+        "topic_complete",
         "session_start",
         "session_refresh",
         "artifact_read",
@@ -1438,51 +1467,55 @@ fn tools() -> Vec<Value> {
             true,
         ),
         tool(
+            "topic_complete",
+            "Seal a topic at its exact current head revision. Repeating the same completion is an idempotent no-op; later artifact mutations on the topic are rejected. This is a durable coordination fact, not a review or quality judgment.",
+            json!({"topic":id_schema("Exact topic_id owned by session."),"revision":id_schema("Exact current head topic_revision_id to make immutable."),"session":id_schema("Exact authoring session_id for this topic."),"summary":{"type":"string","description":"Optional factual handoff summary.","minLength":1,"maxLength":4096}}),
+            &["topic", "revision", "session"],
+            true,
+        ),
+        tool(
             "session_start",
-            "Start a topic-bound authoring session over an exact view.",
-            json!({"topic":s(),"view":s(),"actor":s()}),
+            "Start a topic-bound authoring session over an exact resolved view. The session writes only to the supplied topic; its initial read frontier is copied from the supplied view.",
+            json!({"topic":id_schema("Exact topic_id returned by topic_create or inspect."),"view":id_schema("Exact resolved_view_id returned by repository_status or view_resolve."),"actor":id_schema("Stable caller-chosen actor identifier used for provenance.")}),
             &["topic", "view", "actor"],
             true,
         ),
         tool(
             "session_refresh",
-            "Refresh a session using an explicit frontier policy.",
-            json!({"session":s(),"policy":{"type":"string","enum":["manual","follow","none"]}}),
+            "Explicitly refresh heads for non-write topics already present in this session frontier. This never discovers newly created topics. manual and follow both refresh now; follow records continued opt-in intent, while none changes policy without advancing the frontier.",
+            json!({"session":id_schema("Exact session_id returned by session_start."),"policy":{"type":"string","enum":["manual","follow","none"],"description":"manual: refresh scoped topic heads now. follow: refresh now and retain follow intent. none: retain the current exact frontier."}}),
             &["session", "policy"],
             true,
         ),
-        tool(
+        scoped_read_tool(
             "artifact_read",
-            "Read persisted artifact content and identity from a session.",
-            json!({"path":path_schema(),"session":s()}),
-            &["path", "session"],
-            false,
+            "Read persisted artifact content and identity from either an authoring session or an exact resolved view. View reads are read-only and create no session.",
+            json!({"path":path_schema(),"session":id_schema("Exact session_id for session-scoped reading."),"view":id_schema("Exact resolved_view_id for session-free read-only access.")}),
+            &["path"],
         ),
-        tool(
+        scoped_read_tool(
             "artifact_list",
-            "List persisted artifacts under an optional repository-relative prefix.",
-            json!({"prefix":path_schema(),"session":s()}),
-            &["session"],
-            false,
+            "List persisted artifacts under an optional repository-relative prefix in either an authoring session or an exact resolved view.",
+            json!({"prefix":path_schema(),"session":id_schema("Exact session_id for session-scoped listing."),"view":id_schema("Exact resolved_view_id for session-free read-only access.")}),
+            &[],
         ),
-        tool(
+        scoped_read_tool(
             "artifact_search",
-            "Search persisted artifact content in a session.",
-            json!({"query":s(),"session":s()}),
-            &["query", "session"],
-            false,
+            "Search persisted artifact content in either an authoring session or an exact resolved view.",
+            json!({"query":s(),"session":id_schema("Exact session_id for session-scoped search."),"view":id_schema("Exact resolved_view_id for session-free read-only access.")}),
+            &["query"],
         ),
         tool(
             "artifact_patch",
-            "Apply a JSON string unified patch with an expected content hash.",
-            json!({"path":path_schema(),"session":s(),"expect_hash":s(),"patch":{"type":"string","maxLength":MAX_CONTENT_BYTES}}),
+            "Apply a standard unified diff to one UTF-8 artifact using compare-and-swap. Use @@ hunk headers with context/removal/addition lines; optional diff/---/+++ headers are accepted. Do not send an apply_patch *** Begin Patch envelope.",
+            json!({"path":path_schema(),"session":id_schema("Exact authoring session_id."),"expect_hash":existing_hash_schema(),"patch":patch_schema()}),
             &["path", "session", "expect_hash", "patch"],
             true,
         ),
         tool(
             "artifact_write",
-            "Create or replace an artifact from JSON string content with CAS and classification.",
-            json!({"path":path_schema(),"session":s(),"expect_hash":s(),"content":{"type":"string","maxLength":MAX_CONTENT_BYTES},"classification":class_schema()}),
+            "Create or replace one artifact using compare-and-swap. Use expect_hash \"new\" only to assert that the path is absent; otherwise pass the exact sha256 content_hash returned by artifact_read.",
+            json!({"path":path_schema(),"session":id_schema("Exact authoring session_id."),"expect_hash":write_expect_hash_schema(),"content":{"type":"string","description":"Complete artifact bytes encoded as a JSON UTF-8 string.","maxLength":MAX_CONTENT_BYTES},"classification":class_schema()}),
             &[
                 "path",
                 "session",
@@ -1495,28 +1528,28 @@ fn tools() -> Vec<Value> {
         tool(
             "artifact_move",
             "Move an artifact while preserving identity.",
-            json!({"from":path_schema(),"to":path_schema(),"session":s(),"expect_hash":s()}),
+            json!({"from":path_schema(),"to":path_schema(),"session":id_schema("Exact authoring session_id."),"expect_hash":existing_hash_schema()}),
             &["from", "to", "session", "expect_hash"],
             true,
         ),
         tool(
             "artifact_delete",
             "Tombstone an artifact with CAS.",
-            json!({"path":path_schema(),"session":s(),"expect_hash":s()}),
+            json!({"path":path_schema(),"session":id_schema("Exact authoring session_id."),"expect_hash":existing_hash_schema()}),
             &["path", "session", "expect_hash"],
             true,
         ),
         tool(
             "artifact_metadata_set",
             "Set artifact classification with CAS.",
-            json!({"path":path_schema(),"session":s(),"expect_hash":s(),"classification":class_schema()}),
+            json!({"path":path_schema(),"session":id_schema("Exact authoring session_id."),"expect_hash":existing_hash_schema(),"classification":class_schema()}),
             &["path", "session", "expect_hash", "classification"],
             true,
         ),
         tool(
             "view_resolve",
-            "Resolve an exact base and topic revision selection.",
-            json!({"base":s(),"include":{"type":"array","maxItems":128,"items":{"type":"object","additionalProperties":false,"properties":{"topic":s(),"revision":s()},"required":["topic","revision"]}}}),
+            "Resolve one exact revision per topic over the base checkpoint. Every supplied selection is echoed as requested_frontier and normalized_frontier; dependencies, conflicts, and staleness are returned as facts rather than merged implicitly.",
+            json!({"base":id_schema("Exact base checkpoint_id."),"include":{"type":"array","maxItems":128,"description":"Exact topic revision selections. Omit to resolve current heads. A topic may appear at most once.","items":{"type":"object","additionalProperties":false,"properties":{"topic":id_schema("Exact topic_id, not a slug."),"revision":id_schema("Exact topic_revision_id belonging to topic.")},"required":["topic","revision"]}}}),
             &["base"],
             true,
         ),
@@ -1606,6 +1639,15 @@ fn tools() -> Vec<Value> {
         ),
     ]
 }
+fn scoped_read_tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+    let mut value = tool(name, description, properties, required, false);
+    value["inputSchema"]["oneOf"] = json!([
+        {"required":["session"]},
+        {"required":["view"]}
+    ]);
+    value
+}
+
 fn tool(
     name: &str,
     description: &str,
@@ -1613,10 +1655,37 @@ fn tool(
     required: &[&str],
     mutating: bool,
 ) -> Value {
-    json!({"name":name,"description":description,"inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":required},"annotations":{"readOnlyHint":!mutating,"destructiveHint":matches!(name,"artifact_delete"|"git_export"),"idempotentHint":matches!(name,"repository_init"|"repository_status"|"artifact_read"|"artifact_list"|"artifact_search"|"compat_diff"|"policy_check_export"|"policy_check_commit"|"policy_explain"|"inspect")}})
+    json!({"name":name,"description":description,"inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":required},"annotations":{"readOnlyHint":!mutating,"destructiveHint":matches!(name,"artifact_delete"|"git_export"),"idempotentHint":matches!(name,"repository_init"|"repository_status"|"topic_complete"|"artifact_read"|"artifact_list"|"artifact_search"|"compat_diff"|"policy_check_export"|"policy_check_commit"|"policy_explain"|"inspect")}})
 }
 fn s() -> Value {
     json!({"type":"string","minLength":1,"maxLength":16384})
+}
+fn id_schema(description: &str) -> Value {
+    json!({"type":"string","description":description,"minLength":1,"maxLength":16384})
+}
+fn existing_hash_schema() -> Value {
+    json!({
+        "type":"string",
+        "pattern":r"^sha256:[0-9a-f]{64}$",
+        "description":"Exact sha256 content_hash returned by artifact_read for the current session view."
+    })
+}
+fn write_expect_hash_schema() -> Value {
+    json!({
+        "description":"Use literal new to assert path absence; otherwise use the exact current sha256 content_hash.",
+        "oneOf":[
+            {"type":"string","const":"new","description":"Create only if the path is absent."},
+            {"type":"string","pattern":r"^sha256:[0-9a-f]{64}$","description":"Replace only if the current content hash matches."}
+        ]
+    })
+}
+fn patch_schema() -> Value {
+    json!({
+        "type":"string",
+        "description":"Standard unified diff for this artifact. Optional diff/---/+++ headers are accepted. Hunks start with @@ -old_start,old_count +new_start,new_count @@ and use space context, - removal, and + addition lines. Do not wrap it in *** Begin Patch.",
+        "examples":["@@ -1,2 +1,2 @@\n first\n-old\n+new\n"],
+        "maxLength":MAX_CONTENT_BYTES
+    })
 }
 fn path_schema() -> Value {
     json!({"type":"string","description":"Portable repository-relative artifact path; absolute paths and traversal are rejected.","maxLength":16384})
@@ -1651,5 +1720,110 @@ mod tests {
             })
         ));
         assert!(validate_repo_relative("../escape", "path", false).is_err());
+    }
+    #[test]
+    fn agent_contract_exposes_creation_patch_and_completion_facts() {
+        let advertised = tools();
+        let find = |name: &str| advertised.iter().find(|tool| tool["name"] == name).unwrap();
+
+        let write = find("artifact_write");
+        let expect = &write["inputSchema"]["properties"]["expect_hash"];
+        assert_eq!(expect["oneOf"][0]["const"], "new");
+        assert_eq!(expect["oneOf"][1]["pattern"], r"^sha256:[0-9a-f]{64}$");
+        assert!(write["description"]
+            .as_str()
+            .unwrap()
+            .contains("Use expect_hash \"new\" only"));
+
+        let patch = find("artifact_patch");
+        assert!(patch["description"]
+            .as_str()
+            .unwrap()
+            .contains("standard unified diff"));
+        assert!(patch["inputSchema"]["properties"]["patch"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Do not wrap it in *** Begin Patch"));
+
+        let complete = find("topic_complete");
+        assert_eq!(
+            complete["inputSchema"]["required"],
+            json!(["topic", "revision", "session"])
+        );
+        assert_eq!(complete["annotations"]["idempotentHint"], true);
+        assert!(complete["description"]
+            .as_str()
+            .unwrap()
+            .contains("durable coordination fact"));
+    }
+
+    #[test]
+    fn artifact_reads_require_one_clear_session_or_view_scope() {
+        let advertised = tools();
+        let read = advertised
+            .iter()
+            .find(|tool| tool["name"] == "artifact_read")
+            .unwrap();
+        assert_eq!(
+            read["inputSchema"]["oneOf"],
+            json!([{"required":["session"]},{"required":["view"]}])
+        );
+        assert!(read["inputSchema"]["properties"]["view"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("session-free read-only access"));
+
+        let temp = PrivateTemp::new(Path::new(".")).unwrap();
+        let invocation = build_invocation(
+            "artifact_read",
+            &json!({"path":"README.md","view":"view_exact"}),
+            Path::new("."),
+            &temp,
+        )
+        .unwrap();
+        assert!(invocation
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["--view", "view_exact"]));
+
+        let both = build_invocation(
+            "artifact_read",
+            &json!({"path":"README.md","session":"session_a","view":"view_exact"}),
+            Path::new("."),
+            &temp,
+        );
+        assert!(matches!(
+            both,
+            Err(ToolFailure {
+                code: "artifact_read_scope_invalid",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn view_resolve_mcp_array_preserves_each_include_argument() {
+        let temp = PrivateTemp::new(Path::new(".")).unwrap();
+        let argv = build_invocation(
+            "view_resolve",
+            &json!({
+                "base":"checkpoint_base_0001",
+                "include":[
+                    {"topic":"topic_a","revision":"rev_a_0001"},
+                    {"topic":"topic_b","revision":"rev_b_0001"}
+                ]
+            }),
+            Path::new("."),
+            &temp,
+        )
+        .unwrap();
+        assert!(argv
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["--include", "topic_a:rev_a_0001"]));
+        assert!(argv
+            .argv
+            .windows(2)
+            .any(|pair| pair == ["--include", "topic_b:rev_b_0001"]));
     }
 }

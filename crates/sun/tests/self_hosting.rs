@@ -95,7 +95,7 @@ fn self_hosting_real_repository_acceptance() {
     let patch_file = inputs.join("cargo.patch");
     fs::write(
         &patch_file,
-        "--- a/Cargo.toml\n+++ b/Cargo.toml\n@@\n-[workspace]\n+# persisted self-hosting native patch\n+[workspace]\n",
+        "--- a/Cargo.toml\n+++ b/Cargo.toml\n@@ -1,1 +1,2 @@\n-[workspace]\n+# persisted self-hosting native patch\n+[workspace]\n",
     )
     .unwrap();
     let patched = sun_json_os(

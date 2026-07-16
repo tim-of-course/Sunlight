@@ -438,6 +438,7 @@ fn run(ctx: &CommandContext) -> Result<(), CliError> {
             Err(invalid_request("usage: sun init [--repo <path>]"))
         }
         [scope, command, ..] if scope == "topic" && command == "create" => topic_create(&ctx),
+        [scope, command, ..] if scope == "topic" && command == "complete" => topic_complete(&ctx),
         [scope, command, ..] if scope == "session" && command == "start" => session_start(&ctx),
         [scope, command, ..] if scope == "session" && command == "refresh" => session_refresh(&ctx),
         [scope, command, ..] if scope == "view" && command == "resolve" => view_resolve(&ctx),
@@ -614,6 +615,10 @@ fn topic_create(ctx: &CommandContext) -> Result<(), CliError> {
     Ok(())
 }
 
+fn topic_complete(ctx: &CommandContext) -> Result<(), CliError> {
+    real_topic_complete(ctx, parse_topic_complete_options(ctx)?)
+}
+
 fn session_start(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_session_start_options(ctx)?;
     if let Some(fixture) = &options.fixture {
@@ -651,8 +656,12 @@ fn artifact_read(ctx: &CommandContext) -> Result<(), CliError> {
         return real_artifact_read(ctx, options);
     };
     let store = fixture_store(fixture)?;
+    let session_id = options
+        .session_id
+        .as_deref()
+        .expect("fixture artifact reads require a session");
     let response = store
-        .read(&options.session_id, &options.operands[0])
+        .read(session_id, &options.operands[0])
         .map_err(artifact_error)?;
 
     if ctx.json {
@@ -671,9 +680,11 @@ fn artifact_list(ctx: &CommandContext) -> Result<(), CliError> {
         return real_artifact_list(ctx, options);
     };
     let store = fixture_store(fixture)?;
-    let response = store
-        .list(&options.session_id, prefix)
-        .map_err(artifact_error)?;
+    let session_id = options
+        .session_id
+        .as_deref()
+        .expect("fixture artifact reads require a session");
+    let response = store.list(session_id, prefix).map_err(artifact_error)?;
 
     if ctx.json {
         outputln!(ctx, "{}", list_success_envelope(&response));
@@ -692,8 +703,12 @@ fn artifact_search(ctx: &CommandContext) -> Result<(), CliError> {
         return real_artifact_search(ctx, options);
     };
     let store = fixture_store(fixture)?;
+    let session_id = options
+        .session_id
+        .as_deref()
+        .expect("fixture artifact reads require a session");
     let response = store
-        .search(&options.session_id, &options.operands[0])
+        .search(session_id, &options.operands[0])
         .map_err(artifact_error)?;
 
     if ctx.json {
@@ -925,14 +940,20 @@ fn view_resolve(ctx: &CommandContext) -> Result<(), CliError> {
         frontier.push(selection);
     }
 
+    let requested_frontier = exact_requested_frontier(&frontier)?;
     let result = resolve_fixture_view(
         fixture_resolver_input(frontier),
         fixture_base_entries(),
         revisions,
     );
+    ensure_resolver_preserved_frontier(&requested_frontier, &result.topic_frontier)?;
 
     if ctx.json {
-        outputln!(ctx, "{}", view_resolve_success_envelope(&result));
+        outputln!(
+            ctx,
+            "{}",
+            view_resolve_success_envelope(&result, &requested_frontier)
+        );
     } else if result.conflict_free() {
         let tree_hash = result
             .tree_identity
@@ -2183,6 +2204,7 @@ fn real_resolved_view(state: &RealRepoState) -> ResolvedViewResult {
 }
 
 fn real_resolve_view_by_id(
+    repo_root: &Path,
     state: &RealRepoState,
     view_id: &str,
 ) -> Result<RealResolvedRepoView, CliError> {
@@ -2205,7 +2227,104 @@ fn real_resolve_view_by_id(
         return Ok(head);
     }
 
+    if let Some(frontier) = load_persisted_view_frontier(repo_root, state, view_id)? {
+        let resolved = state.resolve_view(
+            frontier
+                .into_iter()
+                .map(|(topic_id, revision_id)| TopicRevisionSelection {
+                    topic_id,
+                    revision_id,
+                })
+                .collect(),
+        );
+        if resolved.result.resolved_view_id != view_id {
+            return Err(CliError::new(
+                "persisted_view_mismatch",
+                "the persisted view frontier no longer resolves to its recorded identity",
+            )
+            .with_detail("recorded_view_id", view_id)
+            .with_detail("resolved_view_id", resolved.result.resolved_view_id));
+        }
+        return Ok(resolved);
+    }
+
     Err(object_not_found("resolved_view", view_id))
+}
+
+fn load_persisted_view_frontier(
+    repo_root: &Path,
+    state: &RealRepoState,
+    view_id: &str,
+) -> Result<Option<BTreeMap<String, String>>, CliError> {
+    if view_id.is_empty()
+        || !view_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Ok(None);
+    }
+    let path = repo_root
+        .join(".sunlight")
+        .join("views")
+        .join(format!("{view_id}.json"));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CliError::new(
+                "persisted_view_read_failed",
+                "the persisted view record could not be read",
+            )
+            .with_detail("resolved_view_id", view_id)
+            .with_detail("path", path.display().to_string())
+            .with_detail("reason", error.to_string()));
+        }
+    };
+    let record = parse_json_record(&bytes).map_err(|error| {
+        CliError::new(
+            "persisted_view_invalid",
+            "the persisted view record is not valid JSON",
+        )
+        .with_detail("resolved_view_id", view_id)
+        .with_detail("reason", error.to_string())
+    })?;
+    let JsonValue::Object(object) = record else {
+        return Err(CliError::new(
+            "persisted_view_invalid",
+            "the persisted view record must be a JSON object",
+        )
+        .with_detail("resolved_view_id", view_id));
+    };
+    if !matches!(object.get("record_type"), Some(JsonValue::String(value)) if value == "resolved_view")
+        || !matches!(object.get("id"), Some(JsonValue::String(value)) if value == view_id)
+        || !matches!(object.get("repository_id"), Some(JsonValue::String(value)) if value == &state.repository_id)
+    {
+        return Err(CliError::new(
+            "persisted_view_invalid",
+            "the persisted view identity does not match the requested repository view",
+        )
+        .with_detail("resolved_view_id", view_id));
+    }
+    let Some(JsonValue::Object(values)) = object.get("topic_frontier") else {
+        return Err(CliError::new(
+            "persisted_view_invalid",
+            "the persisted view record has no valid topic_frontier",
+        )
+        .with_detail("resolved_view_id", view_id));
+    };
+    let mut frontier = BTreeMap::new();
+    for (topic_id, value) in values {
+        let JsonValue::String(revision_id) = value else {
+            return Err(CliError::new(
+                "persisted_view_invalid",
+                "persisted topic frontier revisions must be strings",
+            )
+            .with_detail("resolved_view_id", view_id)
+            .with_detail("topic_id", topic_id));
+        };
+        frontier.insert(topic_id.clone(), revision_id.clone());
+    }
+    Ok(Some(frontier))
 }
 
 fn real_view_state(state: &RealRepoState, resolved: &RealResolvedRepoView) -> RealRepoState {
@@ -2376,6 +2495,7 @@ fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Resul
         acceptance_criteria: options.acceptance_criteria.clone(),
         base_checkpoint_id: state.base_checkpoint_id.clone(),
         head_revision_id: None,
+        completed_revision_id: None,
         revision_number: 0,
     });
     state.sync_compat_fields();
@@ -2406,6 +2526,119 @@ fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Resul
             options.visibility,
             state.base_checkpoint_id,
             options.acceptance_criteria.len()
+        );
+    }
+    Ok(())
+}
+
+fn real_topic_complete(
+    ctx: &CommandContext,
+    options: TopicCompleteOptions,
+) -> Result<(), CliError> {
+    let repo_root = ctx.repo_root.clone();
+    let mut state = RealRepoState::load(&repo_root)?;
+    let session = real_session(&state, &options.session_id)?.clone();
+    if session.write_topic_id != options.topic_id {
+        return Err(CliError::new(
+            "topic_session_mismatch",
+            "the session does not own the topic being completed",
+        )
+        .with_detail("session_id", session.session_id)
+        .with_detail("session_topic_id", session.write_topic_id)
+        .with_detail("requested_topic_id", options.topic_id));
+    }
+    let topic_index = state
+        .topics
+        .iter()
+        .position(|topic| topic.topic_id == options.topic_id)
+        .ok_or_else(|| object_not_found("topic", &options.topic_id))?;
+    let topic = &state.topics[topic_index];
+    if topic.head_revision_id.as_deref() != Some(options.revision_id.as_str()) {
+        return Err(CliError::new(
+            "topic_head_mismatch",
+            "topic completion requires the exact current head revision",
+        )
+        .with_detail("topic_id", topic.topic_id.clone())
+        .with_detail("expected_revision_id", options.revision_id)
+        .with_detail(
+            "current_head_revision_id",
+            topic.head_revision_id.as_deref().unwrap_or("none"),
+        ));
+    }
+    let changed = match topic.completed_revision_id.as_deref() {
+        None => true,
+        Some(revision_id) if revision_id == options.revision_id => false,
+        Some(revision_id) => {
+            return Err(CliError::new(
+                "topic_already_completed",
+                "the topic is already completed at an immutable revision",
+            )
+            .with_detail("topic_id", topic.topic_id.clone())
+            .with_detail("completed_revision_id", revision_id)
+            .with_detail("requested_revision_id", options.revision_id));
+        }
+    };
+
+    if changed {
+        state.topics[topic_index].completed_revision_id = Some(options.revision_id.clone());
+        state.sync_compat_fields();
+        let topic = state.topics[topic_index].clone();
+        let summary = options.summary.as_deref().unwrap_or("");
+        let completion_id = format!("completion_{}", topic.topic_id);
+        let records = vec![
+            state.record_publication(
+                "topics",
+                &topic.topic_id,
+                &format!(
+                    "{{\"record_type\":\"topic\",\"id\":\"{}\",\"repository_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"owner_actor_id\":\"{}\",\"visibility\":\"{}\",\"acceptance_criteria\":{},\"base_checkpoint_id\":\"{}\",\"head_revision_id\":\"{}\",\"completed_revision_id\":\"{}\"}}\n",
+                    json_escape(&topic.topic_id),
+                    json_escape(&state.repository_id),
+                    json_escape(&topic.slug),
+                    json_escape(&topic.display_name),
+                    json_escape(&topic.owner_actor_id),
+                    json_escape(&topic.visibility),
+                    string_array_json(topic.acceptance_criteria.iter().map(String::as_str)),
+                    json_escape(&topic.base_checkpoint_id),
+                    json_escape(&options.revision_id),
+                    json_escape(&options.revision_id),
+                ),
+            )?,
+            state.record_publication(
+                "topics",
+                &completion_id,
+                &format!(
+                    "{{\"record_type\":\"topic_completion\",\"id\":\"{}\",\"repository_id\":\"{}\",\"topic_id\":\"{}\",\"completed_revision_id\":\"{}\",\"session_id\":\"{}\",\"actor_id\":\"{}\",\"summary\":\"{}\",\"immutable\":true}}\n",
+                    json_escape(&completion_id),
+                    json_escape(&state.repository_id),
+                    json_escape(&topic.topic_id),
+                    json_escape(&options.revision_id),
+                    json_escape(&session.session_id),
+                    json_escape(&session.actor_id),
+                    json_escape(summary),
+                ),
+            )?,
+        ];
+        state.save_with_records(&repo_root, &records)?;
+    }
+
+    let topic = &state.topics[topic_index];
+    if ctx.json {
+        outputln!(
+            ctx,
+            "{{\"ok\":true,\"data\":{{\"command\":\"topic.complete\",\"repository_id\":\"{}\",\"ids\":{{\"topic_id\":\"{}\",\"completed_revision_id\":\"{}\",\"session_id\":\"{}\"}},\"changed\":{},\"immutable\":true,\"topic\":{}}},\"warnings\":[]}}",
+            json_escape(&state.repository_id),
+            json_escape(&topic.topic_id),
+            json_escape(&options.revision_id),
+            json_escape(&session.session_id),
+            changed,
+            real_topic_metadata_json(topic),
+        );
+    } else {
+        outputln!(
+            ctx,
+            "completed topic {} at {}",
+            topic.topic_id,
+            options.revision_id
         );
     }
     Ok(())
@@ -2684,7 +2917,13 @@ fn real_artifact_read(
     options: ArtifactCommandOptions,
 ) -> Result<(), CliError> {
     let state = RealRepoState::load(&ctx.repo_root)?;
-    let session = real_session(&state, &options.session_id)?;
+    if let Some(view_id) = options.view_id.as_deref() {
+        return real_artifact_read_view(ctx, &state, view_id, &options.operands[0]);
+    }
+    let session_id = options
+        .session_id
+        .expect("artifact read scope was validated");
+    let session = real_session(&state, &session_id)?;
     let resolved = state.resolve_session_view(session);
     let entry = real_entry(&state, &resolved.entries, &options.operands[0])?;
     let bytes = std::str::from_utf8(&entry.bytes)
@@ -2692,7 +2931,7 @@ fn real_artifact_read(
     let response = ReadResponse {
         command: "artifact.read",
         repository_id: state.repository_id.clone(),
-        session_id: options.session_id,
+        session_id,
         view: real_resolved_session_view(&state, session, &resolved),
         artifact: real_artifact_view(entry),
         content: sunlight_core::artifacts::ContentView {
@@ -2713,13 +2952,19 @@ fn real_artifact_list(
     options: ArtifactCommandOptions,
 ) -> Result<(), CliError> {
     let state = RealRepoState::load(&ctx.repo_root)?;
-    let session = real_session(&state, &options.session_id)?;
+    if let Some(view_id) = options.view_id.as_deref() {
+        return real_artifact_list_view(ctx, &state, view_id, options.operands.first());
+    }
+    let session_id = options
+        .session_id
+        .expect("artifact read scope was validated");
+    let session = real_session(&state, &session_id)?;
     let resolved = state.resolve_session_view(session);
     let prefix = options.operands.first().map(String::as_str).unwrap_or("");
     let response = ListResponse {
         command: "artifact.list",
         repository_id: state.repository_id.clone(),
-        session_id: options.session_id,
+        session_id,
         view: real_resolved_session_view(&state, session, &resolved),
         artifacts: resolved
             .entries
@@ -2748,7 +2993,13 @@ fn real_artifact_search(
     options: ArtifactCommandOptions,
 ) -> Result<(), CliError> {
     let state = RealRepoState::load(&ctx.repo_root)?;
-    let session = real_session(&state, &options.session_id)?;
+    if let Some(view_id) = options.view_id.as_deref() {
+        return real_artifact_search_view(ctx, &state, view_id, &options.operands[0]);
+    }
+    let session_id = options
+        .session_id
+        .expect("artifact read scope was validated");
+    let session = real_session(&state, &session_id)?;
     let resolved = state.resolve_session_view(session);
     let query = &options.operands[0];
     let mut matches = Vec::new();
@@ -2770,7 +3021,7 @@ fn real_artifact_search(
     let response = SearchResponse {
         command: "artifact.search",
         repository_id: state.repository_id.clone(),
-        session_id: options.session_id,
+        session_id,
         view: real_resolved_session_view(&state, session, &resolved),
         matches,
     };
@@ -2778,6 +3029,152 @@ fn real_artifact_search(
         outputln!(ctx, "{}", search_success_envelope(&response));
     } else {
         for item in response.matches {
+            outputln!(ctx, "{}:{}:{}", item.path, item.line, item.snippet);
+        }
+    }
+    Ok(())
+}
+
+fn real_readable_view(
+    ctx: &CommandContext,
+    state: &RealRepoState,
+    view_id: &str,
+) -> Result<RealResolvedRepoView, CliError> {
+    let resolved = real_resolve_view_by_id(&ctx.repo_root, state, view_id)?;
+    if resolved.result.conflict_free() {
+        return Ok(resolved);
+    }
+
+    let conflict_ids = resolved
+        .result
+        .conflicts()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+    let staleness_ids = resolved
+        .result
+        .staleness()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+    Err(CliError::new(
+        "view_not_readable",
+        "the resolved view has conflicts or staleness and has no readable tree",
+    )
+    .with_raw_details_json(format!(
+        "{{\"resolved_view_id\":\"{}\",\"conflict_ids\":{},\"staleness_ids\":{},\"inspect_ref\":\"view:{}\"}}",
+        json_escape(view_id),
+        string_array_json(conflict_ids.iter().copied()),
+        string_array_json(staleness_ids.iter().copied()),
+        json_escape(view_id),
+    )))
+}
+
+fn real_view_entry<'a>(
+    entries: &'a [RealArtifactEntry],
+    path_or_artifact_id: &str,
+    view_id: &str,
+) -> Result<&'a RealArtifactEntry, CliError> {
+    entries
+        .iter()
+        .find(|entry| {
+            !entry.tombstone
+                && (entry.path == path_or_artifact_id || entry.artifact_id == path_or_artifact_id)
+        })
+        .ok_or_else(|| {
+            CliError::new(
+                "path_not_found",
+                format!("path or artifact `{path_or_artifact_id}` was not found"),
+            )
+            .with_detail("path_or_artifact_id", path_or_artifact_id)
+            .with_detail("resolved_view_id", view_id)
+        })
+}
+
+fn real_artifact_read_view(
+    ctx: &CommandContext,
+    state: &RealRepoState,
+    view_id: &str,
+    path_or_artifact_id: &str,
+) -> Result<(), CliError> {
+    let resolved = real_readable_view(ctx, state, view_id)?;
+    let entry = real_view_entry(&resolved.entries, path_or_artifact_id, view_id)?;
+    let bytes = std::str::from_utf8(&entry.bytes)
+        .map_err(|_| CliError::new("invalid_content_encoding", "path is not UTF-8 text"))?;
+    if ctx.json {
+        outputln!(
+            ctx,
+            "{}",
+            view_read_success_envelope(state, &resolved.result, entry, bytes)
+        );
+    } else {
+        output!(ctx, "{}", bytes);
+    }
+    Ok(())
+}
+
+fn real_artifact_list_view(
+    ctx: &CommandContext,
+    state: &RealRepoState,
+    view_id: &str,
+    prefix: Option<&String>,
+) -> Result<(), CliError> {
+    let resolved = real_readable_view(ctx, state, view_id)?;
+    let prefix = prefix.map(String::as_str).unwrap_or("");
+    let artifacts = resolved
+        .entries
+        .iter()
+        .filter(|entry| {
+            !entry.tombstone
+                && (prefix.is_empty()
+                    || entry.path == prefix
+                    || entry.path.starts_with(&format!("{prefix}/")))
+        })
+        .map(real_artifact_view)
+        .collect::<Vec<_>>();
+    if ctx.json {
+        outputln!(
+            ctx,
+            "{}",
+            view_list_success_envelope(state, &resolved.result, &artifacts)
+        );
+    } else {
+        for artifact in artifacts {
+            outputln!(ctx, "{}", artifact.path);
+        }
+    }
+    Ok(())
+}
+
+fn real_artifact_search_view(
+    ctx: &CommandContext,
+    state: &RealRepoState,
+    view_id: &str,
+    query: &str,
+) -> Result<(), CliError> {
+    let resolved = real_readable_view(ctx, state, view_id)?;
+    let mut matches = Vec::new();
+    for entry in resolved.entries.iter().filter(|entry| !entry.tombstone) {
+        if let Ok(text) = std::str::from_utf8(&entry.bytes) {
+            for (line_index, line) in text.lines().enumerate() {
+                if line.contains(query) {
+                    matches.push(sunlight_core::artifacts::SearchMatch {
+                        artifact_id: entry.artifact_id.clone(),
+                        path: entry.path.clone(),
+                        content_hash: entry.content_hash.clone(),
+                        line: line_index + 1,
+                        snippet: line.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    if ctx.json {
+        outputln!(
+            ctx,
+            "{}",
+            view_search_success_envelope(state, &resolved.result, &matches)
+        );
+    } else {
+        for item in matches {
             outputln!(ctx, "{}:{}:{}", item.path, item.line, item.snippet);
         }
     }
@@ -2844,15 +3241,19 @@ fn real_artifact_write(
         (ExpectedHash::Existing(expected), None) => {
             return Err(CliError::new(
                 "precondition_failed",
-                "mutation precondition failed: expected_hash",
+                "the path is absent, so an existing content hash cannot match",
             )
+            .with_detail("failed_precondition", "expected_hash")
             .with_detail("path", path)
+            .with_detail("path_state", "absent")
             .with_detail("expected", expected)
+            .with_detail("actual", "absent")
             .with_detail(
-                "session_generation_id",
-                real_view(&state).session_generation_id,
+                "hint",
+                "Use expect_hash \"new\" only if creating this absent path is intended.",
             )
-            .with_detail("resolved_view_id", state.resolved_view_id.clone()));
+            .with_detail("session_generation_id", session.session_generation_id)
+            .with_detail("resolved_view_id", session.resolved_view_id));
         }
         _ => {}
     }
@@ -2997,12 +3398,14 @@ fn real_view_resolve(ctx: &CommandContext, options: ViewResolveOptions) -> Resul
             })
             .collect::<Result<Vec<_>, CliError>>()?
     };
+    let requested_frontier = exact_requested_frontier(&frontier)?;
     let resolved = if frontier.is_empty() {
         state.resolve_head_view()
     } else {
         state.resolve_view(frontier)
     };
     let view = resolved.result;
+    ensure_resolver_preserved_frontier(&requested_frontier, &view.topic_frontier)?;
     state.persist_record(
         &ctx.repo_root,
         "views",
@@ -3018,7 +3421,11 @@ fn real_view_resolve(ctx: &CommandContext, options: ViewResolveOptions) -> Resul
         )?;
     }
     if ctx.json {
-        outputln!(ctx, "{}", view_resolve_success_envelope(&view));
+        outputln!(
+            ctx,
+            "{}",
+            view_resolve_success_envelope(&view, &requested_frontier)
+        );
     } else {
         let tree_hash = view
             .tree_identity
@@ -3037,7 +3444,7 @@ fn real_project_materialize(
     let repo_root = ctx.repo_root.clone();
     let projection_policy = require_projection_policy(&repo_root)?;
     let mut state = RealRepoState::load(&repo_root)?;
-    let resolved = real_resolve_view_by_id(&state, &options.view_id)?;
+    let resolved = real_resolve_view_by_id(&repo_root, &state, &options.view_id)?;
     if !resolved.result.conflict_free() {
         return Err(CliError::new(
             "conflicted_view",
@@ -3693,7 +4100,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     }
     let mut state = RealRepoState::load(&repo_root)?;
     let relative_cwd = real_execution_relative_cwd(&options.cwd)?;
-    let resolved = real_resolve_view_by_id(&state, &options.view_id)?;
+    let resolved = real_resolve_view_by_id(&repo_root, &state, &options.view_id)?;
     if !resolved.result.conflict_free() {
         return Err(CliError::new(
             "execution_conflicted_view",
@@ -3883,7 +4290,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         &mut quarantine,
     )?;
     projected_entries.sort_by(|left, right| left.path.cmp(&right.path));
-    let outputs = real_execution_outputs(&view_state.entries, &projected_entries);
+    let outputs = real_execution_outputs(&repo_root, &view_state.entries, &projected_entries);
     #[cfg(windows)]
     let cleanup_error = isolation.finish().err().map(|error| error.to_string());
     #[cfg(not(windows))]
@@ -4301,7 +4708,7 @@ fn real_checkpoint_create(
     options: CheckpointCreateOptions,
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&ctx.repo_root)?;
-    let resolved = real_resolve_view_by_id(&state, &options.view_id)?;
+    let resolved = real_resolve_view_by_id(&ctx.repo_root, &state, &options.view_id)?;
     if !resolved.result.conflict_free() {
         return Err(CliError::new(
             "conflicted_view",
@@ -4727,6 +5134,24 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
                 }
                 return Ok(true);
             }
+            "--view" => {
+                let resolved = real_resolve_view_by_id(&repo_root, &state, value)?;
+                if ctx.json {
+                    outputln!(
+                        ctx,
+                        "{}",
+                        real_view_envelope("status.view", &state, &resolved.result)
+                    );
+                } else {
+                    outputln!(
+                        ctx,
+                        "{} {}",
+                        resolved.result.resolved_view_id,
+                        resolved_view_lifecycle_state(&resolved.result)
+                    );
+                }
+                return Ok(true);
+            }
             "--compat-import" => {
                 let operation = state
                     .operations
@@ -4972,6 +5397,15 @@ fn real_accept_mutation(
             )
             .with_detail("topic", session.write_topic_id.clone())
         })?;
+    if let Some(completed_revision_id) = &topic.completed_revision_id {
+        return Err(CliError::new(
+            "topic_completed",
+            "the topic is completed and its head revision is immutable",
+        )
+        .with_detail("topic_id", topic.topic_id)
+        .with_detail("completed_revision_id", completed_revision_id.clone())
+        .with_detail("session_id", session.session_id));
+    }
     let topic_id = topic.topic_id.clone();
     let prior_view = real_session_view(state, &session);
     let parent_revision_id = topic.head_revision_id.clone();
@@ -5319,7 +5753,53 @@ fn real_session_generation_publication(
     )?)
 }
 
+fn repository_ignores_execution_path(repo_root: &Path, path: &str) -> bool {
+    Command::new("git")
+        .args(["check-ignore", "--quiet", "--no-index", "--", path])
+        .current_dir(repo_root)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn common_created_output_classification(path: &str) -> Option<&'static str> {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let segments = normalized.split('/').collect::<Vec<_>>();
+    if normalized.ends_with(".tsbuildinfo")
+        || normalized.ends_with(".pyc")
+        || segments
+            .iter()
+            .any(|segment| matches!(*segment, ".cache" | ".tmp" | "__pycache__"))
+        || segments
+            .windows(2)
+            .any(|pair| pair[0] == "node_modules" && matches!(pair[1], ".cache" | ".tmp"))
+    {
+        return Some("cache");
+    }
+    if segments
+        .iter()
+        .any(|segment| matches!(*segment, "dist" | "build" | "target" | "coverage" | ".next"))
+    {
+        return Some("ignored");
+    }
+    None
+}
+
+fn classify_execution_output(repo_root: &Path, entry: &RealArtifactEntry, created: bool) -> String {
+    if entry.classification == "generated" {
+        "generated_artifact".to_string()
+    } else if repository_ignores_execution_path(repo_root, &entry.path) {
+        "ignored".to_string()
+    } else if created {
+        common_created_output_classification(&entry.path)
+            .unwrap_or("source_like_delta")
+            .to_string()
+    } else {
+        "source_like_delta".to_string()
+    }
+}
+
 fn real_execution_outputs(
+    repo_root: &Path,
     before: &[RealArtifactEntry],
     after: &[RealArtifactEntry],
 ) -> Vec<RealExecutionOutputSnapshot> {
@@ -5337,11 +5817,7 @@ fn real_execution_outputs(
             }
             Some(RealExecutionOutputSnapshot {
                 path: entry.path.clone(),
-                classification: if entry.classification == "generated" {
-                    "generated_artifact".to_string()
-                } else {
-                    "source_like_delta".to_string()
-                },
+                classification: classify_execution_output(repo_root, entry, before_entry.is_none()),
                 before_hash: before_entry.map(|candidate| candidate.content_hash.clone()),
                 after_hash: entry.content_hash.clone(),
                 byte_length: entry.bytes.len() as u64,
@@ -5404,35 +5880,378 @@ fn real_precondition_error(
     .with_detail("resolved_view_id", state.resolved_view_id.clone())
 }
 
+#[derive(Debug)]
+struct UnifiedPatchLine {
+    patch_line: usize,
+    kind: char,
+    text: String,
+}
+
+#[derive(Debug)]
+struct UnifiedPatchHunk {
+    old_start: usize,
+    old_count: usize,
+    new_count: usize,
+    lines: Vec<UnifiedPatchLine>,
+}
+
+fn patch_failure(
+    code: &'static str,
+    message: &'static str,
+    hunk: usize,
+    patch_line: usize,
+    reason: impl Into<String>,
+) -> CliError {
+    CliError::new(code, message)
+        .with_detail("failed_hunk", hunk.to_string())
+        .with_detail("patch_line", patch_line.to_string())
+        .with_detail("reason", reason.into())
+}
+
+fn parse_unified_range(
+    value: &str,
+    side: &'static str,
+    hunk: usize,
+    patch_line: usize,
+) -> Result<(usize, usize), CliError> {
+    let (start, count) = value
+        .split_once(',')
+        .map(|(start, count)| (start, Some(count)))
+        .unwrap_or((value, None));
+    let start = start.parse::<usize>().map_err(|_| {
+        patch_failure(
+            "patch_parse_failed",
+            "unified diff hunk header is invalid",
+            hunk,
+            patch_line,
+            format!("{side} range start is not an unsigned integer"),
+        )
+    })?;
+    let count = count.unwrap_or("1").parse::<usize>().map_err(|_| {
+        patch_failure(
+            "patch_parse_failed",
+            "unified diff hunk header is invalid",
+            hunk,
+            patch_line,
+            format!("{side} range count is not an unsigned integer"),
+        )
+    })?;
+    Ok((start, count))
+}
+
+fn parse_unified_hunk_header(
+    line: &str,
+    hunk: usize,
+    patch_line: usize,
+) -> Result<(usize, usize, usize), CliError> {
+    let Some(body) = line.strip_prefix("@@ -") else {
+        return Err(patch_failure(
+            "patch_parse_failed",
+            "unified diff hunk header is invalid",
+            hunk,
+            patch_line,
+            "expected @@ -old_start,old_count +new_start,new_count @@",
+        ));
+    };
+    let Some((ranges, _label)) = body.split_once(" @@") else {
+        return Err(patch_failure(
+            "patch_parse_failed",
+            "unified diff hunk header is invalid",
+            hunk,
+            patch_line,
+            "hunk header is missing its closing @@",
+        ));
+    };
+    let Some((old_range, new_range)) = ranges.split_once(" +") else {
+        return Err(patch_failure(
+            "patch_parse_failed",
+            "unified diff hunk header is invalid",
+            hunk,
+            patch_line,
+            "hunk header is missing the +new range",
+        ));
+    };
+    let (old_start, old_count) = parse_unified_range(old_range, "old", hunk, patch_line)?;
+    let (_new_start, new_count) = parse_unified_range(new_range, "new", hunk, patch_line)?;
+    Ok((old_start, old_count, new_count))
+}
+
+fn parse_unified_patch(patch: &str) -> Result<Vec<UnifiedPatchHunk>, CliError> {
+    if patch.contains("*** Begin Patch") || patch.contains("*** End Patch") {
+        return Err(patch_failure(
+            "patch_parse_failed",
+            "expected a standard unified diff, not an apply_patch envelope",
+            0,
+            1,
+            "remove the *** Begin Patch and *** End Patch wrapper",
+        ));
+    }
+
+    let mut hunks = Vec::new();
+    let mut current: Option<UnifiedPatchHunk> = None;
+    for (index, raw_line) in patch.lines().enumerate() {
+        let patch_line = index + 1;
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.starts_with("@@") {
+            if let Some(hunk) = current.take() {
+                hunks.push(hunk);
+            }
+            let hunk_number = hunks.len() + 1;
+            let (old_start, old_count, new_count) =
+                parse_unified_hunk_header(line, hunk_number, patch_line)?;
+            current = Some(UnifiedPatchHunk {
+                old_start,
+                old_count,
+                new_count,
+                lines: Vec::new(),
+            });
+            continue;
+        }
+
+        if let Some(hunk) = current.as_mut() {
+            if line == "\\ No newline at end of file" {
+                continue;
+            }
+            let Some(kind) = line.chars().next() else {
+                return Err(patch_failure(
+                    "patch_parse_failed",
+                    "unified diff contains an unprefixed hunk line",
+                    hunks.len() + 1,
+                    patch_line,
+                    "empty context lines must start with one space",
+                ));
+            };
+            if !matches!(kind, ' ' | '-' | '+') {
+                return Err(patch_failure(
+                    "patch_parse_failed",
+                    "unified diff contains an unsupported hunk line",
+                    hunks.len() + 1,
+                    patch_line,
+                    "hunk lines must start with space, -, or +",
+                ));
+            }
+            hunk.lines.push(UnifiedPatchLine {
+                patch_line,
+                kind,
+                text: line[1..].to_string(),
+            });
+            continue;
+        }
+
+        if line.is_empty()
+            || line.starts_with("diff ")
+            || line.starts_with("index ")
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+        {
+            continue;
+        }
+        return Err(patch_failure(
+            "patch_parse_failed",
+            "content appeared before the first unified diff hunk",
+            0,
+            patch_line,
+            "start changes with an @@ hunk header; optional diff/---/+++ headers may precede it",
+        ));
+    }
+    if let Some(hunk) = current {
+        hunks.push(hunk);
+    }
+    if hunks.is_empty() {
+        return Err(patch_failure(
+            "patch_parse_failed",
+            "unified diff contains no hunks",
+            0,
+            0,
+            "add at least one @@ -old +new @@ hunk",
+        ));
+    }
+    Ok(hunks)
+}
+
+fn patch_line_preview(value: &str) -> String {
+    let mut preview = value.chars().take(256).collect::<String>();
+    if value.chars().count() > 256 {
+        preview.push_str("...");
+    }
+    preview
+}
+
 fn apply_real_patch(before: &str, patch: &str) -> Result<(String, usize), CliError> {
-    let mut removed = Vec::new();
-    let mut added = Vec::new();
-    let mut hunk_count = 0;
+    let hunks = parse_unified_patch(patch)?;
     let line_ending = if before.contains("\r\n") {
         "\r\n"
     } else {
         "\n"
     };
-    for line in patch.lines() {
-        if line.starts_with("@@") {
-            hunk_count += 1;
-        } else if line.starts_with("---") || line.starts_with("+++") || line.starts_with("diff ") {
-        } else if let Some(rest) = line.strip_prefix('-') {
-            removed.push(format!("{rest}{line_ending}"));
-        } else if let Some(rest) = line.strip_prefix('+') {
-            added.push(format!("{rest}{line_ending}"));
+    let normalized = before.replace("\r\n", "\n");
+    let had_final_newline = normalized.ends_with('\n');
+    let source = normalized.split_terminator('\n').collect::<Vec<_>>();
+    let mut output = Vec::<String>::new();
+    let mut source_cursor = 0usize;
+
+    for (index, hunk) in hunks.iter().enumerate() {
+        let hunk_number = index + 1;
+        let target = hunk.old_start.saturating_sub(1);
+        if target < source_cursor || target > source.len() {
+            return Err(patch_failure(
+                "patch_apply_failed",
+                "unified diff hunk starts outside the available source range",
+                hunk_number,
+                hunk.lines.first().map(|line| line.patch_line).unwrap_or(0),
+                format!(
+                    "old_start={} resolves to source index {}, current cursor={}, source lines={}",
+                    hunk.old_start,
+                    target,
+                    source_cursor,
+                    source.len()
+                ),
+            ));
+        }
+        output.extend(
+            source[source_cursor..target]
+                .iter()
+                .map(|line| (*line).to_string()),
+        );
+        source_cursor = target;
+        let mut old_seen = 0usize;
+        let mut new_seen = 0usize;
+
+        for line in &hunk.lines {
+            match line.kind {
+                ' ' | '-' => {
+                    let Some(actual) = source.get(source_cursor) else {
+                        return Err(patch_failure(
+                            "patch_apply_failed",
+                            "unified diff expected a source line past end of file",
+                            hunk_number,
+                            line.patch_line,
+                            format!("expected {:?}", patch_line_preview(&line.text)),
+                        ));
+                    };
+                    if *actual != line.text {
+                        return Err(patch_failure(
+                            "patch_apply_failed",
+                            "unified diff context or removal did not match the source",
+                            hunk_number,
+                            line.patch_line,
+                            format!(
+                                "source_line={} expected={:?} actual={:?}",
+                                source_cursor + 1,
+                                patch_line_preview(&line.text),
+                                patch_line_preview(actual)
+                            ),
+                        ));
+                    }
+                    if line.kind == ' ' {
+                        output.push(line.text.clone());
+                        new_seen += 1;
+                    }
+                    source_cursor += 1;
+                    old_seen += 1;
+                }
+                '+' => {
+                    output.push(line.text.clone());
+                    new_seen += 1;
+                }
+                _ => unreachable!("parser accepts only unified diff line prefixes"),
+            }
+        }
+
+        if old_seen != hunk.old_count || new_seen != hunk.new_count {
+            return Err(patch_failure(
+                "patch_parse_failed",
+                "unified diff hunk line counts do not match its header",
+                hunk_number,
+                hunk.lines.last().map(|line| line.patch_line).unwrap_or(0),
+                format!(
+                    "header old_count={} new_count={}; body old_count={} new_count={}",
+                    hunk.old_count, hunk.new_count, old_seen, new_seen
+                ),
+            ));
         }
     }
-    let before_block = removed.concat();
-    let after_block = added.concat();
-    let Some(start) = before.find(&before_block) else {
-        return Err(CliError::new("patch_apply_failed", "patch did not apply"));
-    };
-    let mut output = String::new();
-    output.push_str(&before[..start]);
-    output.push_str(&after_block);
-    output.push_str(&before[start + before_block.len()..]);
-    Ok((output, hunk_count))
+
+    output.extend(
+        source[source_cursor..]
+            .iter()
+            .map(|line| (*line).to_string()),
+    );
+    let mut result = output.join(line_ending);
+    if had_final_newline {
+        result.push_str(line_ending);
+    }
+    Ok((result, hunks.len()))
+}
+
+#[cfg(test)]
+mod unified_patch_tests {
+    use super::{apply_real_patch, common_created_output_classification};
+
+    #[test]
+    fn applies_multiple_standard_hunks() {
+        let before = "alpha\nbeta\ngamma\ndelta\nepsilon\n";
+        let patch =
+            "@@ -1,2 +1,2 @@\n alpha\n-beta\n+BETA\n@@ -4,2 +4,2 @@\n delta\n-epsilon\n+EPSILON\n";
+        let (after, hunks) = apply_real_patch(before, patch).unwrap();
+        assert_eq!(hunks, 2);
+        assert_eq!(after, "alpha\nBETA\ngamma\ndelta\nEPSILON\n");
+    }
+
+    #[test]
+    fn preserves_crlf_line_endings() {
+        let before = "alpha\r\nbeta\r\n";
+        let patch = "@@ -1,2 +1,2 @@\n alpha\n-beta\n+BETA\n";
+        let (after, hunks) = apply_real_patch(before, patch).unwrap();
+        assert_eq!(hunks, 1);
+        assert_eq!(after, "alpha\r\nBETA\r\n");
+    }
+
+    #[test]
+    fn rejects_apply_patch_envelopes_with_actionable_details() {
+        let error = apply_real_patch(
+            "alpha\n",
+            "*** Begin Patch\n*** Update File: src.txt\n@@\n-alpha\n+ALPHA\n*** End Patch\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "patch_parse_failed");
+        assert!(error.message.contains("standard unified diff"));
+        assert!(error
+            .details
+            .iter()
+            .any(|(key, value)| *key == "failed_hunk" && value == "0"));
+        assert!(error
+            .details
+            .iter()
+            .any(|(key, value)| *key == "patch_line" && value == "1"));
+        assert!(error.details.iter().any(|(key, value)| {
+            *key == "reason" && value.contains("remove the *** Begin Patch")
+        }));
+    }
+    #[test]
+    fn common_build_outputs_are_not_source_promotion_candidates() {
+        for path in [
+            "dist/app.js",
+            "build/output.bin",
+            "target/debug/app.exe",
+            "coverage/report.json",
+            ".next/server/app.js",
+        ] {
+            assert_eq!(common_created_output_classification(path), Some("ignored"));
+        }
+        for path in [
+            "tsconfig.tsbuildinfo",
+            "node_modules/.tmp/cache.json",
+            ".cache/tool/state",
+            "src/__pycache__/module.pyc",
+        ] {
+            assert_eq!(common_created_output_classification(path), Some("cache"));
+        }
+        assert_eq!(
+            common_created_output_classification("src/generated/client.ts"),
+            None
+        );
+    }
 }
 
 fn real_mutation_ref(
@@ -5739,13 +6558,21 @@ fn real_topic_create_success_envelope(state: &RealRepoState) -> String {
 }
 
 fn real_topic_metadata_json(topic: &RealTopicRecord) -> String {
+    let status = if topic.completed_revision_id.is_some() {
+        "completed"
+    } else {
+        "open"
+    };
     format!(
-        "{{\"topic_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"status\":\"open\",\"lifecycle\":\"open\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":{},\"owner_actor_id\":\"{}\",\"visibility\":\"{}\",\"acceptance_criteria\":{}}}",
+        "{{\"topic_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"status\":\"{}\",\"lifecycle\":\"{}\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":{},\"completed_revision_id\":{},\"owner_actor_id\":\"{}\",\"visibility\":\"{}\",\"acceptance_criteria\":{}}}",
         json_escape(&topic.topic_id),
         json_escape(&topic.slug),
         json_escape(&topic.display_name),
+        status,
+        status,
         json_escape(&topic.base_checkpoint_id),
         optional_string_json(topic.head_revision_id.as_deref()),
+        optional_string_json(topic.completed_revision_id.as_deref()),
         json_escape(&topic.owner_actor_id),
         json_escape(&topic.visibility),
         string_array_json(topic.acceptance_criteria.iter().map(String::as_str)),
@@ -7014,10 +7841,12 @@ fn real_topic_heads_json(state: &RealRepoState) -> String {
             .topics
             .iter()
             .map(|topic| format!(
-                "{{\"topic_id\":\"{}\",\"slug\":\"{}\",\"head_revision_id\":{},\"revision_number\":{}}}",
+                "{{\"topic_id\":\"{}\",\"slug\":\"{}\",\"status\":\"{}\",\"head_revision_id\":{},\"completed_revision_id\":{},\"revision_number\":{}}}",
                 json_escape(&topic.topic_id),
                 json_escape(&topic.slug),
+                if topic.completed_revision_id.is_some() { "completed" } else { "open" },
                 optional_string_json(topic.head_revision_id.as_deref()),
+                optional_string_json(topic.completed_revision_id.as_deref()),
                 topic.revision_number
             ))
             .collect::<Vec<_>>()
@@ -7490,6 +8319,17 @@ fn available_newer_topic_heads(
         .collect()
 }
 
+fn real_view_envelope(command: &str, state: &RealRepoState, view: &ResolvedViewResult) -> String {
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"resolved_view_id\":\"{}\"}},\"view\":{},\"resolved_view\":{}}},\"warnings\":[]}}",
+        json_escape(command),
+        json_escape(&state.repository_id),
+        json_escape(&view.resolved_view_id),
+        view_resolve_view_json(view),
+        resolved_view_record_json(view),
+    )
+}
+
 fn real_inspect_envelope(
     repo_root: &Path,
     state: &RealRepoState,
@@ -7632,18 +8472,8 @@ fn real_inspect_envelope(
         return Ok(real_export_map_inspect_envelope(state, export_map));
     }
     if let Some(view) = selector.strip_prefix("view:") {
-        let resolved = state.resolve_head_view();
-        if view == resolved.result.resolved_view_id
-            || view == state.resolved_view_id
-            || view == state.base_resolved_view_id
-        {
-            return Ok(format!("{{\"ok\":true,\"data\":{{\"command\":\"inspect.view\",\"repository_id\":\"{}\",\"ids\":{{\"resolved_view_id\":\"{}\"}},\"view\":{},\"resolved_view\":{}}},\"warnings\":[]}}",
-                json_escape(&state.repository_id),
-                json_escape(view),
-                view_resolve_view_json(&resolved.result),
-                resolved_view_record_json(&resolved.result),
-            ));
-        }
+        let resolved = real_resolve_view_by_id(repo_root, state, view)?;
+        return Ok(real_view_envelope("inspect.view", state, &resolved.result));
     }
     if let Some(conflict) = selector.strip_prefix("conflict:") {
         let resolved = state.resolve_head_view();
@@ -8549,7 +9379,7 @@ fn parse_git_export_execution_fixture(
 
 fn parse_view_resolve_options(ctx: &CommandContext) -> Result<ViewResolveOptions, CliError> {
     let mut fixture = None;
-    let mut include = None;
+    let mut include = Vec::new();
     let mut base_checkpoint_id = None;
     let mut args = ctx.args.iter().skip(2);
 
@@ -8567,7 +9397,7 @@ fn parse_view_resolve_options(ctx: &CommandContext) -> Result<ViewResolveOptions
                         "usage: sun view resolve requires --include topic:revision[,topic:revision]",
                     )
                 })?;
-                include = Some(parse_view_include(value)?);
+                include.extend(parse_view_include(value)?);
             }
             "--base" => {
                 let value = args.next().ok_or_else(|| {
@@ -8587,8 +9417,6 @@ fn parse_view_resolve_options(ctx: &CommandContext) -> Result<ViewResolveOptions
             }
         }
     }
-
-    let include = include.unwrap_or_default();
 
     Ok(ViewResolveOptions {
         fixture,
@@ -10848,6 +11676,14 @@ struct TopicCreateOptions {
 }
 
 #[derive(Debug)]
+struct TopicCompleteOptions {
+    topic_id: String,
+    revision_id: String,
+    session_id: String,
+    summary: Option<String>,
+}
+
+#[derive(Debug)]
 struct SessionStartOptions {
     topic: String,
     view_id: String,
@@ -10863,7 +11699,8 @@ struct SessionRefreshOptions {
 
 #[derive(Debug)]
 struct ArtifactCommandOptions {
-    session_id: String,
+    session_id: Option<String>,
+    view_id: Option<String>,
     fixture: Option<String>,
     operands: Vec<String>,
 }
@@ -10956,6 +11793,76 @@ fn parse_topic_create_options(ctx: &CommandContext) -> Result<TopicCreateOptions
         visibility: visibility.unwrap_or_else(|| "local".to_string()),
         acceptance_criteria,
         fixture,
+    })
+}
+
+fn parse_topic_complete_options(ctx: &CommandContext) -> Result<TopicCompleteOptions, CliError> {
+    let mut topic_id = None;
+    let mut revision_id = None;
+    let mut session_id = None;
+    let mut summary = None;
+    let mut args = ctx.args.iter().skip(2);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--topic" => {
+                topic_id = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request("sun topic complete requires --topic <topic-id>")
+                        })?
+                        .clone(),
+                );
+            }
+            "--revision" => {
+                revision_id = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request(
+                                "sun topic complete requires --revision <topic-revision-id>",
+                            )
+                        })?
+                        .clone(),
+                );
+            }
+            "--session" => {
+                session_id = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request("sun topic complete requires --session <session-id>")
+                        })?
+                        .clone(),
+                );
+            }
+            "--summary" => {
+                summary = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request("sun topic complete --summary requires text")
+                        })?
+                        .clone(),
+                );
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun topic complete"
+                )));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected topic complete argument `{value}`"
+                )));
+            }
+        }
+    }
+    Ok(TopicCompleteOptions {
+        topic_id: topic_id
+            .ok_or_else(|| invalid_request("sun topic complete requires --topic <topic-id>"))?,
+        revision_id: revision_id.ok_or_else(|| {
+            invalid_request("sun topic complete requires --revision <topic-revision-id>")
+        })?,
+        session_id: session_id
+            .ok_or_else(|| invalid_request("sun topic complete requires --session <session-id>"))?,
+        summary,
     })
 }
 
@@ -11071,6 +11978,7 @@ fn parse_artifact_options(
     max_operands: usize,
 ) -> Result<ArtifactCommandOptions, CliError> {
     let mut session_id = None;
+    let mut view_id = None;
     let mut fixture = None;
     let mut operands = Vec::new();
     let mut args = ctx.args.iter().skip(1);
@@ -11082,6 +11990,14 @@ fn parse_artifact_options(
                     invalid_request(format!("usage: sun {command} requires --session <session>"))
                 })?;
                 session_id = Some(value.clone());
+            }
+            "--view" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(format!(
+                        "usage: sun {command} requires --view <resolved-view>"
+                    ))
+                })?;
+                view_id = Some(value.clone());
             }
             "--fixture" => {
                 let value = args.next().ok_or_else(|| {
@@ -11102,11 +12018,22 @@ fn parse_artifact_options(
         return Err(invalid_request(artifact_usage(command)));
     }
 
-    let session_id = session_id.ok_or_else(|| {
-        invalid_request(format!("usage: sun {command} requires --session <session>"))
-    })?;
+    if session_id.is_some() == view_id.is_some() {
+        return Err(CliError::new(
+            "artifact_read_scope_invalid",
+            format!("sun {command} requires exactly one of --session or --view"),
+        )
+        .with_detail("session_supplied", session_id.is_some().to_string())
+        .with_detail("view_supplied", view_id.is_some().to_string()));
+    }
+    if fixture.is_some() && view_id.is_some() {
+        return Err(invalid_request(
+            "fixture artifact reads require --session; direct --view reads are repository-backed",
+        ));
+    }
     Ok(ArtifactCommandOptions {
         session_id,
+        view_id,
         fixture,
         operands,
     })
@@ -11114,9 +12041,9 @@ fn parse_artifact_options(
 
 fn artifact_usage(command: &str) -> String {
     match command {
-        "read" => "usage: sun read <path-or-artifact-id> --session <session> [--fixture basic-app]",
-        "list" => "usage: sun list [path-prefix] --session <session> [--fixture basic-app]",
-        "search" => "usage: sun search <query> --session <session> [--fixture basic-app]",
+        "read" => "usage: sun read <path-or-artifact-id> (--session <session> | --view <resolved-view>) [--fixture basic-app]",
+        "list" => "usage: sun list [path-prefix] (--session <session> | --view <resolved-view>) [--fixture basic-app]",
+        "search" => "usage: sun search <query> (--session <session> | --view <resolved-view>) [--fixture basic-app]",
         "patch" => {
             "usage: sun patch <path> --session <session> [--fixture basic-app] --expect-hash <hash> --patch-file <file>"
         }
@@ -15281,6 +16208,95 @@ fn search_success_envelope(response: &SearchResponse) -> String {
     )
 }
 
+fn view_read_success_envelope(
+    state: &RealRepoState,
+    view: &ResolvedViewResult,
+    entry: &RealArtifactEntry,
+    bytes: &str,
+) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"artifact.read\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"resolved_view_id\":\"{}\"}},",
+            "\"access_mode\":\"read_only_view\",",
+            "\"view\":{},",
+            "\"artifacts\":[{}],",
+            "\"content\":{{\"encoding\":\"utf-8\",\"bytes\":\"{}\"}}",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&state.repository_id),
+        json_escape(&view.resolved_view_id),
+        view_resolve_view_json(view),
+        artifact_json(&real_artifact_view(entry)),
+        json_escape(bytes),
+    )
+}
+
+fn view_list_success_envelope(
+    state: &RealRepoState,
+    view: &ResolvedViewResult,
+    artifacts: &[SessionVisibleArtifactView],
+) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"artifact.list\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"resolved_view_id\":\"{}\"}},",
+            "\"access_mode\":\"read_only_view\",",
+            "\"view\":{},",
+            "\"artifacts\":[{}]",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&state.repository_id),
+        json_escape(&view.resolved_view_id),
+        view_resolve_view_json(view),
+        artifacts
+            .iter()
+            .map(artifact_json)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn view_search_success_envelope(
+    state: &RealRepoState,
+    view: &ResolvedViewResult,
+    matches: &[sunlight_core::artifacts::SearchMatch],
+) -> String {
+    format!(
+        concat!(
+            "{{\"ok\":true,\"data\":{{",
+            "\"command\":\"artifact.search\",",
+            "\"repository_id\":\"{}\",",
+            "\"ids\":{{\"resolved_view_id\":\"{}\"}},",
+            "\"access_mode\":\"read_only_view\",",
+            "\"view\":{},",
+            "\"matches\":[{}]",
+            "}},\"warnings\":[]}}"
+        ),
+        json_escape(&state.repository_id),
+        json_escape(&view.resolved_view_id),
+        view_resolve_view_json(view),
+        matches
+            .iter()
+            .map(|item| {
+                format!(
+                    "{{\"artifact_id\":\"{}\",\"path\":\"{}\",\"content_hash\":\"{}\",\"line\":{},\"snippet\":\"{}\"}}",
+                    json_escape(&item.artifact_id),
+                    json_escape(&item.path),
+                    json_escape(&item.content_hash),
+                    item.line,
+                    json_escape(&item.snippet),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
 fn mutation_success_envelope(response: &MutationResponse) -> String {
     format!(
         concat!(
@@ -15357,7 +16373,48 @@ fn promotion_success_envelope(
     )
 }
 
-fn view_resolve_success_envelope(result: &ResolvedViewResult) -> String {
+fn exact_requested_frontier(
+    selections: &[TopicRevisionSelection],
+) -> Result<BTreeMap<String, String>, CliError> {
+    let mut frontier = BTreeMap::new();
+    for selection in selections {
+        if let Some(previous) =
+            frontier.insert(selection.topic_id.clone(), selection.revision_id.clone())
+        {
+            return Err(CliError::new(
+                "duplicate_topic_selection",
+                "an exact view may select only one revision per topic",
+            )
+            .with_detail("topic_id", selection.topic_id.clone())
+            .with_detail("first_revision_id", previous)
+            .with_detail("second_revision_id", selection.revision_id.clone()));
+        }
+    }
+    Ok(frontier)
+}
+
+fn ensure_resolver_preserved_frontier(
+    requested: &BTreeMap<String, String>,
+    normalized: &BTreeMap<String, String>,
+) -> Result<(), CliError> {
+    if requested.is_empty() || requested == normalized {
+        return Ok(());
+    }
+    Err(CliError::new(
+        "resolver_frontier_input_lost",
+        "the resolver did not preserve the exact requested topic frontier",
+    )
+    .with_raw_details_json(format!(
+        "{{\"requested_frontier\":{},\"normalized_frontier\":{}}}",
+        string_string_map_json(requested),
+        string_string_map_json(normalized),
+    )))
+}
+
+fn view_resolve_success_envelope(
+    result: &ResolvedViewResult,
+    requested_frontier: &BTreeMap<String, String>,
+) -> String {
     let conflict_ids = result
         .conflicts()
         .map(|record| record.id.as_str())
@@ -15378,6 +16435,8 @@ fn view_resolve_success_envelope(result: &ResolvedViewResult) -> String {
             "\"resolved_view_id\":\"{}\",",
             "\"base_checkpoint_ids\":{},",
             "\"topic_frontier\":{},",
+            "\"requested_frontier\":{},",
+            "\"normalized_frontier\":{},",
             "\"dependency_closure\":{},",
             "\"operation_semantics_version\":\"{}\",",
             "\"path_policy_id\":\"{}\",",
@@ -15398,6 +16457,8 @@ fn view_resolve_success_envelope(result: &ResolvedViewResult) -> String {
         json_escape(&result.resolved_view_id),
         string_array_json(result.base_checkpoint_ids.iter().map(String::as_str)),
         topic_frontier_json(result),
+        string_string_map_json(requested_frontier),
+        string_string_map_json(&result.topic_frontier),
         dependency_closure_json(&result.dependency_closure),
         json_escape(&result.operation_semantics_version),
         json_escape(&result.path_policy_id),
@@ -16598,6 +17659,15 @@ fn mutation_artifact_json(artifact: &MutationArtifactView) -> String {
     )
 }
 
+fn string_string_map_json(values: &BTreeMap<String, String>) -> String {
+    let fields = values
+        .iter()
+        .map(|(key, value)| format!("\"{}\":\"{}\"", json_escape(key), json_escape(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{fields}}}")
+}
+
 fn string_array_json<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
     let items = values
         .into_iter()
@@ -16703,9 +17773,10 @@ sun - local-first source artifact management
 Usage:
   sun init [--repo <path>]
   sun topic create <slug> --display-name <name> [--owner <actor>] [--visibility local|private] [--acceptance-criterion <text>...] [--json]
+  sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]
   sun session start --topic <topic> --view <view> --actor <actor-id> [--json]
   sun session refresh <session> --policy manual|follow|none [--json]
-  sun read|list|search ... --session <session> [--json]
+  sun read|list|search ... (--session <session> | --view <resolved-view>) [--json]
   sun patch|write|move|delete|metadata set ... --session <session> [--json]
   sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]
   sun project materialize --view <view> --purpose execution|compatibility|inspection|export [--strategy copy|reflink|hardlink_readonly|overlay_copyup] [--no-copy-fallback] [--projection-root <path>] [--json]
@@ -16725,7 +17796,7 @@ Usage:
 
 Commands:
   init       Ingest the repository into persisted Sunlight native state
-  topic      Create durable authoring topics
+  topic      Create and durably complete authoring topics
   session    Start and explicitly refresh topic-bound sessions over exact views
   read/list/search/inspect
              Query persisted artifacts and provenance
@@ -16763,7 +17834,9 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
     match command {
         "status" => outputln!(ctx, "sun status\n\nUsage:\n  sun status [--json]\n  sun status --topic <topic> [--json]\n  sun status --session <session> [--json]\n  sun status --view <view> [--json]\n  sun status --projection <projection> [--json]\n  sun status --execution <execution> [--json]\n  sun status --checkpoint <checkpoint> [--json]\n  sun status --export <export-map> [--json]\n\nRepository status is derived from persisted Sunlight state, not git status or the main working tree."),
         "inspect" => outputln!(ctx, "sun inspect\n\nUsage:\n  sun inspect repository [--json]\n  sun inspect topic:<topic>|session:<session>|view:<view> [--json]\n  sun inspect artifact:<path>|operation:<id>|conflict:<id> [--json]\n  sun inspect projection:<id>|execution:<id>|checkpoint:<id>|export:<id> [--json]"),
-        "topic" | "topic create" => outputln!(ctx, "sun topic create\n\nUsage:\n  sun topic create <slug> --display-name <name> [--owner <actor>] [--visibility local|private] [--acceptance-criterion <text>...] [--json]\n\nCreates a durable topic in the initialized repository. Defaults: owner=local, visibility=local."),
+        "topic" => outputln!(ctx, "sun topic\n\nUsage:\n  sun topic create <slug> --display-name <name> [options] [--json]\n  sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]"),
+        "topic create" => outputln!(ctx, "sun topic create\n\nUsage:\n  sun topic create <slug> --display-name <name> [--owner <actor>] [--visibility local|private] [--acceptance-criterion <text>...] [--json]\n\nCreates a durable topic in the initialized repository. Defaults: owner=local, visibility=local."),
+        "topic complete" => outputln!(ctx, "sun topic complete\n\nUsage:\n  sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]\n\nRecords an idempotent durable completion fact for the exact current topic revision; it does not assert review or quality."),
         "session" => outputln!(ctx, "sun session\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]\n  sun session refresh <session> --policy manual|follow|none [--json]"),
         "session start" => outputln!(ctx, "sun session start\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]"),
         "session refresh" => outputln!(ctx, "sun session refresh\n\nUsage:\n  sun session refresh <session> --policy manual|follow|none [--json]\n\nmanual and follow immediately advance already-selected non-write topics to current heads; none pins them. The write topic always remains at the session revision. An unchanged policy/frontier is an idempotent no-op."),
@@ -16772,7 +17845,7 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
         "git" | "git export" => outputln!(ctx, "sun git export\n\nUsage:\n  sun git export --checkpoint <checkpoint> --branch <ref> [--write-plan|--execute-local] [--repo <path>] [--json]"),
         "checkpoint" | "checkpoint create" => outputln!(ctx, "sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--execution <passing-execution-id>] [--json]\n\nWhen supplied, execution evidence must pass and exactly match the resolved view and tree."),
         "run" => outputln!(ctx, "sun run\n\nUsage:\n  sun run --view <resolved-view-id> [--network disabled|not_enforced] -- <command> [args...]\n\nRuntime bounds come from [execution_policy] in .sunlight/config.toml. Windows runs always use restricted low-integrity filesystem isolation and a dedicated Job Object. Network disabled adds a capability-less per-execution AppContainer; not_enforced retains compatibility with ordinary user toolchains."),
-        "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => outputln!(ctx, "sun artifact operations\n\nUsage:\n  sun read <path> --session <session> [--json]\n  sun list [path-prefix] --session <session> [--json]\n  sun search <query> --session <session> [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification <class> [--json]"),
+        "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => outputln!(ctx, "sun artifact operations\n\nUsage:\n  sun read <path> (--session <session> | --view <resolved-view>) [--json]\n  sun list [path-prefix] (--session <session> | --view <resolved-view>) [--json]\n  sun search <query> (--session <session> | --view <resolved-view>) [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification <class> [--json]\n\nResolved-view reads are read-only and do not create a session. Mutations always require a topic-bound authoring session."),
         "view" | "view resolve" => outputln!(ctx, "sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nResolves persisted topic selections; conflicts and staleness remain inspectable records."),
         "project" | "project materialize" | "projection" | "projection create" => outputln!(ctx, "sun project materialize\n\nUsage:\n  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export [--strategy copy|reflink|hardlink_readonly|overlay_copyup] [--no-copy-fallback] [--projection-root <path>] [--json]\n\nManaged projections adapt persisted views for filesystem tools and are not source truth. Automatic selection prefers safe Windows block cloning and falls back to full copy; --no-copy-fallback makes the requested strategy required."),
         "execution" | "execution promote-output" => outputln!(ctx, "sun execution promote-output\n\nUsage:\n  sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> [--json]"),

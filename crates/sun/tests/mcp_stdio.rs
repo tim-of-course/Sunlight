@@ -153,7 +153,7 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
 
     let listed = mcp.request(2, "tools/list", json!({}));
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 26);
+    assert_eq!(tools.len(), 27);
     let advertised = serde_json::to_string(tools).unwrap();
     assert!(!advertised.to_ascii_lowercase().contains("fixture"));
     for required in [
@@ -164,6 +164,7 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
         "session_refresh",
         "artifact_read",
         "artifact_write",
+        "topic_complete",
         "execution_run",
         "checkpoint_create",
         "git_export",
@@ -226,6 +227,74 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
         .as_str()
         .expect("write response should identify its after view")
         .to_string();
+    let revision = write["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .expect("write response should identify its exact revision")
+        .to_string();
+    let direct_read = mcp.call(
+        90,
+        "artifact_read",
+        json!({"path":"mcp/note.txt","view":view}),
+    );
+    assert_eq!(direct_read["data"]["access_mode"], "read_only_view");
+    assert_eq!(direct_read["data"]["ids"]["resolved_view_id"], view);
+    assert_eq!(
+        direct_read["data"]["content"]["bytes"],
+        "written through typed MCP content\n"
+    );
+    let direct_list = mcp.call(91, "artifact_list", json!({"prefix":"mcp","view":view}));
+    assert_eq!(direct_list["data"]["artifacts"][0]["path"], "mcp/note.txt");
+    let direct_search = mcp.call(
+        92,
+        "artifact_search",
+        json!({"query":"typed MCP","view":view}),
+    );
+    assert_eq!(direct_search["data"]["matches"][0]["path"], "mcp/note.txt");
+    let invalid_scope = mcp.call_error(
+        93,
+        "artifact_read",
+        json!({"path":"mcp/note.txt","session":session_id,"view":view}),
+    );
+    assert_eq!(
+        invalid_scope["error"]["code"],
+        "artifact_read_scope_invalid"
+    );
+    let completed = mcp.call(
+        94,
+        "topic_complete",
+        json!({
+            "topic":"topic_mcp_authoring",
+            "revision":revision,
+            "session":session_id,
+            "summary":"MCP authoring change finished"
+        }),
+    );
+    assert_eq!(completed["data"]["command"], "topic.complete");
+
+    let repeated_completion = mcp.call(
+        95,
+        "topic_complete",
+        json!({
+            "topic":"topic_mcp_authoring",
+            "revision":revision,
+            "session":session_id,
+            "summary":"same immutable completion"
+        }),
+    );
+    assert_eq!(repeated_completion["data"]["changed"], false);
+    let completed_write = mcp.call_error(
+        96,
+        "artifact_write",
+        json!({
+            "path":"mcp/after-completion.txt",
+            "session":session_id,
+            "expect_hash":"new",
+            "content":"must not be authored\n",
+            "classification":"source"
+        }),
+    );
+    assert_eq!(completed_write["error"]["code"], "topic_completed");
+
     let refreshed = mcp.call(
         10,
         "session_refresh",
@@ -310,6 +379,225 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
     assert!(!sent.contains("--fixture"));
     assert!(!sent.contains("\"fixture\""));
     mcp.shutdown();
+}
+
+#[test]
+fn two_live_mcp_agents_author_independent_topics_into_one_exact_view() {
+    let temp = TempDir::new("sun-mcp-two-agents");
+    let repo = temp.path().join("repository");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    git(&repo, &["config", "user.name", "Sun MCP Test"]);
+    git(&repo, &["config", "user.email", "sun-mcp@example.invalid"]);
+    fs::write(repo.join("README.md"), "# shared repository\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+
+    let mut agent_a = Mcp::start(&repo);
+    let mut agent_b = Mcp::start(&repo);
+    for (agent, name) in [
+        (&mut agent_a, "agent-a-client"),
+        (&mut agent_b, "agent-b-client"),
+    ] {
+        let initialized = agent.request(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion":"2025-11-25",
+                "capabilities":{},
+                "clientInfo":{"name":name,"version":"1"}
+            }),
+        );
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+        agent.notify("notifications/initialized", json!({}));
+    }
+
+    assert_eq!(agent_a.call(2, "repository_init", json!({}))["ok"], true);
+    assert_eq!(
+        agent_b.call(2, "repository_status", json!({}))["data"]["command"],
+        "status.repository"
+    );
+
+    agent_a.call(
+        3,
+        "topic_create",
+        json!({"slug":"agent-a-change","display_name":"Agent A change"}),
+    );
+    agent_b.call(
+        3,
+        "topic_create",
+        json!({"slug":"agent-b-change","display_name":"Agent B change"}),
+    );
+    let session_a = agent_a.call(
+        4,
+        "session_start",
+        json!({
+            "topic":"agent-a-change",
+            "view":"view_base_0001",
+            "actor":"agent-a"
+        }),
+    );
+    let session_b = agent_b.call(
+        4,
+        "session_start",
+        json!({
+            "topic":"agent-b-change",
+            "view":"view_base_0001",
+            "actor":"agent-b"
+        }),
+    );
+    let session_a_id = session_a["data"]["ids"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let session_b_id = session_b["data"]["ids"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    agent_a.start_call(
+        5,
+        "artifact_write",
+        json!({
+            "path":"agents/a.txt",
+            "session":session_a_id,
+            "expect_hash":"new",
+            "content":"authored by agent A\n",
+            "classification":"source"
+        }),
+    );
+    agent_b.start_call(
+        5,
+        "artifact_write",
+        json!({
+            "path":"agents/b.txt",
+            "session":session_b_id,
+            "expect_hash":"new",
+            "content":"authored by agent B\n",
+            "classification":"source"
+        }),
+    );
+    let mut write_a = agent_a.finish_call(5);
+    let mut write_b = agent_b.finish_call(5);
+    for round in 1..=6 {
+        let request_id = 100 + round;
+        agent_a.start_call(
+            request_id,
+            "artifact_write",
+            json!({
+                "path":format!("agents/a-{round}.txt"),
+                "session":session_a_id,
+                "expect_hash":"new",
+                "content":format!("agent A round {round}\n"),
+                "classification":"source"
+            }),
+        );
+        agent_b.start_call(
+            request_id,
+            "artifact_write",
+            json!({
+                "path":format!("agents/b-{round}.txt"),
+                "session":session_b_id,
+                "expect_hash":"new",
+                "content":format!("agent B round {round}\n"),
+                "classification":"source"
+            }),
+        );
+        write_a = agent_a.finish_call(request_id);
+        write_b = agent_b.finish_call(request_id);
+    }
+    let revision_a = write_a["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let revision_b = write_b["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let combined = agent_a.call(
+        6,
+        "view_resolve",
+        json!({
+            "base":"checkpoint_base_0001",
+            "include":[
+                {"topic":"topic_agent_a_change","revision":revision_a},
+                {"topic":"topic_agent_b_change","revision":revision_b}
+            ]
+        }),
+    );
+    assert_eq!(combined["data"]["conflict_ids"], json!([]));
+    assert_eq!(combined["data"]["staleness_ids"], json!([]));
+    assert_eq!(
+        combined["data"]["normalized_frontier"]["topic_agent_a_change"],
+        revision_a
+    );
+    assert_eq!(
+        combined["data"]["normalized_frontier"]["topic_agent_b_change"],
+        revision_b
+    );
+    let combined_view = combined["data"]["ids"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let a_reads_b = agent_a.call(
+        7,
+        "artifact_read",
+        json!({"path":"agents/b.txt","view":combined_view}),
+    );
+    let b_reads_a = agent_b.call(
+        7,
+        "artifact_read",
+        json!({"path":"agents/a.txt","view":combined_view}),
+    );
+    assert_eq!(
+        a_reads_b["data"]["content"]["bytes"],
+        "authored by agent B\n"
+    );
+    assert_eq!(
+        b_reads_a["data"]["content"]["bytes"],
+        "authored by agent A\n"
+    );
+    assert_eq!(a_reads_b["data"]["access_mode"], "read_only_view");
+    assert_eq!(b_reads_a["data"]["access_mode"], "read_only_view");
+
+    assert_eq!(
+        agent_a.call(
+            8,
+            "topic_complete",
+            json!({
+                "topic":"topic_agent_a_change",
+                "revision":revision_a,
+                "session":session_a_id
+            }),
+        )["data"]["command"],
+        "topic.complete"
+    );
+    assert_eq!(
+        agent_b.call(
+            8,
+            "topic_complete",
+            json!({
+                "topic":"topic_agent_b_change",
+                "revision":revision_b,
+                "session":session_b_id
+            }),
+        )["data"]["command"],
+        "topic.complete"
+    );
+    let final_status = agent_b.call(9, "repository_status", json!({}));
+    assert_eq!(
+        final_status["data"]["operational_summary"]["topics"]["count"],
+        2
+    );
+    assert!(fs::read_dir(repo.join(".sunlight/projections"))
+        .unwrap()
+        .next()
+        .is_none());
+
+    agent_a.shutdown();
+    agent_b.shutdown();
 }
 
 #[test]
@@ -532,7 +820,20 @@ impl Mcp {
         self.send(json!({"jsonrpc":"2.0","method":method,"params":params}));
     }
     fn call(&mut self, id: u64, name: &str, arguments: Value) -> Value {
-        let response = self.request(id, "tools/call", json!({"name":name,"arguments":arguments}));
+        self.start_call(id, name, arguments);
+        self.finish_call(id)
+    }
+    fn start_call(&mut self, id: u64, name: &str, arguments: Value) {
+        self.send(json!({
+            "jsonrpc":"2.0",
+            "id":id,
+            "method":"tools/call",
+            "params":{"name":name,"arguments":arguments}
+        }));
+    }
+    fn finish_call(&mut self, id: u64) -> Value {
+        let response = self.read();
+        assert_eq!(response["id"], id);
         assert!(
             response.get("error").is_none(),
             "protocol error: {response}"

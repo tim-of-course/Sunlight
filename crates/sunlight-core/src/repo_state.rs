@@ -32,6 +32,9 @@ const PROJECTION_CACHE_ROOT: &str = ".sunlight/cache/projections/v1";
 const PROJECTION_CACHE_MANIFEST_FILE: &str = "manifest.json";
 const PROJECTION_CACHE_CONTENT_ROOT: &str = "root";
 static PROJECTION_CACHE_NONCE: AtomicU64 = AtomicU64::new(1);
+const PROJECTION_CACHE_STAGING_STALE_AFTER_NANOS: u128 = 24 * 60 * 60 * 1_000_000_000;
+const PROJECTION_CACHE_STAGING_SCAN_LIMIT: usize = 256;
+const PROJECTION_CACHE_STAGING_REMOVE_LIMIT: usize = 4;
 
 const DERIVED_RECORD_NAMESPACES: &[&str] = &[
     "checkpoints",
@@ -349,6 +352,7 @@ pub struct RealExecutionSnapshot {
     pub memory_policy: String,
     pub environment_policy: String,
     pub environment_allowlist: Vec<String>,
+    pub environment_summary: RealExecutionEnvironmentSummary,
     pub network_policy_requested: String,
     pub network_policy: String,
     pub filesystem_write_policy_requested: String,
@@ -357,6 +361,24 @@ pub struct RealExecutionSnapshot {
     pub started_at: String,
     pub finished_at: String,
     pub privacy_class: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealExecutionEnvironmentSummary {
+    pub os: String,
+    pub platform_hint: String,
+    pub arch: String,
+    pub sunlight_build_id: String,
+    pub command_runner_version: String,
+    pub tool_hints: Vec<RealExecutionToolHint>,
+    pub redacted_env_allowlist_digest: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RealExecutionToolHint {
+    pub name: String,
+    pub version_or_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2936,6 +2958,73 @@ pub fn real_content_hash(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+pub fn real_execution_environment_summary_digest(
+    summary: &RealExecutionEnvironmentSummary,
+    environment_policy: &str,
+    environment_allowlist: &[String],
+    network_policy: &str,
+    filesystem_write_policy: &str,
+) -> String {
+    let mut tool_hints = summary.tool_hints.clone();
+    tool_hints.sort();
+    let tool_hints = tool_hints
+        .into_iter()
+        .map(|hint| {
+            JsonValue::Object(BTreeMap::from([
+                ("name".to_string(), JsonValue::String(hint.name)),
+                (
+                    "version_or_digest".to_string(),
+                    JsonValue::String(hint.version_or_digest),
+                ),
+            ]))
+        })
+        .collect();
+    let mut allowlist = environment_allowlist.to_vec();
+    allowlist.sort();
+    allowlist.dedup();
+    let value = JsonValue::Object(BTreeMap::from([
+        ("os".to_string(), JsonValue::String(summary.os.clone())),
+        (
+            "platform_hint".to_string(),
+            JsonValue::String(summary.platform_hint.clone()),
+        ),
+        ("arch".to_string(), JsonValue::String(summary.arch.clone())),
+        (
+            "sunlight_build_id".to_string(),
+            JsonValue::String(summary.sunlight_build_id.clone()),
+        ),
+        (
+            "command_runner_version".to_string(),
+            JsonValue::String(summary.command_runner_version.clone()),
+        ),
+        ("tool_hints".to_string(), JsonValue::Array(tool_hints)),
+        (
+            "environment_policy".to_string(),
+            JsonValue::String(environment_policy.to_string()),
+        ),
+        (
+            "environment_allowlist".to_string(),
+            JsonValue::Array(allowlist.into_iter().map(JsonValue::String).collect()),
+        ),
+        (
+            "redacted_env_allowlist_digest".to_string(),
+            JsonValue::String(summary.redacted_env_allowlist_digest.clone()),
+        ),
+        (
+            "network_policy".to_string(),
+            JsonValue::String(network_policy.to_string()),
+        ),
+        (
+            "filesystem_write_policy".to_string(),
+            JsonValue::String(filesystem_write_policy.to_string()),
+        ),
+    ]));
+    real_content_hash(
+        &canonical_json_bytes(&value)
+            .expect("execution environment summary contains canonical JSON values"),
+    )
+}
+
 pub fn real_tree_hash(entries: &[RealArtifactEntry]) -> String {
     let mut hasher = Sha256::new();
     for entry in entries.iter().filter(|entry| !entry.tombstone) {
@@ -3093,6 +3182,7 @@ fn ensure_real_projection_cache_entry(
 ) -> Result<RealProjectionCacheEntry, RepoStateError> {
     let cache_root = repo_root.join(PROJECTION_CACHE_ROOT);
     ensure_safe_projection_cache_root(repo_root, &cache_root, cache_key)?;
+    cleanup_stale_projection_cache_staging(&cache_root);
     let key_digest = format!("{:x}", Sha256::digest(cache_key.as_bytes()));
     let entry_root = cache_root.join(&key_digest);
     let expected_manifest = real_projection_cache_manifest_bytes(state, request, cache_key)?;
@@ -3215,6 +3305,149 @@ fn state_logical_bytes(state: &RealRepoState) -> u64 {
         .filter(|entry| !entry.tombstone)
         .map(|entry| entry.bytes.len() as u64)
         .sum()
+}
+fn projection_cache_staging_identity(name: &str) -> Option<(u32, u128)> {
+    let mut parts = name.strip_prefix(".staging-")?.split('-');
+    let key_digest = parts.next()?;
+    let process_id = parts.next()?.parse().ok()?;
+    let created_at_nanos = parts.next()?.parse().ok()?;
+    let nonce = parts.next()?;
+    if parts.next().is_some()
+        || key_digest.len() != 64
+        || !key_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || nonce.parse::<u64>().is_err()
+    {
+        return None;
+    }
+    Some((process_id, created_at_nanos))
+}
+
+#[cfg(windows)]
+fn projection_cache_staging_process_may_be_live(process_id: u32) -> bool {
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    unsafe extern "system" {
+        fn OpenProcess(
+            desired_access: u32,
+            inherit_handle: i32,
+            process_id: u32,
+        ) -> *mut std::ffi::c_void;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if handle.is_null() {
+        return !matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(87) | Some(1168)
+        );
+    }
+    unsafe {
+        CloseHandle(handle);
+    }
+    true
+}
+
+#[cfg(unix)]
+fn projection_cache_staging_process_may_be_live(process_id: u32) -> bool {
+    if process_id > i32::MAX as u32 {
+        return false;
+    }
+    unsafe extern "C" {
+        fn kill(process_id: i32, signal: i32) -> i32;
+    }
+    if unsafe { kill(process_id as i32, 0) } == 0 {
+        true
+    } else {
+        std::io::Error::last_os_error().raw_os_error() != Some(3)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn projection_cache_staging_process_may_be_live(_process_id: u32) -> bool {
+    true
+}
+
+fn make_projection_cache_staging_removable(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if projection_metadata_is_reparse(&metadata) {
+        return;
+    }
+    if metadata.is_dir() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        }
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                make_projection_cache_staging_removable(&entry.path());
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(path, permissions);
+    }
+}
+
+fn cleanup_stale_projection_cache_staging(cache_root: &Path) -> usize {
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let Ok(entries) = fs::read_dir(cache_root) else {
+        return 0;
+    };
+    let mut stale = entries
+        .take(PROJECTION_CACHE_STAGING_SCAN_LIMIT)
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let (process_id, created_at_nanos) = projection_cache_staging_identity(name)?;
+            if now_nanos.saturating_sub(created_at_nanos)
+                <= PROJECTION_CACHE_STAGING_STALE_AFTER_NANOS
+                || projection_cache_staging_process_may_be_live(process_id)
+            {
+                return None;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            if projection_metadata_is_reparse(&metadata) || !metadata.is_dir() {
+                return None;
+            }
+            Some((created_at_nanos, path))
+        })
+        .collect::<Vec<_>>();
+    stale.sort_by_key(|(created_at_nanos, path)| (*created_at_nanos, path.clone()));
+    let mut removed = 0;
+    for (_, path) in stale
+        .into_iter()
+        .take(PROJECTION_CACHE_STAGING_REMOVE_LIMIT)
+    {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if projection_metadata_is_reparse(&metadata) || !metadata.is_dir() {
+            continue;
+        }
+        make_projection_cache_staging_removable(&path);
+        if fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 fn ensure_safe_projection_cache_root(
@@ -4496,6 +4729,139 @@ fn parse_projection_materialization_metrics(
     }))
 }
 
+fn parse_execution_environment_summary(
+    object: &BTreeMap<String, JsonValue>,
+    state_path: &Path,
+) -> Result<RealExecutionEnvironmentSummary, RepoStateError> {
+    let Some(value) = object.get("environment_summary") else {
+        return Ok(RealExecutionEnvironmentSummary {
+            os: "legacy_unrecorded".to_string(),
+            platform_hint: "legacy_unrecorded".to_string(),
+            arch: "legacy_unrecorded".to_string(),
+            sunlight_build_id: "legacy_unrecorded".to_string(),
+            command_runner_version: "legacy_unrecorded".to_string(),
+            tool_hints: Vec::new(),
+            redacted_env_allowlist_digest: "legacy_unrecorded".to_string(),
+            digest: "legacy_unrecorded".to_string(),
+        });
+    };
+    let JsonValue::Object(summary_object) = value else {
+        return Err(invalid_state(
+            state_path,
+            "execution environment_summary must be a JSON object",
+        ));
+    };
+    let tool_hints = required_array(summary_object, "tool_hints", state_path)?
+        .iter()
+        .map(|value| {
+            let JsonValue::Object(hint) = value else {
+                return Err(invalid_state(
+                    state_path,
+                    "execution environment_summary tool_hints must contain objects",
+                ));
+            };
+            Ok(RealExecutionToolHint {
+                name: required_string(hint, "name", state_path)?,
+                version_or_digest: required_string(hint, "version_or_digest", state_path)?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if tool_hints.len() > 8 {
+        return Err(invalid_state(
+            state_path,
+            "execution environment_summary may contain at most 8 tool hints",
+        ));
+    }
+    let mut tool_names = BTreeSet::new();
+    for hint in &tool_hints {
+        if hint.name.is_empty()
+            || hint.name.chars().count() > 64
+            || hint.version_or_digest.is_empty()
+            || hint.version_or_digest.chars().count() > 256
+            || !tool_names.insert(hint.name.as_str())
+        {
+            return Err(invalid_state(
+                state_path,
+                "execution environment_summary tool hints must be unique, non-empty, and bounded",
+            ));
+        }
+    }
+    let summary = RealExecutionEnvironmentSummary {
+        os: required_string(summary_object, "os", state_path)?,
+        platform_hint: required_string(summary_object, "platform_hint", state_path)?,
+        arch: required_string(summary_object, "arch", state_path)?,
+        sunlight_build_id: required_string(summary_object, "sunlight_build_id", state_path)?,
+        command_runner_version: required_string(
+            summary_object,
+            "command_runner_version",
+            state_path,
+        )?,
+        tool_hints,
+        redacted_env_allowlist_digest: required_string(
+            summary_object,
+            "redacted_env_allowlist_digest",
+            state_path,
+        )?,
+        digest: required_string(summary_object, "digest", state_path)?,
+    };
+    for (field, value, limit) in [
+        ("os", summary.os.as_str(), 64),
+        ("platform_hint", summary.platform_hint.as_str(), 128),
+        ("arch", summary.arch.as_str(), 64),
+        ("sunlight_build_id", summary.sunlight_build_id.as_str(), 128),
+        (
+            "command_runner_version",
+            summary.command_runner_version.as_str(),
+            128,
+        ),
+    ] {
+        if value.is_empty() || value.chars().count() > limit {
+            return Err(invalid_state(
+                state_path,
+                &format!("execution environment_summary {field} must be non-empty and bounded"),
+            ));
+        }
+    }
+    if !summary.redacted_env_allowlist_digest.starts_with("sha256:")
+        || summary.redacted_env_allowlist_digest.len() != 71
+    {
+        return Err(invalid_state(
+            state_path,
+            "execution environment_summary allowlist digest must be sha256",
+        ));
+    }
+    let environment_policy = optional_string(object, "environment_policy", state_path)?
+        .unwrap_or_else(|| "legacy_unrecorded".to_string());
+    let environment_allowlist = optional_array(object, "environment_allowlist", state_path)?
+        .iter()
+        .map(|value| match value {
+            JsonValue::String(name) => Ok(name.clone()),
+            _ => Err(invalid_state(
+                state_path,
+                "execution environment_allowlist must contain strings",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let network_policy = optional_string(object, "network_policy", state_path)?
+        .unwrap_or_else(|| "legacy_unrecorded".to_string());
+    let filesystem_write_policy = optional_string(object, "filesystem_write_policy", state_path)?
+        .unwrap_or_else(|| "legacy_unrecorded".to_string());
+    let expected = real_execution_environment_summary_digest(
+        &summary,
+        &environment_policy,
+        &environment_allowlist,
+        &network_policy,
+        &filesystem_write_policy,
+    );
+    if summary.digest != expected {
+        return Err(invalid_state(
+            state_path,
+            "execution environment_summary digest does not match persisted evidence",
+        ));
+    }
+    Ok(summary)
+}
+
 fn parse_execution_snapshot(
     value: &JsonValue,
     state_path: &Path,
@@ -4588,6 +4954,7 @@ fn parse_execution_snapshot(
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?,
+        environment_summary: parse_execution_environment_summary(object, state_path)?,
         network_policy_requested: optional_string(object, "network_policy_requested", state_path)?
             .unwrap_or_else(|| "legacy_unrecorded".to_string()),
         network_policy: optional_string(object, "network_policy", state_path)?
@@ -4924,6 +5291,51 @@ fn projection_materialization_metrics_json(
     JsonValue::Object(object)
 }
 
+fn execution_environment_summary_json(summary: &RealExecutionEnvironmentSummary) -> JsonValue {
+    JsonValue::Object(BTreeMap::from([
+        ("os".to_string(), JsonValue::String(summary.os.clone())),
+        (
+            "platform_hint".to_string(),
+            JsonValue::String(summary.platform_hint.clone()),
+        ),
+        ("arch".to_string(), JsonValue::String(summary.arch.clone())),
+        (
+            "sunlight_build_id".to_string(),
+            JsonValue::String(summary.sunlight_build_id.clone()),
+        ),
+        (
+            "command_runner_version".to_string(),
+            JsonValue::String(summary.command_runner_version.clone()),
+        ),
+        (
+            "tool_hints".to_string(),
+            JsonValue::Array(
+                summary
+                    .tool_hints
+                    .iter()
+                    .map(|hint| {
+                        JsonValue::Object(BTreeMap::from([
+                            ("name".to_string(), JsonValue::String(hint.name.clone())),
+                            (
+                                "version_or_digest".to_string(),
+                                JsonValue::String(hint.version_or_digest.clone()),
+                            ),
+                        ]))
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "redacted_env_allowlist_digest".to_string(),
+            JsonValue::String(summary.redacted_env_allowlist_digest.clone()),
+        ),
+        (
+            "digest".to_string(),
+            JsonValue::String(summary.digest.clone()),
+        ),
+    ]))
+}
+
 fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert(
@@ -5082,6 +5494,10 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
                 .map(|name| JsonValue::String(name.clone()))
                 .collect(),
         ),
+    );
+    object.insert(
+        "environment_summary".to_string(),
+        execution_environment_summary_json(&execution.environment_summary),
     );
     object.insert(
         "network_policy_requested".to_string(),
@@ -5803,6 +6219,82 @@ mod tests {
     use std::time::Duration;
 
     static FAILPOINT_ENV_LOCK: Mutex<()> = Mutex::new(());
+    #[test]
+    fn execution_environment_summary_is_content_addressed_and_tamper_evident() {
+        let allowlist = vec!["PATH".to_string(), "HOME".to_string()];
+        let mut summary = RealExecutionEnvironmentSummary {
+            os: "linux".to_string(),
+            platform_hint: "local_process".to_string(),
+            arch: "x86_64".to_string(),
+            sunlight_build_id: "sun/0.1.0".to_string(),
+            command_runner_version: "bounded_local_process_v3".to_string(),
+            tool_hints: vec![RealExecutionToolHint {
+                name: "cargo".to_string(),
+                version_or_digest: format!("sha256:{}", "1".repeat(64)),
+            }],
+            redacted_env_allowlist_digest: format!("sha256:{}", "2".repeat(64)),
+            digest: String::new(),
+        };
+        summary.digest = real_execution_environment_summary_digest(
+            &summary,
+            "minimal_os_allowlist",
+            &allowlist,
+            "not_enforced",
+            "not_enforced",
+        );
+        assert!(summary.digest.starts_with("sha256:"));
+
+        let object = BTreeMap::from([
+            (
+                "environment_summary".to_string(),
+                execution_environment_summary_json(&summary),
+            ),
+            (
+                "environment_policy".to_string(),
+                JsonValue::String("minimal_os_allowlist".to_string()),
+            ),
+            (
+                "environment_allowlist".to_string(),
+                JsonValue::Array(allowlist.iter().cloned().map(JsonValue::String).collect()),
+            ),
+            (
+                "network_policy".to_string(),
+                JsonValue::String("not_enforced".to_string()),
+            ),
+            (
+                "filesystem_write_policy".to_string(),
+                JsonValue::String("not_enforced".to_string()),
+            ),
+        ]);
+        let parsed =
+            parse_execution_environment_summary(&object, Path::new("native-state.json")).unwrap();
+        assert_eq!(parsed, summary);
+
+        let mut tampered = object;
+        let JsonValue::Object(summary_object) = tampered.get_mut("environment_summary").unwrap()
+        else {
+            panic!("environment summary should be an object");
+        };
+        summary_object.insert("os".to_string(), JsonValue::String("tampered".to_string()));
+        let error = parse_execution_environment_summary(&tampered, Path::new("native-state.json"))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("environment_summary digest does not match persisted evidence"));
+
+        let original = summary.digest.clone();
+        summary.tool_hints[0].version_or_digest = format!("sha256:{}", "3".repeat(64));
+        assert_ne!(
+            real_execution_environment_summary_digest(
+                &summary,
+                "minimal_os_allowlist",
+                &allowlist,
+                "not_enforced",
+                "not_enforced",
+            ),
+            original
+        );
+    }
 
     fn temp_repo(name: &str) -> PathBuf {
         let mut root = std::env::temp_dir();
@@ -7050,6 +7542,67 @@ mod tests {
     }
 
     #[test]
+    fn stale_projection_cache_staging_cleanup_is_safe_and_bounded() {
+        let repo = temp_repo("projection-cache-staging-gc");
+        let cache_root = repo.join(PROJECTION_CACHE_ROOT);
+        fs::create_dir_all(&cache_root).unwrap();
+        let key_digest = "a".repeat(64);
+        for nonce in 0..6 {
+            let staging = cache_root.join(format!(".staging-{key_digest}-{}-1-{nonce}", u32::MAX));
+            fs::create_dir_all(staging.join("root")).unwrap();
+            let file = staging.join("root/partial");
+            fs::write(&file, b"stale").unwrap();
+            set_cache_file_permissions(&file, false).unwrap();
+        }
+        let live = cache_root.join(format!(
+            ".staging-{key_digest}-{}-1-100",
+            std::process::id()
+        ));
+        fs::create_dir(&live).unwrap();
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fresh = cache_root.join(format!(
+            ".staging-{key_digest}-{}-{now_nanos}-101",
+            u32::MAX
+        ));
+        fs::create_dir(&fresh).unwrap();
+        let malformed = cache_root.join(".staging-interrupted-publication");
+        fs::create_dir(&malformed).unwrap();
+
+        assert_eq!(
+            cleanup_stale_projection_cache_staging(&cache_root),
+            PROJECTION_CACHE_STAGING_REMOVE_LIMIT
+        );
+        let stale_remaining = fs::read_dir(&cache_root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!(".staging-{key_digest}-{}-1-", u32::MAX))
+            })
+            .count();
+        assert_eq!(stale_remaining, 2);
+        assert!(live.is_dir());
+        assert!(fresh.is_dir());
+        assert!(malformed.is_dir());
+
+        assert_eq!(cleanup_stale_projection_cache_staging(&cache_root), 2);
+        assert!(live.is_dir());
+        assert!(fresh.is_dir());
+        assert!(malformed.is_dir());
+        assert_eq!(
+            cleanup_stale_projection_cache_staging(&cache_root),
+            0,
+            "fresh, live, and malformed directories must never be collected"
+        );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
     fn real_projection_cache_publishes_once_concurrently_and_keys_semantic_policy() {
         let repo = temp_repo("projection-cache-concurrent");
         fs::write(repo.join("source.txt"), b"source truth\n").unwrap();
@@ -7101,6 +7654,13 @@ mod tests {
             .join(".staging-interrupted-publication");
         fs::create_dir(&interrupted).unwrap();
         fs::write(interrupted.join("partial"), b"must never be reused").unwrap();
+        let stale = repo.join(PROJECTION_CACHE_ROOT).join(format!(
+            ".staging-{}-{}-1-999",
+            "b".repeat(64),
+            u32::MAX
+        ));
+        fs::create_dir(&stale).unwrap();
+        fs::write(stale.join("partial"), b"stale crash debris").unwrap();
         let after_interruption = materialize_real_projection(
             &repo,
             &state,
@@ -7114,6 +7674,8 @@ mod tests {
             b"source truth\n"
         );
         assert_eq!(published_projection_cache_entries(&repo), 1);
+        assert!(!stale.exists());
+        assert!(interrupted.exists());
 
         let mut changed_policy = request.clone();
         changed_policy.operation_semantics_version = "file_ops_test_v2".to_string();

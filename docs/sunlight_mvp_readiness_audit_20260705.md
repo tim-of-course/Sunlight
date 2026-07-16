@@ -1,5 +1,7 @@
 # Sunlight MVP Readiness Audit - Superseded Correction
 
+This correction is historical. The fresh repo-backed completion audit is `docs/sunlight_mvp_readiness_audit_20260716.md`.
+
 This document previously concluded that the fixture/local acceptance target was complete. That was not a valid conclusion for the actual Sunlight MVP described in `docs/sunlight_consolidated_architecture_v0_3.md`.
 
 ## Corrected Status

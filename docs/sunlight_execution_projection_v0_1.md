@@ -102,14 +102,23 @@ The Phase 3 `execution` record uses the v1 schema contract.
   },
   "working_directory": ".",
   "environment_summary": {
-    "id": "env_summary_wsl_rust_0001",
-    "os": "linux",
+    "os": "windows",
+    "platform_hint": "windows_low_integrity_appcontainer",
     "arch": "x86_64",
-    "tool_hints": {
-      "cargo": "digest-or-version-if-available"
-    },
-    "env_policy": "default_redacted",
-    "digest": "sha256:envsummary"
+    "sunlight_build_id": "sun/0.1.0",
+    "command_runner_version": "bounded_local_process_v3",
+    "tool_hints": [
+      {
+        "name": "cargo",
+        "version_or_digest": "sha256:executable-content"
+      }
+    ],
+    "redacted_env_allowlist_digest": "sha256:allowlisted-values",
+    "environment_policy": "allowlist_only",
+    "environment_allowlist": ["PATH"],
+    "network_policy": "disabled",
+    "filesystem_write_policy": "projection_private_low_integrity",
+    "digest": "sha256:canonical-summary-and-policy"
   },
   "projection_id": "projection_exec_auth_profile_0001",
   "inputs": {
@@ -143,6 +152,10 @@ Identity inputs follow the schema contract: resolved view ID, tree identity, nor
 ## Environment Summary
 
 Environment summaries are reproducibility hints, not full machine snapshots. Capture enough to explain common MVP failures without leaking secrets.
+
+The local implementation persists a bounded, content-addressed summary with OS, platform hint, architecture, Sunlight build ID, runner version, up to eight tool hints, and a digest of allowlisted environment values. Tool hints use a bounded executable-content digest when the command can be resolved cheaply; the implementation does not launch separate version-probe subprocesses. Raw environment values are never serialized. Legacy execution records load with an explicit `legacy_unrecorded` summary.
+
+The summary digest also commits to the requested environment policy and allowlist, network policy, and filesystem-write policy. Loading rejects a modified summary whose canonical digest no longer matches.
 
 Required summary fields:
 

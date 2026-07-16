@@ -96,14 +96,15 @@ use sunlight_core::projection::{
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repo_state::{
     materialize_real_projection, native_session_generation_id, quarantine_report_publication,
-    real_artifact_id_for_path, real_content_hash, real_tree_hash,
-    scan_real_projection_files_with_quarantine, validate_topic_metadata, DerivedRecordPublication,
-    RealArtifactEntry, RealCheckpointSnapshot, RealExecutionOutputSnapshot,
-    RealExecutionPromotionSnapshot, RealExecutionSnapshot, RealExportMapSnapshot,
-    RealOperationEffect, RealOperationRecord, RealProjectionMaterialization,
-    RealProjectionMaterializationRequest, RealProjectionSnapshot, RealProjectionStrategy,
-    RealRepoState, RealResolvedRepoView, RealSessionGenerationRecord, RealSessionRecord,
-    RealTopicRecord, RepoStateError, TopicMetadataValidationError,
+    real_artifact_id_for_path, real_content_hash, real_execution_environment_summary_digest,
+    real_tree_hash, scan_real_projection_files_with_quarantine, validate_topic_metadata,
+    DerivedRecordPublication, RealArtifactEntry, RealCheckpointSnapshot,
+    RealExecutionEnvironmentSummary, RealExecutionOutputSnapshot, RealExecutionPromotionSnapshot,
+    RealExecutionSnapshot, RealExecutionToolHint, RealExportMapSnapshot, RealOperationEffect,
+    RealOperationRecord, RealProjectionMaterialization, RealProjectionMaterializationRequest,
+    RealProjectionSnapshot, RealProjectionStrategy, RealRepoState, RealResolvedRepoView,
+    RealSessionGenerationRecord, RealSessionRecord, RealTopicRecord, RepoStateError,
+    TopicMetadataValidationError,
 };
 use sunlight_core::repository::{
     init_repository, resolve_projection_policy, ExecutionPolicy, RepositoryConfig,
@@ -488,33 +489,65 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
     let report = init_repository(&repo_root).map_err(|error| {
         invalid_request(error.to_string()).with_detail("command", "repository.init")
     })?;
-    let ingest = RealRepoState::ingest(&report.repo_root, &report.repository_id)?;
-    let records = vec![
-        quarantine_report_publication(&ingest.quarantine)?,
-        ingest.record_publication(
-            "checkpoints",
-            &ingest.base_checkpoint_id,
-            &format!(
-            "{{\"record_type\":\"checkpoint\",\"id\":\"{}\",\"repository_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"source\":\"worktree_ingest\"}}\n",
-            json_escape(&ingest.base_checkpoint_id),
-            json_escape(&ingest.repository_id),
-            json_escape(&ingest.base_resolved_view_id),
-            json_escape(&ingest.tree_hash),
-            ),
-        )?,
-        ingest.record_publication(
-            "views",
-            &ingest.base_resolved_view_id,
-            &format!(
-            "{{\"record_type\":\"resolved_view\",\"id\":\"{}\",\"repository_id\":\"{}\",\"base_checkpoint_ids\":[\"{}\"],\"tree_hash\":\"{}\"}}\n",
-            json_escape(&ingest.base_resolved_view_id),
-            json_escape(&ingest.repository_id),
-            json_escape(&ingest.base_checkpoint_id),
-            json_escape(&ingest.tree_hash),
-            ),
-        )?,
-    ];
-    ingest.save_with_records(&report.repo_root, &records)?;
+    let mut quarantine_count = 0;
+    let state_exists = match RealRepoState::load(&report.repo_root) {
+        Ok(state) => {
+            quarantine_count = state.quarantine.len();
+            if state.repository_id != report.repository_id {
+                return Err(invalid_request(
+                    "persisted Sunlight state belongs to a different repository",
+                )
+                .with_detail("config_repository_id", report.repository_id.clone())
+                .with_detail("state_repository_id", state.repository_id));
+            }
+            true
+        }
+        Err(RepoStateError::NotInitialized { .. }) => false,
+        Err(error) => return Err(error.into()),
+    };
+    if !state_exists {
+        let ingest = RealRepoState::ingest(&report.repo_root, &report.repository_id)?;
+        quarantine_count = ingest.quarantine.len();
+        let records = vec![
+            quarantine_report_publication(&ingest.quarantine)?,
+            ingest.record_publication(
+                "checkpoints",
+                &ingest.base_checkpoint_id,
+                &format!(
+                "{{\"record_type\":\"checkpoint\",\"id\":\"{}\",\"repository_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"source\":\"worktree_ingest\"}}\n",
+                json_escape(&ingest.base_checkpoint_id),
+                json_escape(&ingest.repository_id),
+                json_escape(&ingest.base_resolved_view_id),
+                json_escape(&ingest.tree_hash),
+                ),
+            )?,
+            ingest.record_publication(
+                "views",
+                &ingest.base_resolved_view_id,
+                &format!(
+                "{{\"record_type\":\"resolved_view\",\"id\":\"{}\",\"repository_id\":\"{}\",\"base_checkpoint_ids\":[\"{}\"],\"tree_hash\":\"{}\"}}\n",
+                json_escape(&ingest.base_resolved_view_id),
+                json_escape(&ingest.repository_id),
+                json_escape(&ingest.base_checkpoint_id),
+                json_escape(&ingest.tree_hash),
+                ),
+            )?,
+        ];
+        match ingest.save_with_records(&report.repo_root, &records) {
+            Ok(()) => {}
+            Err(RepoStateError::ConcurrentStateUpdate { .. }) => {
+                let state = RealRepoState::load(&report.repo_root)?;
+                if state.repository_id != report.repository_id {
+                    return Err(invalid_request(
+                        "persisted Sunlight state belongs to a different repository",
+                    )
+                    .with_detail("config_repository_id", report.repository_id.clone())
+                    .with_detail("state_repository_id", state.repository_id));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 
     if ctx.json {
         outputln!(
@@ -527,7 +560,7 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
                 report.created_config,
                 report.created_gitignore,
                 report.created_directories.len(),
-                ingest.quarantine.len(),
+                quarantine_count,
             )
         );
     } else {
@@ -542,8 +575,8 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
             "created_directories = {}",
             report.created_directories.len()
         );
-        if !ingest.quarantine.is_empty() {
-            outputln!(ctx, "quarantined_secrets = {}", ingest.quarantine.len());
+        if quarantine_count != 0 {
+            outputln!(ctx, "quarantined_secrets = {}", quarantine_count);
         }
     }
 
@@ -3210,6 +3243,144 @@ fn execution_environment_allowlist() -> Vec<&'static str> {
     }
 }
 
+const MAX_TOOL_EXECUTABLE_HASH_BYTES: u64 = 256 * 1024 * 1024;
+const COMMAND_RUNNER_VERSION: &str = "bounded_local_process_v3";
+
+fn redacted_environment_allowlist_digest(allowlist: &[String]) -> String {
+    let mut names = allowlist.to_vec();
+    names.sort();
+    names.dedup();
+    let mut hasher = Sha256::new();
+    for name in names {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        match env::var_os(&name) {
+            Some(value) => {
+                let value = value.to_string_lossy();
+                hasher.update([1]);
+                hasher.update((value.len() as u64).to_le_bytes());
+                hasher.update(value.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn resolve_execution_program(program: &str, cwd: &Path) -> Option<PathBuf> {
+    let path = Path::new(program);
+    if path.is_absolute() || path.components().count() > 1 {
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        if candidate.is_file() {
+            return fs::canonicalize(candidate).ok();
+        }
+        #[cfg(windows)]
+        if candidate.extension().is_none() {
+            let candidate = candidate.with_extension("exe");
+            if candidate.is_file() {
+                return fs::canonicalize(candidate).ok();
+            }
+        }
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        windows_isolation::search_executable(program)
+            .ok()
+            .and_then(|path| fs::canonicalize(path).ok())
+    }
+    #[cfg(not(windows))]
+    {
+        env::var_os("PATH")
+            .into_iter()
+            .flat_map(env::split_paths)
+            .map(|root| root.join(program))
+            .find(|candidate| candidate.is_file())
+            .and_then(|path| fs::canonicalize(path).ok())
+    }
+}
+
+fn bounded_file_digest(path: &Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_TOOL_EXECUTABLE_HASH_BYTES {
+        return None;
+    }
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        hasher.update(&buffer[..count]);
+    }
+    Some(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn capture_execution_environment_summary(
+    argv: &[String],
+    cwd: &Path,
+    environment_policy: &str,
+    environment_allowlist: &[String],
+    network_policy: &str,
+    filesystem_write_policy: &str,
+) -> RealExecutionEnvironmentSummary {
+    let tool_hints = argv
+        .first()
+        .and_then(|program| {
+            let path = resolve_execution_program(program, cwd)?;
+            let version_or_digest = bounded_file_digest(&path)?;
+            let mut name = Path::new(program)
+                .file_name()?
+                .to_string_lossy()
+                .to_string();
+            if cfg!(windows) && name.to_ascii_lowercase().ends_with(".exe") {
+                name.truncate(name.len() - 4);
+            }
+            if name.is_empty() || name.chars().count() > 64 {
+                return None;
+            }
+            Some(RealExecutionToolHint {
+                name,
+                version_or_digest,
+            })
+        })
+        .into_iter()
+        .collect();
+    let mut summary = RealExecutionEnvironmentSummary {
+        os: env::consts::OS.to_string(),
+        platform_hint: if cfg!(windows) {
+            "windows_low_integrity_local".to_string()
+        } else {
+            "local_process".to_string()
+        },
+        arch: env::consts::ARCH.to_string(),
+        sunlight_build_id: format!("sun/{}", env!("CARGO_PKG_VERSION")),
+        command_runner_version: COMMAND_RUNNER_VERSION.to_string(),
+        tool_hints,
+        redacted_env_allowlist_digest: redacted_environment_allowlist_digest(environment_allowlist),
+        digest: String::new(),
+    };
+    if cfg!(windows) && network_policy == "windows_appcontainer_no_network_capabilities_v1" {
+        summary.platform_hint = "windows_low_integrity_appcontainer".to_string();
+    }
+    summary.digest = real_execution_environment_summary_digest(
+        &summary,
+        environment_policy,
+        environment_allowlist,
+        network_policy,
+        filesystem_write_policy,
+    );
+    summary
+}
+
 fn summarize_bounded_stream<R: Read>(mut stream: R, limit: u64) -> BoundedStreamSummary {
     let mut hasher = Sha256::new();
     let mut observed = 0_u64;
@@ -3622,6 +3793,29 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         entries: view_state.entries.clone(),
     });
 
+    let environment_allowlist = execution_environment_allowlist()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let network_policy_effective =
+        if cfg!(windows) && execution_policy.network_policy == DISABLED_NETWORK_POLICY {
+            "windows_appcontainer_no_network_capabilities_v1".to_string()
+        } else {
+            "not_enforced".to_string()
+        };
+    let filesystem_write_policy_effective = if cfg!(windows) {
+        "windows_low_integrity_private_projection_v1".to_string()
+    } else {
+        "not_enforced".to_string()
+    };
+    let environment_summary = capture_execution_environment_summary(
+        &options.command_argv,
+        &execution_cwd,
+        &execution_policy.environment_inheritance,
+        &environment_allowlist,
+        &network_policy_effective,
+        &filesystem_write_policy_effective,
+    );
     let started_at = real_now_id();
     let command_output = run_bounded_process(
         &options.command_argv,
@@ -3776,24 +3970,12 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
             "not_enforced".to_string()
         },
         environment_policy: execution_policy.environment_inheritance,
-        environment_allowlist: execution_environment_allowlist()
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        environment_allowlist,
+        environment_summary,
         network_policy_requested: execution_policy.network_policy.clone(),
-        network_policy: if cfg!(windows)
-            && execution_policy.network_policy == DISABLED_NETWORK_POLICY
-        {
-            "windows_appcontainer_no_network_capabilities_v1".to_string()
-        } else {
-            "not_enforced".to_string()
-        },
+        network_policy: network_policy_effective,
         filesystem_write_policy_requested: execution_policy.filesystem_write_policy,
-        filesystem_write_policy: if cfg!(windows) {
-            "windows_low_integrity_private_projection_v1".to_string()
-        } else {
-            "not_enforced".to_string()
-        },
+        filesystem_write_policy: filesystem_write_policy_effective,
         outputs,
         started_at,
         finished_at,
@@ -6044,17 +6226,32 @@ fn real_execution_record(
         },
         working_directory: execution.working_directory.clone(),
         environment_summary: sunlight_core::execution::EnvironmentSummary {
-            id: format!("env_{}", execution.execution_id),
-            os: std::env::consts::OS.to_string(),
-            platform_hint: "local".to_string(),
-            arch: std::env::consts::ARCH.to_string(),
-            sunlight_build_id: "sun-cli".to_string(),
-            command_runner_version: "bounded_local_process_v2".to_string(),
-            tool_hints: Vec::new(),
-            env_policy: execution.environment_policy.clone(),
-            redacted_env_allowlist_digest: real_content_hash(
-                execution.environment_allowlist.join("\n").as_bytes(),
+            id: format!(
+                "env_{}",
+                execution
+                    .environment_summary
+                    .digest
+                    .trim_start_matches("sha256:")
             ),
+            os: execution.environment_summary.os.clone(),
+            platform_hint: execution.environment_summary.platform_hint.clone(),
+            arch: execution.environment_summary.arch.clone(),
+            sunlight_build_id: execution.environment_summary.sunlight_build_id.clone(),
+            command_runner_version: execution.environment_summary.command_runner_version.clone(),
+            tool_hints: execution
+                .environment_summary
+                .tool_hints
+                .iter()
+                .map(|hint| sunlight_core::execution::ToolHint {
+                    name: hint.name.clone(),
+                    version_or_digest: hint.version_or_digest.clone(),
+                })
+                .collect(),
+            env_policy: execution.environment_policy.clone(),
+            redacted_env_allowlist_digest: execution
+                .environment_summary
+                .redacted_env_allowlist_digest
+                .clone(),
             network_policy: if execution.network_policy
                 == "windows_appcontainer_no_network_capabilities_v1"
             {
@@ -6069,7 +6266,7 @@ fn real_execution_record(
             } else {
                 sunlight_core::execution::WritablePolicy::ManagedProjectionWritableNotIsolated
             },
-            digest: format!("sha256:{}", execution.execution_id),
+            digest: execution.environment_summary.digest.clone(),
         },
         projection_id: execution.projection_id.clone(),
         inputs: sunlight_core::execution::ExecutionInputs {
@@ -6355,6 +6552,7 @@ fn real_execution_status_envelope(
             "\"resolved_view_id\":\"{}\",",
             "\"tree_identity\":{},",
             "\"result\":{},",
+            "\"environment_summary\":{},",
             "\"runtime_policy\":{},",
             "\"output_capture\":{},",
             "\"output_summary_counts\":{},",
@@ -6374,6 +6572,7 @@ fn real_execution_status_envelope(
         json_escape(&execution.resolved_view_id),
         single_repo_tree_json(&record.tree_identity),
         execution_result_json(&record),
+        execution_environment_summary_json(&record.environment_summary),
         real_execution_runtime_policy_json(execution),
         real_execution_output_capture_json(execution),
         output_summary_counts_json(&record),
@@ -6406,6 +6605,7 @@ fn real_execution_run_success_envelope(
             "\"projection\":{},",
             "\"tree_identity\":{},",
             "\"result\":{},",
+            "\"environment_summary\":{},",
             "\"runtime_policy\":{},",
             "\"output_capture\":{},",
             "\"output_summary_counts\":{},",
@@ -6423,6 +6623,7 @@ fn real_execution_run_success_envelope(
         real_execution_projection_json(state, execution),
         single_repo_tree_json(&record.tree_identity),
         execution_result_json(&record),
+        execution_environment_summary_json(&record.environment_summary),
         real_execution_runtime_policy_json(execution),
         real_execution_output_capture_json(execution),
         output_summary_counts_json(&record),
@@ -15340,6 +15541,53 @@ fn fixture_inspect_execution_json(
     )
 }
 
+fn execution_environment_summary_json(
+    summary: &sunlight_core::execution::EnvironmentSummary,
+) -> String {
+    let tool_hints = summary
+        .tool_hints
+        .iter()
+        .map(|hint| {
+            format!(
+                "{{\"name\":\"{}\",\"version_or_digest\":\"{}\"}}",
+                json_escape(&hint.name),
+                json_escape(&hint.version_or_digest),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        concat!(
+            "{{",
+            "\"id\":\"{}\",",
+            "\"os\":\"{}\",",
+            "\"platform_hint\":\"{}\",",
+            "\"arch\":\"{}\",",
+            "\"sunlight_build_id\":\"{}\",",
+            "\"command_runner_version\":\"{}\",",
+            "\"tool_hints\":[{}],",
+            "\"env_policy\":\"{}\",",
+            "\"redacted_env_allowlist_digest\":\"{}\",",
+            "\"network_policy\":\"{}\",",
+            "\"sandbox_writable_policy\":\"{}\",",
+            "\"digest\":\"{}\"",
+            "}}"
+        ),
+        json_escape(&summary.id),
+        json_escape(&summary.os),
+        json_escape(&summary.platform_hint),
+        json_escape(&summary.arch),
+        json_escape(&summary.sunlight_build_id),
+        json_escape(&summary.command_runner_version),
+        tool_hints,
+        json_escape(&summary.env_policy),
+        json_escape(&summary.redacted_env_allowlist_digest),
+        summary.network_policy.as_str(),
+        summary.sandbox_writable_policy.as_str(),
+        json_escape(&summary.digest),
+    )
+}
+
 fn execution_record_json(execution: &ExecutionRecord) -> String {
     format!(
         concat!(
@@ -15352,6 +15600,7 @@ fn execution_record_json(execution: &ExecutionRecord) -> String {
             "\"tree_identity\":{},",
             "\"command\":{{\"argv\":{},\"shell\":{}}},",
             "\"working_directory\":\"{}\",",
+            "\"environment_summary\":{},",
             "\"projection_id\":\"{}\",",
             "\"inputs\":{{",
             "\"resolved_view_id\":\"{}\",",
@@ -15373,6 +15622,7 @@ fn execution_record_json(execution: &ExecutionRecord) -> String {
         string_array_json(execution.command.argv.iter().map(String::as_str)),
         optional_string_json(execution.command.shell.as_deref()),
         json_escape(&execution.working_directory),
+        execution_environment_summary_json(&execution.environment_summary),
         json_escape(&execution.projection_id),
         json_escape(&execution.inputs.resolved_view_id),
         json_escape(&execution.inputs.tree_hash),

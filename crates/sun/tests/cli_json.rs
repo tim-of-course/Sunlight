@@ -436,6 +436,18 @@ fn init_json_returns_repository_success_envelope() {
     assert!(stdout.contains("\"view\":null"));
     assert!(stdout.contains("\"warnings\":[]"));
     assert!(repo.path().join(".sunlight/config.toml").is_file());
+
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let state_before = fs::read(&state_path).unwrap();
+    let second = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("second sun init should run");
+    assert_success(&second);
+    assert!(String::from_utf8_lossy(&second.stdout).contains("\"ok\":true"));
+    assert_eq!(fs::read(state_path).unwrap(), state_before);
 }
 
 #[test]
@@ -1651,11 +1663,21 @@ fn no_fixture_windows_execution_denies_root_and_descendant_loopback_without_host
         ));
     }
 
-    let outside_after = Command::new("curl.exe")
-        .args(["--max-time", "2", "--silent", "--fail", &url])
-        .output()
-        .expect("post-run outside connectivity probe should run");
-    assert!(outside_after.status.success());
+    let outside_after = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_secs(5),
+    );
+    assert!(
+        outside_after.is_ok(),
+        "post-run host connectivity probe failed: {outside_after:?}"
+    );
+    drop(outside_after);
+    for _ in 0..50 {
+        if accepted.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(accepted.load(Ordering::SeqCst), 2);
     stop.store(true, Ordering::SeqCst);
     server.join().unwrap();
@@ -2368,6 +2390,66 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
     assert!(!normal_stdout.contains(secret));
     assert!(!normal_stdout.contains("SUNLIGHT_TEST_SECRET"));
     let execution_id = json_string_field(&normal_stdout, "execution_id");
+    let normal_json: serde_json::Value = serde_json::from_str(&normal_stdout).unwrap();
+    let environment_summary = &normal_json["data"]["environment_summary"];
+    assert_eq!(environment_summary["os"], std::env::consts::OS);
+    assert_eq!(environment_summary["arch"], std::env::consts::ARCH);
+    assert_eq!(environment_summary["sunlight_build_id"], "sun/0.1.0");
+    assert_eq!(
+        environment_summary["command_runner_version"],
+        "bounded_local_process_v3"
+    );
+    assert_eq!(
+        environment_summary["platform_hint"],
+        if cfg!(windows) {
+            "windows_low_integrity_local"
+        } else {
+            "local_process"
+        }
+    );
+    let tool_hints = environment_summary["tool_hints"].as_array().unwrap();
+    assert_eq!(tool_hints.len(), 1);
+    assert_eq!(
+        tool_hints[0]["name"],
+        if cfg!(windows) { "cmd" } else { "python" }
+    );
+    assert!(tool_hints[0]["version_or_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    let environment_digest = environment_summary["digest"].as_str().unwrap().to_string();
+    assert!(environment_digest.starts_with("sha256:"));
+    assert_eq!(environment_digest.len(), 71);
+    assert_ne!(environment_digest, format!("sha256:{execution_id}"));
+    assert!(environment_summary["redacted_env_allowlist_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+
+    let reloaded = RealRepoState::load(repo.path()).unwrap();
+    let persisted_execution = reloaded
+        .executions
+        .iter()
+        .find(|execution| execution.execution_id == execution_id)
+        .unwrap();
+    assert_eq!(
+        persisted_execution.environment_summary.digest,
+        environment_digest
+    );
+    assert_eq!(persisted_execution.environment_summary.tool_hints.len(), 1);
+    let persisted_record: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            repo.path()
+                .join(".sunlight/executions")
+                .join(format!("{execution_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        persisted_record["environment_summary"]["digest"],
+        environment_digest
+    );
 
     for output in [
         sun()
@@ -2390,6 +2472,9 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
         let body = stdout(&output);
         assert_valid_json(&body);
         assert!(body.contains("\"runtime_policy\":"));
+        assert!(body.contains("\"environment_summary\":"));
+        assert!(body.contains(&environment_digest));
+        assert!(body.contains("bounded_local_process_v3"));
         assert!(body.contains("\"output_capture\":"));
         assert!(body.contains(
             "\"network\":{\"requested\":\"not_enforced\",\"effective\":\"not_enforced\"}"
@@ -2397,6 +2482,34 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
         assert!(body.contains("\"inheritance\":\"minimal_os_allowlist\""));
         assert!(!body.contains(secret));
     }
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let canonical_state = fs::read(&state_path).unwrap();
+    let mut legacy_state: serde_json::Value = serde_json::from_slice(&canonical_state).unwrap();
+    legacy_state["executions"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("environment_summary");
+    fs::write(&state_path, serde_json::to_vec(&legacy_state).unwrap()).unwrap();
+    let legacy_loaded = RealRepoState::load(repo.path()).unwrap();
+    assert_eq!(
+        legacy_loaded.executions[0].environment_summary.digest,
+        "legacy_unrecorded"
+    );
+
+    fs::write(&state_path, &canonical_state).unwrap();
+    let mut tampered_state: serde_json::Value = serde_json::from_slice(&canonical_state).unwrap();
+    let tampered_execution = tampered_state["executions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|execution| execution["execution_id"].as_str() == Some(&execution_id))
+        .unwrap();
+    tampered_execution["environment_summary"]["os"] = serde_json::json!("tampered");
+    fs::write(&state_path, serde_json::to_vec(&tampered_state).unwrap()).unwrap();
+    let error = RealRepoState::load(repo.path()).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("state recovery failed"), "{message}");
+    fs::write(&state_path, canonical_state).unwrap();
 }
 
 #[cfg(windows)]

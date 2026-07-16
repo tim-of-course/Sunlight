@@ -255,6 +255,18 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
         execution["data"]["runtime_policy"]["network"]["requested"],
         "not_enforced"
     );
+    assert_eq!(
+        execution["data"]["environment_summary"]["command_runner_version"],
+        "bounded_local_process_v3"
+    );
+    assert_eq!(
+        execution["data"]["environment_summary"]["tool_hints"][0]["name"],
+        "git"
+    );
+    assert!(execution["data"]["environment_summary"]["digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
     let execution_id = execution["data"]["execution_id"]
         .as_str()
         .expect("execution response should identify execution");

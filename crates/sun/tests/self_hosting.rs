@@ -462,6 +462,25 @@ fn self_hosting_real_repository_acceptance() {
             "not_enforced"
         }
     );
+    assert_eq!(
+        string(&run, &["data", "environment_summary", "sunlight_build_id"]),
+        "sun/0.1.0"
+    );
+    assert_eq!(
+        string(
+            &run,
+            &["data", "environment_summary", "command_runner_version"]
+        ),
+        "bounded_local_process_v3"
+    );
+    assert!(string(&run, &["data", "environment_summary", "digest"]).starts_with("sha256:"));
+    let tool_hints = array(&run, &["data", "environment_summary", "tool_hints"]);
+    assert_eq!(tool_hints.len(), 1);
+    assert_eq!(
+        string(&tool_hints[0], &["name"]),
+        if cfg!(windows) { "powershell" } else { "sh" }
+    );
+    assert!(string(&tool_hints[0], &["version_or_digest"]).starts_with("sha256:"));
     let execution_id = string(&run, &["data", "execution_id"]).to_string();
     assert!(array(&run, &["data", "promotion_candidates"])
         .iter()

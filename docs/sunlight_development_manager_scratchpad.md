@@ -33,11 +33,11 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 - Management lane changed on 2026-07-06: work directly in the Windows checkout at `C:\Users\TimothyCardoza\Documents\AI-Apps\Sunlight 2`.
 - Older WSL clone rows below are historical checkpoints only; do not treat them as the active work lane.
 - Critical handoff correction: previous fixture-backed acceptance is not product completion.
-- Current implementation reality: fixture prototype plus a substantial repo-backed product path with durable authoring/resolution/projection/execution/checkpoint/export/policy/compatibility features, no-fixture self-hosting acceptance, and a repository-confined persistent MCP transport over the same in-process engine as the CLI; still not yet certified as the full v0.3 product.
-- Rename-plus-edit remains unresolved because compatibility projections expose no reliable identity signal; fuzzy inference is intentionally excluded.
+- Current implementation reality: the local v0.3 MVP is certified by the 2026-07-16 architecture-to-product audit. The repo-backed CLI and MCP share one engine and cover native authoring, exact resolution/conflicts, projections/execution/promotion, checkpoints, policy, compatibility import, and Git export.
+- Rename-plus-edit compatibility inference remains intentionally conservative: exact unambiguous renames are preserved; fuzzy identity inference is deferred.
 - Windows executions enforce process-tree, CPU, memory, process-count, and filesystem-write isolation. Explicit `disabled` network mode uses a capability-less AppContainer; the default `not_enforced` mode preserves ordinary local toolchains, and requested/effective policy is recorded. Pre-existing unrelated low-integrity host paths remain outside the write boundary.
-- Reusable verified projection cache entries now avoid rebuilding immutable input trees and preserve private writable outputs; Windows ReFS block cloning is used when proven, while NTFS and non-Windows hosts retain truthful full-copy fallback. Physical allocation measurement and stale staging GC remain open.
-- Main product gaps from the completed criterion audit: persisted execution-environment summaries where facts are knowable, stale projection-cache staging GC, and remaining platform-specific projection scaling beyond the measured full-copy fallback.
+- Reusable verified projection cache entries avoid rebuilding immutable input trees and preserve private writable outputs. Windows ReFS block cloning is used when proven; NTFS and non-Windows hosts retain the architecture-permitted measured copy fallback. Physical allocation remains null when it cannot be measured truthfully.
+- Execution records now persist bounded content-addressed environment summaries without raw secrets, and projection-cache staging cleanup is safe, age/liveness-gated, and bounded.
 
 ## Workstreams
 
@@ -85,13 +85,14 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 | repo-backed-v0.3-gap-closure | Windows CLI drift correction `019f5ea5-d19c-7001-acf1-5aaa70da1fc5` after stale desktop task and allocation correction | `main`, logs `C:\tmp\sunlight-v03-correction.jsonl` and `C:\tmp\sunlight-v03-drift-correction.jsonl` | Windows commit `f16d8e3` | Completed | Add a truthful operator warning for Git working-tree changes outside Sunlight without making the working tree authoritative. | Path-free JSON/human warnings use no-optional-locks Git status, exclude root .sunlight metadata, preserve Git index/native state, retain truthful null allocation, and passed focused plus worker/manager full default-parallel suites. |
 | repo-backed-checkpoint-evidence | Windows CLI thread `019f5f30-1264-7d41-9acc-94e0f2e7e8e3` | Windows commit `c3bcd07` | Completed | Persist validated passing execution evidence on real checkpoints across CLI, MCP, state, inspect, and export reconstruction. | Focused no-fixture/core/MCP tests and the full default-parallel workspace suite passed independently; invalid evidence is atomic and backward-compatible parsing is covered. |
 | repo-backed-topic-intent | Windows CLI threads `019f5fba-68c6-72e1-bb0a-755e308a0f20`, correction `019f6043-094e-7390-9b1f-b279f567082a` | Windows commit `11f54eb` | Completed | Persist validated topic owner, base, local/private visibility, acceptance criteria, CLI/MCP surfaces, and fail-closed Git-export policy. | Reload validation, legacy defaults, missing/unknown frontier metadata, atomic rejection, derived records, status/inspect, focused tests, and independent full workspace/release verification passed. |
+| repo-backed-mvp-certification | Windows Codex desktop | Working tree, 2026-07-16 | Completed | Close the remaining audited local-v0.3 gaps and re-run criterion-level acceptance. | Persisted tamper-evident environment summaries, bounded stale staging GC, repeat-init repair, 418 workspace tests, three smoke lanes, formatting/checks, self-hosting, and release build passed. |
 
 ## Delegation Queue
 
-1. Complete and review the active persisted execution-environment evidence slice.
-2. Close stale projection-cache staging GC and measured platform projection limitations where they materially affect production use, without relabeling fallback as zero-copy completion.
-3. Re-run criterion-level acceptance after the remaining audited production gaps close.
-4. Keep fixture tests only when they directly support the repo-backed product path.
+1. Keep fixture tests only when they directly support the repo-backed product path.
+2. Post-MVP: reduce strict-Clippy debt without destabilizing public error contracts.
+3. Post-MVP: add more platform-native COW/physical-allocation measurement where supported; never label copy fallback as zero-copy.
+4. Post-MVP: improve compatibility rename identity only when a reliable signal exists.
 
 
 ## Heartbeat Procedure
@@ -106,4 +107,4 @@ Build Sunlight as a local-first native source artifact database. Git and filesys
 ## Open Management Decisions
 
 - Production-like validation repository selected: Sunlight itself via isolated local clone.
-- Do not certify MVP completion until a fresh architecture-to-product audit proves every local v0.3 acceptance criterion through real repo-backed behavior.
+- Local v0.3 MVP certified on 2026-07-16 by `docs/sunlight_mvp_readiness_audit_20260716.md`; subsequent work is hardening or post-MVP unless the architecture scope changes.

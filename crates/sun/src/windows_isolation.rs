@@ -962,7 +962,7 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
 }
 
-fn search_executable(program: &str) -> io::Result<PathBuf> {
+pub(crate) fn search_executable(program: &str) -> io::Result<PathBuf> {
     let append_exe = Path::new(program).extension().is_none();
     let program = wide_null(program);
     let extension = wide_null(".exe");

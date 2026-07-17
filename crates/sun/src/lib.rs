@@ -1,9 +1,9 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::rc::Rc;
@@ -2625,13 +2625,14 @@ fn real_topic_complete(
     if ctx.json {
         outputln!(
             ctx,
-            "{{\"ok\":true,\"data\":{{\"command\":\"topic.complete\",\"repository_id\":\"{}\",\"ids\":{{\"topic_id\":\"{}\",\"completed_revision_id\":\"{}\",\"session_id\":\"{}\"}},\"changed\":{},\"immutable\":true,\"topic\":{}}},\"warnings\":[]}}",
+            "{{\"ok\":true,\"data\":{{\"command\":\"topic.complete\",\"repository_id\":\"{}\",\"ids\":{{\"topic_id\":\"{}\",\"completed_revision_id\":\"{}\",\"session_id\":\"{}\"}},\"changed\":{},\"immutable\":true,\"topic\":{},\"handoff\":{}}},\"warnings\":[]}}",
             json_escape(&state.repository_id),
             json_escape(&topic.topic_id),
             json_escape(&options.revision_id),
             json_escape(&session.session_id),
             changed,
             real_topic_metadata_json(topic),
+            real_topic_handoff_json(&repo_root, &state, topic),
         );
     } else {
         outputln!(
@@ -3534,6 +3535,7 @@ struct BoundedStreamSummary {
     observed_digest: String,
     observed_byte_length: u64,
     captured_byte_length: u64,
+    captured_bytes: Vec<u8>,
     truncated: bool,
     capture_failed: bool,
 }
@@ -3792,6 +3794,7 @@ fn summarize_bounded_stream<R: Read>(mut stream: R, limit: u64) -> BoundedStream
     let mut hasher = Sha256::new();
     let mut observed = 0_u64;
     let mut captured = 0_u64;
+    let mut captured_bytes = Vec::new();
     let mut buffer = [0_u8; 8192];
     let mut capture_failed = false;
     loop {
@@ -3809,11 +3812,13 @@ fn summarize_bounded_stream<R: Read>(mut stream: R, limit: u64) -> BoundedStream
         let remaining = limit.saturating_sub(captured) as usize;
         let captured_now = count.min(remaining);
         captured += captured_now as u64;
+        captured_bytes.extend_from_slice(&buffer[..captured_now]);
     }
     BoundedStreamSummary {
         observed_digest: format!("sha256:{:x}", hasher.finalize()),
         observed_byte_length: observed,
         captured_byte_length: captured,
+        captured_bytes,
         truncated: observed > captured,
         capture_failed,
     }
@@ -4030,6 +4035,7 @@ fn run_bounded_process(
         observed_digest: real_content_hash(&[]),
         observed_byte_length: 0,
         captured_byte_length: 0,
+        captured_bytes: Vec::new(),
         truncated: false,
         capture_failed: true,
     };
@@ -4081,6 +4087,7 @@ fn run_bounded_process(
 }
 
 fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Result<(), CliError> {
+    let overall_started = Instant::now();
     let repo_root = ctx.repo_root.clone();
     let config = require_repository_config(repo_root.clone())?;
     let projection_policy = resolve_required_projection_policy(&repo_root, &config)?;
@@ -4115,6 +4122,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     );
     let execution_id = format!("exec_native_{:04}", state.executions.len() + 1);
     let provisional_root = projection_policy.execution_root(&provisional_projection_id);
+    let materialization_started = Instant::now();
     let materialization = materialize_repo_projection(
         &repo_root,
         &view_state,
@@ -4130,6 +4138,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     );
     let projection_root = projection_policy.execution_root(&projection_id);
     relocate_managed_projection_root(&provisional_root, &projection_root)?;
+    let materialization_ms = materialization_started.elapsed().as_millis();
     #[cfg(windows)]
     let mut isolation = windows_isolation::PreparedIsolation::prepare(
         &repo_root,
@@ -4224,6 +4233,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         &filesystem_write_policy_effective,
     );
     let started_at = real_now_id();
+    let command_started = Instant::now();
     let command_output = run_bounded_process(
         &options.command_argv,
         &execution_cwd,
@@ -4271,6 +4281,9 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
             .with_detail("command_started", "false")
         }
     })?;
+    let command_ms = command_started.elapsed().as_millis();
+    let stdout_text = String::from_utf8_lossy(&command_output.stdout.captured_bytes).into_owned();
+    let stderr_text = String::from_utf8_lossy(&command_output.stderr.captured_bytes).into_owned();
     if command_output.cancelled {
         #[cfg(windows)]
         let _ = isolation.finish();
@@ -4281,6 +4294,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         ));
     }
     let finished_at = real_now_id();
+    let output_scan_started = Instant::now();
     let mut projected_entries = Vec::new();
     let mut quarantine = Vec::new();
     scan_real_projection_files_with_quarantine(
@@ -4290,7 +4304,22 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         &mut quarantine,
     )?;
     projected_entries.sort_by(|left, right| left.path.cmp(&right.path));
-    let outputs = real_execution_outputs(&repo_root, &view_state.entries, &projected_entries);
+    let outputs = real_execution_outputs(
+        &repo_root,
+        &view_state.entries,
+        &projected_entries,
+        &ctx.cancellation,
+    );
+    let output_scan_ms = output_scan_started.elapsed().as_millis();
+    if ctx.cancellation.load(Ordering::Acquire) {
+        #[cfg(windows)]
+        let _ = isolation.finish();
+        remove_unpublished_execution_root(&projection_root);
+        return Err(CliError::new(
+            "request_cancelled",
+            "tool call was cancelled",
+        ));
+    }
     #[cfg(windows)]
     let cleanup_error = isolation.finish().err().map(|error| error.to_string());
     #[cfg(not(windows))]
@@ -4388,6 +4417,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         finished_at,
         privacy_class: "policy_gated".to_string(),
     };
+    let publication_started = Instant::now();
     state.executions.push(execution.clone());
     let records = vec![
         real_projection_publication(&state, state.projections.last().unwrap())?,
@@ -4401,6 +4431,8 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         )?,
     ];
     state.save_with_records(&repo_root, &records)?;
+    let publication_ms = publication_started.elapsed().as_millis();
+    let total_ms = overall_started.elapsed().as_millis();
     if let Some(cleanup_error) = cleanup_error {
         return Err(CliError::new(
             "execution_network_isolation_cleanup_failed",
@@ -4414,7 +4446,17 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         outputln!(
             ctx,
             "{}",
-            real_execution_run_success_envelope(&state, &execution)
+            real_execution_run_success_envelope(
+                &state,
+                &execution,
+                &stdout_text,
+                &stderr_text,
+                materialization_ms,
+                command_ms,
+                output_scan_ms,
+                publication_ms,
+                total_ms,
+            )
         );
     } else {
         outputln!(ctx, "{} {}", execution.execution_id, execution.status);
@@ -5753,12 +5795,87 @@ fn real_session_generation_publication(
     )?)
 }
 
-fn repository_ignores_execution_path(repo_root: &Path, path: &str) -> bool {
-    Command::new("git")
-        .args(["check-ignore", "--quiet", "--no-index", "--", path])
+fn repository_ignored_execution_paths(
+    repo_root: &Path,
+    paths: &[String],
+    cancellation: &AtomicBool,
+) -> BTreeSet<String> {
+    if paths.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut child = match Command::new("git")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "check-ignore",
+            "--no-index",
+            "--stdin",
+            "-z",
+        ])
         .current_dir(repo_root)
-        .status()
-        .is_ok_and(|status| status.success())
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return BTreeSet::new(),
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return BTreeSet::new();
+    };
+    let input_written = paths
+        .iter()
+        .all(|path| stdin.write_all(path.as_bytes()).is_ok() && stdin.write_all(&[0]).is_ok());
+    drop(stdin);
+    let stdout_reader = child.stdout.take().and_then(|mut stdout| {
+        thread::Builder::new()
+            .name("sun-git-ignore-reader".to_string())
+            .spawn(move || {
+                let mut bytes = Vec::new();
+                stdout.read_to_end(&mut bytes).map(|_| bytes)
+            })
+            .ok()
+    });
+    if !input_written {
+        let _ = child.kill();
+        let _ = child.wait();
+        return BTreeSet::new();
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if cancellation.load(Ordering::Acquire) || Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return BTreeSet::new();
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return BTreeSet::new();
+            }
+        }
+    };
+    if !status.success() {
+        return BTreeSet::new();
+    }
+    stdout_reader
+        .and_then(|reader| reader.join().ok())
+        .and_then(Result::ok)
+        .unwrap_or_default()
+        .split(|byte| *byte == 0)
+        .filter_map(|path| std::str::from_utf8(path).ok())
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn common_created_output_classification(path: &str) -> Option<&'static str> {
@@ -5784,15 +5901,27 @@ fn common_created_output_classification(path: &str) -> Option<&'static str> {
     None
 }
 
-fn classify_execution_output(repo_root: &Path, entry: &RealArtifactEntry, created: bool) -> String {
+fn classify_execution_output(
+    entry: &RealArtifactEntry,
+    created: bool,
+    ignored_paths: &BTreeSet<String>,
+) -> String {
     if entry.classification == "generated" {
         "generated_artifact".to_string()
-    } else if repository_ignores_execution_path(repo_root, &entry.path) {
-        "ignored".to_string()
     } else if created {
-        common_created_output_classification(&entry.path)
-            .unwrap_or("source_like_delta")
-            .to_string()
+        common_created_output_classification(&entry.path).map_or_else(
+            || {
+                if ignored_paths.contains(&entry.path) {
+                    "ignored"
+                } else {
+                    "source_like_delta"
+                }
+                .to_string()
+            },
+            str::to_string,
+        )
+    } else if ignored_paths.contains(&entry.path) {
+        "ignored".to_string()
     } else {
         "source_like_delta".to_string()
     }
@@ -5802,8 +5931,9 @@ fn real_execution_outputs(
     repo_root: &Path,
     before: &[RealArtifactEntry],
     after: &[RealArtifactEntry],
+    cancellation: &AtomicBool,
 ) -> Vec<RealExecutionOutputSnapshot> {
-    after
+    let changed = after
         .iter()
         .filter(|entry| !entry.tombstone)
         .filter_map(|entry| {
@@ -5813,15 +5943,35 @@ fn real_execution_outputs(
             if before_entry.map(|candidate| candidate.content_hash.as_str())
                 == Some(entry.content_hash.as_str())
             {
-                return None;
+                None
+            } else {
+                Some((entry, before_entry))
             }
-            Some(RealExecutionOutputSnapshot {
-                path: entry.path.clone(),
-                classification: classify_execution_output(repo_root, entry, before_entry.is_none()),
-                before_hash: before_entry.map(|candidate| candidate.content_hash.clone()),
-                after_hash: entry.content_hash.clone(),
-                byte_length: entry.bytes.len() as u64,
-            })
+        })
+        .collect::<Vec<_>>();
+    let paths_needing_git = changed
+        .iter()
+        .filter(|(entry, before_entry)| {
+            entry.classification != "generated"
+                && !(before_entry.is_none()
+                    && common_created_output_classification(&entry.path).is_some())
+        })
+        .map(|(entry, _)| entry.path.clone())
+        .collect::<Vec<_>>();
+    let ignored_paths =
+        repository_ignored_execution_paths(repo_root, &paths_needing_git, cancellation);
+    changed
+        .into_iter()
+        .map(|(entry, before_entry)| RealExecutionOutputSnapshot {
+            path: entry.path.clone(),
+            classification: classify_execution_output(
+                entry,
+                before_entry.is_none(),
+                &ignored_paths,
+            ),
+            before_hash: before_entry.map(|candidate| candidate.content_hash.clone()),
+            after_hash: entry.content_hash.clone(),
+            byte_length: entry.bytes.len() as u64,
         })
         .collect()
 }
@@ -5889,9 +6039,7 @@ struct UnifiedPatchLine {
 
 #[derive(Debug)]
 struct UnifiedPatchHunk {
-    old_start: usize,
-    old_count: usize,
-    new_count: usize,
+    old_start: Option<usize>,
     lines: Vec<UnifiedPatchLine>,
 }
 
@@ -5943,14 +6091,17 @@ fn parse_unified_hunk_header(
     line: &str,
     hunk: usize,
     patch_line: usize,
-) -> Result<(usize, usize, usize), CliError> {
+) -> Result<Option<usize>, CliError> {
+    if line == "@@" || (line.starts_with("@@ ") && !line.starts_with("@@ -")) {
+        return Ok(None);
+    }
     let Some(body) = line.strip_prefix("@@ -") else {
         return Err(patch_failure(
             "patch_parse_failed",
             "unified diff hunk header is invalid",
             hunk,
             patch_line,
-            "expected @@ -old_start,old_count +new_start,new_count @@",
+            "expected @@ or @@ -old_start,old_count +new_start,new_count @@",
         ));
     };
     let Some((ranges, _label)) = body.split_once(" @@") else {
@@ -5971,38 +6122,30 @@ fn parse_unified_hunk_header(
             "hunk header is missing the +new range",
         ));
     };
-    let (old_start, old_count) = parse_unified_range(old_range, "old", hunk, patch_line)?;
-    let (_new_start, new_count) = parse_unified_range(new_range, "new", hunk, patch_line)?;
-    Ok((old_start, old_count, new_count))
+    let (old_start, _old_count) = parse_unified_range(old_range, "old", hunk, patch_line)?;
+    let _ = parse_unified_range(new_range, "new", hunk, patch_line)?;
+    Ok(Some(old_start))
 }
 
 fn parse_unified_patch(patch: &str) -> Result<Vec<UnifiedPatchHunk>, CliError> {
-    if patch.contains("*** Begin Patch") || patch.contains("*** End Patch") {
-        return Err(patch_failure(
-            "patch_parse_failed",
-            "expected a standard unified diff, not an apply_patch envelope",
-            0,
-            1,
-            "remove the *** Begin Patch and *** End Patch wrapper",
-        ));
-    }
-
     let mut hunks = Vec::new();
     let mut current: Option<UnifiedPatchHunk> = None;
     for (index, raw_line) in patch.lines().enumerate() {
         let patch_line = index + 1;
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if matches!(line, "*** Begin Patch" | "*** End Patch")
+            || line.starts_with("*** Update File:")
+        {
+            continue;
+        }
         if line.starts_with("@@") {
             if let Some(hunk) = current.take() {
                 hunks.push(hunk);
             }
             let hunk_number = hunks.len() + 1;
-            let (old_start, old_count, new_count) =
-                parse_unified_hunk_header(line, hunk_number, patch_line)?;
+            let old_start = parse_unified_hunk_header(line, hunk_number, patch_line)?;
             current = Some(UnifiedPatchHunk {
                 old_start,
-                old_count,
-                new_count,
                 lines: Vec::new(),
             });
             continue;
@@ -6063,7 +6206,7 @@ fn parse_unified_patch(patch: &str) -> Result<Vec<UnifiedPatchHunk>, CliError> {
             "unified diff contains no hunks",
             0,
             0,
-            "add at least one @@ -old +new @@ hunk",
+            "add at least one @@ or @@ -old +new @@ hunk",
         ));
     }
     Ok(hunks)
@@ -6075,6 +6218,62 @@ fn patch_line_preview(value: &str) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+fn hunk_matches_source(source: &[&str], target: usize, hunk: &UnifiedPatchHunk) -> bool {
+    let old_lines = hunk
+        .lines
+        .iter()
+        .filter(|line| matches!(line.kind, ' ' | '-'))
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>();
+    source
+        .get(target..target.saturating_add(old_lines.len()))
+        .is_some_and(|candidate| candidate == old_lines.as_slice())
+}
+
+fn locate_patch_hunk(
+    source: &[&str],
+    source_cursor: usize,
+    hunk: &UnifiedPatchHunk,
+    hunk_number: usize,
+) -> Result<usize, CliError> {
+    let old_line_count = hunk
+        .lines
+        .iter()
+        .filter(|line| matches!(line.kind, ' ' | '-'))
+        .count();
+    if old_line_count == 0 {
+        return Ok(hunk
+            .old_start
+            .map(|start| start.saturating_sub(1))
+            .unwrap_or(source_cursor));
+    }
+    if let Some(declared) = hunk.old_start.map(|start| start.saturating_sub(1)) {
+        if declared >= source_cursor && hunk_matches_source(source, declared, hunk) {
+            return Ok(declared);
+        }
+    }
+    let candidates = (source_cursor..=source.len().saturating_sub(old_line_count))
+        .filter(|target| hunk_matches_source(source, *target, hunk))
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [target] => Ok(*target),
+        [] => Err(patch_failure(
+            "patch_apply_failed",
+            "patch context did not match the source",
+            hunk_number,
+            hunk.lines.first().map(|line| line.patch_line).unwrap_or(0),
+            "refresh the artifact and include exact surrounding context",
+        )),
+        _ => Err(patch_failure(
+            "patch_apply_failed",
+            "patch context is ambiguous",
+            hunk_number,
+            hunk.lines.first().map(|line| line.patch_line).unwrap_or(0),
+            "include more unchanged surrounding lines so the target is unique",
+        )),
+    }
 }
 
 fn apply_real_patch(before: &str, patch: &str) -> Result<(String, usize), CliError> {
@@ -6092,7 +6291,7 @@ fn apply_real_patch(before: &str, patch: &str) -> Result<(String, usize), CliErr
 
     for (index, hunk) in hunks.iter().enumerate() {
         let hunk_number = index + 1;
-        let target = hunk.old_start.saturating_sub(1);
+        let target = locate_patch_hunk(&source, source_cursor, hunk, hunk_number)?;
         if target < source_cursor || target > source.len() {
             return Err(patch_failure(
                 "patch_apply_failed",
@@ -6100,8 +6299,7 @@ fn apply_real_patch(before: &str, patch: &str) -> Result<(String, usize), CliErr
                 hunk_number,
                 hunk.lines.first().map(|line| line.patch_line).unwrap_or(0),
                 format!(
-                    "old_start={} resolves to source index {}, current cursor={}, source lines={}",
-                    hunk.old_start,
+                    "target source index {}, current cursor={}, source lines={}",
                     target,
                     source_cursor,
                     source.len()
@@ -6114,8 +6312,6 @@ fn apply_real_patch(before: &str, patch: &str) -> Result<(String, usize), CliErr
                 .map(|line| (*line).to_string()),
         );
         source_cursor = target;
-        let mut old_seen = 0usize;
-        let mut new_seen = 0usize;
 
         for line in &hunk.lines {
             match line.kind {
@@ -6145,30 +6341,14 @@ fn apply_real_patch(before: &str, patch: &str) -> Result<(String, usize), CliErr
                     }
                     if line.kind == ' ' {
                         output.push(line.text.clone());
-                        new_seen += 1;
                     }
                     source_cursor += 1;
-                    old_seen += 1;
                 }
                 '+' => {
                     output.push(line.text.clone());
-                    new_seen += 1;
                 }
                 _ => unreachable!("parser accepts only unified diff line prefixes"),
             }
-        }
-
-        if old_seen != hunk.old_count || new_seen != hunk.new_count {
-            return Err(patch_failure(
-                "patch_parse_failed",
-                "unified diff hunk line counts do not match its header",
-                hunk_number,
-                hunk.lines.last().map(|line| line.patch_line).unwrap_or(0),
-                format!(
-                    "header old_count={} new_count={}; body old_count={} new_count={}",
-                    hunk.old_count, hunk.new_count, old_seen, new_seen
-                ),
-            ));
         }
     }
 
@@ -6186,7 +6366,9 @@ fn apply_real_patch(before: &str, patch: &str) -> Result<(String, usize), CliErr
 
 #[cfg(test)]
 mod unified_patch_tests {
-    use super::{apply_real_patch, common_created_output_classification};
+    use super::{
+        apply_real_patch, common_created_output_classification, execution_output_requires_promotion,
+    };
 
     #[test]
     fn applies_multiple_standard_hunks() {
@@ -6208,25 +6390,25 @@ mod unified_patch_tests {
     }
 
     #[test]
-    fn rejects_apply_patch_envelopes_with_actionable_details() {
-        let error = apply_real_patch(
+    fn accepts_apply_patch_envelopes_and_context_located_hunks() {
+        let (after, hunks) = apply_real_patch(
             "alpha\n",
             "*** Begin Patch\n*** Update File: src.txt\n@@\n-alpha\n+ALPHA\n*** End Patch\n",
         )
-        .unwrap_err();
-        assert_eq!(error.code, "patch_parse_failed");
-        assert!(error.message.contains("standard unified diff"));
-        assert!(error
-            .details
-            .iter()
-            .any(|(key, value)| *key == "failed_hunk" && value == "0"));
-        assert!(error
-            .details
-            .iter()
-            .any(|(key, value)| *key == "patch_line" && value == "1"));
-        assert!(error.details.iter().any(|(key, value)| {
-            *key == "reason" && value.contains("remove the *** Begin Patch")
-        }));
+        .unwrap();
+        assert_eq!(hunks, 1);
+        assert_eq!(after, "ALPHA\n");
+    }
+
+    #[test]
+    fn infers_incorrect_header_counts_when_context_is_exact() {
+        let (after, hunks) = apply_real_patch(
+            "alpha\nbeta\ngamma\n",
+            "@@ -99,50 +99,60 @@\n beta\n-gamma\n+GAMMA\n",
+        )
+        .unwrap();
+        assert_eq!(hunks, 1);
+        assert_eq!(after, "alpha\nbeta\nGAMMA\n");
     }
     #[test]
     fn common_build_outputs_are_not_source_promotion_candidates() {
@@ -6247,6 +6429,17 @@ mod unified_patch_tests {
         ] {
             assert_eq!(common_created_output_classification(path), Some("cache"));
         }
+        let ignored = super::RealExecutionOutputSnapshot {
+            path: "dist/app.js".to_string(),
+            classification: "ignored".to_string(),
+            before_hash: None,
+            after_hash: "sha256:after".to_string(),
+            byte_length: 1,
+        };
+        let mut source = ignored.clone();
+        source.classification = "source_like_delta".to_string();
+        assert!(!execution_output_requires_promotion(&ignored));
+        assert!(execution_output_requires_promotion(&source));
         assert_eq!(
             common_created_output_classification("src/generated/client.ts"),
             None
@@ -6576,6 +6769,77 @@ fn real_topic_metadata_json(topic: &RealTopicRecord) -> String {
         json_escape(&topic.owner_actor_id),
         json_escape(&topic.visibility),
         string_array_json(topic.acceptance_criteria.iter().map(String::as_str)),
+    )
+}
+
+fn real_topic_handoff_json(
+    repo_root: &Path,
+    state: &RealRepoState,
+    topic: &RealTopicRecord,
+) -> String {
+    let completion = topic.completed_revision_id.as_ref().and_then(|_| {
+        let path = repo_root.join(format!(
+            ".sunlight/topics/completion_{}.json",
+            topic.topic_id
+        ));
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    });
+    let completion_string = |field: &str| {
+        completion
+            .as_ref()
+            .and_then(|value| value.get(field))
+            .and_then(serde_json::Value::as_str)
+    };
+    let topic_operations = state
+        .operations
+        .iter()
+        .filter(|operation| operation.topic_id == topic.topic_id)
+        .collect::<Vec<_>>();
+    let mut changed_paths = BTreeSet::new();
+    let operations_json = topic_operations
+        .iter()
+        .map(|operation| {
+            let effects = operation
+                .artifact_effects()
+                .into_iter()
+                .map(|effect| {
+                    changed_paths.insert(effect.path.clone());
+                    format!(
+                        "{{\"artifact_id\":\"{}\",\"path\":\"{}\",\"before_hash\":{},\"after_hash\":\"{}\",\"classification\":\"{}\",\"tombstone\":{}}}",
+                        json_escape(&effect.artifact_id),
+                        json_escape(&effect.path),
+                        optional_string_json(effect.base_content_hash.as_deref()),
+                        json_escape(&effect.result_content_hash),
+                        json_escape(&effect.classification),
+                        effect.tombstone,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"operation_transaction_id\":\"{}\",\"topic_revision_id\":\"{}\",\"session_id\":\"{}\",\"mutation\":\"{}\",\"effects\":[{}]}}",
+                json_escape(&operation.operation_transaction_id),
+                json_escape(&operation.topic_revision_id),
+                json_escape(&operation.session_id),
+                json_escape(&operation.mutation),
+                effects,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"available\":{},\"immutable\":{},\"completed_revision_id\":{},\"summary\":{},\"session_id\":{},\"actor_id\":{},\"operation_count\":{},\"changed_paths\":{},\"operations\":[{}]}}",
+        topic.completed_revision_id.is_some(),
+        topic.completed_revision_id.is_some(),
+        optional_string_json(topic.completed_revision_id.as_deref()),
+        optional_string_json(completion_string("summary")),
+        optional_string_json(completion_string("session_id")),
+        optional_string_json(completion_string("actor_id")),
+        topic_operations.len(),
+        string_array_json(changed_paths.iter().map(String::as_str)),
+        operations_json,
     )
 }
 
@@ -7159,22 +7423,6 @@ fn real_execution_output_summaries(
     outputs
 }
 
-fn real_execution_candidate(
-    execution: &RealExecutionSnapshot,
-    output: &RealExecutionOutputSnapshot,
-    topic_id: &str,
-) -> PromotionCandidateProvenance {
-    PromotionCandidateProvenance {
-        execution_id: execution.execution_id.clone(),
-        projection_id: execution.projection_id.clone(),
-        output_path: output.path.clone(),
-        target_topic_id: topic_id.to_string(),
-        classification: real_output_classification(&output.classification),
-        before_hash: output.before_hash.clone(),
-        after_hash: output.after_hash.clone(),
-    }
-}
-
 fn real_execution_promotion_record(
     promotion: &RealExecutionPromotionSnapshot,
 ) -> ExecutionOutputPromotionRecord {
@@ -7291,13 +7539,25 @@ fn real_execution_output_capture_json(execution: &RealExecutionSnapshot) -> Stri
     )
 }
 
+fn execution_output_requires_promotion(output: &RealExecutionOutputSnapshot) -> bool {
+    matches!(
+        output.classification.as_str(),
+        "source_like_delta" | "generated_artifact"
+    )
+}
+
 fn real_execution_promotion_status(
     state: &RealRepoState,
     execution: &RealExecutionSnapshot,
 ) -> &'static str {
-    if execution.outputs.is_empty() || execution.status != "pass" {
+    let promotable = execution
+        .outputs
+        .iter()
+        .filter(|output| execution_output_requires_promotion(output))
+        .collect::<Vec<_>>();
+    if promotable.is_empty() || execution.status != "pass" {
         "none"
-    } else if execution.outputs.iter().all(|output| {
+    } else if promotable.iter().all(|output| {
         state.promotions.iter().any(|promotion| {
             promotion.execution_id == execution.execution_id && promotion.output_path == output.path
         })
@@ -7315,23 +7575,30 @@ fn real_execution_promotion_candidates_json(
     if execution.status != "pass" {
         return String::new();
     }
-    let topic_id = state
-        .sessions
-        .last()
-        .map(|session| session.write_topic_id.as_str())
-        .or_else(|| state.topics.last().map(|topic| topic.topic_id.as_str()))
-        .unwrap_or("topic_unknown");
     execution
         .outputs
         .iter()
         .filter(|output| {
-            !state.promotions.iter().any(|promotion| {
-                promotion.execution_id == execution.execution_id
-                    && promotion.output_path == output.path
-            })
+            execution_output_requires_promotion(output)
+                && !state.promotions.iter().any(|promotion| {
+                    promotion.execution_id == execution.execution_id
+                        && promotion.output_path == output.path
+                })
         })
         .map(|output| {
-            promotion_candidate_json(&real_execution_candidate(execution, output, topic_id))
+            format!(
+                concat!(
+                    "{{\"execution_id\":\"{}\",\"projection_id\":\"{}\",",
+                    "\"output_path\":\"{}\",\"target_topic_id\":null,",
+                    "\"classification\":\"{}\",\"before_hash\":{},\"after_hash\":\"{}\"}}"
+                ),
+                json_escape(&execution.execution_id),
+                json_escape(&execution.projection_id),
+                json_escape(&output.path),
+                output.classification,
+                optional_string_json(output.before_hash.as_deref()),
+                json_escape(&output.after_hash),
+            )
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -7413,6 +7680,13 @@ fn real_execution_status_envelope(
 fn real_execution_run_success_envelope(
     state: &RealRepoState,
     execution: &RealExecutionSnapshot,
+    stdout_text: &str,
+    stderr_text: &str,
+    materialization_ms: u128,
+    command_ms: u128,
+    output_scan_ms: u128,
+    publication_ms: u128,
+    total_ms: u128,
 ) -> String {
     let record = real_execution_record(state, execution);
     format!(
@@ -7435,6 +7709,9 @@ fn real_execution_run_success_envelope(
             "\"environment_summary\":{},",
             "\"runtime_policy\":{},",
             "\"output_capture\":{},",
+            "\"output_text\":{{\"stdout\":\"{}\",\"stderr\":\"{}\",\"durability\":\"response_only\"}},",
+            "\"phase_timings_ms\":{{\"materialization\":{},\"command\":{},",
+            "\"output_scan_and_classification\":{},\"publication\":{},\"total\":{}}},",
             "\"output_summary_counts\":{},",
             "\"promotion_candidates\":[{}]",
             "}},\"warnings\":[]}}"
@@ -7453,6 +7730,13 @@ fn real_execution_run_success_envelope(
         execution_environment_summary_json(&record.environment_summary),
         real_execution_runtime_policy_json(execution),
         real_execution_output_capture_json(execution),
+        json_escape(stdout_text),
+        json_escape(stderr_text),
+        materialization_ms,
+        command_ms,
+        output_scan_ms,
+        publication_ms,
+        total_ms,
         output_summary_counts_json(&record),
         real_execution_promotion_candidates_json(state, execution),
     )
@@ -7767,6 +8051,7 @@ fn real_operational_summary(repo_root: &Path, state: &RealRepoState) -> RealOper
             summary.pending_promotions += execution
                 .outputs
                 .iter()
+                .filter(|output| execution_output_requires_promotion(output))
                 .filter(|output| {
                     !state.promotions.iter().any(|promotion| {
                         promotion.execution_id == execution.execution_id
@@ -8236,6 +8521,9 @@ fn real_status_envelope(
     let topic_json = topic
         .map(real_topic_metadata_json)
         .unwrap_or_else(|| "{\"topic_id\":null,\"head_revision_id\":null}".to_string());
+    let handoff_json = topic
+        .map(|topic| real_topic_handoff_json(repo_root, state, topic))
+        .unwrap_or_else(|| "null".to_string());
     let session_id = session.map(|session| session.session_id.as_str());
     let fallback_view = real_view(state);
     let session_generation_id = session
@@ -8277,7 +8565,7 @@ fn real_status_envelope(
         })
         .unwrap_or_default();
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"quarantined_secret_count\":{},\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"}},\"topic\":{},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"quarantined_secret_count\":{},\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"}},\"topic\":{},\"handoff\":{},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
         command,
         json_escape(&state.repository_id),
         json_escape(&state.repository_id),
@@ -8290,6 +8578,7 @@ fn real_status_envelope(
         json_escape(&state.base_checkpoint_id),
         state.quarantine.len(),
         topic_json,
+        handoff_json,
         optional_string_json(session_id),
         json_escape(session_generation_id),
         compatibility_projections,

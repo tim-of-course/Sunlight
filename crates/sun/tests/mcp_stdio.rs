@@ -153,13 +153,14 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
 
     let listed = mcp.request(2, "tools/list", json!({}));
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 27);
+    assert_eq!(tools.len(), 28);
     let advertised = serde_json::to_string(tools).unwrap();
     assert!(!advertised.to_ascii_lowercase().contains("fixture"));
     for required in [
         "repository_init",
         "repository_status",
         "topic_create",
+        "topic_wait",
         "session_start",
         "session_refresh",
         "artifact_read",
@@ -562,31 +563,48 @@ fn two_live_mcp_agents_author_independent_topics_into_one_exact_view() {
     assert_eq!(a_reads_b["data"]["access_mode"], "read_only_view");
     assert_eq!(b_reads_a["data"]["access_mode"], "read_only_view");
 
-    assert_eq!(
-        agent_a.call(
-            8,
-            "topic_complete",
-            json!({
-                "topic":"topic_agent_a_change",
-                "revision":revision_a,
-                "session":session_a_id
-            }),
-        )["data"]["command"],
-        "topic.complete"
+    agent_b.start_call(
+        8,
+        "topic_wait",
+        json!({"topic":"topic_agent_a_change","timeout_ms":5000}),
     );
+    let completed_a = agent_a.call(
+        8,
+        "topic_complete",
+        json!({
+            "topic":"topic_agent_a_change",
+            "revision":revision_a,
+            "session":session_a_id,
+            "summary":"Agent A authored the agents/a files."
+        }),
+    );
+    assert_eq!(completed_a["data"]["command"], "topic.complete");
+    let waited_a = agent_b.finish_call(8);
+    assert_eq!(waited_a["data"]["wait"]["outcome"], "completed");
+    assert_eq!(waited_a["data"]["topic"]["status"], "completed");
+    assert_eq!(
+        waited_a["data"]["handoff"]["summary"],
+        "Agent A authored the agents/a files."
+    );
+    assert_eq!(waited_a["data"]["handoff"]["operation_count"], 7);
+    assert!(waited_a["data"]["handoff"]["changed_paths"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("agents/a.txt")));
     assert_eq!(
         agent_b.call(
-            8,
+            9,
             "topic_complete",
             json!({
                 "topic":"topic_agent_b_change",
                 "revision":revision_b,
-                "session":session_b_id
+                "session":session_b_id,
+                "summary":"Agent B authored the agents/b files."
             }),
         )["data"]["command"],
         "topic.complete"
     );
-    let final_status = agent_b.call(9, "repository_status", json!({}));
+    let final_status = agent_b.call(10, "repository_status", json!({}));
     assert_eq!(
         final_status["data"]["operational_summary"]["topics"]["count"],
         2

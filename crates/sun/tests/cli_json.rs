@@ -1292,6 +1292,47 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
 }
 
 #[test]
+fn ignored_execution_outputs_are_batched_bounded_and_not_promotable() {
+    let repo = TestRepo::new("ignored-execution-outputs");
+    init_local_git_repo(&repo);
+    repo.write_file(".gitignore", "custom-output/\ndist/\n");
+    git(repo.path(), &["add", ".gitignore"]);
+    git(repo.path(), &["commit", "-m", "ignore build outputs"]);
+    let init = run_real_json(&repo, &["init"]);
+    assert_success(&init);
+
+    let run = sun()
+        .args(["run", "--view", "view_base_0001", "--json", "--"])
+        .args([
+            "python",
+            "-c",
+            "from pathlib import Path; [Path('custom-output').mkdir(exist_ok=True), Path('dist').mkdir(exist_ok=True)]; [Path(f'custom-output/out-{i}.txt').write_text(str(i)) for i in range(20)]; [Path(f'dist/bundle-{i}.js').write_text(str(i)) for i in range(20)]; print('build-complete')",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("ignored-output execution should run");
+    assert_success(&run);
+    let run_stdout = stdout(&run);
+    assert!(run_stdout.contains("\"status\":\"pass\""));
+    assert!(run_stdout.contains("\"output_text\":{"));
+    assert!(run_stdout.contains("build-complete"));
+    assert!(run_stdout.contains("\"phase_timings_ms\":{"));
+    assert!(run_stdout.contains("\"file_delta\":40,\"source_like_delta\":0"));
+    assert!(run_stdout.contains("\"promotion_candidates\":[]"));
+    let execution_id = json_string_field(&run_stdout, "execution_id");
+
+    let status = run_real_json(&repo, &["status", "--execution", &execution_id]);
+    assert_success(&status);
+    let status_stdout = stdout(&status);
+    assert!(status_stdout.contains("\"promotion_status\":\"none\""));
+    assert!(status_stdout.contains("\"promotion_candidates\":[]"));
+
+    let repository_status = run_real_json(&repo, &["status"]);
+    assert_success(&repository_status);
+    assert!(stdout(&repository_status).contains("\"pending_promotions\":0"));
+}
+
+#[test]
 fn no_fixture_checkpoint_persists_and_exports_validated_execution_evidence() {
     let repo = TestRepo::new("real-checkpoint-execution-evidence");
     init_local_git_repo(&repo);
@@ -2362,8 +2403,10 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
     assert_valid_json(&persisted_large);
     assert!(persisted_large.contains(&format!("\"observed_digest\":\"{complete_stdout_digest}\"")));
     assert!(!persisted_large.contains(&retained_stdout_prefix_digest));
-    assert!(!large_stdout.contains(&"A".repeat(100)));
-    assert!(!large_stdout.contains(&"B".repeat(100)));
+    assert!(large_stdout.contains("\"output_text\":{"));
+    assert!(large_stdout.contains(&"A".repeat(100)));
+    assert!(large_stdout.contains(&"B".repeat(100)));
+    assert!(!persisted_large.contains(&"A".repeat(100)));
 
     let secret = "do-not-inherit-this-test-secret";
     let mut normal_command = sun();
@@ -12949,7 +12992,7 @@ fn no_fixture_session_refresh_conflict_keeps_last_good_generation_and_evidence()
 }
 
 #[test]
-fn no_fixture_patch_applies_standard_multi_hunk_diff_and_reports_envelope_errors() {
+fn no_fixture_patch_accepts_standard_and_envelope_forms_and_rejects_stale_context() {
     let repo = TestRepo::new("real-standard-unified-patch");
     init_local_git_repo(&repo);
     repo.write_file("src.txt", "alpha\nbeta\ngamma\ndelta\nepsilon\n");
@@ -12985,7 +13028,7 @@ fn no_fixture_patch_applies_standard_multi_hunk_diff_and_reports_envelope_errors
 
     let current_hash = json_string_field(&stdout(&after), "content_hash");
     let envelope = repo.write_file(
-        "invalid-envelope.diff",
+        "envelope.diff",
         "*** Begin Patch\n*** Update File: src.txt\n@@\n-alpha\n+ALPHA\n*** End Patch\n",
     );
     let rejected = run_real_json_os(
@@ -13001,12 +13044,99 @@ fn no_fixture_patch_applies_standard_multi_hunk_diff_and_reports_envelope_errors
             envelope.as_os_str(),
         ],
     );
+    assert_success(&rejected);
+    let after_envelope = run_real_json(&repo, &["read", "src.txt", "--session", "session_agent_a"]);
+    assert_success(&after_envelope);
+    assert!(stdout(&after_envelope).contains("ALPHA\\nBETA\\ngamma\\ndelta\\nEPSILON\\n"));
+
+    let stale_hash = json_string_field(&stdout(&after_envelope), "content_hash");
+    let stale = repo.write_file("stale.diff", "@@\n-missing\n+MISSING\n");
+    let rejected = run_real_json_os(
+        &repo,
+        &[
+            "patch".as_ref(),
+            "src.txt".as_ref(),
+            "--session".as_ref(),
+            "session_agent_a".as_ref(),
+            "--expect-hash".as_ref(),
+            stale_hash.as_ref(),
+            "--patch-file".as_ref(),
+            stale.as_os_str(),
+        ],
+    );
     assert_failure(&rejected);
     let rejected = stdout(&rejected);
-    assert!(rejected.contains("\"code\":\"patch_parse_failed\""));
-    assert!(rejected.contains("remove the *** Begin Patch and *** End Patch wrapper"));
-    assert!(rejected.contains("\"failed_hunk\":\"0\""));
-    assert!(rejected.contains("\"patch_line\":\"1\""));
+    assert!(rejected.contains("\"code\":\"patch_apply_failed\""));
+    assert!(rejected.contains("patch context did not match the source"));
+    assert!(rejected.contains("refresh the artifact and include exact surrounding context"));
+}
+
+#[test]
+fn completed_topic_status_exposes_structured_handoff_facts() {
+    let repo = TestRepo::new("topic-handoff-facts");
+    init_local_git_repo(&repo);
+    repo.write_file("src.txt", "before\n");
+    git(repo.path(), &["add", "src.txt"]);
+    git(repo.path(), &["commit", "-m", "add handoff source"]);
+    start_native_session(&repo, "handoff-facts");
+
+    let read = run_real_json(&repo, &["read", "src.txt", "--session", "session_agent_a"]);
+    assert_success(&read);
+    let before_hash = json_string_field(&stdout(&read), "content_hash");
+    let patch = repo.write_file("handoff.diff", "@@\n-before\n+after\n");
+    let applied = run_real_json_os(
+        &repo,
+        &[
+            "patch".as_ref(),
+            "src.txt".as_ref(),
+            "--session".as_ref(),
+            "session_agent_a".as_ref(),
+            "--expect-hash".as_ref(),
+            before_hash.as_ref(),
+            "--patch-file".as_ref(),
+            patch.as_os_str(),
+        ],
+    );
+    assert_success(&applied);
+    let applied_stdout = stdout(&applied);
+    let revision_id = json_string_field(&applied_stdout, "topic_revision_id");
+    let after_hash = json_string_field(&applied_stdout, "after_hash");
+
+    let completed = sun()
+        .args([
+            "topic",
+            "complete",
+            "--topic",
+            "topic_handoff_facts",
+            "--revision",
+            &revision_id,
+            "--session",
+            "session_agent_a",
+            "--summary",
+            "Changed src.txt from before to after.",
+            "--json",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("topic completion should run");
+    assert_success(&completed);
+    let completed_stdout = stdout(&completed);
+    assert!(completed_stdout.contains("\"handoff\":{"));
+    assert!(completed_stdout.contains("\"available\":true"));
+    assert!(completed_stdout.contains("Changed src.txt from before to after."));
+    assert!(completed_stdout.contains("\"changed_paths\":[\"src.txt\"]"));
+    assert!(completed_stdout.contains(&format!("\"before_hash\":\"{before_hash}\"")));
+    assert!(completed_stdout.contains(&format!("\"after_hash\":\"{after_hash}\"")));
+
+    let status = run_real_json(&repo, &["status", "--topic", "topic_handoff_facts"]);
+    assert_success(&status);
+    let status_stdout = stdout(&status);
+    assert!(status_stdout.contains("\"status\":\"completed\""));
+    assert!(status_stdout.contains("\"handoff\":{"));
+    assert!(status_stdout.contains("Changed src.txt from before to after."));
+    assert!(status_stdout.contains("\"operation_count\":1"));
+    assert!(status_stdout.contains("\"operation_transaction_id\":\"op_native_0001\""));
+    assert!(status_stdout.contains("\"changed_paths\":[\"src.txt\"]"));
 }
 
 fn assert_success(output: &Output) {

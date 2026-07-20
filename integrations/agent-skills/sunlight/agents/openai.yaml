@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sunlight"
+  short_description: "Coordinate exact multi-agent source changes"
+  default_prompt: "Use $sunlight to complete this coding task through the repository's Sunlight MCP workflow."

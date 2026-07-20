@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod agent_setup;
 pub mod engine;
 mod mcp;
 #[cfg(windows)]
@@ -437,6 +438,8 @@ fn run(ctx: &CommandContext) -> Result<(), CliError> {
         [command, ..] if command == "init" => {
             Err(invalid_request("usage: sun init [--repo <path>]"))
         }
+        [scope, command, ..] if scope == "agent" && command == "install" => agent_install(ctx),
+        [scope, command, ..] if scope == "agent" && command == "doctor" => agent_doctor(ctx),
         [scope, command, ..] if scope == "topic" && command == "create" => topic_create(&ctx),
         [scope, command, ..] if scope == "topic" && command == "complete" => topic_complete(&ctx),
         [scope, command, ..] if scope == "session" && command == "start" => session_start(&ctx),
@@ -484,6 +487,173 @@ fn run(ctx: &CommandContext) -> Result<(), CliError> {
         [command, ..] => Err(invalid_request(format!("unknown command `{command}`"))
             .with_detail("command", command.clone())),
     }
+}
+
+fn agent_install(ctx: &CommandContext) -> Result<(), CliError> {
+    let (client, force) = parse_agent_options(ctx, true)?;
+    let executable = env::current_exe().map_err(|error| {
+        invalid_request(format!(
+            "cannot resolve the running sun executable: {error}"
+        ))
+    })?;
+    let report =
+        agent_setup::install(&ctx.repo_root, &executable, client, force).map_err(|error| {
+            invalid_request(error.to_string()).with_detail("command", "agent.install")
+        })?;
+    let repository = agent_setup::display_path(&ctx.repo_root);
+
+    if ctx.json {
+        outputln!(
+            ctx,
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "data": {
+                    "command": "agent.install",
+                    "repository": repository,
+                    "client": report.client.as_str(),
+                    "changed": report.changed,
+                    "unchanged": report.unchanged,
+                    "restart_required": report.restart_required,
+                    "next_command": format!("sun agent doctor --client {} --repo \"{}\"", report.client.as_str(), repository),
+                },
+                "warnings": []
+            })
+        );
+    } else {
+        outputln!(
+            ctx,
+            "Sunlight agent setup installed for {} in {}",
+            report.client.as_str(),
+            repository
+        );
+        for path in &report.changed {
+            outputln!(ctx, "  changed: {path}");
+        }
+        for path in &report.unchanged {
+            outputln!(ctx, "  current: {path}");
+        }
+        if report.restart_required {
+            outputln!(
+                ctx,
+                "Restart or reload the client before verifying MCP tools."
+            );
+        }
+        outputln!(
+            ctx,
+            "Verify: sun agent doctor --client {} --repo \"{}\"",
+            report.client.as_str(),
+            repository
+        );
+    }
+    Ok(())
+}
+
+fn agent_doctor(ctx: &CommandContext) -> Result<(), CliError> {
+    let (client, _) = parse_agent_options(ctx, false)?;
+    let executable = env::current_exe().map_err(|error| {
+        invalid_request(format!(
+            "cannot resolve the running sun executable: {error}"
+        ))
+    })?;
+    let report = agent_setup::doctor(&ctx.repo_root, &executable, client);
+    let repository = agent_setup::display_path(&ctx.repo_root);
+    if !report.healthy {
+        return Err(CliError::new(
+            "agent_setup_incomplete",
+            "Sunlight agent setup is missing or stale; rerun agent install with --force after reviewing managed files",
+        )
+        .with_raw_details_json(
+            serde_json::json!({
+                "client": report.client.as_str(),
+                "repository": repository,
+                "current": report.current,
+                "missing_or_stale": report.missing_or_stale,
+                "repository_initialized": report.repository_initialized,
+            })
+            .to_string(),
+        ));
+    }
+
+    if ctx.json {
+        outputln!(
+            ctx,
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "data": {
+                    "command": "agent.doctor",
+                    "repository": repository,
+                    "client": report.client.as_str(),
+                    "healthy": true,
+                    "repository_initialized": report.repository_initialized,
+                    "current": report.current,
+                    "missing_or_stale": report.missing_or_stale,
+                    "next_action": if report.repository_initialized { "restart the client and call repository_status" } else { "restart the client and call repository_init" },
+                },
+                "warnings": if report.repository_initialized { Vec::<String>::new() } else { vec!["repository is not initialized; the bound MCP server can initialize it".to_string()] }
+            })
+        );
+    } else {
+        outputln!(
+            ctx,
+            "Sunlight agent setup is healthy for {} in {}",
+            report.client.as_str(),
+            repository
+        );
+        outputln!(ctx, "  portable skill: current");
+        outputln!(
+            ctx,
+            "  repository: {}",
+            if report.repository_initialized {
+                "initialized"
+            } else {
+                "ready for repository_init"
+            }
+        );
+    }
+    Ok(())
+}
+
+fn parse_agent_options(
+    ctx: &CommandContext,
+    allow_force: bool,
+) -> Result<(agent_setup::AgentClient, bool), CliError> {
+    let mut client = None;
+    let mut force = false;
+    let mut args = ctx.args.iter().skip(2);
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--client" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("sun agent requires --client generic|codex|cursor")
+                })?;
+                client = Some(
+                    agent_setup::AgentClient::parse(value)
+                        .map_err(|error| invalid_request(error.to_string()))?,
+                );
+            }
+            "--force" if allow_force => force = true,
+            "--repo" => {
+                args.next().ok_or_else(|| {
+                    invalid_request("sun agent --repo requires a repository path")
+                })?;
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun agent"
+                )))
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected argument `{value}` for sun agent"
+                )))
+            }
+        }
+    }
+    let client = client
+        .ok_or_else(|| invalid_request("sun agent requires --client generic|codex|cursor"))?;
+    Ok((client, force))
 }
 
 fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
@@ -18061,6 +18231,8 @@ sun - local-first source artifact management
 
 Usage:
   sun init [--repo <path>]
+  sun agent install --client generic|codex|cursor [--force] [--repo <path>] [--json]
+  sun agent doctor --client generic|codex|cursor [--repo <path>] [--json]
   sun topic create <slug> --display-name <name> [--owner <actor>] [--visibility local|private] [--acceptance-criterion <text>...] [--json]
   sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]
   sun session start --topic <topic> --view <view> --actor <actor-id> [--json]
@@ -18085,6 +18257,7 @@ Usage:
 
 Commands:
   init       Ingest the repository into persisted Sunlight native state
+  agent      Install the portable skill and client MCP adapter; diagnose setup
   topic      Create and durably complete authoring topics
   session    Start and explicitly refresh topic-bound sessions over exact views
   read/list/search/inspect
@@ -18121,6 +18294,8 @@ Compatibility/testing:
 
 fn print_command_help(ctx: &CommandContext, command: &str) {
     match command {
+        "agent" | "agent install" => outputln!(ctx, "sun agent install\n\nUsage:\n  sun agent install --client generic|codex|cursor [--force] [--repo <path>] [--json]\n\nInstalls the portable Sunlight Agent Skill. Codex and Cursor also receive a repository-bound local MCP entry. Existing unrelated client configuration is preserved."),
+        "agent doctor" => outputln!(ctx, "sun agent doctor\n\nUsage:\n  sun agent doctor --client generic|codex|cursor [--repo <path>] [--json]\n\nVerifies that the portable skill and selected client MCP entry match the running Sunlight build and repository."),
         "status" => outputln!(ctx, "sun status\n\nUsage:\n  sun status [--json]\n  sun status --topic <topic> [--json]\n  sun status --session <session> [--json]\n  sun status --view <view> [--json]\n  sun status --projection <projection> [--json]\n  sun status --execution <execution> [--json]\n  sun status --checkpoint <checkpoint> [--json]\n  sun status --export <export-map> [--json]\n\nRepository status is derived from persisted Sunlight state, not git status or the main working tree."),
         "inspect" => outputln!(ctx, "sun inspect\n\nUsage:\n  sun inspect repository [--json]\n  sun inspect topic:<topic>|session:<session>|view:<view> [--json]\n  sun inspect artifact:<path>|operation:<id>|conflict:<id> [--json]\n  sun inspect projection:<id>|execution:<id>|checkpoint:<id>|export:<id> [--json]"),
         "topic" => outputln!(ctx, "sun topic\n\nUsage:\n  sun topic create <slug> --display-name <name> [options] [--json]\n  sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]"),

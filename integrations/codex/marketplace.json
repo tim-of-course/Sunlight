@@ -1,0 +1,20 @@
+{
+  "name": "sunlight-local",
+  "interface": {
+    "displayName": "Sunlight Local"
+  },
+  "plugins": [
+    {
+      "name": "sunlight",
+      "source": {
+        "source": "local",
+        "path": "./plugins/sunlight"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

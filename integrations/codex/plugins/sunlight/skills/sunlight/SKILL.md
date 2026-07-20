@@ -1,0 +1,45 @@
+---
+name: sunlight
+description: Use Sunlight for repository-confined source inspection, topic-owned edits, exact multi-agent coordination, validation, checkpointing, and Git export. Trigger when the user asks to use Sunlight, when a repository exposes Sunlight MCP tools, or when multiple coding agents need isolated changes without worktrees or full source copies.
+---
+
+# Sunlight
+
+Use the repository-bound Sunlight MCP server as source truth for a
+Sunlight-native task. Exercise engineering judgment; preserve exact identities,
+preconditions, and handoffs rather than following a rigid script.
+
+## Begin safely
+
+1. Find the MCP server that exposes `repository_status` and the Sunlight
+   artifact tools. Server names may be repository-specific.
+2. Call `repository_status`. Initialize through `repository_init` only when the
+   bound root is uninitialized.
+3. If the tools are missing, stop instead of silently editing tracked source by
+   another route. Read [references/setup.md](references/setup.md) and give the
+   user the relevant install or doctor command.
+
+## Author and coordinate
+
+Read [references/workflow.md](references/workflow.md) before beginning native
+authoring or integration.
+
+- Create one bounded topic and one actor-owned session from an exact view.
+- Inspect and mutate tracked artifacts through Sunlight. Use returned hashes as
+  compare-and-swap preconditions.
+- Complete work at the exact head revision with a factual immutable handoff.
+- Use `topic_wait` for agent dependencies and `view_resolve` with exact selected
+  revisions for integration.
+- Run validation on the exact combined view. Promote only intentional outputs,
+  then create a checkpoint from matching passing evidence.
+- Export to Git only when the user requests that compatibility handoff.
+
+Treat conflicts, staleness, policy failures, and execution results as facts to
+inspect. Do not bypass them through a working tree, projection, moving head, or
+another agent's session.
+
+## Report
+
+Report the relevant topic, session, operation, revision, view, tree, execution,
+checkpoint, projection, and export IDs. State what was validated and whether
+any tracked-source access occurred outside Sunlight.

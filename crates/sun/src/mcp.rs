@@ -1575,7 +1575,7 @@ fn tools() -> Vec<Value> {
         tool(
             "session_start",
             "Start a topic-bound authoring session over an exact resolved view. The session writes only to the supplied topic; its initial read frontier is copied from the supplied view.",
-            json!({"topic":id_schema("Exact topic_id returned by topic_create or inspect."),"view":id_schema("Exact resolved_view_id returned by repository_status or view_resolve."),"actor":id_schema("Stable caller-chosen actor identifier used for provenance.")}),
+            json!({"topic":id_schema("Exact topic_id returned by topic_create or inspect, or its unique topic slug."),"view":id_schema("Exact resolved_view_id returned by repository_status or view_resolve."),"actor":id_schema("Stable caller-chosen actor identifier used for provenance.")}),
             &["topic", "view", "actor"],
             true,
         ),
@@ -1655,56 +1655,56 @@ fn tools() -> Vec<Value> {
         tool(
             "project_materialize",
             "Materialize a managed projection inside the bound repository policy root.",
-            json!({"view":s(),"purpose":{"type":"string","enum":["execution","compatibility","inspection","export"]},"strategy":{"type":"string","enum":["copy","reflink","hardlink_readonly","overlay_copyup"]},"require_strategy":{"type":"boolean","default":false}}),
+            json!({"view":id_schema("Exact conflict-free resolved_view_id to materialize."),"purpose":{"type":"string","description":"Consumer-specific projection policy and cache namespace.","enum":["execution","compatibility","inspection","export"]},"strategy":{"type":"string","description":"Optional required or preferred filesystem strategy.","enum":["copy","reflink","hardlink_readonly","overlay_copyup"]},"require_strategy":{"type":"boolean","description":"When true, fail instead of using a safe fallback strategy.","default":false}}),
             &["view", "purpose"],
             true,
         ),
         tool(
             "compat_project",
             "Create a compatibility projection for a session.",
-            json!({"session":s()}),
+            json!({"session":id_schema("Exact session_id whose current generation becomes the compatibility baseline.")}),
             &["session"],
             true,
         ),
         tool(
             "compat_diff",
             "Diff a managed compatibility projection against its persisted baseline.",
-            json!({"projection":s()}),
+            json!({"projection":id_schema("Exact compatibility projection_id returned by compat_project.")}),
             &["projection"],
             false,
         ),
         tool(
             "compat_import",
             "Import selected compatibility candidates as one native transaction.",
-            json!({"projection":s(),"candidates":{"type":"array","minItems":1,"maxItems":128,"items":s()},"session_generation":s()}),
+            json!({"projection":id_schema("Exact compatibility projection_id returned by compat_project."),"candidates":{"type":"array","description":"Exact candidate_delta_id values returned by compat_diff.","minItems":1,"maxItems":128,"items":id_schema("One exact candidate_delta_id.")},"session_generation":id_schema("Exact session_generation_id that owns the compatibility baseline.")}),
             &["projection", "candidates"],
             true,
         ),
         tool(
             "execution_run",
             "Run one bare non-shell program with structured arguments against an exact view. Returns bounded stdout/stderr text in output_text for immediate diagnosis, capture digests, phase_timings_ms, classified file deltas, and only actionable source/generated promotion candidates. Known build/cache paths are classified without per-file subprocesses; remaining Git ignore checks are batched and bounded.",
-            json!({"view":s(),"program":{"type":"string","description":"Bare executable name; shells and host paths are rejected."},"args":{"type":"array","maxItems":256,"items":{"type":"string","maxLength":16384}},"cwd":{"type":"string","description":"Repository-relative projection cwd.","default":"."},"network":{"type":"string","enum":["disabled","not_enforced"],"description":"Optional per-run network policy override."}}),
+            json!({"view":id_schema("Exact conflict-free resolved_view_id to execute."),"program":{"type":"string","description":"Bare executable name; shells and host paths are rejected."},"args":{"type":"array","description":"Structured argv entries passed without a shell.","maxItems":256,"items":{"type":"string","maxLength":16384}},"cwd":{"type":"string","description":"Repository-relative projection cwd.","default":"."},"network":{"type":"string","enum":["disabled","not_enforced"],"description":"Optional per-run network policy override."}}),
             &["view", "program"],
             true,
         ),
         tool(
             "execution_promote_output",
             "Promote one classified execution output into a session-owned operation.",
-            json!({"execution":s(),"path":path_schema(),"session":s(),"classification":class_schema()}),
+            json!({"execution":id_schema("Exact execution_id that produced the candidate."),"path":path_schema(),"session":id_schema("Exact authoring session_id that will own the promoted operation."),"classification":class_schema()}),
             &["execution", "path", "session", "classification"],
             true,
         ),
         tool(
             "checkpoint_create",
             "Freeze an exact resolved view with optional validated passing execution evidence.",
-            json!({"view":s(),"execution":s()}),
+            json!({"view":id_schema("Exact conflict-free resolved_view_id to freeze."),"execution":id_schema("Optional passing execution_id whose view and tree exactly match.")}),
             &["view"],
             true,
         ),
         tool(
             "policy_check_export",
             "Validate a checkpoint for export policy.",
-            json!({"checkpoint":s(),"branch":s()}),
+            json!({"checkpoint":id_schema("Exact checkpoint_id to validate."),"branch":{"type":"string","description":"Optional target Git branch or ref to validate."}}),
             &["checkpoint"],
             false,
         ),
@@ -1718,21 +1718,21 @@ fn tools() -> Vec<Value> {
         tool(
             "policy_explain",
             "Explain a persisted policy validation report.",
-            json!({"validation_report":s()}),
+            json!({"validation_report":id_schema("Exact validation_report_id returned by a policy check.")}),
             &["validation_report"],
             false,
         ),
         tool(
             "git_export",
             "Plan or execute Git export of a checkpoint to a branch in the bound repository.",
-            json!({"checkpoint":s(),"branch":s(),"mode":{"type":"string","enum":["plan","execute"]}}),
+            json!({"checkpoint":id_schema("Exact checkpoint_id to export."),"branch":{"type":"string","description":"Target Git branch or ref."},"mode":{"type":"string","description":"Plan without Git mutation or execute the validated local export.","enum":["plan","execute"]}}),
             &["checkpoint", "branch", "mode"],
             true,
         ),
         tool(
             "inspect",
             "Inspect persisted repository objects with a typed selector.",
-            json!({"selector":{"type":"string","description":"repository or topic:/session:/view:/artifact:/operation:/conflict:/projection:/execution:/checkpoint:/export:/git: selector"},"session":s()}),
+            json!({"selector":{"type":"string","description":"repository or topic:/session:/view:/artifact:/operation:/conflict:/projection:/execution:/checkpoint:/export:/git: selector"},"session":id_schema("Optional exact session_id used to disambiguate session-relative artifact inspection.")}),
             &["selector"],
             false,
         ),
@@ -1754,7 +1754,210 @@ fn tool(
     required: &[&str],
     mutating: bool,
 ) -> Value {
-    json!({"name":name,"description":description,"inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":required},"outputSchema":{"type":"object","description":"Every tool returns exactly one Sunlight envelope: ok=true with data and warnings, or ok=false with error.","required":["ok"],"properties":{"ok":{"type":"boolean"},"data":{"type":"object"},"error":{"type":"object"},"warnings":{"type":["array","object"]}},"additionalProperties":false},"annotations":{"readOnlyHint":!mutating,"destructiveHint":matches!(name,"artifact_delete"|"git_export"),"idempotentHint":matches!(name,"repository_init"|"repository_status"|"topic_complete"|"topic_wait"|"artifact_read"|"artifact_list"|"artifact_search"|"compat_diff"|"policy_check_export"|"policy_check_commit"|"policy_explain"|"inspect")}})
+    json!({"name":name,"description":description,"inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":required},"outputSchema":output_schema(name),"annotations":{"readOnlyHint":!mutating,"destructiveHint":matches!(name,"artifact_delete"|"git_export"),"idempotentHint":matches!(name,"repository_init"|"repository_status"|"topic_complete"|"topic_wait"|"artifact_read"|"artifact_list"|"artifact_search"|"compat_diff"|"policy_check_export"|"policy_check_commit"|"policy_explain"|"inspect")}})
+}
+
+fn output_schema(name: &str) -> Value {
+    let mut data = serde_json::Map::new();
+    data.insert(
+        "command".to_string(),
+        json!({"type":"string","description":"Stable Sunlight command name that produced this envelope."}),
+    );
+    data.insert(
+        "repository_id".to_string(),
+        json!({"type":"string","description":"Canonical repository identity when the command is repository-backed."}),
+    );
+
+    let ids = output_ids(name);
+    if !ids.is_empty() {
+        let properties = ids
+            .iter()
+            .map(|id| {
+                (
+                    (*id).to_string(),
+                    json!({"type":["string","null"],"description":format!("Exact {id} returned by this operation when applicable.")}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        data.insert(
+            "ids".to_string(),
+            json!({"type":"object","description":"Exact native identities for chaining subsequent tools.","properties":properties,"additionalProperties":true}),
+        );
+    }
+
+    for (field, description) in output_payloads(name) {
+        data.insert(field.to_string(), json!({"description":description}));
+    }
+
+    json!({
+        "type":"object",
+        "description":"One Sunlight envelope: ok=true with tool-specific data and warnings, or ok=false with a stable structured error.",
+        "required":["ok"],
+        "properties":{
+            "ok":{"type":"boolean"},
+            "data":{"type":"object","description":format!("Successful {name} result. Use exact returned IDs and hashes as later inputs."),"properties":data,"additionalProperties":true},
+            "error":{"type":"object","description":"Stable native error with code, message, and inspectable details.","properties":{"code":{"type":"string"},"message":{"type":"string"},"details":{"type":"object"}},"additionalProperties":true},
+            "warnings":{"type":["array","object"],"description":"Advisory facts that do not replace hard error states."}
+        },
+        "additionalProperties":false
+    })
+}
+
+fn output_ids(name: &str) -> &'static [&'static str] {
+    match name {
+        "repository_init" => &["repository_id", "checkpoint_id", "resolved_view_id"],
+        "repository_status" => &["repository_id"],
+        "topic_create" => &["topic_id", "topic_revision_id"],
+        "topic_complete" | "topic_wait" => &["topic_id", "topic_revision_id", "session_id"],
+        "session_start" | "session_refresh" => &[
+            "topic_id",
+            "session_id",
+            "session_generation_id",
+            "resolved_view_id",
+        ],
+        "artifact_read" | "artifact_list" | "artifact_search" => {
+            &["session_id", "session_generation_id", "resolved_view_id"]
+        }
+        "artifact_patch"
+        | "artifact_write"
+        | "artifact_move"
+        | "artifact_delete"
+        | "artifact_metadata_set"
+        | "compat_import" => &[
+            "operation_transaction_id",
+            "topic_revision_id",
+            "session_generation_id",
+            "resolved_view_id",
+        ],
+        "view_resolve" => &["resolved_view_id"],
+        "project_materialize" | "compat_project" => &["projection_id", "resolved_view_id"],
+        "compat_diff" => &["projection_id"],
+        "execution_run" => &["execution_id", "projection_id", "resolved_view_id"],
+        "execution_promote_output" => &["execution_id", "operation_transaction_id"],
+        "checkpoint_create" => &["checkpoint_id", "resolved_view_id", "execution_id"],
+        "policy_check_export" | "policy_check_commit" | "policy_explain" => {
+            &["validation_report_id"]
+        }
+        "git_export" => &["checkpoint_id", "export_map_id", "git_commit_id"],
+        "inspect" => &[],
+        _ => &[],
+    }
+}
+
+fn output_payloads(name: &str) -> &'static [(&'static str, &'static str)] {
+    match name {
+        "repository_init" | "repository_status" => &[(
+            "repository",
+            "Repository lifecycle, policy, and health facts.",
+        )],
+        "topic_create" => &[("topic", "Created durable topic record.")],
+        "topic_complete" => &[
+            ("topic", "Completed topic record."),
+            ("handoff", "Immutable factual completion handoff."),
+        ],
+        "topic_wait" => &[
+            ("topic", "Observed topic status."),
+            (
+                "handoff",
+                "Immutable factual completion handoff when available.",
+            ),
+            ("wait", "Wait outcome and timing facts."),
+        ],
+        "session_start" | "session_refresh" => &[
+            ("session", "Exact authoring session and frontier facts."),
+            ("view", "Exact session-visible resolved view."),
+        ],
+        "artifact_read" => &[
+            (
+                "artifact",
+                "Persisted artifact identity, hash, classification, and content.",
+            ),
+            ("content", "UTF-8 artifact content when readable."),
+        ],
+        "artifact_list" => &[("artifacts", "Ordered persisted artifact summaries.")],
+        "artifact_search" => &[("matches", "Bounded persisted-content search matches.")],
+        "artifact_patch"
+        | "artifact_write"
+        | "artifact_move"
+        | "artifact_delete"
+        | "artifact_metadata_set" => &[
+            ("operation", "Atomic topic-owned operation transaction."),
+            ("artifact", "Before and after artifact facts."),
+            ("view", "Exact post-operation session view."),
+        ],
+        "view_resolve" => &[
+            (
+                "resolved_view",
+                "Exact normalized frontier and tree identity.",
+            ),
+            (
+                "conflicts",
+                "Inspectable conflict records that block downstream use.",
+            ),
+            (
+                "staleness",
+                "Inspectable dependency staleness records that block downstream use.",
+            ),
+        ],
+        "project_materialize" | "compat_project" => &[
+            (
+                "projection",
+                "Managed projection identity, strategy, root handle, and policy.",
+            ),
+            (
+                "metrics",
+                "Materialization cost, cache, and amplification measurements.",
+            ),
+        ],
+        "compat_diff" => &[(
+            "candidates",
+            "Explicit compatibility deltas available for import.",
+        )],
+        "compat_import" => &[
+            ("operation", "Atomic native import transaction."),
+            (
+                "candidates",
+                "Selected compatibility candidates and outcomes.",
+            ),
+        ],
+        "execution_run" => &[
+            (
+                "execution",
+                "Persisted execution result and environment evidence.",
+            ),
+            (
+                "output_text",
+                "Bounded stdout and stderr text for diagnosis.",
+            ),
+            ("phase_timings_ms", "Measured execution phase timings."),
+            ("file_deltas", "Classified projection file changes."),
+            (
+                "promotion_candidates",
+                "Only actionable source-like or generated outputs.",
+            ),
+        ],
+        "execution_promote_output" => &[
+            ("promotion", "Execution provenance for the promoted output."),
+            ("operation", "Topic-owned operation created by promotion."),
+        ],
+        "checkpoint_create" => &[(
+            "checkpoint",
+            "Frozen exact view, tree, and selected evidence.",
+        )],
+        "policy_check_export" | "policy_check_commit" | "policy_explain" => &[(
+            "validation_report",
+            "Persisted policy checks, warnings, and blocking failures.",
+        )],
+        "git_export" => &[(
+            "git_export",
+            "Export plan or persisted Git mapping and ref result.",
+        )],
+        "inspect" => &[(
+            "object",
+            "Typed persisted object or provenance response selected by the caller.",
+        )],
+        _ => &[],
+    }
 }
 fn s() -> Value {
     json!({"type":"string","minLength":1,"maxLength":16384})
@@ -1796,6 +1999,33 @@ fn class_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            let number = TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("sun-mcp-unit-{}-{number}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn private_temp() -> (TestRoot, Arc<PrivateTemp>) {
+        let root = TestRoot::new();
+        let temp = PrivateTemp::new(&root.0).unwrap();
+        (root, temp)
+    }
+
     #[test]
     fn advertised_tools_have_no_fixture_vocabulary() {
         let encoded = serde_json::to_string(&tools()).unwrap();
@@ -1804,11 +2034,11 @@ mod tests {
     }
     #[test]
     fn run_rejects_shells_and_host_paths() {
-        let temp = PrivateTemp::new(Path::new(".")).unwrap();
+        let (root, temp) = private_temp();
         let shell = build_invocation(
             "execution_run",
             &json!({"view":"v","program":"powershell","args":[]}),
-            Path::new("."),
+            &root.0,
             &temp,
         );
         assert!(matches!(
@@ -1860,6 +2090,23 @@ mod tests {
         assert_eq!(wait["annotations"]["idempotentHint"], true);
         assert_eq!(wait["inputSchema"]["required"], json!(["topic"]));
         assert!(wait.get("outputSchema").is_some());
+        assert!(wait["outputSchema"]["properties"]["data"]["properties"]
+            .get("handoff")
+            .is_some());
+        assert!(wait["outputSchema"]["properties"]["data"]["properties"]
+            .get("wait")
+            .is_some());
+    }
+
+    #[test]
+    fn local_mcp_documentation_names_every_advertised_tool() {
+        let documentation = include_str!("../../../docs/local_mcp.md");
+        for name in tool_names() {
+            assert!(
+                documentation.contains(&format!("`{name}`")),
+                "local MCP documentation omits {name}"
+            );
+        }
     }
 
     #[test]
@@ -1878,11 +2125,11 @@ mod tests {
             .unwrap()
             .contains("session-free read-only access"));
 
-        let temp = PrivateTemp::new(Path::new(".")).unwrap();
+        let (root, temp) = private_temp();
         let invocation = build_invocation(
             "artifact_read",
             &json!({"path":"README.md","view":"view_exact"}),
-            Path::new("."),
+            &root.0,
             &temp,
         )
         .unwrap();
@@ -1894,7 +2141,7 @@ mod tests {
         let both = build_invocation(
             "artifact_read",
             &json!({"path":"README.md","session":"session_a","view":"view_exact"}),
-            Path::new("."),
+            &root.0,
             &temp,
         );
         assert!(matches!(
@@ -1908,7 +2155,7 @@ mod tests {
 
     #[test]
     fn view_resolve_mcp_array_preserves_each_include_argument() {
-        let temp = PrivateTemp::new(Path::new(".")).unwrap();
+        let (root, temp) = private_temp();
         let argv = build_invocation(
             "view_resolve",
             &json!({
@@ -1918,7 +2165,7 @@ mod tests {
                     {"topic":"topic_b","revision":"rev_b_0001"}
                 ]
             }),
-            Path::new("."),
+            &root.0,
             &temp,
         )
         .unwrap();

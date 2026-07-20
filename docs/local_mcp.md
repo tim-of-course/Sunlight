@@ -20,7 +20,32 @@ An uninitialized existing directory may also be bound so the
 `repository_init` tool can perform the one-time ingest. All other repository
 tools require initialized native state.
 
-## Codex configuration
+## Harness-neutral agent setup
+
+Install the portable Sunlight Agent Skill and the selected client's local MCP
+entry from the target repository:
+
+```powershell
+sun agent install --client generic
+sun agent install --client codex
+sun agent install --client cursor
+```
+
+Use one client value per installation. `generic` installs only
+`.agents/skills/sunlight`; Codex also manages `.codex/config.toml`, and Cursor
+also manages `.cursor/mcp.json`. Existing unrelated client configuration is
+preserved. Verify the result with:
+
+```powershell
+sun agent doctor --client codex
+```
+
+Restart or reload the client after its MCP configuration changes. The generated
+configuration contains local absolute paths and should be treated as
+machine-local unless the team intentionally replaces them with a portable
+installation convention.
+
+## Manual Codex configuration
 
 Add a server entry to `%USERPROFILE%\.codex\config.toml`, using absolute paths:
 
@@ -30,6 +55,23 @@ command = 'C:\src\sunlight\target\debug\sun.exe'
 args = ['mcp', 'serve', '--repo', 'C:\src\my-repo']
 startup_timeout_sec = 15
 tool_timeout_sec = 900
+```
+
+For project-local configuration, place the same entry in
+`<repository>/.codex/config.toml`. `sun agent install --client codex` uses this
+safer repository-scoped form.
+
+Cursor uses an equivalent project-local `.cursor/mcp.json` entry:
+
+```json
+{
+  "mcpServers": {
+    "sunlight": {
+      "command": "C:\\src\\sunlight\\target\\release\\sun.exe",
+      "args": ["mcp", "serve", "--repo", "C:\\src\\my-repo"]
+    }
+  }
+}
 ```
 
 For Claude Desktop, the equivalent entry in its JSON configuration is:
@@ -53,7 +95,7 @@ server entry for each repository; a running server cannot switch roots.
 The server exposes these typed tools:
 
 - `repository_init`, `repository_status`
-- `topic_create`, `session_start`, `session_refresh`
+- `topic_create`, `topic_complete`, `topic_wait`, `session_start`, `session_refresh`
 - `artifact_read`, `artifact_list`, `artifact_search`
 - `artifact_patch`, `artifact_write`, `artifact_move`, `artifact_delete`,
   `artifact_metadata_set`
@@ -68,6 +110,10 @@ Every successful or native command-error result includes both MCP text content
 and `structuredContent` containing the existing `sun --json` envelope. Native
 errors such as `precondition_failed`, `repository_writer_busy`, and
 `concurrent_state_update` are returned as tool errors without translation.
+Tool-specific output schemas describe the main returned IDs and payloads while
+allowing forward-compatible additional fields. The initialization response also
+describes the core authoring and coordination lifecycle, so a generic MCP client
+does not depend on a Codex- or Cursor-specific prompt.
 
 ## Confinement and lifecycle
 

@@ -49,6 +49,52 @@ fn global_and_primary_help_describe_repo_backed_operator_workflow() {
 }
 
 #[test]
+fn agent_install_and_doctor_create_a_discoverable_cursor_setup() {
+    let repo = TestRepo::new("agent-install-cursor");
+    let install = run_real_json(&repo, &["agent", "install", "--client", "cursor"]);
+    assert_success(&install);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&install)).unwrap();
+    assert_eq!(value["data"]["command"], "agent.install");
+    assert_eq!(value["data"]["client"], "cursor");
+    assert_eq!(value["data"]["restart_required"], true);
+    assert!(!value["data"]["repository"]
+        .as_str()
+        .unwrap()
+        .starts_with(r"\\?\"));
+    assert!(repo
+        .path()
+        .join(".agents/skills/sunlight/SKILL.md")
+        .is_file());
+    assert!(repo.path().join(".cursor/mcp.json").is_file());
+
+    let cursor: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(repo.path().join(".cursor/mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(cursor["mcpServers"]["sunlight"]["args"][0], "mcp");
+    assert_eq!(cursor["mcpServers"]["sunlight"]["args"][1], "serve");
+
+    let doctor = run_real_json(&repo, &["agent", "doctor", "--client", "cursor"]);
+    assert_success(&doctor);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    assert_eq!(value["data"]["healthy"], true);
+    assert_eq!(value["data"]["repository_initialized"], false);
+    assert!(value["warnings"][0]
+        .as_str()
+        .unwrap()
+        .contains("repository is not initialized"));
+
+    fs::write(
+        repo.path().join(".agents/skills/sunlight/SKILL.md"),
+        "stale",
+    )
+    .unwrap();
+    let stale = run_real_json(&repo, &["agent", "doctor", "--client", "cursor"]);
+    assert_failure(&stale);
+    assert!(stdout(&stale).contains("agent_setup_incomplete"));
+    assert!(stdout(&stale).contains(".agents/skills/sunlight/SKILL.md"));
+}
+
+#[test]
 fn no_fixture_topic_intent_metadata_is_durable_inspectable_validated_and_export_gated() {
     let repo = TestRepo::new("topic-intent-metadata");
     init_local_git_repo(&repo);

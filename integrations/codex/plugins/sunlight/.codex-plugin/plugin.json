@@ -1,0 +1,24 @@
+{
+  "name": "sunlight",
+  "version": "0.1.0",
+  "description": "Use the harness-neutral Sunlight agent workflow in Codex.",
+  "author": {
+    "name": "Sunlight"
+  },
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["agents", "coding", "mcp", "source-control"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Sunlight",
+    "shortDescription": "Coordinate exact multi-agent source changes.",
+    "longDescription": "A thin Codex adapter for Sunlight's portable Agent Skill. Repository-bound MCP setup remains client-neutral and is managed by the sun CLI.",
+    "developerName": "Sunlight",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": [
+      "Use Sunlight for this coding task.",
+      "Coordinate these agents through Sunlight.",
+      "Integrate and validate the completed Sunlight topics."
+    ]
+  }
+}

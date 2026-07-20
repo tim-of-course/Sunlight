@@ -89,4 +89,6 @@ scripts\mvp-smoke.ps1
 
 See [the local MCP reference](docs/local_mcp.md) and the
 [v0.3 readiness audit](docs/sunlight_mvp_readiness_audit_20260716.md) for the
-implemented lifecycle, constraints, and acceptance evidence.
+implemented lifecycle and current evidence. The
+[open-alpha acceptance gate](docs/open_alpha_acceptance.md) defines the
+remaining release tests and decision criteria.

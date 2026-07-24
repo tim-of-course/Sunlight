@@ -1338,6 +1338,65 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
 }
 
 #[test]
+fn oversized_execution_output_promotion_fails_closed_without_native_mutation() {
+    let repo = TestRepo::new("oversized-execution-output-promotion");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "oversized-promotion");
+
+    let run = sun()
+        .args(["run", "--view", "view_base_0001", "--json", "--"])
+        .args([
+            "python",
+            "-c",
+            "from pathlib import Path; Path('src').mkdir(exist_ok=True); Path('src/generated_large.rs').write_bytes(b'x' * 2097153)",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("oversized-output execution should run");
+    assert_success(&run);
+    let run_body = stdout(&run);
+    assert!(run_body.contains("\"output_path\":\"src/generated_large.rs\""));
+    assert!(run_body.contains("\"classification\":\"source_like_delta\""));
+    let execution_id = json_string_field(&run_body, "execution_id");
+
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let state_before = fs::read(&state_path).unwrap();
+    let operations_before = fs::read_dir(repo.path().join(".sunlight/operations"))
+        .unwrap()
+        .count();
+    let promote = sun()
+        .args(["execution", "promote-output"])
+        .arg(&execution_id)
+        .args([
+            "--path",
+            "src/generated_large.rs",
+            "--session",
+            "session_agent_a",
+            "--classification",
+            "source_like_delta",
+            "--json",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("oversized output promotion should return a policy denial");
+    assert_failure(&promote);
+    let denial = stdout(&promote);
+    assert_valid_json(&denial);
+    assert!(denial.contains("\"code\":\"promotion_policy_failed\""));
+    assert!(denial.contains("execution output exceeds the source-promotion size limit"));
+    assert!(denial.contains("\"observed_bytes\":2097153"));
+    assert!(denial.contains("\"maximum_promotable_bytes\":2097152"));
+    assert!(denial.contains("keep denied output local-only"));
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert_eq!(
+        fs::read_dir(repo.path().join(".sunlight/operations"))
+            .unwrap()
+            .count(),
+        operations_before
+    );
+}
+
+#[test]
 fn ignored_execution_outputs_are_batched_bounded_and_not_promotable() {
     let repo = TestRepo::new("ignored-execution-outputs");
     init_local_git_repo(&repo);
@@ -3068,6 +3127,77 @@ fn no_fixture_repeated_exact_view_reuses_one_durable_projection_cache_entry() {
     assert_eq!(projection_cache_entry_roots(&repo).len(), 2);
 }
 
+#[cfg(windows)]
+#[test]
+fn no_fixture_repeated_default_inspection_reuses_verified_read_only_projection() {
+    let repo = TestRepo::new("projection-readonly-reuse");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "projection-readonly-reuse");
+
+    let materialize = || {
+        sun()
+            .args([
+                "project",
+                "materialize",
+                "--view",
+                "view_base_0001",
+                "--purpose",
+                "inspection",
+                "--json",
+            ])
+            .current_dir(repo.path())
+            .output()
+            .expect("sun project materialize should run")
+    };
+    let first = materialize();
+    assert_success(&first);
+    let first_body = stdout(&first);
+    assert!(first_body.contains("\"selected_strategy\":\"hardlink_readonly\""));
+    let projection_id = json_string_field(&first_body, "projection_id");
+
+    let second = materialize();
+    assert_success(&second);
+    let second_body = stdout(&second);
+    assert_eq!(
+        json_string_field(&second_body, "projection_id"),
+        projection_id
+    );
+    assert!(second_body.contains("\"cache_hit\":true"));
+    assert!(second_body.contains("\"reuse\":\"reused_verified_projection\""));
+    assert!(second_body.contains("\"integrity_revalidated\":true"));
+    assert!(second_body.contains("\"physically_materialized_bytes\":0"));
+    assert_eq!(
+        fs::read_dir(repo.path().join(".sunlight/projections"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "json"))
+            .count(),
+        1
+    );
+
+    let projection_root = repo
+        .path()
+        .join(".sunlight/projections/inspection")
+        .join(&projection_id)
+        .join("root");
+    fs::remove_file(projection_root.join("base.txt")).unwrap();
+    let repaired = materialize();
+    assert_success(&repaired);
+    let repaired_body = stdout(&repaired);
+    let repaired_id = json_string_field(&repaired_body, "projection_id");
+    assert_ne!(repaired_id, projection_id);
+    assert!(!repaired_body.contains("\"reuse\":\"reused_verified_projection\""));
+    assert!(repo
+        .path()
+        .join(".sunlight/projections/inspection")
+        .join(repaired_id)
+        .join("root/base.txt")
+        .is_file());
+}
+
 #[test]
 fn no_fixture_corrupt_cache_is_quarantined_rebuilt_without_source_truth_damage() {
     let repo = TestRepo::new("projection-cache-corruption");
@@ -3230,7 +3360,7 @@ fn no_fixture_cache_reparse_point_is_quarantined_before_reuse() {
 }
 
 #[test]
-fn no_fixture_unsupported_strategy_falls_back_or_fails_atomically_when_required() {
+fn no_fixture_hardlink_strategy_is_supported_only_for_safe_read_only_projections() {
     let repo = TestRepo::new("projection-strategy-fallback-atomic");
     init_local_git_repo(&repo);
     start_native_session(&repo, "projection-fallback");
@@ -3254,7 +3384,11 @@ fn no_fixture_unsupported_strategy_falls_back_or_fails_atomically_when_required(
         .output()
         .unwrap();
     assert_success(&fallback);
-    assert!(stdout(&fallback).contains("\"selected_strategy\":\"copy\""));
+    if cfg!(windows) {
+        assert!(stdout(&fallback).contains("\"selected_strategy\":\"hardlink_readonly\""));
+    } else {
+        assert!(stdout(&fallback).contains("\"selected_strategy\":\"copy\""));
+    }
 
     let state_path = repo.path().join(".sunlight/records/native-state.json");
     let state_before = fs::read(&state_path).unwrap();
@@ -3277,19 +3411,25 @@ fn no_fixture_unsupported_strategy_falls_back_or_fails_atomically_when_required(
         .current_dir(repo.path())
         .output()
         .unwrap();
-    assert_failure(&required);
-    let error = stdout(&required);
-    assert_valid_json(&error);
-    assert!(
-        error.contains("\"code\":\"projection_materialization_unsupported_filesystem_strategy\"")
-    );
-    assert!(error.contains("\"strategy\":\"hardlink_readonly\""));
-    assert!(!required_root.exists());
-    assert_eq!(fs::read(state_path).unwrap(), state_before);
-    assert!(!repo
-        .path()
-        .join(".sunlight/projections/projection_inspection_native_0002.json")
-        .exists());
+    if cfg!(windows) {
+        assert_success(&required);
+        let body = stdout(&required);
+        assert!(body.contains("\"selected_strategy\":\"hardlink_readonly\""));
+        assert!(required_root.join("base.txt").is_file());
+        assert!(fs::metadata(required_root.join("base.txt"))
+            .unwrap()
+            .permissions()
+            .readonly());
+    } else {
+        assert_failure(&required);
+        let error = stdout(&required);
+        assert_valid_json(&error);
+        assert!(error
+            .contains("\"code\":\"projection_materialization_unsupported_filesystem_strategy\""));
+        assert!(error.contains("\"strategy\":\"hardlink_readonly\""));
+        assert!(!required_root.exists());
+        assert_eq!(fs::read(state_path).unwrap(), state_before);
+    }
 }
 
 #[test]
@@ -3321,15 +3461,26 @@ fn no_fixture_automatic_strategy_reports_real_volume_result_without_assuming_cow
     assert_valid_json(&body);
     let strategy = json_string_field(&body, "selected_strategy");
     assert!(
-        strategy == "copy" || strategy == "reflink",
+        strategy == "copy" || strategy == "reflink" || strategy == "hardlink_readonly",
         "unexpected strategy: {strategy}"
     );
     if strategy == "reflink" {
         assert!(!body.contains("\"physically_materialized_bytes\":16394"));
-    } else {
+    } else if strategy == "copy" {
         assert!(body.contains("\"physically_materialized_bytes\":16394"));
+    } else {
+        assert!(body.contains("\"physically_materialized_bytes\":8197"));
+        assert!(body.contains("\"storage_amplification\":1.000000"));
     }
-    fs::write(root.join("aligned.bin"), "private write").unwrap();
+    let write = fs::write(root.join("aligned.bin"), "private write");
+    if strategy == "hardlink_readonly" {
+        assert!(
+            write.is_err(),
+            "read-only hardlink projection accepted a write"
+        );
+    } else {
+        write.unwrap();
+    }
     assert_eq!(
         fs::read_to_string(repo.path().join("aligned.bin")).unwrap(),
         "x".repeat(8192)
@@ -3650,6 +3801,110 @@ fn no_fixture_topics_and_sessions_are_distinct_repo_backed_records() {
     assert!(beta_status_stdout.contains("\"session_id\":\"session_agent_b\""));
     assert!(beta_status_stdout.contains("\"topic_id\":\"topic_beta_topic\""));
     assert!(beta_status_stdout.contains("\"session_generation_id\":\"gen_agent_b_0002\""));
+
+    let native_state_path = repo.path().join(".sunlight/records/native-state.json");
+    let state_before_invalid = fs::read(&native_state_path).unwrap();
+    let invalid_session = sun()
+        .arg("write")
+        .arg("invalid-session.txt")
+        .arg("--session")
+        .arg("session_missing")
+        .arg("--expect-hash")
+        .arg("new")
+        .arg("--content-file")
+        .arg(&alpha_content)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("invalid session write should return a structured denial");
+    assert_failure(&invalid_session);
+    assert!(stdout(&invalid_session).contains("\"code\":\"session_not_found\""));
+    assert_eq!(fs::read(&native_state_path).unwrap(), state_before_invalid);
+
+    let state_before_wrong_owner = fs::read(&native_state_path).unwrap();
+    let wrong_owner = sun()
+        .args([
+            "topic",
+            "complete",
+            "--topic",
+            "topic_beta_topic",
+            "--revision",
+            "rev_beta_topic_0001",
+            "--session",
+            "session_agent_a",
+            "--json",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("wrong-owner completion should return a structured denial");
+    assert_failure(&wrong_owner);
+    assert!(stdout(&wrong_owner).contains("\"code\":\"topic_session_mismatch\""));
+    assert_eq!(
+        fs::read(&native_state_path).unwrap(),
+        state_before_wrong_owner
+    );
+
+    let complete_alpha = sun()
+        .args([
+            "topic",
+            "complete",
+            "--topic",
+            "topic_alpha_topic",
+            "--revision",
+            "rev_alpha_topic_0001",
+            "--session",
+            "session_agent_a",
+            "--json",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("owned topic completion should run");
+    assert_success(&complete_alpha);
+    let completion_path = repo
+        .path()
+        .join(".sunlight/topics/completion_topic_alpha_topic.json");
+    let completion_before = fs::read(&completion_path).unwrap();
+    let state_before_completed_session = fs::read(&native_state_path).unwrap();
+    let completed_session = sun()
+        .arg("write")
+        .arg("after-completion.txt")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--expect-hash")
+        .arg("new")
+        .arg("--content-file")
+        .arg(&alpha_content)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("completed-session write should return a structured denial");
+    assert_failure(&completed_session);
+    assert!(stdout(&completed_session).contains("\"code\":\"topic_completed\""));
+    assert_eq!(
+        fs::read(&native_state_path).unwrap(),
+        state_before_completed_session
+    );
+    assert_eq!(fs::read(&completion_path).unwrap(), completion_before);
+
+    let state_before_repeated_init = fs::read(&native_state_path).unwrap();
+    let repeated_init = run_real_json(&repo, &["init"]);
+    assert_success(&repeated_init);
+    assert_eq!(
+        fs::read(&native_state_path).unwrap(),
+        state_before_repeated_init
+    );
+    let first_repeated_status = run_real_json(&repo, &["status"]);
+    let second_repeated_status = run_real_json(&repo, &["status"]);
+    assert_success(&first_repeated_status);
+    assert_success(&second_repeated_status);
+    assert_eq!(
+        stdout(&first_repeated_status),
+        stdout(&second_repeated_status)
+    );
 
     let state_json = fs::read_to_string(repo.path().join(".sunlight/records/native-state.json"))
         .expect("native state should exist");
@@ -4263,7 +4518,7 @@ fn no_fixture_init_respects_git_ignore_policy() {
 
     let native_state = fs::read_to_string(repo.path().join(".sunlight/records/native-state.json"))
         .expect("native state should exist");
-    assert!(native_state.contains("\"path\":\"src/lib.rs\""));
+    assert!(native_state.contains("\"src/lib.rs\""));
     assert!(!native_state.contains("target/debug/build.log"));
     assert!(!native_state.contains(".cache/sun/local.txt"));
     assert!(!native_state.contains("ignored-build-needle"));
@@ -4385,6 +4640,7 @@ fn no_fixture_init_quarantines_tracked_secret_without_persisting_or_searching_by
     let status_stdout = stdout(&status);
     assert!(status_stdout.contains("\"quarantined_secret_count\":1"));
     assert!(status_stdout.contains("\"code\":\"ingest_secrets_quarantined\""));
+    assert!(status_stdout.contains("\"next_action\":\"Inspect the report, rotate real credentials, and author only a sanitized non-secret replacement through a Sunlight topic; quarantined bytes were not stored and cannot be restored by Sunlight.\""));
 
     let list_root = sun()
         .arg("list")
@@ -10512,14 +10768,12 @@ fn no_fixture_persisted_local_only_checkpoint_entry_is_export_blocked() {
     let checkpoint_id = create_real_base_checkpoint(&repo);
     let state_path = repo.path().join(".sunlight/records/native-state.json");
     let mut state = fs::read_to_string(&state_path).unwrap();
-    let checkpoint_offset = state.find("\"checkpoints\":[{").unwrap();
-    let classification_offset = state[checkpoint_offset..]
-        .find("\"classification\":\"source\"")
-        .unwrap()
-        + checkpoint_offset;
+    let base_entries_offset = state.find("\"base_entries_compact\":[[").unwrap();
+    let classification_offset =
+        state[base_entries_offset..].find("\"source\"").unwrap() + base_entries_offset;
     state.replace_range(
-        classification_offset..classification_offset + "\"classification\":\"source\"".len(),
-        "\"classification\":\"local_only\"",
+        classification_offset..classification_offset + "\"source\"".len(),
+        "\"local_only\"",
     );
     fs::write(&state_path, state).unwrap();
 

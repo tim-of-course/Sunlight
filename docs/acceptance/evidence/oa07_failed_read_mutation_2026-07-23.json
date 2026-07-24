@@ -1,0 +1,1212 @@
+﻿{
+    "schema":  "sunlight.open-alpha.oa07.v1",
+    "result":  "fail",
+    "recorded_at_utc":  "2026-07-24T00:39:05.4972779Z",
+    "threshold_source":  "docs/acceptance/open_alpha_thresholds.md",
+    "sunlight":  {
+                     "source_commit":  "7a7ed0dbaa0ac41d06248ea0bde2c40284faf098",
+                     "executable":  "C:\\Users\\TimothyCardoza\\Documents\\AI-Apps\\Sunlight 2\\target\\release\\sun.exe",
+                     "executable_sha256":  "e38899b1bc762e418a210bea49fec8fc2e8634a97124af9429a74951f2082910",
+                     "source_worktree_status":  [
+                                                    " M crates/sun/src/engine.rs",
+                                                    " M crates/sun/src/lib.rs",
+                                                    " M crates/sun/src/mcp.rs",
+                                                    " M crates/sun/src/windows_isolation.rs",
+                                                    " M crates/sun/tests/cli_json.rs",
+                                                    " M crates/sun/tests/mcp_stdio.rs",
+                                                    " M crates/sunlight-core/src/compat_import.rs",
+                                                    " M crates/sunlight-core/src/execution.rs",
+                                                    " M crates/sunlight-core/src/repo_state.rs",
+                                                    " M crates/sunlight-core/src/resolver.rs",
+                                                    " M docs/local_mcp.md",
+                                                    " M integrations/agent-skills/sunlight/references/workflow.md",
+                                                    " M integrations/codex/plugins/sunlight/skills/sunlight/references/workflow.md",
+                                                    "?? .tmp-oa07-final.log",
+                                                    "?? .tmp-oa07-final.started",
+                                                    "?? crates/sun/tests/open_alpha_handoff.rs",
+                                                    "?? docs/acceptance/",
+                                                    "?? scripts/open-alpha-scale.ps1"
+                                                ]
+                 },
+    "platform":  {
+                     "os":  "Microsoft Windows NT 10.0.26200.0",
+                     "powershell":  "5.1.26100.8875",
+                     "filesystem_root":  "C:\\",
+                     "filesystem":  "NTFS",
+                     "local_ssd_operator_confirmed":  true
+                 },
+    "target":  {
+                   "source_path":  "C:\\Users\\TimothyCardoza\\Documents\\AI-Apps\\Phaser",
+                   "source_commit":  "8f05a0a3e62c89a1f5719f81092f1820ce913a5c",
+                   "initial_status":  [
+
+                                      ],
+                   "final_status":  [
+
+                                    ],
+                   "tracked_files":  5818,
+                   "logical_tracked_bytes":  90935221,
+                   "disposable_path":  "C:\\Users\\TimothyCardoza\\AppData\\Local\\Temp\\sun-oa07-d6d1b89a093e42589186611fd9c28ae9\\target",
+                   "remotes_after_clone":  [
+
+                                           ],
+                   "remotes_final":  [
+
+                                     ]
+               },
+    "conventional_baseline":  {
+                                  "clone_ms":  2409.827,
+                                  "authoring_ms":  21.38,
+                                  "test_ms":  76.385,
+                                  "journey_ms":  120.268,
+                                  "repository_bytes":  116120610,
+                                  "changed_path_count":  20,
+                                  "changed_paths":  [
+                                                        "sunlight_alpha/worker-1-1.txt",
+                                                        "sunlight_alpha/worker-1-2.txt",
+                                                        "sunlight_alpha/worker-1-3.txt",
+                                                        "sunlight_alpha/worker-1-4.txt",
+                                                        "sunlight_alpha/worker-1-5.txt",
+                                                        "sunlight_alpha/worker-2-1.txt",
+                                                        "sunlight_alpha/worker-2-2.txt",
+                                                        "sunlight_alpha/worker-2-3.txt",
+                                                        "sunlight_alpha/worker-2-4.txt",
+                                                        "sunlight_alpha/worker-2-5.txt",
+                                                        "sunlight_alpha/worker-3-1.txt",
+                                                        "sunlight_alpha/worker-3-2.txt",
+                                                        "sunlight_alpha/worker-3-3.txt",
+                                                        "sunlight_alpha/worker-3-4.txt",
+                                                        "sunlight_alpha/worker-3-5.txt",
+                                                        "sunlight_alpha/worker-4-1.txt",
+                                                        "sunlight_alpha/worker-4-2.txt",
+                                                        "sunlight_alpha/worker-4-3.txt",
+                                                        "sunlight_alpha/worker-4-4.txt",
+                                                        "sunlight_alpha/worker-4-5.txt"
+                                                    ],
+                                  "action_count":  21,
+                                  "action_scope":  "20 direct working-tree writes and one target test; clone and verified cleanup are harness setup/teardown",
+                                  "cleanup_verified_before_sunlight_init":  true
+                              },
+    "conventional_comparison":  {
+                                    "conventional_test_external_ms":  76.385,
+                                    "exact_view_first_test_command_ms":  1832,
+                                    "exact_view_first_to_conventional_test_ratio":  23.983829,
+                                    "timing_basis":  "same bun test command; conventional external wall time versus Sunlight execution command phase",
+                                    "sunlight_journey_ms":  152691.388,
+                                    "conventional_journey_ms":  120.268,
+                                    "sunlight_to_conventional_journey_ratio":  1269.594924,
+                                    "sunlight_action_count":  36,
+                                    "conventional_action_count":  21,
+                                    "sunlight_to_conventional_action_ratio":  1.714286,
+                                    "action_count_comparable":  true,
+                                    "action_count_basis":  "Sunlight post-ingest status plus MCP tool calls versus 20 direct writes plus one conventional target test"
+                                },
+    "sunlight_run":  {
+                         "init_ms":  108880.938,
+                         "journey_ms":  340920.189,
+                         "base_checkpoint_id":  "checkpoint_base_0001",
+                         "resolved_view_id":  "view_fixture_d69f61fbd4c3696d",
+                         "topics":  [
+                                        "topic_oa07_worker_1",
+                                        "topic_oa07_worker_2",
+                                        "topic_oa07_worker_3",
+                                        "topic_oa07_worker_4"
+                                    ],
+                         "sessions":  [
+                                          "session_oa07_agent_1",
+                                          "session_oa07_agent_2",
+                                          "session_oa07_agent_3",
+                                          "session_oa07_agent_4"
+                                      ],
+                         "revisions":  [
+                                           "rev_oa07_worker_1_0005",
+                                           "rev_oa07_worker_2_0005",
+                                           "rev_oa07_worker_3_0005",
+                                           "rev_oa07_worker_4_0005"
+                                       ],
+                         "executions":  [
+                                            "exec_native_0001",
+                                            "exec_native_0002"
+                                        ],
+                         "execution_metrics":  [
+                                                   {
+                                                       "execution_id":  "exec_native_0001",
+                                                       "projection_id":  "projection_execution_copy_native_0002",
+                                                       "result":  "pass",
+                                                       "external_ms":  134273,
+                                                       "transport":  {
+                                                                         "automatic_concurrency_retries":  0,
+                                                                         "queue_ms":  0,
+                                                                         "worker_ms":  134246
+                                                                     },
+                                                       "phase_timings_ms":  {
+                                                                                "command":  1832,
+                                                                                "materialization":  116400,
+                                                                                "output_scan_and_classification":  4040,
+                                                                                "publication":  1539,
+                                                                                "total":  134061
+                                                                            }
+                                                   },
+                                                   {
+                                                       "execution_id":  "exec_native_0002",
+                                                       "projection_id":  "projection_execution_copy_native_0003",
+                                                       "result":  "pass",
+                                                       "external_ms":  107501.975,
+                                                       "transport":  {
+                                                                         "automatic_concurrency_retries":  0,
+                                                                         "queue_ms":  0,
+                                                                         "worker_ms":  107486
+                                                                     },
+                                                       "phase_timings_ms":  {
+                                                                                "command":  1426,
+                                                                                "materialization":  91860,
+                                                                                "output_scan_and_classification":  3531,
+                                                                                "publication":  1552,
+                                                                                "total":  107239
+                                                                            }
+                                                   }
+                                               ],
+                         "checkpoints":  [
+                                             "checkpoint_5b70703a1bc9fe44_73821db308ff",
+                                             "checkpoint_5b70703a1bc9fe44_a85e08a03ecc"
+                                         ],
+                         "latency":  {
+                                         "status":  {
+                                                        "count":  20,
+                                                        "p50_ms":  220.805,
+                                                        "p95_ms":  407.75,
+                                                        "max_ms":  492.213
+                                                    },
+                                         "list":  {
+                                                      "count":  20,
+                                                      "p50_ms":  746.566,
+                                                      "p95_ms":  996.736,
+                                                      "max_ms":  1096.224
+                                                  },
+                                         "search":  {
+                                                        "count":  20,
+                                                        "p50_ms":  843.77,
+                                                        "p95_ms":  966.3,
+                                                        "max_ms":  1004.874
+                                                    },
+                                         "read":  {
+                                                      "count":  20,
+                                                      "p50_ms":  745.434,
+                                                      "p95_ms":  867.922,
+                                                      "max_ms":  871.098
+                                                  },
+                                         "mutation":  {
+                                                          "count":  32,
+                                                          "p50_ms":  777.795,
+                                                          "p95_ms":  2457.094,
+                                                          "max_ms":  2457.109
+                                                      },
+                                         "resolution":  {
+                                                            "count":  10,
+                                                            "p50_ms":  153.589,
+                                                            "p95_ms":  190.041,
+                                                            "max_ms":  190.041
+                                                        }
+                                     },
+                         "queue":  {
+                                       "p50_ms":  154,
+                                       "p95_ms":  621,
+                                       "max_ms":  621
+                                   },
+                         "maximum_automatic_concurrency_retries":  0,
+                         "first_projection":  {
+                                                  "cache_hit":  false,
+                                                  "elapsed_ms":  14995,
+                                                  "file_count":  5829,
+                                                  "integrity_revalidated":  true,
+                                                  "logical_bytes":  85993789,
+                                                  "physical_allocation_bytes":  null,
+                                                  "physically_materialized_bytes":  85993789,
+                                                  "reuse":  "created",
+                                                  "storage_amplification":  1.0
+                                              },
+                         "cached_projection":  {
+                                                   "cache_hit":  true,
+                                                   "elapsed_ms":  3611,
+                                                   "file_count":  5829,
+                                                   "integrity_revalidated":  true,
+                                                   "logical_bytes":  85993789,
+                                                   "physical_allocation_bytes":  0,
+                                                   "physically_materialized_bytes":  0,
+                                                   "reuse":  "reused_verified_projection",
+                                                   "storage_amplification":  0.0
+                                               },
+                         "cached_elapsed_ratio":  0.240814,
+                         "initial_sunlight_bytes":  87022047,
+                         "final_sunlight_bytes":  520831338,
+                         "initial_native_state_bytes":  87022047,
+                         "final_native_state_bytes":  87144997,
+                         "incremental_native_state_bytes":  122950,
+                         "total_sunlight_growth_bytes":  433809291,
+                         "mcp_tool_call_count":  132,
+                         "post_ingest_cli_domain_call_count":  1,
+                         "initialization_setup_call_count":  1,
+                         "comparable_action_count":  36,
+                         "full_benchmark_action_count":  133,
+                         "authoring_mode":  "four native MCP authors sharing one canonical repository; no per-author projection requested"
+                     },
+    "checks":  {
+                   "init_under_120s":  true,
+                   "status_p95":  true,
+                   "list_p95":  true,
+                   "search_p95":  true,
+                   "read_p95":  false,
+                   "mutation_p95":  false,
+                   "resolution_p95":  true,
+                   "queue_p95":  true,
+                   "queue_max":  true,
+                   "retries_not_exhausted":  true,
+                   "first_projection":  true,
+                   "cached_projection":  true,
+                   "storage_amplification":  true,
+                   "incremental_growth":  true,
+                   "journey_under_15m":  true,
+                   "windows_host":  true,
+                   "local_ssd_confirmed":  true,
+                   "target_file_count_in_scope":  true,
+                   "conventional_scope_matched":  true,
+                   "four_distinct_sessions":  true,
+                   "no_remote":  true,
+                   "fixture_head_unchanged":  true,
+                   "source_head_unchanged":  true,
+                   "source_status_unchanged":  true
+               },
+    "sample_count":  132,
+    "samples":  [
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  205.635,
+                        "queue_ms":  0,
+                        "worker_ms":  182,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  350.392,
+                        "queue_ms":  134,
+                        "worker_ms":  194,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  588.91,
+                        "queue_ms":  185,
+                        "worker_ms":  177,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  553.848,
+                        "queue_ms":  349,
+                        "worker_ms":  198,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  1143.751,
+                        "queue_ms":  751,
+                        "worker_ms":  177,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  218.035,
+                        "queue_ms":  0,
+                        "worker_ms":  192,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  1362.151,
+                        "queue_ms":  565,
+                        "worker_ms":  180,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  215.369,
+                        "queue_ms":  0,
+                        "worker_ms":  193,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  528.507,
+                        "queue_ms":  247,
+                        "worker_ms":  256,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  534.037,
+                        "queue_ms":  0,
+                        "worker_ms":  241,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  777.795,
+                        "queue_ms":  506,
+                        "worker_ms":  245,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  1025.717,
+                        "queue_ms":  755,
+                        "worker_ms":  249,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  279.706,
+                        "queue_ms":  0,
+                        "worker_ms":  264,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  1442.608,
+                        "queue_ms":  713,
+                        "worker_ms":  714,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  2096.053,
+                        "queue_ms":  1436,
+                        "worker_ms":  641,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  2098.062,
+                        "queue_ms":  266,
+                        "worker_ms":  440,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  713.054,
+                        "queue_ms":  0,
+                        "worker_ms":  683,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  1273.472,
+                        "queue_ms":  686,
+                        "worker_ms":  584,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  2457.094,
+                        "queue_ms":  1845,
+                        "worker_ms":  591,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  2457.109,
+                        "queue_ms":  1273,
+                        "worker_ms":  566,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  563.239,
+                        "queue_ms":  1,
+                        "worker_ms":  550,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  1723.382,
+                        "queue_ms":  1140,
+                        "worker_ms":  567,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  2279.061,
+                        "queue_ms":  1716,
+                        "worker_ms":  531,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  2280.061,
+                        "queue_ms":  551,
+                        "worker_ms":  582,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  1746.08,
+                        "queue_ms":  1198,
+                        "worker_ms":  541,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  1747.572,
+                        "queue_ms":  0,
+                        "worker_ms":  552,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  2377.605,
+                        "queue_ms":  1737,
+                        "worker_ms":  622,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  2377.605,
+                        "queue_ms":  549,
+                        "worker_ms":  642,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  495.881,
+                        "queue_ms":  0,
+                        "worker_ms":  480,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  561.611,
+                        "queue_ms":  0,
+                        "worker_ms":  535,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  622.395,
+                        "queue_ms":  0,
+                        "worker_ms":  589,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "mutation",
+                        "external_ms":  659.916,
+                        "queue_ms":  1,
+                        "worker_ms":  639,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "resolution",
+                        "external_ms":  161.881,
+                        "queue_ms":  0,
+                        "worker_ms":  154,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "resolution",
+                        "external_ms":  122.732,
+                        "queue_ms":  0,
+                        "worker_ms":  114,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "resolution",
+                        "external_ms":  153.589,
+                        "queue_ms":  0,
+                        "worker_ms":  127,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "resolution",
+                        "external_ms":  123.255,
+                        "queue_ms":  0,
+                        "worker_ms":  100,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "resolution",
+                        "external_ms":  154.111,
+                        "queue_ms":  0,
+                        "worker_ms":  148,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "resolution",
+                        "external_ms":  184.856,
+                        "queue_ms":  0,
+                        "worker_ms":  162,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "resolution",
+                        "external_ms":  154.432,
+                        "queue_ms":  0,
+                        "worker_ms":  129,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "resolution",
+                        "external_ms":  124.214,
+                        "queue_ms":  0,
+                        "worker_ms":  115,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "resolution",
+                        "external_ms":  123.67,
+                        "queue_ms":  0,
+                        "worker_ms":  120,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "resolution",
+                        "external_ms":  190.041,
+                        "queue_ms":  0,
+                        "worker_ms":  157,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  374.642,
+                        "queue_ms":  0,
+                        "worker_ms":  366,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  1096.224,
+                        "queue_ms":  0,
+                        "worker_ms":  1082,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  938.799,
+                        "queue_ms":  0,
+                        "worker_ms":  918,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  871.098,
+                        "queue_ms":  0,
+                        "worker_ms":  847,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  187.378,
+                        "queue_ms":  0,
+                        "worker_ms":  175,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  688.78,
+                        "queue_ms":  0,
+                        "worker_ms":  668,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  966.3,
+                        "queue_ms":  0,
+                        "worker_ms":  932,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  689.466,
+                        "queue_ms":  0,
+                        "worker_ms":  676,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  220.805,
+                        "queue_ms":  0,
+                        "worker_ms":  202,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  721.12,
+                        "queue_ms":  0,
+                        "worker_ms":  701,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  783.701,
+                        "queue_ms":  0,
+                        "worker_ms":  749,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  784.894,
+                        "queue_ms":  0,
+                        "worker_ms":  770,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  492.213,
+                        "queue_ms":  0,
+                        "worker_ms":  490,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  721.365,
+                        "queue_ms":  0,
+                        "worker_ms":  711,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  909.862,
+                        "queue_ms":  0,
+                        "worker_ms":  895,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  867.922,
+                        "queue_ms":  0,
+                        "worker_ms":  866,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  187.056,
+                        "queue_ms":  0,
+                        "worker_ms":  166,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  844.181,
+                        "queue_ms":  0,
+                        "worker_ms":  824,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  874.297,
+                        "queue_ms":  0,
+                        "worker_ms":  853,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  809.562,
+                        "queue_ms":  0,
+                        "worker_ms":  798,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  219.282,
+                        "queue_ms":  0,
+                        "worker_ms":  194,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  840.518,
+                        "queue_ms":  0,
+                        "worker_ms":  819,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  872.484,
+                        "queue_ms":  0,
+                        "worker_ms":  846,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  778.8,
+                        "queue_ms":  0,
+                        "worker_ms":  771,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  219.546,
+                        "queue_ms":  0,
+                        "worker_ms":  188,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  649.136,
+                        "queue_ms":  0,
+                        "worker_ms":  643,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  1004.874,
+                        "queue_ms":  0,
+                        "worker_ms":  983,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  778.541,
+                        "queue_ms":  0,
+                        "worker_ms":  755,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  248.066,
+                        "queue_ms":  0,
+                        "worker_ms":  241,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  752.376,
+                        "queue_ms":  0,
+                        "worker_ms":  746,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  843.77,
+                        "queue_ms":  0,
+                        "worker_ms":  822,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  688.042,
+                        "queue_ms":  0,
+                        "worker_ms":  681,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  251.112,
+                        "queue_ms":  0,
+                        "worker_ms":  233,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  719.083,
+                        "queue_ms":  0,
+                        "worker_ms":  708,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  809.662,
+                        "queue_ms":  0,
+                        "worker_ms":  793,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  719.998,
+                        "queue_ms":  0,
+                        "worker_ms":  716,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  218.633,
+                        "queue_ms":  0,
+                        "worker_ms":  185,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  746.566,
+                        "queue_ms":  0,
+                        "worker_ms":  743,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  813.488,
+                        "queue_ms":  0,
+                        "worker_ms":  805,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  715.803,
+                        "queue_ms":  0,
+                        "worker_ms":  709,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  154.664,
+                        "queue_ms":  0,
+                        "worker_ms":  151,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  624.51,
+                        "queue_ms":  0,
+                        "worker_ms":  614,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  879.28,
+                        "queue_ms":  0,
+                        "worker_ms":  865,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  751.078,
+                        "queue_ms":  0,
+                        "worker_ms":  739,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  373.426,
+                        "queue_ms":  0,
+                        "worker_ms":  346,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  845.45,
+                        "queue_ms":  0,
+                        "worker_ms":  823,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  842.519,
+                        "queue_ms":  0,
+                        "worker_ms":  814,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  749.199,
+                        "queue_ms":  0,
+                        "worker_ms":  730,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  311.541,
+                        "queue_ms":  0,
+                        "worker_ms":  307,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  725.596,
+                        "queue_ms":  0,
+                        "worker_ms":  706,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  871.137,
+                        "queue_ms":  0,
+                        "worker_ms":  855,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  720.467,
+                        "queue_ms":  0,
+                        "worker_ms":  697,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  407.75,
+                        "queue_ms":  0,
+                        "worker_ms":  396,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  744.259,
+                        "queue_ms":  0,
+                        "worker_ms":  714,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  843.295,
+                        "queue_ms":  0,
+                        "worker_ms":  834,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  652.419,
+                        "queue_ms":  0,
+                        "worker_ms":  649,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  310.432,
+                        "queue_ms":  0,
+                        "worker_ms":  288,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  785.6,
+                        "queue_ms":  0,
+                        "worker_ms":  764,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  839.766,
+                        "queue_ms":  0,
+                        "worker_ms":  818,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  720.437,
+                        "queue_ms":  0,
+                        "worker_ms":  698,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  186.179,
+                        "queue_ms":  0,
+                        "worker_ms":  181,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  996.736,
+                        "queue_ms":  0,
+                        "worker_ms":  971,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  845.652,
+                        "queue_ms":  0,
+                        "worker_ms":  841,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  745.434,
+                        "queue_ms":  0,
+                        "worker_ms":  741,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  216.326,
+                        "queue_ms":  0,
+                        "worker_ms":  204,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  747.964,
+                        "queue_ms":  0,
+                        "worker_ms":  738,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  815.401,
+                        "queue_ms":  0,
+                        "worker_ms":  786,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  749.31,
+                        "queue_ms":  0,
+                        "worker_ms":  721,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  217.804,
+                        "queue_ms":  0,
+                        "worker_ms":  205,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  782.891,
+                        "queue_ms":  0,
+                        "worker_ms":  772,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  809.994,
+                        "queue_ms":  0,
+                        "worker_ms":  799,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  719.194,
+                        "queue_ms":  0,
+                        "worker_ms":  700,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  249.486,
+                        "queue_ms":  0,
+                        "worker_ms":  222,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  718.282,
+                        "queue_ms":  0,
+                        "worker_ms":  715,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  870.976,
+                        "queue_ms":  0,
+                        "worker_ms":  841,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  719.329,
+                        "queue_ms":  0,
+                        "worker_ms":  695,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "status",
+                        "external_ms":  245.494,
+                        "queue_ms":  0,
+                        "worker_ms":  214,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "list",
+                        "external_ms":  782.648,
+                        "queue_ms":  0,
+                        "worker_ms":  763,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "search",
+                        "external_ms":  813.058,
+                        "queue_ms":  0,
+                        "worker_ms":  799,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "read",
+                        "external_ms":  775.843,
+                        "queue_ms":  0,
+                        "worker_ms":  769,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "queue_burst",
+                        "external_ms":  157.644,
+                        "queue_ms":  0,
+                        "worker_ms":  132,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "queue_burst",
+                        "external_ms":  405.442,
+                        "queue_ms":  154,
+                        "worker_ms":  235,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "queue_burst",
+                        "external_ms":  624.563,
+                        "queue_ms":  403,
+                        "worker_ms":  198,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "queue_burst",
+                        "external_ms":  968.306,
+                        "queue_ms":  621,
+                        "worker_ms":  314,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "projection",
+                        "external_ms":  17200.629,
+                        "queue_ms":  0,
+                        "worker_ms":  17175,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "projection",
+                        "external_ms":  4773.971,
+                        "queue_ms":  0,
+                        "worker_ms":  4754,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "execution",
+                        "external_ms":  134273,
+                        "queue_ms":  0,
+                        "worker_ms":  134246,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "execution",
+                        "external_ms":  107501.975,
+                        "queue_ms":  0,
+                        "worker_ms":  107486,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "checkpoint",
+                        "external_ms":  3158.266,
+                        "queue_ms":  0,
+                        "worker_ms":  3147,
+                        "automatic_concurrency_retries":  0
+                    },
+                    {
+                        "operation":  "checkpoint",
+                        "external_ms":  3309.953,
+                        "queue_ms":  0,
+                        "worker_ms":  3306,
+                        "automatic_concurrency_retries":  0
+                    }
+                ],
+    "safety":  {
+                   "target_source_modified":  false,
+                   "disposable_remote_removed":  true,
+                   "fixture_head_changed":  false,
+                   "push_performed":  false
+               }
+}

@@ -53,7 +53,9 @@ bypass a failed CAS by writing outside Sunlight.
    `execution_run` on the exact combined view.
 6. Inspect output classification. Generated or source-like outputs enter source
    truth only through explicit `execution_promote_output`; ignored build/cache
-   output should not be promoted.
+   output should not be promoted. Promotion accepts one classified regular file
+   up to 2 MiB; keep denied output local-only and reduce or split legitimate
+   larger generated source before retrying.
 7. Create a checkpoint using passing evidence that matches the exact view and
    tree. Materialize an inspection projection only when a filesystem consumer
    needs one.

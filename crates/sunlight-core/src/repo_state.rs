@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -26,6 +26,20 @@ use crate::resolver::{
 };
 
 pub const REPO_STATE_SCHEMA_VERSION: u32 = 1;
+
+struct BlobReadCache {
+    load_bytes: bool,
+    bytes: BTreeMap<String, Vec<u8>>,
+}
+
+impl BlobReadCache {
+    fn new(load_bytes: bool) -> Self {
+        Self {
+            load_bytes,
+            bytes: BTreeMap::new(),
+        }
+    }
+}
 
 const PROJECTION_CACHE_SCHEMA_VERSION: u32 = 1;
 const PROJECTION_CACHE_ROOT: &str = ".sunlight/cache/projections/v1";
@@ -66,6 +80,7 @@ pub struct RealRepoState {
     pub base_resolved_view_id: String,
     pub resolved_view_id: String,
     pub tree_hash: String,
+    pub current_topic_frontier: BTreeMap<String, String>,
     pub topic_id: Option<String>,
     pub topic_slug: Option<String>,
     pub topic_display_name: Option<String>,
@@ -253,6 +268,7 @@ pub struct RealProjectionSnapshot {
     pub purpose: String,
     pub resolved_view_id: String,
     pub tree_hash: String,
+    pub topic_frontier: BTreeMap<String, String>,
     pub manifest_digest: String,
     pub created_from_content_tree: String,
     pub materialized_root: Option<String>,
@@ -328,6 +344,7 @@ pub struct RealExecutionSnapshot {
     pub working_directory: String,
     pub exit_code: Option<i32>,
     pub status: String,
+    pub runner_process_id: Option<u32>,
     pub command_started: bool,
     pub timed_out: bool,
     pub termination_reason: Option<String>,
@@ -588,6 +605,7 @@ impl RealRepoState {
             base_resolved_view_id: "view_base_0001".to_string(),
             resolved_view_id: "view_base_0001".to_string(),
             tree_hash,
+            current_topic_frontier: BTreeMap::new(),
             topic_id: None,
             topic_slug: None,
             topic_display_name: None,
@@ -614,16 +632,35 @@ impl RealRepoState {
     }
 
     pub fn load(repo_root: &Path) -> Result<Self, RepoStateError> {
+        Self::load_with_blob_mode(repo_root, true)
+    }
+
+    pub fn load_metadata(repo_root: &Path) -> Result<Self, RepoStateError> {
+        Self::load_with_blob_mode(repo_root, false)
+    }
+
+    fn load_with_blob_mode(
+        repo_root: &Path,
+        load_blob_bytes: bool,
+    ) -> Result<Self, RepoStateError> {
         let _writer_lock = RepositoryWriterLock::acquire(repo_root)?;
         recover_state_publication(repo_root)?;
         recover_publication_outbox(repo_root)?;
         let path = real_state_path(repo_root);
-        let state = Self::load_from_path(repo_root, &path)?;
+        let state = Self::load_from_path_with_blob_mode(repo_root, &path, load_blob_bytes)?;
         state.reconcile_session_generation_records(repo_root)?;
         Ok(state)
     }
 
     fn load_from_path(repo_root: &Path, path: &Path) -> Result<Self, RepoStateError> {
+        Self::load_from_path_with_blob_mode(repo_root, path, true)
+    }
+
+    fn load_from_path_with_blob_mode(
+        repo_root: &Path,
+        path: &Path,
+        load_blob_bytes: bool,
+    ) -> Result<Self, RepoStateError> {
         let body = fs::read(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 RepoStateError::NotInitialized {
@@ -644,10 +681,13 @@ impl RealRepoState {
                 format!("unsupported schema_version `{schema_version}`"),
             ));
         }
+        let mut blob_cache = BlobReadCache::new(load_blob_bytes);
         let entries = required_array(&object, "entries", &path)?
             .iter()
-            .map(|entry| parse_entry(repo_root, entry, &path))
+            .map(|entry| parse_entry(repo_root, entry, &path, &mut blob_cache))
             .collect::<Result<Vec<_>, _>>()?;
+        let compact_entries = optional_bool(&object, "entries_compact", &path)?.unwrap_or(false);
+        let current_topic_frontier = parse_string_map(&object, "current_topic_frontier", &path)?;
         let quarantine = optional_array(&object, "quarantine", &path)?
             .iter()
             .map(|entry| parse_quarantine_entry(entry, &path))
@@ -672,20 +712,28 @@ impl RealRepoState {
             .iter()
             .map(|generation| parse_session_generation(generation, &path))
             .collect::<Result<Vec<_>, _>>()?;
-        let base_entries = match optional_array_field(&object, "base_entries") {
+        let base_entries = match optional_array_field(&object, "base_entries_compact") {
             Some(values) => values
                 .iter()
-                .map(|entry| parse_entry(repo_root, entry, &path))
+                .map(|entry| parse_compact_entry(repo_root, entry, &path, &mut blob_cache))
                 .collect::<Result<Vec<_>, _>>()?,
-            None => entries.clone(),
+            None => match optional_array_field(&object, "base_entries") {
+                Some(values) => values
+                    .iter()
+                    .map(|entry| parse_entry(repo_root, entry, &path, &mut blob_cache))
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => entries.clone(),
+            },
         };
         let operations = optional_array(&object, "operations", &path)?
             .iter()
-            .map(|operation| parse_operation(repo_root, operation, &path))
+            .map(|operation| parse_operation(repo_root, operation, &path, &mut blob_cache))
             .collect::<Result<Vec<_>, _>>()?;
         let projections = optional_array(&object, "projections", &path)?
             .iter()
-            .map(|projection| parse_projection_snapshot(repo_root, projection, &path))
+            .map(|projection| {
+                parse_projection_snapshot(repo_root, projection, &path, &mut blob_cache)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let executions = optional_array(&object, "executions", &path)?
             .iter()
@@ -697,7 +745,9 @@ impl RealRepoState {
             .collect::<Result<Vec<_>, _>>()?;
         let checkpoints = optional_array(&object, "checkpoints", &path)?
             .iter()
-            .map(|checkpoint| parse_checkpoint_snapshot(repo_root, checkpoint, &path))
+            .map(|checkpoint| {
+                parse_checkpoint_snapshot(repo_root, checkpoint, &path, &mut blob_cache)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let export_maps = optional_array(&object, "export_maps", &path)?
             .iter()
@@ -809,6 +859,7 @@ impl RealRepoState {
             base_resolved_view_id: required_string(&object, "base_resolved_view_id", &path)?,
             resolved_view_id: required_string(&object, "resolved_view_id", &path)?,
             tree_hash: required_string(&object, "tree_hash", &path)?,
+            current_topic_frontier,
             topic_id,
             topic_slug,
             topic_display_name,
@@ -831,10 +882,177 @@ impl RealRepoState {
             quarantine,
         };
         state.sync_compat_fields();
+        if !compact_entries
+            && state.current_topic_frontier.is_empty()
+            && state.resolved_view_id != state.base_resolved_view_id
+        {
+            if let Some(session) = state
+                .sessions
+                .iter()
+                .find(|session| session.resolved_view_id == state.resolved_view_id)
+            {
+                state.current_topic_frontier = session.topic_frontier.clone();
+            }
+        }
+        if compact_entries {
+            if state.current_topic_frontier.is_empty()
+                && state.resolved_view_id == state.base_resolved_view_id
+            {
+                if real_tree_hash(&state.base_entries) != state.tree_hash {
+                    return Err(invalid_state(
+                        &path,
+                        "compact base view does not reproduce its persisted tree identity",
+                    ));
+                }
+                state.entries = state.base_entries.clone();
+            } else {
+                let resolved = state.resolve_view(
+                    state
+                        .current_topic_frontier
+                        .iter()
+                        .map(|(topic_id, revision_id)| TopicRevisionSelection {
+                            topic_id: topic_id.clone(),
+                            revision_id: revision_id.clone(),
+                        })
+                        .collect(),
+                );
+                if !resolved.result.conflict_free()
+                    || resolved.result.resolved_view_id != state.resolved_view_id
+                    || resolved
+                        .result
+                        .tree_identity
+                        .as_ref()
+                        .map(|tree| tree.tree_hash.as_str())
+                        != Some(state.tree_hash.as_str())
+                {
+                    return Err(invalid_state(
+                        &path,
+                        "compact current view frontier does not reproduce its persisted view/tree identity",
+                    ));
+                }
+                state.entries = resolved.entries;
+            }
+        }
+        if load_blob_bytes {
+            state.hydrate_compact_snapshot_entries(&path)?;
+        }
         state
             .entries
             .sort_by(|left, right| left.path.cmp(&right.path));
         Ok(state)
+    }
+
+    fn hydrate_compact_snapshot_entries(
+        &mut self,
+        state_path: &Path,
+    ) -> Result<(), RepoStateError> {
+        let mut resolved_entries = BTreeMap::<(String, String), Vec<RealArtifactEntry>>::new();
+        resolved_entries.insert(
+            (self.resolved_view_id.clone(), self.tree_hash.clone()),
+            self.entries.clone(),
+        );
+
+        let projection_requests = self
+            .projections
+            .iter()
+            .enumerate()
+            .filter(|(_, projection)| projection.entries.is_empty())
+            .map(|(index, projection)| {
+                (
+                    index,
+                    projection.resolved_view_id.clone(),
+                    projection.tree_hash.clone(),
+                    projection.topic_frontier.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (index, view_id, tree_hash, frontier) in projection_requests {
+            let entries = self.compact_snapshot_entries(
+                state_path,
+                &view_id,
+                &tree_hash,
+                &frontier,
+                &mut resolved_entries,
+            )?;
+            self.projections[index].entries = entries;
+        }
+
+        let checkpoint_requests = self
+            .checkpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, checkpoint)| checkpoint.entries.is_empty())
+            .map(|(index, checkpoint)| {
+                (
+                    index,
+                    checkpoint.resolved_view_id.clone(),
+                    checkpoint.tree_hash.clone(),
+                    checkpoint.topic_frontier.iter().cloned().collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (index, view_id, tree_hash, frontier) in checkpoint_requests {
+            let entries = self.compact_snapshot_entries(
+                state_path,
+                &view_id,
+                &tree_hash,
+                &frontier,
+                &mut resolved_entries,
+            )?;
+            self.checkpoints[index].entries = entries;
+        }
+        Ok(())
+    }
+
+    fn compact_snapshot_entries(
+        &self,
+        state_path: &Path,
+        view_id: &str,
+        tree_hash: &str,
+        frontier: &BTreeMap<String, String>,
+        cache: &mut BTreeMap<(String, String), Vec<RealArtifactEntry>>,
+    ) -> Result<Vec<RealArtifactEntry>, RepoStateError> {
+        let key = (view_id.to_string(), tree_hash.to_string());
+        if let Some(entries) = cache.get(&key) {
+            return Ok(entries.clone());
+        }
+        if frontier.is_empty() && view_id == self.base_resolved_view_id {
+            if real_tree_hash(&self.base_entries) != tree_hash {
+                return Err(invalid_state(
+                    state_path,
+                    format!("compact base snapshot does not reproduce tree `{tree_hash}`"),
+                ));
+            }
+            cache.insert(key, self.base_entries.clone());
+            return Ok(self.base_entries.clone());
+        }
+        let resolved = self.resolve_view(
+            frontier
+                .iter()
+                .map(|(topic_id, revision_id)| TopicRevisionSelection {
+                    topic_id: topic_id.clone(),
+                    revision_id: revision_id.clone(),
+                })
+                .collect(),
+        );
+        if !resolved.result.conflict_free()
+            || resolved.result.resolved_view_id != view_id
+            || resolved
+                .result
+                .tree_identity
+                .as_ref()
+                .map(|tree| tree.tree_hash.as_str())
+                != Some(tree_hash)
+        {
+            return Err(invalid_state(
+                state_path,
+                format!(
+                    "compact snapshot frontier does not reproduce view `{view_id}` and tree `{tree_hash}`"
+                ),
+            ));
+        }
+        cache.insert(key, resolved.entries.clone());
+        Ok(resolved.entries)
     }
 
     pub fn save(&self, repo_root: &Path) -> Result<(), RepoStateError> {
@@ -879,7 +1097,7 @@ impl RealRepoState {
         recover_state_publication(repo_root)?;
         recover_publication_outbox(repo_root)?;
         let actual_sequence = if path.exists() {
-            Some(Self::load_from_path(repo_root, &path)?.publication_sequence)
+            Some(read_publication_sequence(&path)?)
         } else {
             None
         };
@@ -907,23 +1125,46 @@ impl RealRepoState {
     }
 
     pub fn persist_blobs(&self, repo_root: &Path) -> Result<(), RepoStateError> {
+        let mut persisted = BTreeSet::new();
+        let mut existing_metadata_blobs = None;
+        let mut persist = |content_hash: &str, bytes: &[u8]| -> Result<(), RepoStateError> {
+            if !persisted.insert(content_hash.to_string()) {
+                return Ok(());
+            }
+            if bytes.is_empty() && content_hash != real_content_hash(&[]) {
+                let inventory = match &existing_metadata_blobs {
+                    Some(inventory) => inventory,
+                    None => {
+                        existing_metadata_blobs.insert(existing_real_blob_inventory(repo_root)?)
+                    }
+                };
+                if inventory.contains(content_hash.trim_start_matches("sha256:")) {
+                    return Ok(());
+                }
+                return Err(RepoStateError::InvalidState {
+                    path: real_blob_path(repo_root, content_hash),
+                    message: "metadata-only state references a missing content blob".to_string(),
+                });
+            }
+            persist_blob(repo_root, content_hash, bytes)
+        };
         for entry in self.entries.iter().chain(self.base_entries.iter()) {
-            persist_blob(repo_root, &entry.content_hash, &entry.bytes)?;
+            persist(&entry.content_hash, &entry.bytes)?;
         }
         for operation in &self.operations {
-            persist_blob(repo_root, &operation.result_content_hash, &operation.bytes)?;
+            persist(&operation.result_content_hash, &operation.bytes)?;
             for effect in &operation.effects {
-                persist_blob(repo_root, &effect.result_content_hash, &effect.bytes)?;
+                persist(&effect.result_content_hash, &effect.bytes)?;
             }
         }
         for projection in &self.projections {
             for entry in &projection.entries {
-                persist_blob(repo_root, &entry.content_hash, &entry.bytes)?;
+                persist(&entry.content_hash, &entry.bytes)?;
             }
         }
         for checkpoint in &self.checkpoints {
             for entry in &checkpoint.entries {
-                persist_blob(repo_root, &entry.content_hash, &entry.bytes)?;
+                persist(&entry.content_hash, &entry.bytes)?;
             }
         }
         Ok(())
@@ -1004,6 +1245,11 @@ impl RealRepoState {
             "tree_hash".to_string(),
             JsonValue::String(self.tree_hash.clone()),
         );
+        object.insert(
+            "current_topic_frontier".to_string(),
+            string_map_json(&self.current_topic_frontier),
+        );
+        object.insert("entries_compact".to_string(), JsonValue::Bool(true));
         object.insert("topic_id".to_string(), optional_json(&self.topic_id));
         object.insert("topic_slug".to_string(), optional_json(&self.topic_slug));
         object.insert(
@@ -1041,9 +1287,10 @@ impl RealRepoState {
                     .collect(),
             ),
         );
+        object.insert("base_entries".to_string(), JsonValue::Array(Vec::new()));
         object.insert(
-            "base_entries".to_string(),
-            JsonValue::Array(self.base_entries.iter().map(entry_json).collect()),
+            "base_entries_compact".to_string(),
+            JsonValue::Array(self.base_entries.iter().map(compact_entry_json).collect()),
         );
         object.insert(
             "operations".to_string(),
@@ -1094,10 +1341,7 @@ impl RealRepoState {
                     .collect(),
             ),
         );
-        object.insert(
-            "entries".to_string(),
-            JsonValue::Array(self.entries.iter().map(entry_json).collect()),
-        );
+        object.insert("entries".to_string(), JsonValue::Array(Vec::new()));
         object.insert(
             "quarantine".to_string(),
             JsonValue::Array(self.quarantine.iter().map(quarantine_json).collect()),
@@ -1284,18 +1528,55 @@ pub fn expanded_operation_order(
     state: &RealRepoState,
     frontier: &BTreeMap<String, String>,
 ) -> Vec<String> {
-    let mut operation_ids = Vec::new();
+    let mut remaining = Vec::new();
     for (topic_id, head_revision_id) in frontier {
         for operation in state
             .operations
             .iter()
             .filter(|operation| operation.topic_id == *topic_id)
         {
-            operation_ids.push(operation.operation_transaction_id.clone());
+            remaining.push(operation);
             if operation.topic_revision_id == *head_revision_id {
                 break;
             }
         }
+    }
+
+    let mut operation_ids = Vec::new();
+    while !remaining.is_empty() {
+        let remaining_revisions = remaining
+            .iter()
+            .map(|operation| operation.topic_revision_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut ready = remaining
+            .iter()
+            .enumerate()
+            .filter(|(index, operation)| {
+                !operation
+                    .dependency_revision_ids
+                    .iter()
+                    .any(|dependency| remaining_revisions.contains(dependency.as_str()))
+                    && !remaining[..*index]
+                        .iter()
+                        .any(|earlier| earlier.topic_id == operation.topic_id)
+            })
+            .map(|(index, operation)| {
+                (
+                    index,
+                    operation.topic_id.as_str(),
+                    operation.topic_revision_id.as_str(),
+                    operation.operation_transaction_id.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        ready.sort_by(|left, right| {
+            left.1
+                .cmp(right.1)
+                .then(left.2.cmp(right.2))
+                .then(left.3.cmp(right.3))
+        });
+        let index = ready.first().map(|(index, _, _, _)| *index).unwrap_or(0);
+        operation_ids.push(remaining.remove(index).operation_transaction_id.clone());
     }
     operation_ids
 }
@@ -1334,7 +1615,7 @@ fn expanded_same_artifact_conflicts(
     by_artifact
         .into_iter()
         .filter_map(|(artifact_id, operations)| {
-            if operations.len() <= 1 {
+            if operations.len() <= 1 || real_operations_form_dependency_chain(&operations) {
                 return None;
             }
             let candidate_hashes = operations
@@ -1398,6 +1679,41 @@ fn expanded_same_artifact_conflicts(
             })
         })
         .collect()
+}
+
+fn real_operations_form_dependency_chain(
+    operations: &[(&RealOperationRecord, RealOperationEffect)],
+) -> bool {
+    let mut remaining = operations.to_vec();
+    let mut previous: Option<(&RealOperationRecord, RealOperationEffect)> = None;
+
+    while !remaining.is_empty() {
+        let candidates = remaining
+            .iter()
+            .enumerate()
+            .filter(|(_, (operation, effect))| match &previous {
+                Some((previous_operation, previous_effect)) => {
+                    operation
+                        .dependency_revision_ids
+                        .contains(&previous_operation.topic_revision_id)
+                        && effect.base_content_hash.as_deref()
+                            == Some(previous_effect.result_content_hash.as_str())
+                }
+                None => !operation.dependency_revision_ids.iter().any(|dependency| {
+                    remaining
+                        .iter()
+                        .any(|(candidate, _)| candidate.topic_revision_id == *dependency)
+                }),
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return false;
+        }
+        previous = Some(remaining.remove(candidates[0]));
+    }
+
+    true
 }
 
 fn materialize_real_resolved_entries(
@@ -1513,10 +1829,10 @@ pub fn scan_real_projection_files_with_quarantine(
             })?;
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| io_error(&path, "failed to inspect projection path", error))?;
-        if metadata.file_type().is_symlink() {
+        if projection_metadata_is_reparse(&metadata) {
             return Err(invalid_state(
                 &path,
-                "projection symlinks are not supported by the local MVP scanner",
+                "projection reparse points and symlinks are not supported by the local scanner",
             ));
         }
         if metadata.is_dir() {
@@ -1551,9 +1867,14 @@ fn scan_real_repo_files_fallback(
         if matches!(name.to_str(), Some(".git" | ".sunlight")) {
             continue;
         }
-        let metadata = child
-            .metadata()
+        let metadata = fs::symlink_metadata(&path)
             .map_err(|error| io_error(&path, "failed to inspect worktree path", error))?;
+        if projection_metadata_is_reparse(&metadata) {
+            return Err(invalid_state(
+                &path,
+                "worktree reparse points and symlinks are not supported by the local scanner",
+            ));
+        }
         if metadata.is_dir() {
             scan_real_repo_files_fallback(repo_root, &path, entries, quarantine)?;
         } else if metadata.is_file() {
@@ -1615,8 +1936,20 @@ fn ingest_real_repo_path(
     quarantine: &mut Vec<RealQuarantineEntry>,
 ) -> Result<(), RepoStateError> {
     let path = repo_root.join(relative);
-    let metadata = fs::metadata(&path)
-        .map_err(|error| io_error(&path, "failed to inspect worktree path", error))?;
+    if !validate_worktree_path_components(repo_root, relative)? {
+        return Ok(());
+    }
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error(&path, "failed to inspect worktree path", error)),
+    };
+    if projection_metadata_is_reparse(&metadata) {
+        return Err(invalid_state(
+            &path,
+            "worktree reparse points and symlinks are not supported by the local scanner",
+        ));
+    }
     if !metadata.is_file() {
         return Ok(());
     }
@@ -1643,6 +1976,40 @@ fn ingest_real_repo_path(
         bytes,
     });
     Ok(())
+}
+
+fn validate_worktree_path_components(
+    repo_root: &Path,
+    relative: &str,
+) -> Result<bool, RepoStateError> {
+    let mut current = repo_root.to_path_buf();
+    for component in Path::new(relative).components() {
+        let Component::Normal(component) = component else {
+            return Err(invalid_state(
+                repo_root.join(relative),
+                "worktree path contains a non-relative component",
+            ));
+        };
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(io_error(
+                    &current,
+                    "failed to inspect worktree path component",
+                    error,
+                ))
+            }
+        };
+        if projection_metadata_is_reparse(&metadata) {
+            return Err(invalid_state(
+                &current,
+                "worktree path traverses a reparse point or symlink",
+            ));
+        }
+    }
+    Ok(true)
 }
 
 fn looks_like_secret_value(value: &str, quoted: bool) -> bool {
@@ -1847,6 +2214,16 @@ pub fn real_state_path(repo_root: &Path) -> PathBuf {
         .join(".sunlight")
         .join("records")
         .join("native-state.json")
+}
+
+fn read_publication_sequence(path: &Path) -> Result<u64, RepoStateError> {
+    let body = fs::read(path)
+        .map_err(|error| io_error(path, "failed to read native Sunlight state", error))?;
+    let value = parse_json_record(&body)?;
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(path, "state root must be a JSON object"));
+    };
+    required_u64(&object, "publication_sequence", path)
 }
 
 #[cfg(debug_assertions)]
@@ -2125,12 +2502,7 @@ fn publish_committed_record_batch(
             .ok()
             .is_none_or(|existing| existing != bytes)
         {
-            durable_publish_json_bytes(
-                repo_root,
-                &final_path,
-                &bytes,
-                "batch_record_after_prepare",
-            )?;
+            publish_staged_derived_record(repo_root, &staged, &final_path, &bytes)?;
         }
         if run_failpoints {
             trigger_failpoint("batch_mid_derived_publication", &final_path)?;
@@ -2168,6 +2540,29 @@ fn publish_committed_record_batch(
         remove_dir_if_empty(local)?;
     }
     Ok(())
+}
+
+fn publish_staged_derived_record(
+    repo_root: &Path,
+    staged: &Path,
+    final_path: &Path,
+    canonical_bytes: &[u8],
+) -> Result<(), RepoStateError> {
+    if let Some(parent) = final_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            io_error(parent, "failed to create derived record directory", error)
+        })?;
+    }
+    trigger_failpoint("batch_record_after_prepare", final_path)?;
+    match fs::hard_link(staged, final_path) {
+        Ok(()) => Ok(()),
+        Err(_) => durable_publish_json_bytes(
+            repo_root,
+            final_path,
+            canonical_bytes,
+            "batch_record_after_prepare",
+        ),
+    }
 }
 
 fn validate_staged_publication_payloads(
@@ -2533,7 +2928,7 @@ fn publish_native_state(
     atomic_replace_file(&recovery.staged, canonical, Some(recovery.backup.as_path()))?;
     trigger_failpoint("state_after_replace", canonical)?;
 
-    RealRepoState::load_from_path(repo_root, canonical)?;
+    RealRepoState::load_from_path_with_blob_mode(repo_root, canonical, false)?;
     cleanup_state_recovery(&recovery)?;
     cleanup_recovery_evidence(&recovery)?;
     Ok(())
@@ -2544,7 +2939,7 @@ fn recover_state_publication(repo_root: &Path) -> Result<(), RepoStateError> {
     let recovery = state_recovery_paths(repo_root);
     if !recovery.journal.exists() {
         if canonical.exists() {
-            if RealRepoState::load_from_path(repo_root, &canonical).is_ok() {
+            if RealRepoState::load_from_path_with_blob_mode(repo_root, &canonical, false).is_ok() {
                 cleanup_state_recovery(&recovery)?;
                 return Ok(());
             }
@@ -2900,6 +3295,7 @@ fn atomic_replace_file(
         ) -> i32;
     }
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    const REPLACEFILE_IGNORE_MERGE_ERRORS: u32 = 0x2;
 
     if let Some(parent) = final_path.parent() {
         fs::create_dir_all(parent)
@@ -2949,7 +3345,7 @@ fn atomic_replace_file(
                 backup_wide
                     .as_ref()
                     .map_or(std::ptr::null(), |path| path.as_ptr()),
-                0,
+                REPLACEFILE_IGNORE_MERGE_ERRORS,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )
@@ -3010,11 +3406,44 @@ pub fn real_blob_path(repo_root: &Path, content_hash: &str) -> PathBuf {
 
 pub fn read_real_blob(repo_root: &Path, content_hash: &str) -> Result<Vec<u8>, RepoStateError> {
     let path = real_blob_path(repo_root, content_hash);
-    fs::read(&path).map_err(|error| io_error(&path, "failed to read content blob", error))
+    let bytes =
+        fs::read(&path).map_err(|error| io_error(&path, "failed to read content blob", error))?;
+    if real_content_hash(&bytes) != content_hash {
+        return Err(RepoStateError::InvalidState {
+            path,
+            message: "existing content blob is malformed; evidence was retained".to_string(),
+        });
+    }
+    Ok(bytes)
+}
+
+fn read_real_blob_cached(
+    repo_root: &Path,
+    content_hash: &str,
+    cache: &mut BlobReadCache,
+) -> Result<Vec<u8>, RepoStateError> {
+    if !cache.load_bytes {
+        return Ok(Vec::new());
+    }
+    if let Some(bytes) = cache.bytes.get(content_hash) {
+        return Ok(bytes.clone());
+    }
+    let bytes = read_real_blob(repo_root, content_hash)?;
+    cache.bytes.insert(content_hash.to_string(), bytes.clone());
+    Ok(bytes)
 }
 
 fn persist_blob(repo_root: &Path, content_hash: &str, bytes: &[u8]) -> Result<(), RepoStateError> {
     let path = real_blob_path(repo_root, content_hash);
+    if bytes.is_empty() && content_hash != real_content_hash(&[]) {
+        if path.is_file() {
+            return Ok(());
+        }
+        return Err(RepoStateError::InvalidState {
+            path,
+            message: "metadata-only state references a missing content blob".to_string(),
+        });
+    }
     if real_content_hash(bytes) != content_hash {
         return Err(RepoStateError::InvalidState {
             path,
@@ -3026,14 +3455,6 @@ fn persist_blob(repo_root: &Path, content_hash: &str, bytes: &[u8]) -> Result<()
             .map_err(|error| io_error(parent, "failed to create blob directory", error))?;
     }
     if path.exists() {
-        let existing = fs::read(&path)
-            .map_err(|error| io_error(&path, "failed to validate existing content blob", error))?;
-        if existing != bytes {
-            return Err(RepoStateError::InvalidState {
-                path,
-                message: "existing content blob is malformed; evidence was retained".to_string(),
-            });
-        }
         return Ok(());
     }
 
@@ -3055,6 +3476,32 @@ fn persist_blob(repo_root: &Path, content_hash: &str, bytes: &[u8]) -> Result<()
         remove_dir_if_empty(local_root)?;
     }
     Ok(())
+}
+
+fn existing_real_blob_inventory(repo_root: &Path) -> Result<BTreeSet<String>, RepoStateError> {
+    let root = repo_root
+        .join(".sunlight")
+        .join("objects")
+        .join("blobs")
+        .join("sha256");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(io_error(&root, "failed to inventory content blobs", error)),
+    };
+    let mut inventory = BTreeSet::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| io_error(&root, "failed to inventory content blob entry", error))?;
+        if entry
+            .file_type()
+            .map_err(|error| io_error(&entry.path(), "failed to inspect content blob", error))?
+            .is_file()
+        {
+            inventory.insert(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(inventory)
 }
 
 pub fn real_content_hash(bytes: &[u8]) -> String {
@@ -3187,9 +3634,13 @@ pub fn materialize_real_projection(
     }
     .stable_string();
     let cache = ensure_real_projection_cache_entry(repo_root, state, request, &cache_key)?;
-    let preferred = request
-        .required_strategy
-        .unwrap_or(RealProjectionStrategy::Reflink);
+    let preferred = request.required_strategy.unwrap_or_else(|| {
+        if request.writable_policy == WritablePolicy::ReadOnly {
+            RealProjectionStrategy::HardlinkReadonly
+        } else {
+            RealProjectionStrategy::Reflink
+        }
+    });
     let strategies = if preferred == RealProjectionStrategy::Copy {
         vec![RealProjectionStrategy::Copy]
     } else if request.fallback_to_copy {
@@ -3204,8 +3655,13 @@ pub fn materialize_real_projection(
         fs::create_dir_all(&staging).map_err(|error| {
             io_error(&staging, "failed to create projection staging root", error)
         })?;
-        let result =
-            materialize_real_projection_strategy(&cache.content_root, state, &staging, strategy);
+        let result = materialize_real_projection_strategy(
+            &cache.content_root,
+            state,
+            &staging,
+            strategy,
+            request.writable_policy,
+        );
         match result {
             Ok(attempt) => {
                 if let Err(error) = publish_projection_staging(root, &staging) {
@@ -3224,7 +3680,9 @@ pub fn materialize_real_projection(
                     .filter(|entry| !entry.tombstone)
                     .count() as u64;
                 let physically_materialized_bytes = match strategy {
-                    RealProjectionStrategy::Copy | RealProjectionStrategy::Reflink => Some(
+                    RealProjectionStrategy::Copy
+                    | RealProjectionStrategy::Reflink
+                    | RealProjectionStrategy::HardlinkReadonly => Some(
                         cache
                             .physically_materialized_bytes
                             .saturating_add(attempt.bytes_copied),
@@ -3428,7 +3886,7 @@ fn projection_cache_staging_identity(name: &str) -> Option<(u32, u128)> {
 }
 
 #[cfg(windows)]
-fn projection_cache_staging_process_may_be_live(process_id: u32) -> bool {
+pub fn process_may_be_live(process_id: u32) -> bool {
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     unsafe extern "system" {
         fn OpenProcess(
@@ -3437,6 +3895,7 @@ fn projection_cache_staging_process_may_be_live(process_id: u32) -> bool {
             process_id: u32,
         ) -> *mut std::ffi::c_void;
         fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        fn GetExitCodeProcess(handle: *mut std::ffi::c_void, exit_code: *mut u32) -> i32;
     }
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
     if handle.is_null() {
@@ -3445,14 +3904,18 @@ fn projection_cache_staging_process_may_be_live(process_id: u32) -> bool {
             Some(87) | Some(1168)
         );
     }
+    const STILL_ACTIVE: u32 = 259;
+    let mut exit_code = 0;
+    let live =
+        unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0 && exit_code == STILL_ACTIVE;
     unsafe {
         CloseHandle(handle);
     }
-    true
+    live
 }
 
 #[cfg(unix)]
-fn projection_cache_staging_process_may_be_live(process_id: u32) -> bool {
+pub fn process_may_be_live(process_id: u32) -> bool {
     if process_id > i32::MAX as u32 {
         return false;
     }
@@ -3467,7 +3930,7 @@ fn projection_cache_staging_process_may_be_live(process_id: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn projection_cache_staging_process_may_be_live(_process_id: u32) -> bool {
+pub fn process_may_be_live(_process_id: u32) -> bool {
     true
 }
 
@@ -3521,7 +3984,7 @@ fn cleanup_stale_projection_cache_staging(cache_root: &Path) -> usize {
             let (process_id, created_at_nanos) = projection_cache_staging_identity(name)?;
             if now_nanos.saturating_sub(created_at_nanos)
                 <= PROJECTION_CACHE_STAGING_STALE_AFTER_NANOS
-                || projection_cache_staging_process_may_be_live(process_id)
+                || process_may_be_live(process_id)
             {
                 return None;
             }
@@ -3793,6 +4256,49 @@ fn validate_real_projection_cache_entry(
     )?;
     if seen_files.len() != expected_files.len() {
         return Err("cache content tree is missing manifest files".to_string());
+    }
+    Ok(())
+}
+
+pub fn verify_real_readonly_projection(
+    projection_root: &Path,
+    expected_entries: &[RealArtifactEntry],
+) -> Result<(), RepoStateError> {
+    let expected_files = expected_entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .map(|entry| (PathBuf::from(&entry.path), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut expected_dirs = BTreeSet::new();
+    for path in expected_files.keys() {
+        let mut parent = path.parent();
+        while let Some(value) = parent {
+            if value.as_os_str().is_empty() {
+                break;
+            }
+            expected_dirs.insert(value.to_path_buf());
+            parent = value.parent();
+        }
+    }
+    let mut seen_files = BTreeSet::new();
+    validate_real_projection_cache_directory(
+        projection_root,
+        projection_root,
+        &expected_files,
+        &expected_dirs,
+        &mut seen_files,
+    )
+    .map_err(|message| {
+        invalid_state(
+            projection_root,
+            format!("read-only projection integrity verification failed: {message}"),
+        )
+    })?;
+    if seen_files.len() != expected_files.len() {
+        return Err(invalid_state(
+            projection_root,
+            "read-only projection is missing expected files",
+        ));
     }
     Ok(())
 }
@@ -4196,14 +4702,24 @@ fn materialize_real_projection_strategy(
     state: &RealRepoState,
     root: &Path,
     strategy: RealProjectionStrategy,
+    writable_policy: WritablePolicy,
 ) -> Result<StrategyAttemptMetrics, StrategyAttemptError> {
-    if matches!(
-        strategy,
-        RealProjectionStrategy::HardlinkReadonly | RealProjectionStrategy::OverlayCopyup
-    ) {
+    if strategy == RealProjectionStrategy::OverlayCopyup {
         return Err(StrategyAttemptError::Unsupported(
-            "the writable local MVP has no safe hardlink/copy-up or overlay implementation"
-                .to_string(),
+            "the writable local MVP has no safe overlay copy-up implementation".to_string(),
+        ));
+    }
+    if strategy == RealProjectionStrategy::HardlinkReadonly
+        && writable_policy != WritablePolicy::ReadOnly
+    {
+        return Err(StrategyAttemptError::Unsupported(
+            "read-only hardlinks require a read-only projection policy".to_string(),
+        ));
+    }
+    #[cfg(not(windows))]
+    if strategy == RealProjectionStrategy::HardlinkReadonly {
+        return Err(StrategyAttemptError::Unsupported(
+            "read-only hardlink cache protection is not enforced on this platform".to_string(),
         ));
     }
     let mut bytes_copied = 0u64;
@@ -4237,19 +4753,35 @@ fn materialize_real_projection_strategy(
                 bytes_cloned = bytes_cloned.saturating_add(cloned);
                 bytes_copied = bytes_copied.saturating_add(entry.bytes.len() as u64 - cloned);
             }
-            _ => unreachable!(),
+            RealProjectionStrategy::HardlinkReadonly => {
+                #[cfg(windows)]
+                fs::hard_link(&source, &path).map_err(|error| {
+                    StrategyAttemptError::Unsupported(format!(
+                        "failed to create a protected read-only hardlink: {error}"
+                    ))
+                })?;
+                #[cfg(not(windows))]
+                unreachable!();
+            }
+            RealProjectionStrategy::OverlayCopyup => unreachable!(),
         }
-        set_private_projection_permissions(&path, entry.executable)
-            .map_err(StrategyAttemptError::State)?;
-        let materialized = fs::read(&path).map_err(|error| {
-            StrategyAttemptError::State(io_error(&path, "failed to verify projection file", error))
-        })?;
-        if real_content_hash(&materialized) != entry.content_hash {
-            return Err(StrategyAttemptError::State(RepoStateError::InvalidState {
-                path,
-                message: "materialized projection content failed integrity verification"
-                    .to_string(),
-            }));
+        if strategy != RealProjectionStrategy::HardlinkReadonly {
+            set_private_projection_permissions(&path, entry.executable)
+                .map_err(StrategyAttemptError::State)?;
+            let materialized = fs::read(&path).map_err(|error| {
+                StrategyAttemptError::State(io_error(
+                    &path,
+                    "failed to verify projection file",
+                    error,
+                ))
+            })?;
+            if real_content_hash(&materialized) != entry.content_hash {
+                return Err(StrategyAttemptError::State(RepoStateError::InvalidState {
+                    path,
+                    message: "materialized projection content failed integrity verification"
+                        .to_string(),
+                }));
+            }
         }
     }
     if strategy == RealProjectionStrategy::Reflink && bytes_cloned == 0 {
@@ -4517,6 +5049,7 @@ fn parse_entry(
     repo_root: &Path,
     value: &JsonValue,
     state_path: &Path,
+    blob_cache: &mut BlobReadCache,
 ) -> Result<RealArtifactEntry, RepoStateError> {
     let JsonValue::Object(object) = value else {
         return Err(invalid_state(state_path, "entry must be a JSON object"));
@@ -4525,11 +5058,39 @@ fn parse_entry(
     Ok(RealArtifactEntry {
         path: required_string(object, "path", state_path)?,
         artifact_id: required_string(object, "artifact_id", state_path)?,
-        bytes: read_real_blob(repo_root, &content_hash)?,
+        bytes: read_real_blob_cached(repo_root, &content_hash, blob_cache)?,
         content_hash,
         executable: required_bool(object, "executable", state_path)?,
         classification: required_string(object, "classification", state_path)?,
         tombstone: required_bool(object, "tombstone", state_path)?,
+    })
+}
+
+fn parse_compact_entry(
+    repo_root: &Path,
+    value: &JsonValue,
+    state_path: &Path,
+    blob_cache: &mut BlobReadCache,
+) -> Result<RealArtifactEntry, RepoStateError> {
+    let JsonValue::Array(values) = value else {
+        return Err(invalid_state(state_path, "compact entry must be an array"));
+    };
+    let [JsonValue::String(path), JsonValue::String(artifact_id), JsonValue::String(content_hash), JsonValue::Bool(executable), JsonValue::String(classification), JsonValue::Bool(tombstone)] =
+        values.as_slice()
+    else {
+        return Err(invalid_state(
+            state_path,
+            "compact entry must contain path, artifact id, content hash, executable, classification, and tombstone",
+        ));
+    };
+    Ok(RealArtifactEntry {
+        path: path.clone(),
+        artifact_id: artifact_id.clone(),
+        bytes: read_real_blob_cached(repo_root, content_hash, blob_cache)?,
+        content_hash: content_hash.clone(),
+        executable: *executable,
+        classification: classification.clone(),
+        tombstone: *tombstone,
     })
 }
 
@@ -4670,6 +5231,7 @@ fn parse_operation(
     repo_root: &Path,
     value: &JsonValue,
     state_path: &Path,
+    blob_cache: &mut BlobReadCache,
 ) -> Result<RealOperationRecord, RepoStateError> {
     let JsonValue::Object(object) = value else {
         return Err(invalid_state(state_path, "operation must be a JSON object"));
@@ -4687,7 +5249,7 @@ fn parse_operation(
         .collect::<Result<Vec<_>, _>>()?;
     let effects = optional_array(object, "effects", state_path)?
         .iter()
-        .map(|value| parse_operation_effect(repo_root, value, state_path))
+        .map(|value| parse_operation_effect(repo_root, value, state_path, blob_cache))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(RealOperationRecord {
         operation_transaction_id: required_string(object, "operation_transaction_id", state_path)?,
@@ -4698,7 +5260,7 @@ fn parse_operation(
         path: required_string(object, "path", state_path)?,
         mutation: required_string(object, "mutation", state_path)?,
         base_content_hash: optional_string(object, "base_content_hash", state_path)?,
-        bytes: read_real_blob(repo_root, &result_content_hash)?,
+        bytes: read_real_blob_cached(repo_root, &result_content_hash, blob_cache)?,
         result_content_hash,
         authored_context_id: required_string(object, "authored_context_id", state_path)?,
         dependency_revision_ids,
@@ -4728,6 +5290,7 @@ fn parse_operation_effect(
     repo_root: &Path,
     value: &JsonValue,
     state_path: &Path,
+    blob_cache: &mut BlobReadCache,
 ) -> Result<RealOperationEffect, RepoStateError> {
     let JsonValue::Object(object) = value else {
         return Err(invalid_state(
@@ -4740,7 +5303,7 @@ fn parse_operation_effect(
         artifact_id: required_string(object, "artifact_id", state_path)?,
         path: required_string(object, "path", state_path)?,
         base_content_hash: optional_string(object, "base_content_hash", state_path)?,
-        bytes: read_real_blob(repo_root, &result_content_hash)?,
+        bytes: read_real_blob_cached(repo_root, &result_content_hash, blob_cache)?,
         result_content_hash,
         classification: required_string(object, "classification", state_path)?,
         executable: required_bool(object, "executable", state_path)?,
@@ -4752,6 +5315,7 @@ fn parse_projection_snapshot(
     repo_root: &Path,
     value: &JsonValue,
     state_path: &Path,
+    blob_cache: &mut BlobReadCache,
 ) -> Result<RealProjectionSnapshot, RepoStateError> {
     let JsonValue::Object(object) = value else {
         return Err(invalid_state(
@@ -4761,7 +5325,7 @@ fn parse_projection_snapshot(
     };
     let entries = required_array(object, "entries", state_path)?
         .iter()
-        .map(|entry| parse_entry(repo_root, entry, state_path))
+        .map(|entry| parse_entry(repo_root, entry, state_path, blob_cache))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(RealProjectionSnapshot {
         projection_id: required_string(object, "projection_id", state_path)?,
@@ -4769,6 +5333,7 @@ fn parse_projection_snapshot(
         purpose: required_string(object, "purpose", state_path)?,
         resolved_view_id: required_string(object, "resolved_view_id", state_path)?,
         tree_hash: required_string(object, "tree_hash", state_path)?,
+        topic_frontier: parse_string_map(object, "topic_frontier", state_path)?,
         manifest_digest: required_string(object, "manifest_digest", state_path)?,
         created_from_content_tree: required_string(
             object,
@@ -4996,6 +5561,8 @@ fn parse_execution_snapshot(
         working_directory: required_string(object, "working_directory", state_path)?,
         exit_code: optional_i32(object, "exit_code", state_path)?,
         status: required_string(object, "status", state_path)?,
+        runner_process_id: optional_u64(object, "runner_process_id", state_path)?
+            .and_then(|value| u32::try_from(value).ok()),
         command_started: optional_bool(object, "command_started", state_path)?.unwrap_or(true),
         timed_out: optional_bool(object, "timed_out", state_path)?.unwrap_or_else(|| {
             required_string(object, "status", state_path).is_ok_and(|value| value == "timeout")
@@ -5126,6 +5693,7 @@ fn parse_checkpoint_snapshot(
     repo_root: &Path,
     value: &JsonValue,
     state_path: &Path,
+    blob_cache: &mut BlobReadCache,
 ) -> Result<RealCheckpointSnapshot, RepoStateError> {
     let JsonValue::Object(object) = value else {
         return Err(invalid_state(
@@ -5135,7 +5703,7 @@ fn parse_checkpoint_snapshot(
     };
     let entries = required_array(object, "entries", state_path)?
         .iter()
-        .map(|entry| parse_entry(repo_root, entry, state_path))
+        .map(|entry| parse_entry(repo_root, entry, state_path, blob_cache))
         .collect::<Result<Vec<_>, _>>()?;
     let topic_frontier = optional_array(object, "topic_frontier", state_path)?
         .iter()
@@ -5185,12 +5753,14 @@ fn parse_checkpoint_evidence(
         ));
     }
     let result = match required_string(object, "result", state_path)?.as_str() {
+        "running" => ExecutionStatus::Running,
         "pass" => ExecutionStatus::Pass,
         "fail" => ExecutionStatus::Fail,
         "timeout" => ExecutionStatus::Timeout,
         "canceled" => ExecutionStatus::Canceled,
         "flaky" => ExecutionStatus::Flaky,
         "unknown" => ExecutionStatus::Unknown,
+        "interrupted" => ExecutionStatus::Interrupted,
         "policy_blocked" => ExecutionStatus::PolicyBlocked,
         value => {
             return Err(invalid_state(
@@ -5241,24 +5811,15 @@ fn parse_export_map_snapshot(
     })
 }
 
-fn entry_json(entry: &RealArtifactEntry) -> JsonValue {
-    let mut object = BTreeMap::new();
-    object.insert("path".to_string(), JsonValue::String(entry.path.clone()));
-    object.insert(
-        "artifact_id".to_string(),
+fn compact_entry_json(entry: &RealArtifactEntry) -> JsonValue {
+    JsonValue::Array(vec![
+        JsonValue::String(entry.path.clone()),
         JsonValue::String(entry.artifact_id.clone()),
-    );
-    object.insert(
-        "content_hash".to_string(),
         JsonValue::String(entry.content_hash.clone()),
-    );
-    object.insert("executable".to_string(), JsonValue::Bool(entry.executable));
-    object.insert(
-        "classification".to_string(),
+        JsonValue::Bool(entry.executable),
         JsonValue::String(entry.classification.clone()),
-    );
-    object.insert("tombstone".to_string(), JsonValue::Bool(entry.tombstone));
-    JsonValue::Object(object)
+        JsonValue::Bool(entry.tombstone),
+    ])
 }
 
 fn projection_snapshot_json(projection: &RealProjectionSnapshot) -> JsonValue {
@@ -5282,6 +5843,10 @@ fn projection_snapshot_json(projection: &RealProjectionSnapshot) -> JsonValue {
     object.insert(
         "tree_hash".to_string(),
         JsonValue::String(projection.tree_hash.clone()),
+    );
+    object.insert(
+        "topic_frontier".to_string(),
+        string_map_json(&projection.topic_frontier),
     );
     object.insert(
         "manifest_digest".to_string(),
@@ -5339,10 +5904,7 @@ fn projection_snapshot_json(projection: &RealProjectionSnapshot) -> JsonValue {
         "last_import_operation_id".to_string(),
         optional_json(&projection.last_import_operation_id),
     );
-    object.insert(
-        "entries".to_string(),
-        JsonValue::Array(projection.entries.iter().map(entry_json).collect()),
-    );
+    object.insert("entries".to_string(), JsonValue::Array(Vec::new()));
     JsonValue::Object(object)
 }
 
@@ -5482,6 +6044,13 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
     object.insert(
         "status".to_string(),
         JsonValue::String(execution.status.clone()),
+    );
+    object.insert(
+        "runner_process_id".to_string(),
+        execution
+            .runner_process_id
+            .map(|value| JsonValue::Number(value.to_string()))
+            .unwrap_or(JsonValue::Null),
     );
     object.insert(
         "command_started".to_string(),
@@ -5761,10 +6330,7 @@ fn checkpoint_snapshot_json(checkpoint: &RealCheckpointSnapshot) -> JsonValue {
         "created_at".to_string(),
         JsonValue::String(checkpoint.created_at.clone()),
     );
-    object.insert(
-        "entries".to_string(),
-        JsonValue::Array(checkpoint.entries.iter().map(entry_json).collect()),
-    );
+    object.insert("entries".to_string(), JsonValue::Array(Vec::new()));
     JsonValue::Object(object)
 }
 
@@ -6415,6 +6981,61 @@ mod tests {
         root
     }
 
+    #[test]
+    fn loading_rejects_a_tampered_content_addressed_blob() {
+        let repo = temp_repo("tampered-content-blob");
+        fs::write(repo.join("tracked.txt"), b"trusted bytes\n").unwrap();
+        let state = RealRepoState::ingest(&repo, "repo_tampered_blob").unwrap();
+        state.save(&repo).unwrap();
+        let content_hash = state.entry("tracked.txt").unwrap().content_hash.clone();
+        let blob = real_blob_path(&repo, &content_hash);
+        fs::write(&blob, b"tampered bytes\n").unwrap();
+
+        let error = RealRepoState::load(&repo).unwrap_err();
+        assert!(
+            matches!(error, RepoStateError::InvalidState { .. }),
+            "{error:?}"
+        );
+        assert!(error
+            .to_string()
+            .contains("existing content blob is malformed"));
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn metadata_only_state_publication_preserves_exact_blob_bytes() {
+        let repo = temp_repo("metadata-only-publication");
+        fs::write(repo.join("tracked.txt"), b"exact retained bytes\n").unwrap();
+        let state = RealRepoState::ingest(&repo, "repo_metadata_only").unwrap();
+        state.save(&repo).unwrap();
+
+        let mut metadata = RealRepoState::load_metadata(&repo).unwrap();
+        assert!(metadata.entries.iter().all(|entry| entry.bytes.is_empty()));
+        metadata.topics.push(RealTopicRecord {
+            topic_id: "topic_metadata_only".to_string(),
+            slug: "metadata-only".to_string(),
+            display_name: "Metadata only".to_string(),
+            owner_actor_id: "test".to_string(),
+            visibility: "local".to_string(),
+            acceptance_criteria: Vec::new(),
+            base_checkpoint_id: metadata.base_checkpoint_id.clone(),
+            head_revision_id: None,
+            completed_revision_id: None,
+            revision_number: 0,
+        });
+        metadata.save(&repo).unwrap();
+
+        let loaded = RealRepoState::load(&repo).unwrap();
+        assert_eq!(
+            loaded.entry("tracked.txt").unwrap().bytes,
+            b"exact retained bytes\n"
+        );
+        assert!(loaded.topic_by_id_or_slug("metadata-only").is_some());
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
     fn select_publication_failpoint(name: &str, path: &Path) {
         std::env::set_var(
             STATE_PUBLICATION_FAILPOINT_ENV,
@@ -6498,6 +7119,90 @@ mod tests {
         assert!(real_state_path(&repo).is_file());
         assert_eq!(loaded.tree_hash, state.tree_hash);
 
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn compact_state_rehydrates_current_projection_and_checkpoint_manifests() {
+        let repo = temp_repo("compact-manifests");
+        fs::write(repo.join("README.md"), b"# compact\n").unwrap();
+        let mut state = RealRepoState::ingest(&repo, "repo_compact").unwrap();
+        let entries = state.entries.clone();
+        state.projections.push(RealProjectionSnapshot {
+            projection_id: "projection_compact".to_string(),
+            repository_id: state.repository_id.clone(),
+            purpose: "inspection".to_string(),
+            resolved_view_id: state.resolved_view_id.clone(),
+            tree_hash: state.tree_hash.clone(),
+            topic_frontier: BTreeMap::new(),
+            manifest_digest: "sha256:compact".to_string(),
+            created_from_content_tree: state.tree_hash.clone(),
+            materialized_root: None,
+            session_id: None,
+            session_generation_id: None,
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            cache_key: "projection-cache:compact".to_string(),
+            strategy: "copy".to_string(),
+            materialization: Some(RealProjectionMaterializationMetrics {
+                elapsed_ms: 1,
+                logical_bytes: entries[0].bytes.len() as u64,
+                physically_materialized_bytes: Some(entries[0].bytes.len() as u64),
+                physical_allocation_bytes: None,
+                file_count: 1,
+                cache_hit: false,
+                reuse: "created".to_string(),
+                integrity_revalidated: true,
+                storage_amplification_millionths: Some(1_000_000),
+            }),
+            retention_state: "active".to_string(),
+            privacy_class: "local_only".to_string(),
+            last_import_operation_id: None,
+            entries: entries.clone(),
+        });
+        state.checkpoints.push(RealCheckpointSnapshot {
+            checkpoint_id: "checkpoint_compact".to_string(),
+            resolved_view_id: state.resolved_view_id.clone(),
+            tree_hash: state.tree_hash.clone(),
+            topic_frontier: Vec::new(),
+            evidence_refs: Vec::new(),
+            created_at: "time_compact".to_string(),
+            entries: entries.clone(),
+        });
+        state.save(&repo).unwrap();
+
+        let JsonValue::Object(object) =
+            parse_json_record(&fs::read(real_state_path(&repo)).unwrap()).unwrap()
+        else {
+            panic!("persisted state must be an object");
+        };
+        assert!(
+            matches!(object.get("entries"), Some(JsonValue::Array(values)) if values.is_empty())
+        );
+        assert!(
+            matches!(object.get("base_entries"), Some(JsonValue::Array(values)) if values.is_empty())
+        );
+        assert!(
+            matches!(object.get("base_entries_compact"), Some(JsonValue::Array(values)) if values.len() == 1)
+        );
+        assert!(
+            matches!(object.get("projections"), Some(JsonValue::Array(values)) if matches!(&values[0], JsonValue::Object(projection) if matches!(projection.get("entries"), Some(JsonValue::Array(entries)) if entries.is_empty())))
+        );
+        assert!(
+            matches!(object.get("checkpoints"), Some(JsonValue::Array(values)) if matches!(&values[0], JsonValue::Object(checkpoint) if matches!(checkpoint.get("entries"), Some(JsonValue::Array(entries)) if entries.is_empty())))
+        );
+
+        let metadata = RealRepoState::load_metadata(&repo).unwrap();
+        assert_eq!(metadata.entries[0].path, entries[0].path);
+        assert_eq!(metadata.entries[0].content_hash, entries[0].content_hash);
+        assert!(metadata.entries[0].bytes.is_empty());
+        assert!(metadata.projections[0].entries.is_empty());
+        assert!(metadata.checkpoints[0].entries.is_empty());
+
+        let loaded = RealRepoState::load(&repo).unwrap();
+        assert_eq!(loaded.entries, entries);
+        assert_eq!(loaded.projections[0].entries, entries);
+        assert_eq!(loaded.checkpoints[0].entries, entries);
         fs::remove_dir_all(repo).unwrap();
     }
 
@@ -7257,6 +7962,58 @@ mod tests {
     }
 
     #[test]
+    fn git_ingestion_skips_tracked_paths_deleted_from_worktree() {
+        let repo = temp_repo("git-deleted-tracked-path");
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join("kept.txt"), b"kept\n").unwrap();
+        fs::write(repo.join("deleted.txt"), b"deleted\n").unwrap();
+        git(&repo, &["add", "kept.txt", "deleted.txt"]);
+        fs::remove_file(repo.join("deleted.txt")).unwrap();
+
+        let state = RealRepoState::ingest(&repo, "repo_deleted_tracked_path").unwrap();
+
+        assert!(state.entry("kept.txt").is_some());
+        assert!(state.entry("deleted.txt").is_none());
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ingestion_rejects_a_path_traversing_a_windows_junction() {
+        let repo = temp_repo("worktree-junction");
+        let outside = temp_repo("worktree-junction-outside");
+        fs::write(outside.join("outside.txt"), b"outside\n").unwrap();
+        let junction_path = repo.join("linked");
+        let command = format!(
+            "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
+            junction_path.display(),
+            outside.display()
+        );
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(command)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        let error = ingest_real_repo_path(
+            &repo,
+            "linked/outside.txt",
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("worktree path traverses a reparse point or symlink"));
+        fs::remove_dir(junction_path).unwrap();
+        fs::remove_dir_all(repo).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
     fn ingest_quarantines_secret_path_without_persisting_secret_bytes() {
         let repo = temp_repo("secret-path");
         git(&repo, &["init", "-b", "main"]);
@@ -7394,6 +8151,7 @@ mod tests {
             base_resolved_view_id: "view_base_0001".to_string(),
             resolved_view_id: "view_base_0001".to_string(),
             tree_hash: real_tree_hash(&entries),
+            current_topic_frontier: BTreeMap::new(),
             topic_id: None,
             topic_slug: None,
             topic_display_name: None,
@@ -7440,6 +8198,7 @@ mod tests {
             base_resolved_view_id: "view_base_0001".to_string(),
             resolved_view_id: "view_base_0001".to_string(),
             tree_hash: real_tree_hash(&[readme.clone(), lib.clone()]),
+            current_topic_frontier: BTreeMap::new(),
             topic_id: None,
             topic_slug: None,
             topic_display_name: None,
@@ -7525,6 +8284,45 @@ mod tests {
                 .unwrap()
                 .bytes,
             b"pub fn value() -> u32 { 2 }\n"
+        );
+
+        state.topics.push(RealTopicRecord {
+            topic_id: "topic_aaa_docs_cleanup".to_string(),
+            slug: "docs-cleanup".to_string(),
+            display_name: "Docs cleanup".to_string(),
+            owner_actor_id: "agent-cleanup".to_string(),
+            visibility: "local".to_string(),
+            acceptance_criteria: Vec::new(),
+            base_checkpoint_id: "checkpoint_base_0001".to_string(),
+            head_revision_id: Some("rev_docs_cleanup_0001".to_string()),
+            completed_revision_id: None,
+            revision_number: 1,
+        });
+        let docs_result = artifact_entry("README.md", b"# Base\n\nDocs\n");
+        let mut cleanup = operation(
+            "op_docs_cleanup_0001",
+            "topic_aaa_docs_cleanup",
+            "rev_docs_cleanup_0001",
+            &docs_result,
+            b"# Base\n\nClean docs\n",
+        );
+        cleanup.dependency_revision_ids = vec!["rev_docs_0001".to_string()];
+        state.operations.push(cleanup);
+
+        let dependent = state.resolve_head_view();
+        assert!(dependent.result.conflict_free());
+        assert_eq!(
+            dependent.result.resolver_order.operation_ids,
+            vec!["op_code_0001", "op_docs_0001", "op_docs_cleanup_0001"]
+        );
+        assert_eq!(
+            dependent
+                .entries
+                .iter()
+                .find(|entry| entry.path == "README.md")
+                .unwrap()
+                .bytes,
+            b"# Base\n\nClean docs\n"
         );
 
         state.topics.push(RealTopicRecord {
@@ -7741,6 +8539,54 @@ mod tests {
             0,
             "fresh, live, and malformed directories must never be collected"
         );
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_read_only_projection_uses_protected_cache_hardlinks_without_duplicate_bytes() {
+        let repo = temp_repo("projection-hardlink-readonly");
+        fs::write(repo.join("source.txt"), b"source truth\n").unwrap();
+        let state = RealRepoState::ingest(&repo, "repo_projection_hardlink").unwrap();
+        let request = RealProjectionMaterializationRequest {
+            purpose: ProjectionPurpose::Inspection,
+            writable_policy: WritablePolicy::ReadOnly,
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            required_strategy: Some(RealProjectionStrategy::HardlinkReadonly),
+            fallback_to_copy: false,
+        };
+
+        let first_root = repo.join("projection-first");
+        let first = materialize_real_projection(&repo, &state, &first_root, &request).unwrap();
+        assert_eq!(first.strategy, RealProjectionStrategy::HardlinkReadonly);
+        assert!(!first.metrics.cache_hit);
+        assert_eq!(first.metrics.logical_bytes, 13);
+        assert_eq!(first.metrics.physically_materialized_bytes, Some(13));
+        assert_eq!(
+            first.metrics.storage_amplification_millionths,
+            Some(1_000_000)
+        );
+        assert_eq!(
+            fs::read(first_root.join("source.txt")).unwrap(),
+            b"source truth\n"
+        );
+        assert!(fs::metadata(first_root.join("source.txt"))
+            .unwrap()
+            .permissions()
+            .readonly());
+        assert!(fs::write(first_root.join("source.txt"), b"must not mutate cache\n").is_err());
+
+        let second_root = repo.join("projection-second");
+        let second = materialize_real_projection(&repo, &state, &second_root, &request).unwrap();
+        assert!(second.metrics.cache_hit);
+        assert_eq!(second.metrics.physically_materialized_bytes, Some(0));
+        assert_eq!(
+            fs::read(second_root.join("source.txt")).unwrap(),
+            b"source truth\n"
+        );
+        assert_eq!(published_projection_cache_entries(&repo), 1);
+
         fs::remove_dir_all(repo).unwrap();
     }
 

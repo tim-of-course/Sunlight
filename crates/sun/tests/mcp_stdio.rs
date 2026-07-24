@@ -376,6 +376,20 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
     assert_eq!(pong["result"], json!({}));
     let recovered = mcp.call(17, "repository_status", json!({}));
     assert_eq!(recovered["data"]["command"], "status.repository");
+    println!(
+        "OA-02 evidence {}",
+        json!({
+            "topic_id": "topic_mcp_authoring",
+            "session_id": session_id,
+            "revision_id": revision,
+            "resolved_view_id": view,
+            "execution_id": execution_id,
+            "checkpoint_id": checkpoint_id,
+            "planned_export_map_id": export["data"]["ids"]["export_map_id"],
+            "malformed_json_recovered": true,
+            "final_repository_status": "readable"
+        })
+    );
     let sent = mcp.sent.join("\n");
     assert!(!sent.contains("--fixture"));
     assert!(!sent.contains("\"fixture\""));
@@ -616,6 +630,161 @@ fn two_live_mcp_agents_author_independent_topics_into_one_exact_view() {
 
     agent_a.shutdown();
     agent_b.shutdown();
+}
+
+#[test]
+fn open_alpha_oa04_mcp_termination_boundaries_recover_from_durable_facts() {
+    let temp = TempDir::new("sun-mcp-oa04-recovery");
+    let repo = temp.path().join("repository");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    git(&repo, &["config", "user.name", "Sun OA-04 Test"]);
+    git(&repo, &["config", "user.email", "sun-oa04@example.invalid"]);
+    fs::write(repo.join("README.md"), "# OA-04 recovery\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+
+    let mut mcp = initialized_mcp(&repo);
+    mcp.call(2, "repository_init", json!({}));
+    mcp.call(
+        3,
+        "topic_create",
+        json!({"slug":"oa04-recovery","display_name":"OA-04 recovery"}),
+    );
+    let session = mcp.call(
+        4,
+        "session_start",
+        json!({"topic":"oa04-recovery","view":"view_base_0001","actor":"oa04-agent"}),
+    );
+    let session_id = session["data"]["ids"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Boundary 1: an acknowledged mutation must survive abrupt server death exactly once.
+    let write = mcp.call(
+        5,
+        "artifact_write",
+        json!({
+            "path":"src/recovered.txt",
+            "session":session_id,
+            "expect_hash":"new",
+            "content":"acknowledged before termination\n",
+            "classification":"source"
+        }),
+    );
+    let view_id = write["data"]["view"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let revision_id = write["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    mcp.terminate();
+
+    let mut mcp = initialized_mcp(&repo);
+    let recovered = mcp.call(
+        2,
+        "artifact_read",
+        json!({"path":"src/recovered.txt","view":view_id}),
+    );
+    assert_eq!(
+        recovered["data"]["content"]["bytes"],
+        "acknowledged before termination\n"
+    );
+    assert_eq!(recovered["data"]["artifacts"].as_array().unwrap().len(), 1);
+
+    // Boundary 3: completion is immutable and remains an integration-ready exact revision.
+    mcp.call(
+        3,
+        "topic_complete",
+        json!({
+            "topic":"topic_oa04_recovery",
+            "revision":revision_id,
+            "session":session_id,
+            "summary":"OA-04 recovered authoring"
+        }),
+    );
+    mcp.terminate();
+    let mut mcp = initialized_mcp(&repo);
+    let completed = mcp.call(2, "inspect", json!({"selector":"topic:oa04-recovery"}));
+    assert_eq!(completed["data"]["topic"]["status"], "completed");
+    assert_eq!(
+        completed["data"]["topic"]["completed_revision_id"],
+        revision_id
+    );
+
+    // Boundary 2: the running record is durable before the child process can outlive the server.
+    mcp.start_call(
+        3,
+        "execution_run",
+        json!({
+            "view":view_id,
+            "program":"python",
+            "args":["-c","import time; time.sleep(30)"],
+            "cwd":".",
+            "network":"not_enforced"
+        }),
+    );
+    let execution_id = wait_for_running_execution(&repo);
+    mcp.terminate();
+    let mut mcp = initialized_mcp(&repo);
+    let interrupted = mcp.call(
+        2,
+        "repository_status",
+        json!({"scope":"execution","id":execution_id}),
+    );
+    assert_eq!(interrupted["data"]["result"]["status"], "interrupted");
+    assert_eq!(
+        interrupted["data"]["result"]["termination_reason"],
+        "runner_process_terminated"
+    );
+
+    // Boundary 4: an OS-owned writer lease disappears with its owning process; no lock deletion is
+    // required. Terminate a request while a separate process-scoped lease blocks publication.
+    let writer_lock = TestWriterLock::acquire(&repo);
+    mcp.start_call(3, "repository_status", json!({}));
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    mcp.terminate();
+    drop(writer_lock);
+    let mut mcp = initialized_mcp(&repo);
+    assert_eq!(
+        mcp.call(2, "repository_status", json!({}))["data"]["command"],
+        "status.repository"
+    );
+
+    // Boundary 5: facts needed for checkpoint creation survive a death immediately before it.
+    mcp.terminate();
+    let mut mcp = initialized_mcp(&repo);
+    let checkpoint = mcp.call(2, "checkpoint_create", json!({"view":view_id}));
+    assert_eq!(checkpoint["data"]["command"], "checkpoint.create");
+    assert_eq!(
+        checkpoint["data"]["checkpoint"]["resolved_view_id"],
+        view_id
+    );
+    let final_read = mcp.call(
+        3,
+        "artifact_read",
+        json!({"path":"src/recovered.txt","view":view_id}),
+    );
+    assert_eq!(
+        final_read["data"]["content"]["bytes"],
+        "acknowledged before termination\n"
+    );
+    println!(
+        "OA-04 evidence {}",
+        json!({
+            "topic_id": "topic_oa04_recovery",
+            "session_id": session_id,
+            "revision_id": revision_id,
+            "view_id": view_id,
+            "execution_id": execution_id,
+            "checkpoint_id": checkpoint["data"]["checkpoint_id"],
+            "recovered_status": "interrupted"
+        })
+    );
+    mcp.shutdown();
 }
 
 #[test]
@@ -890,6 +1059,102 @@ impl Mcp {
         let status = self.child.as_mut().unwrap().wait().unwrap();
         assert!(status.success());
     }
+    fn terminate(&mut self) {
+        self.stdin.take();
+        let child = self.child.as_mut().unwrap();
+        if child.try_wait().unwrap().is_none() {
+            child.kill().unwrap();
+        }
+        child.wait().unwrap();
+    }
+}
+
+fn initialized_mcp(repo: &Path) -> Mcp {
+    let mut mcp = Mcp::start(repo);
+    let initialized = mcp.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-11-25",
+            "capabilities":{},
+            "clientInfo":{"name":"sun-oa04-recovery-test","version":"1"}
+        }),
+    );
+    assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    mcp.notify("notifications/initialized", json!({}));
+    mcp
+}
+
+fn wait_for_running_execution(repo: &Path) -> String {
+    let root = repo.join(".sunlight/executions");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(entries) = fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let body = fs::read_to_string(entry.path()).unwrap();
+                if body.contains("\"status\":\"running\"") {
+                    return entry
+                        .path()
+                        .file_stem()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "running execution record was not published before timeout"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+struct TestWriterLock(fs::File);
+
+impl TestWriterLock {
+    #[cfg(windows)]
+    fn acquire(repo: &Path) -> Self {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = repo.join(".sunlight/local/command-transaction.lock");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap();
+        Self(file)
+    }
+
+    #[cfg(unix)]
+    fn acquire(repo: &Path) -> Self {
+        use std::os::fd::AsRawFd;
+
+        const LOCK_EX: i32 = 2;
+        let path = repo.join(".sunlight/local/command-transaction.lock");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        unsafe extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        assert_eq!(unsafe { flock(file.as_raw_fd(), LOCK_EX) }, 0);
+        Self(file)
+    }
+}
+
+impl Drop for TestWriterLock {
+    fn drop(&mut self) {
+        let _ = &self.0;
+    }
 }
 
 fn sun_json(repo: &Path, args: &[&str]) -> Value {
@@ -920,6 +1185,7 @@ fn normalize_repository_identity(mut value: Value) -> Value {
     fn visit(value: &mut Value) {
         match value {
             Value::Object(object) => {
+                object.remove("transport");
                 for (key, value) in object {
                     if key == "repository_id" {
                         *value = Value::String("<repository>".to_string());

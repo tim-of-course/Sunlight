@@ -448,20 +448,24 @@ fn same_artifact_conflicts(
     resolved_view_id: &str,
     selected_revisions: &[&TopicRevisionRef],
 ) -> Vec<ResolverConflictOrStalenessRecord> {
-    let mut by_artifact = BTreeMap::<String, Vec<&OperationRef>>::new();
+    let mut by_artifact = BTreeMap::<String, Vec<&TopicRevisionRef>>::new();
     for revision in selected_revisions {
         by_artifact
             .entry(revision.operation.artifact_id.clone())
             .or_default()
-            .push(&revision.operation);
+            .push(revision);
     }
 
     by_artifact
         .into_iter()
-        .filter_map(|(artifact_id, operations)| {
-            if operations.len() <= 1 {
+        .filter_map(|(artifact_id, revisions)| {
+            if revisions.len() <= 1 || revisions_form_dependency_chain(&revisions) {
                 return None;
             }
+            let operations = revisions
+                .iter()
+                .map(|revision| &revision.operation)
+                .collect::<Vec<_>>();
 
             let operation_ids = operations
                 .iter()
@@ -522,15 +526,66 @@ fn same_artifact_conflicts(
         .collect()
 }
 
+fn revisions_form_dependency_chain(revisions: &[&TopicRevisionRef]) -> bool {
+    let mut remaining = revisions.to_vec();
+    let mut previous: Option<&TopicRevisionRef> = None;
+
+    while !remaining.is_empty() {
+        let candidates = remaining
+            .iter()
+            .enumerate()
+            .filter(|(_, revision)| match previous {
+                Some(previous) => {
+                    revision
+                        .dependency_revision_ids
+                        .contains(&previous.revision_id)
+                        && revision.operation.base_content_hash.as_deref()
+                            == Some(previous.operation.result_content_hash.as_str())
+                }
+                None => !revision.dependency_revision_ids.iter().any(|dependency| {
+                    remaining
+                        .iter()
+                        .any(|candidate| candidate.revision_id == *dependency)
+                }),
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return false;
+        }
+        previous = Some(remaining.remove(candidates[0]));
+    }
+
+    true
+}
+
 fn deterministic_operations<'a>(
     repository_id: &str,
     selected_revisions: Vec<&'a TopicRevisionRef>,
 ) -> Vec<&'a OperationRef> {
-    let mut operations = selected_revisions
-        .into_iter()
-        .map(|revision| &revision.operation)
-        .collect::<Vec<_>>();
-    operations.sort_by_key(|operation| operation.canonical_order_key(repository_id));
+    let mut remaining = selected_revisions;
+    let mut operations = Vec::new();
+    while !remaining.is_empty() {
+        let remaining_ids = remaining
+            .iter()
+            .map(|revision| revision.revision_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut ready = remaining
+            .iter()
+            .enumerate()
+            .filter(|(_, revision)| {
+                !revision
+                    .dependency_revision_ids
+                    .iter()
+                    .any(|dependency| remaining_ids.contains(dependency.as_str()))
+            })
+            .map(|(index, revision)| (index, revision.operation.canonical_order_key(repository_id)))
+            .collect::<Vec<_>>();
+        ready.sort_by(|left, right| left.1.cmp(&right.1));
+        let index = ready.first().map(|(index, _)| *index).unwrap_or(0);
+        let revision = remaining.remove(index);
+        operations.push(&revision.operation);
+    }
     operations
 }
 
@@ -738,6 +793,41 @@ mod tests {
         assert_eq!(
             conflict.operation_ids,
             vec!["op_auth_trim_guard_0001", "op_profile_auth_null_guard_0001"]
+        );
+    }
+
+    #[test]
+    fn dependent_same_artifact_revision_composes_after_its_exact_dependency() {
+        let auth = fixture_auth_revision();
+        let cleanup = fixture_revision(
+            "topic_aaa_cleanup",
+            "rev_cleanup_0001",
+            "op_cleanup_0001",
+            "artifact_src_auth_ts",
+            "src/auth.ts",
+            "sha256:auth_trim_guard",
+            "sha256:auth_clean",
+            "ctx_agent_cleanup_gen_0001",
+            vec![auth.revision_id.clone()],
+        );
+
+        let result = resolve_fixture_view(
+            fixture_resolver_input(vec![
+                selection(&cleanup.topic_id, &cleanup.revision_id),
+                selection(&auth.topic_id, &auth.revision_id),
+            ]),
+            fixture_base_entries(),
+            vec![cleanup, auth],
+        );
+
+        assert!(result.conflict_free());
+        assert_eq!(
+            result.resolver_order.operation_ids,
+            vec!["op_auth_trim_guard_0001", "op_cleanup_0001"]
+        );
+        assert_eq!(
+            result.tree_entries["src/auth.ts"].content_hash,
+            "sha256:auth_clean"
         );
     }
 

@@ -109,7 +109,26 @@ The server exposes these typed tools:
 Every successful or native command-error result includes both MCP text content
 and `structuredContent` containing the existing `sun --json` envelope. Native
 errors such as `precondition_failed`, `repository_writer_busy`, and
-`concurrent_state_update` are returned as tool errors without translation.
+`concurrent_state_update` are returned as tool errors without translation. Every
+structured error contains `code`, `message`, inspectable `details`, and a
+`next_action`. Treat `next_action` as the safe normal recovery rule, then use
+the returned exact IDs, hashes, conflicts, or staleness facts from `details`
+before acting; never retry a mutation blindly.
+Successful tool results also include `data.transport.queue_ms`, `worker_ms`, and
+`automatic_concurrency_retries`. `queue_ms` includes both this server's local
+call queue and any cross-process repository-mutation queue; `worker_ms` excludes
+that wait. Automatic retries count repository CAS/writer retries, not queue
+polls. These are observational facts for diagnosing interactive latency and
+writer contention; they do not change operation semantics. Failed tool calls
+put the same transport object under `error.details.transport`.
+
+Secret-like files found during repository ingestion are excluded from source
+truth; their raw bytes are not stored. Inspect
+`.sunlight/quarantine/ingest-report.json`, rotate any real credentials, and
+author only a sanitized replacement (such as `.env.example`) through a normal
+Sunlight topic. Sunlight cannot restore quarantined bytes because retaining
+them would defeat the quarantine boundary.
+
 Tool-specific output schemas describe the main returned IDs and payloads while
 allowing forward-compatible additional fields. The initialization response also
 describes the core authoring and coordination lifecycle, so a generic MCP client
@@ -132,18 +151,30 @@ network limits remain those reported by Sunlight's existing execution policy;
 on Windows, the delegated `sun` process tree is additionally placed in a
 kill-on-close Job Object.
 
-Calls are serialized. This preserves publication transactions and writer CAS,
-and prevents reads from racing an in-process publication. Delegated calls use
-the same built `sun` executable and exact JSON contracts; this is a transitional
-transport boundary until the production engine is split into a shared library.
-There is no recursive `mcp serve` path.
+Each server serializes its own active calls. Short state-mutating calls from
+independent servers additionally wait on the crash-released OS lock
+`.sunlight/local/mcp-mutation-queue.lock` for at most ten seconds. The file is a
+stable lock identity and is never deleted. Read-only calls, `topic_wait`, and
+long external work such as execution or projection materialization do not hold
+that repository queue for their whole duration; their short state publications
+still use the repository CAS/writer transaction boundary. This prevents a slow
+command from blocking unrelated reads or authoring while retaining atomic
+publication. Delegated calls use the same built `sun` executable and exact JSON
+contracts. There is no recursive `mcp serve` path.
 
-Requests are limited to 4 MiB, content fields to 2 MiB, subprocess stdout to
-8 MiB, and stderr to 64 KiB. Ordinary calls time out after two minutes and runs
-after fifteen minutes. Malformed messages produce a JSON-RPC error without
-stopping the server where recovery is possible. Cancellation, stdin EOF, and
-server shutdown terminate the active contained process tree, discard queued
-calls, and remove staged files.
+On Windows, automatic inspection projections hardlink from a fully verified,
+immutable cache and remain read-only. This avoids a second physical source-tree
+copy. Writable compatibility and execution projections continue to use safe
+copy-on-write where available and otherwise isolated private copies.
+
+Requests are limited to 4 MiB, content fields to 2 MiB, execution-output source
+promotion to a 2 MiB regular file, subprocess stdout to 8 MiB, and stderr to
+64 KiB. Ignored, secret, log, cache, and oversized outputs remain local-only;
+the denial reports classification and size facts. Ordinary calls time out after
+two minutes and runs after fifteen minutes. Malformed messages produce a
+JSON-RPC error without stopping the server where recovery is possible.
+Cancellation, stdin EOF, and server shutdown terminate the active contained
+process tree, discard queued calls, and remove staged files.
 
 This slice has no network listener, background service manager, subscriptions,
 or dashboard. The client owns the stdio server process lifetime.

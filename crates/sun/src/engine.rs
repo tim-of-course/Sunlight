@@ -78,6 +78,7 @@ pub struct EngineResponse {
     pub stderr: String,
     pub stdout_overflowed: bool,
     pub stderr_overflowed: bool,
+    pub concurrency_retry_count: usize,
 }
 
 const CONCURRENCY_RETRY_LIMIT: usize = 8;
@@ -117,7 +118,7 @@ pub fn execute_engine(context: &EngineContext, request: EngineRequest) -> Engine
                 && retry_count < CONCURRENCY_RETRY_LIMIT
                 && !context.cancellation.load(Ordering::Acquire)
             {
-                let delay_ms = (1u64 << retry_count.min(6)).min(CONCURRENCY_RETRY_MAX_DELAY_MS);
+                let delay_ms = concurrency_retry_delay_ms(retry_count);
                 retry_count += 1;
                 thread::sleep(Duration::from_millis(delay_ms));
                 continue;
@@ -131,6 +132,7 @@ pub fn execute_engine(context: &EngineContext, request: EngineRequest) -> Engine
                 stderr: String::new(),
                 stdout_overflowed,
                 stderr_overflowed: false,
+                concurrency_retry_count: retry_count,
             },
             Err(error) if json => {
                 use std::fmt::Write as _;
@@ -144,6 +146,7 @@ pub fn execute_engine(context: &EngineContext, request: EngineRequest) -> Engine
                     stderr: String::new(),
                     stdout_overflowed,
                     stderr_overflowed: false,
+                    concurrency_retry_count: retry_count,
                 }
             }
             Err(error) => {
@@ -158,10 +161,15 @@ pub fn execute_engine(context: &EngineContext, request: EngineRequest) -> Engine
                     stderr,
                     stdout_overflowed,
                     stderr_overflowed,
+                    concurrency_retry_count: retry_count,
                 }
             }
         };
     }
+}
+
+fn concurrency_retry_delay_ms(retry_count: usize) -> u64 {
+    (1u64 << retry_count.min(6)).min(CONCURRENCY_RETRY_MAX_DELAY_MS)
 }
 
 fn is_transient_concurrency_error(code: &str) -> bool {
@@ -205,7 +213,7 @@ fn command_allows_automatic_concurrency_retry(arguments: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::command_allows_automatic_concurrency_retry;
+    use super::{command_allows_automatic_concurrency_retry, concurrency_retry_delay_ms};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -229,5 +237,12 @@ mod tests {
         ] {
             assert!(!command_allows_automatic_concurrency_retry(&command));
         }
+    }
+
+    #[test]
+    fn eight_retries_remain_a_short_bounded_fallback() {
+        let delays = (0..8).map(concurrency_retry_delay_ms).collect::<Vec<_>>();
+        assert_eq!(delays, vec![1, 2, 4, 8, 16, 32, 64, 64]);
+        assert_eq!(delays.iter().sum::<u64>(), 191);
     }
 }

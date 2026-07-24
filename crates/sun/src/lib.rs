@@ -96,13 +96,15 @@ use sunlight_core::projection::{
 };
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repo_state::{
-    materialize_real_projection, native_session_generation_id, quarantine_report_publication,
-    real_artifact_id_for_path, real_content_hash, real_execution_environment_summary_digest,
-    real_tree_hash, scan_real_projection_files_with_quarantine, validate_topic_metadata,
-    DerivedRecordPublication, RealArtifactEntry, RealCheckpointSnapshot,
-    RealExecutionEnvironmentSummary, RealExecutionOutputSnapshot, RealExecutionPromotionSnapshot,
-    RealExecutionSnapshot, RealExecutionToolHint, RealExportMapSnapshot, RealOperationEffect,
-    RealOperationRecord, RealProjectionMaterialization, RealProjectionMaterializationRequest,
+    materialize_real_projection, native_session_generation_id, process_may_be_live,
+    quarantine_report_publication, read_real_blob, real_artifact_id_for_path, real_content_hash,
+    real_execution_environment_summary_digest, real_tree_hash,
+    scan_real_projection_files_with_quarantine, validate_topic_metadata,
+    verify_real_readonly_projection, DerivedRecordPublication, RealArtifactEntry,
+    RealCheckpointSnapshot, RealExecutionEnvironmentSummary, RealExecutionOutputSnapshot,
+    RealExecutionPromotionSnapshot, RealExecutionSnapshot, RealExecutionToolHint,
+    RealExportMapSnapshot, RealOperationEffect, RealOperationRecord, RealProjectionMaterialization,
+    RealProjectionMaterializationMetrics, RealProjectionMaterializationRequest,
     RealProjectionSnapshot, RealProjectionStrategy, RealRepoState, RealResolvedRepoView,
     RealSessionGenerationRecord, RealSessionRecord, RealTopicRecord, RepoStateError,
     TopicMetadataValidationError,
@@ -129,6 +131,7 @@ pub use engine::{
 
 const FIXTURE_STALE_COMPATIBILITY_PROJECTION_ID: &str =
     "projection_compat_agent_a_stale_baseline_0001";
+const MAX_PROMOTABLE_EXECUTION_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
 
 pub fn cli_main(args: Vec<String>, current_dir: PathBuf) -> ExitCode {
     #[cfg(windows)]
@@ -342,9 +345,8 @@ impl From<RepoStateError> for CliError {
             RepoStateError::InvalidState { path, message } => {
                 invalid_request(message).with_detail("path", path.display().to_string())
             }
-            RepoStateError::Io { path, message } => {
-                invalid_request(message).with_detail("path", path.display().to_string())
-            }
+            RepoStateError::Io { path, message } => CliError::new("repository_io_failed", message)
+                .with_detail("path", path.display().to_string()),
             RepoStateError::Json(message) => invalid_request(message),
             RepoStateError::Recovery {
                 canonical,
@@ -1806,6 +1808,7 @@ fn real_compat_project(
         purpose: ProjectionPurpose::Compatibility.as_str().to_string(),
         resolved_view_id: resolved.result.resolved_view_id.clone(),
         tree_hash: view_state.tree_hash.clone(),
+        topic_frontier: resolved.result.topic_frontier.clone(),
         manifest_digest,
         created_from_content_tree: view_state.tree_hash.clone(),
         materialized_root: Some(root.display().to_string()),
@@ -2064,6 +2067,7 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
     }
     let refreshed = state.resolve_session_view(real_session(&state, &session_id)?);
     state.resolved_view_id = refreshed.result.resolved_view_id.clone();
+    state.current_topic_frontier = refreshed.result.topic_frontier.clone();
     state.tree_hash = refreshed
         .result
         .tree_identity
@@ -2501,6 +2505,7 @@ fn real_view_state(state: &RealRepoState, resolved: &RealResolvedRepoView) -> Re
     let mut view_state = state.clone();
     view_state.entries = resolved.entries.clone();
     view_state.resolved_view_id = resolved.result.resolved_view_id.clone();
+    view_state.current_topic_frontier = resolved.result.topic_frontier.clone();
     for topic in &mut view_state.topics {
         topic.head_revision_id = resolved.result.topic_frontier.get(&topic.topic_id).cloned();
     }
@@ -2644,7 +2649,7 @@ fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Resul
         }
     })?;
     let repo_root = ctx.repo_root.clone();
-    let mut state = RealRepoState::load(&repo_root)?;
+    let mut state = RealRepoState::load_metadata(&repo_root)?;
     let topic_id = format!("topic_{}", options.slug.replace('-', "_"));
     if state.topic_by_id_or_slug(&options.slug).is_some()
         || state.topic_by_id_or_slug(&topic_id).is_some()
@@ -2706,7 +2711,7 @@ fn real_topic_complete(
     options: TopicCompleteOptions,
 ) -> Result<(), CliError> {
     let repo_root = ctx.repo_root.clone();
-    let mut state = RealRepoState::load(&repo_root)?;
+    let mut state = RealRepoState::load_metadata(&repo_root)?;
     let session = real_session(&state, &options.session_id)?.clone();
     if session.write_topic_id != options.topic_id {
         return Err(CliError::new(
@@ -2817,7 +2822,7 @@ fn real_topic_complete(
 
 fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Result<(), CliError> {
     let repo_root = ctx.repo_root.clone();
-    let mut state = RealRepoState::load(&repo_root)?;
+    let mut state = RealRepoState::load_metadata(&repo_root)?;
     let topic = real_topic(&state, &options.topic)?.clone();
     let selected = if options.view_id == state.base_resolved_view_id {
         real_base_resolved_repo_view(&state)
@@ -2936,7 +2941,7 @@ fn real_session_refresh(
     options: SessionRefreshOptions,
 ) -> Result<(), CliError> {
     let repo_root = ctx.repo_root.clone();
-    let mut state = RealRepoState::load(&repo_root)?;
+    let mut state = RealRepoState::load_metadata(&repo_root)?;
     let current = real_session(&state, &options.session_id)?.clone();
     let mut candidate_frontier = current.topic_frontier.clone();
 
@@ -3087,7 +3092,7 @@ fn real_artifact_read(
     ctx: &CommandContext,
     options: ArtifactCommandOptions,
 ) -> Result<(), CliError> {
-    let state = RealRepoState::load(&ctx.repo_root)?;
+    let state = RealRepoState::load_metadata(&ctx.repo_root)?;
     if let Some(view_id) = options.view_id.as_deref() {
         return real_artifact_read_view(ctx, &state, view_id, &options.operands[0]);
     }
@@ -3096,7 +3101,8 @@ fn real_artifact_read(
         .expect("artifact read scope was validated");
     let session = real_session(&state, &session_id)?;
     let resolved = state.resolve_session_view(session);
-    let entry = real_entry(&state, &resolved.entries, &options.operands[0])?;
+    let mut entry = real_entry(&state, &resolved.entries, &options.operands[0])?.clone();
+    entry.bytes = read_real_blob(&ctx.repo_root, &entry.content_hash)?;
     let bytes = std::str::from_utf8(&entry.bytes)
         .map_err(|_| CliError::new("invalid_content_encoding", "path is not UTF-8 text"))?;
     let response = ReadResponse {
@@ -3104,7 +3110,7 @@ fn real_artifact_read(
         repository_id: state.repository_id.clone(),
         session_id,
         view: real_resolved_session_view(&state, session, &resolved),
-        artifact: real_artifact_view(entry),
+        artifact: real_artifact_view(&entry),
         content: sunlight_core::artifacts::ContentView {
             encoding: "utf-8".to_string(),
             bytes: bytes.to_string(),
@@ -3122,7 +3128,7 @@ fn real_artifact_list(
     ctx: &CommandContext,
     options: ArtifactCommandOptions,
 ) -> Result<(), CliError> {
-    let state = RealRepoState::load(&ctx.repo_root)?;
+    let state = RealRepoState::load_metadata(&ctx.repo_root)?;
     if let Some(view_id) = options.view_id.as_deref() {
         return real_artifact_list_view(ctx, &state, view_id, options.operands.first());
     }
@@ -3267,14 +3273,15 @@ fn real_artifact_read_view(
     path_or_artifact_id: &str,
 ) -> Result<(), CliError> {
     let resolved = real_readable_view(ctx, state, view_id)?;
-    let entry = real_view_entry(&resolved.entries, path_or_artifact_id, view_id)?;
+    let mut entry = real_view_entry(&resolved.entries, path_or_artifact_id, view_id)?.clone();
+    entry.bytes = read_real_blob(&ctx.repo_root, &entry.content_hash)?;
     let bytes = std::str::from_utf8(&entry.bytes)
         .map_err(|_| CliError::new("invalid_content_encoding", "path is not UTF-8 text"))?;
     if ctx.json {
         outputln!(
             ctx,
             "{}",
-            view_read_success_envelope(state, &resolved.result, entry, bytes)
+            view_read_success_envelope(state, &resolved.result, &entry, bytes)
         );
     } else {
         output!(ctx, "{}", bytes);
@@ -3392,7 +3399,10 @@ fn real_artifact_write(
     content: Vec<u8>,
     expected_hash: ExpectedHash,
 ) -> Result<(), CliError> {
-    let mut state = RealRepoState::load(&ctx.repo_root)?;
+    let mut state = match &expected_hash {
+        ExpectedHash::New => RealRepoState::load_metadata(&ctx.repo_root)?,
+        ExpectedHash::Existing(_) => RealRepoState::load(&ctx.repo_root)?,
+    };
     let session = real_session(&state, &options.session_id)?.clone();
     let resolved = state.resolve_session_view(&session);
     let path = options.operands[0].clone();
@@ -3542,7 +3552,7 @@ fn real_artifact_metadata_set(
 }
 
 fn real_view_resolve(ctx: &CommandContext, options: ViewResolveOptions) -> Result<(), CliError> {
-    let state = RealRepoState::load(&ctx.repo_root)?;
+    let state = RealRepoState::load_metadata(&ctx.repo_root)?;
     if let Some(base) = &options.base_checkpoint_id {
         if base != &state.base_checkpoint_id {
             return Err(object_not_found("checkpoint", base));
@@ -3623,12 +3633,84 @@ fn real_project_materialize(
         )
         .with_detail("resolved_view_id", resolved.result.resolved_view_id));
     }
+    let view_state = real_view_state(&state, &resolved);
+    let readonly_reuse_requested = options.purpose == ProjectionPurpose::Inspection
+        && options.projection_root.is_none()
+        && matches!(
+            options.strategy,
+            None | Some(ProjectionStrategy::HardlinkReadonly)
+        );
+    if readonly_reuse_requested {
+        for projection in state.projections.iter().rev().filter(|projection| {
+            projection.purpose == ProjectionPurpose::Inspection.as_str()
+                && projection.resolved_view_id == view_state.resolved_view_id
+                && projection.tree_hash == view_state.tree_hash
+                && projection.strategy == RealProjectionStrategy::HardlinkReadonly.as_str()
+                && projection.retention_state == "active"
+        }) {
+            let Some(root) = projection.materialized_root.as_ref().map(PathBuf::from) else {
+                continue;
+            };
+            let verification_started = Instant::now();
+            if verify_real_readonly_projection(&root, &view_state.entries).is_err() {
+                continue;
+            }
+            let logical_bytes = view_state
+                .entries
+                .iter()
+                .filter(|entry| !entry.tombstone)
+                .map(|entry| entry.bytes.len() as u64)
+                .sum::<u64>();
+            let file_count = view_state
+                .entries
+                .iter()
+                .filter(|entry| !entry.tombstone)
+                .count() as u64;
+            let materialization = RealProjectionMaterialization {
+                cache_key: projection.cache_key.clone(),
+                strategy: RealProjectionStrategy::HardlinkReadonly,
+                metrics: RealProjectionMaterializationMetrics {
+                    elapsed_ms: verification_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                    logical_bytes,
+                    physically_materialized_bytes: Some(0),
+                    physical_allocation_bytes: Some(0),
+                    file_count,
+                    cache_hit: true,
+                    reuse: "reused_verified_projection".to_string(),
+                    integrity_revalidated: true,
+                    storage_amplification_millionths: if logical_bytes == 0 {
+                        None
+                    } else {
+                        Some(0)
+                    },
+                },
+            };
+            if ctx.json {
+                outputln!(
+                    ctx,
+                    "{}",
+                    real_projection_materialized_envelope(
+                        &view_state,
+                        &projection.projection_id,
+                        options.purpose,
+                        &root,
+                        &materialization,
+                    )
+                );
+            } else {
+                outputln!(ctx, "{} {}", projection.projection_id, root.display());
+            }
+            return Ok(());
+        }
+    }
     let provisional_projection_id = format!(
         "projection_{}_native_{:04}",
         options.purpose.as_str(),
         state.projections.len() + 1
     );
-    let view_state = real_view_state(&state, &resolved);
     let caller_root = options.projection_root;
     let provisional_root = caller_root.clone().unwrap_or_else(|| {
         projection_policy.projection_root(options.purpose.as_str(), &provisional_projection_id)
@@ -3662,6 +3744,7 @@ fn real_project_materialize(
         purpose: options.purpose.as_str().to_string(),
         resolved_view_id: view_state.resolved_view_id.clone(),
         tree_hash: view_state.tree_hash.clone(),
+        topic_frontier: resolved.result.topic_frontier.clone(),
         manifest_digest,
         created_from_content_tree: view_state.tree_hash.clone(),
         materialized_root: Some(root.display().to_string()),
@@ -3726,6 +3809,7 @@ struct BoundedProcessOutput {
 enum ProcessRunError {
     Command(io::Error),
     ContainmentSetup(io::Error),
+    Publication(RepoStateError),
     #[cfg(windows)]
     FilesystemIsolationSetup(io::Error),
     #[cfg(windows)]
@@ -4025,6 +4109,7 @@ fn run_bounded_process(
     policy: &ExecutionPolicy,
     cancellation: &AtomicBool,
     #[cfg(windows)] isolation: &windows_isolation::PreparedIsolation,
+    on_started: impl FnOnce() -> Result<(), RepoStateError>,
 ) -> Result<BoundedProcessOutput, ProcessRunError> {
     let allowlist = execution_environment_allowlist();
     #[cfg(windows)]
@@ -4053,6 +4138,13 @@ fn run_bounded_process(
         command.process_group(0);
     }
     let mut execution_child = ExecutionChild::spawn(command, policy)?;
+    if let Err(error) = on_started() {
+        let (_, root_termination_started) = execution_child.terminate_tree();
+        if root_termination_started {
+            let _ = execution_child.child_mut().wait();
+        }
+        return Err(ProcessRunError::Publication(error));
+    }
     let stdout_limit = policy.stdout_limit_bytes;
     let stderr_limit = policy.stderr_limit_bytes;
     let stdout_reader = execution_child.child_mut().stdout.take().map(|stdout| {
@@ -4363,6 +4455,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         purpose: "execution".to_string(),
         resolved_view_id: view_state.resolved_view_id.clone(),
         tree_hash: view_state.tree_hash.clone(),
+        topic_frontier: resolved.result.topic_frontier.clone(),
         manifest_digest: manifest_digest.clone(),
         created_from_content_tree: view_state.tree_hash.clone(),
         materialized_root: Some(projection_root.display().to_string()),
@@ -4403,6 +4496,76 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         &filesystem_write_policy_effective,
     );
     let started_at = real_now_id();
+    let empty_output_digest = real_content_hash(&[]);
+    let running_execution = RealExecutionSnapshot {
+        execution_id: execution_id.clone(),
+        projection_id: projection_id.clone(),
+        resolved_view_id: view_state.resolved_view_id.clone(),
+        tree_hash: view_state.tree_hash.clone(),
+        command_argv: options.command_argv.clone(),
+        working_directory: options.cwd.clone(),
+        exit_code: None,
+        status: "running".to_string(),
+        runner_process_id: Some(std::process::id()),
+        command_started: true,
+        timed_out: false,
+        termination_reason: None,
+        termination_failed: false,
+        wait_failed: false,
+        stdout_observed_digest: empty_output_digest.clone(),
+        stdout_byte_length: 0,
+        stdout_captured_byte_length: 0,
+        stdout_truncated: false,
+        stdout_capture_failed: false,
+        stderr_observed_digest: empty_output_digest,
+        stderr_byte_length: 0,
+        stderr_captured_byte_length: 0,
+        stderr_truncated: false,
+        stderr_capture_failed: false,
+        timeout_ms: Some(execution_policy.timeout_ms),
+        process_memory_limit_bytes: Some(execution_policy.process_memory_limit_bytes),
+        job_memory_limit_bytes: Some(execution_policy.job_memory_limit_bytes),
+        cpu_time_limit_ms: Some(execution_policy.cpu_time_limit_ms),
+        active_process_limit: Some(execution_policy.active_process_limit),
+        process_tree_policy: if cfg!(windows) {
+            "windows_job_object_kill_on_close".to_string()
+        } else {
+            "not_enforced".to_string()
+        },
+        cpu_policy: if cfg!(windows) {
+            "windows_job_object_cpu_time".to_string()
+        } else {
+            "not_enforced".to_string()
+        },
+        memory_policy: if cfg!(windows) {
+            "windows_job_object_process_and_job_memory".to_string()
+        } else {
+            "not_enforced".to_string()
+        },
+        environment_policy: execution_policy.environment_inheritance.clone(),
+        environment_allowlist: environment_allowlist.clone(),
+        environment_summary: environment_summary.clone(),
+        network_policy_requested: execution_policy.network_policy.clone(),
+        network_policy: network_policy_effective.clone(),
+        filesystem_write_policy_requested: execution_policy.filesystem_write_policy.clone(),
+        filesystem_write_policy: filesystem_write_policy_effective.clone(),
+        outputs: Vec::new(),
+        started_at: started_at.clone(),
+        finished_at: String::new(),
+        privacy_class: "policy_gated".to_string(),
+    };
+    state.executions.push(running_execution.clone());
+    let running_records = vec![
+        real_projection_publication(&state, state.projections.last().unwrap())?,
+        state.record_publication(
+            "executions",
+            &running_execution.execution_id,
+            &format!(
+                "{}\n",
+                real_execution_snapshot_record_json(&state, &running_execution)
+            ),
+        )?,
+    ];
     let command_started = Instant::now();
     let command_output = run_bounded_process(
         &options.command_argv,
@@ -4411,6 +4574,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         &ctx.cancellation,
         #[cfg(windows)]
         &isolation,
+        || state.save_with_records(&repo_root, &running_records),
     )
     .map_err(|error| match error {
         ProcessRunError::Command(error) => {
@@ -4429,6 +4593,10 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
             )
             .with_detail("platform", std::env::consts::OS)
             .with_detail("command_started", "false")
+        }
+        ProcessRunError::Publication(error) => {
+            remove_unpublished_execution_root(&projection_root);
+            CliError::from(error)
         }
         #[cfg(windows)]
         ProcessRunError::FilesystemIsolationSetup(error) => {
@@ -4454,15 +4622,6 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     let command_ms = command_started.elapsed().as_millis();
     let stdout_text = String::from_utf8_lossy(&command_output.stdout.captured_bytes).into_owned();
     let stderr_text = String::from_utf8_lossy(&command_output.stderr.captured_bytes).into_owned();
-    if command_output.cancelled {
-        #[cfg(windows)]
-        let _ = isolation.finish();
-        remove_unpublished_execution_root(&projection_root);
-        return Err(CliError::new(
-            "request_cancelled",
-            "tool call was cancelled",
-        ));
-    }
     let finished_at = real_now_id();
     let output_scan_started = Instant::now();
     let mut projected_entries = Vec::new();
@@ -4474,22 +4633,18 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         &mut quarantine,
     )?;
     projected_entries.sort_by(|left, right| left.path.cmp(&right.path));
-    let outputs = real_execution_outputs(
-        &repo_root,
-        &view_state.entries,
-        &projected_entries,
-        &ctx.cancellation,
-    );
+    let outputs = if command_output.cancelled {
+        Vec::new()
+    } else {
+        real_execution_outputs(
+            &repo_root,
+            &view_state.entries,
+            &projected_entries,
+            &ctx.cancellation,
+        )
+    };
     let output_scan_ms = output_scan_started.elapsed().as_millis();
-    if ctx.cancellation.load(Ordering::Acquire) {
-        #[cfg(windows)]
-        let _ = isolation.finish();
-        remove_unpublished_execution_root(&projection_root);
-        return Err(CliError::new(
-            "request_cancelled",
-            "tool call was cancelled",
-        ));
-    }
+    state = RealRepoState::load(&repo_root)?;
     #[cfg(windows)]
     let cleanup_error = isolation.finish().err().map(|error| error.to_string());
     #[cfg(not(windows))]
@@ -4499,7 +4654,9 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
             projection.retention_state = "quarantined".to_string();
         }
     }
-    let status = if command_output.resource_termination.is_some() || cleanup_error.is_some() {
+    let status = if command_output.cancelled {
+        "canceled"
+    } else if command_output.resource_termination.is_some() || cleanup_error.is_some() {
         "policy_blocked"
     } else if command_output.stdout.capture_failed
         || command_output.stderr.capture_failed
@@ -4514,81 +4671,54 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     } else {
         "fail"
     };
-    let termination_reason = cleanup_error
-        .as_ref()
-        .map(|_| "execution_network_isolation_cleanup_failed".to_string())
-        .or_else(|| command_output.resource_termination.clone())
-        .or_else(|| {
-            if command_output.timed_out {
-                Some("wall_clock_timeout".to_string())
-            } else if command_output.stdout.capture_failed
-                || command_output.stderr.capture_failed
-                || command_output.termination_failed
-                || command_output.wait_failed
-            {
-                Some("runner_failure".to_string())
-            } else {
-                Some("command_exit".to_string())
-            }
-        });
-    let execution = RealExecutionSnapshot {
-        execution_id: execution_id.clone(),
-        projection_id: projection_id.clone(),
-        resolved_view_id: view_state.resolved_view_id.clone(),
-        tree_hash: view_state.tree_hash.clone(),
-        command_argv: options.command_argv,
-        working_directory: options.cwd,
-        exit_code: command_output.status.and_then(|status| status.code()),
-        status: status.to_string(),
-        command_started: true,
-        timed_out: command_output.timed_out,
-        termination_reason,
-        termination_failed: command_output.termination_failed,
-        wait_failed: command_output.wait_failed,
-        stdout_observed_digest: command_output.stdout.observed_digest,
-        stdout_byte_length: command_output.stdout.observed_byte_length,
-        stdout_captured_byte_length: command_output.stdout.captured_byte_length,
-        stdout_truncated: command_output.stdout.truncated,
-        stdout_capture_failed: command_output.stdout.capture_failed,
-        stderr_observed_digest: command_output.stderr.observed_digest,
-        stderr_byte_length: command_output.stderr.observed_byte_length,
-        stderr_captured_byte_length: command_output.stderr.captured_byte_length,
-        stderr_truncated: command_output.stderr.truncated,
-        stderr_capture_failed: command_output.stderr.capture_failed,
-        timeout_ms: Some(execution_policy.timeout_ms),
-        process_memory_limit_bytes: Some(execution_policy.process_memory_limit_bytes),
-        job_memory_limit_bytes: Some(execution_policy.job_memory_limit_bytes),
-        cpu_time_limit_ms: Some(execution_policy.cpu_time_limit_ms),
-        active_process_limit: Some(execution_policy.active_process_limit),
-        process_tree_policy: if cfg!(windows) {
-            "windows_job_object_kill_on_close".to_string()
-        } else {
-            "not_enforced".to_string()
-        },
-        cpu_policy: if cfg!(windows) {
-            "windows_job_object_cpu_time".to_string()
-        } else {
-            "not_enforced".to_string()
-        },
-        memory_policy: if cfg!(windows) {
-            "windows_job_object_process_and_job_memory".to_string()
-        } else {
-            "not_enforced".to_string()
-        },
-        environment_policy: execution_policy.environment_inheritance,
-        environment_allowlist,
-        environment_summary,
-        network_policy_requested: execution_policy.network_policy.clone(),
-        network_policy: network_policy_effective,
-        filesystem_write_policy_requested: execution_policy.filesystem_write_policy,
-        filesystem_write_policy: filesystem_write_policy_effective,
-        outputs,
-        started_at,
-        finished_at,
-        privacy_class: "policy_gated".to_string(),
+    let termination_reason = if command_output.cancelled {
+        Some("request_cancelled".to_string())
+    } else {
+        cleanup_error
+            .as_ref()
+            .map(|_| "execution_network_isolation_cleanup_failed".to_string())
+            .or_else(|| command_output.resource_termination.clone())
+            .or_else(|| {
+                if command_output.timed_out {
+                    Some("wall_clock_timeout".to_string())
+                } else if command_output.stdout.capture_failed
+                    || command_output.stderr.capture_failed
+                    || command_output.termination_failed
+                    || command_output.wait_failed
+                {
+                    Some("runner_failure".to_string())
+                } else {
+                    Some("command_exit".to_string())
+                }
+            })
     };
+    let mut execution = running_execution;
+    execution.exit_code = command_output.status.and_then(|status| status.code());
+    execution.status = status.to_string();
+    execution.runner_process_id = None;
+    execution.timed_out = command_output.timed_out;
+    execution.termination_reason = termination_reason;
+    execution.termination_failed = command_output.termination_failed;
+    execution.wait_failed = command_output.wait_failed;
+    execution.stdout_observed_digest = command_output.stdout.observed_digest;
+    execution.stdout_byte_length = command_output.stdout.observed_byte_length;
+    execution.stdout_captured_byte_length = command_output.stdout.captured_byte_length;
+    execution.stdout_truncated = command_output.stdout.truncated;
+    execution.stdout_capture_failed = command_output.stdout.capture_failed;
+    execution.stderr_observed_digest = command_output.stderr.observed_digest;
+    execution.stderr_byte_length = command_output.stderr.observed_byte_length;
+    execution.stderr_captured_byte_length = command_output.stderr.captured_byte_length;
+    execution.stderr_truncated = command_output.stderr.truncated;
+    execution.stderr_capture_failed = command_output.stderr.capture_failed;
+    execution.outputs = outputs;
+    execution.finished_at = finished_at;
     let publication_started = Instant::now();
-    state.executions.push(execution.clone());
+    let persisted_execution = state
+        .executions
+        .iter_mut()
+        .find(|persisted| persisted.execution_id == execution.execution_id)
+        .ok_or_else(|| object_not_found("execution", &execution.execution_id))?;
+    *persisted_execution = execution.clone();
     let records = vec![
         real_projection_publication(&state, state.projections.last().unwrap())?,
         state.record_publication(
@@ -4610,6 +4740,13 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         )
         .with_detail("platform", "windows")
         .with_detail("command_started", "true")
+        .with_detail("execution_id", execution.execution_id));
+    }
+    if command_output.cancelled {
+        return Err(CliError::new(
+            "request_cancelled",
+            "tool call was cancelled; the canceled execution record is durable",
+        )
         .with_detail("execution_id", execution.execution_id));
     }
     if ctx.json {
@@ -4638,6 +4775,69 @@ fn remove_unpublished_execution_root(projection_root: &Path) {
     if let Some(allocation_root) = projection_root.parent() {
         let _ = fs::remove_dir_all(allocation_root);
     }
+}
+
+fn recover_interrupted_executions(
+    repo_root: &Path,
+    state: &mut RealRepoState,
+) -> Result<(), CliError> {
+    let interrupted_ids = state
+        .executions
+        .iter()
+        .filter(|execution| {
+            execution.status == "running"
+                && execution
+                    .runner_process_id
+                    .is_none_or(|process_id| !process_may_be_live(process_id))
+        })
+        .map(|execution| execution.execution_id.clone())
+        .collect::<Vec<_>>();
+    if interrupted_ids.is_empty() {
+        return Ok(());
+    }
+
+    let recovered_at = real_now_id();
+    for execution in &mut state.executions {
+        if interrupted_ids.contains(&execution.execution_id) {
+            execution.status = "interrupted".to_string();
+            execution.runner_process_id = None;
+            execution.termination_reason = Some("runner_process_terminated".to_string());
+            execution.wait_failed = true;
+            execution.finished_at = recovered_at.clone();
+        }
+    }
+    for projection in &mut state.projections {
+        if state.executions.iter().any(|execution| {
+            interrupted_ids.contains(&execution.execution_id)
+                && execution.projection_id == projection.projection_id
+        }) {
+            projection.retention_state = "quarantined".to_string();
+        }
+    }
+
+    let mut records = Vec::new();
+    for execution_id in &interrupted_ids {
+        let execution = state
+            .executions
+            .iter()
+            .find(|execution| execution.execution_id == *execution_id)
+            .expect("interrupted execution remains present");
+        records.push(
+            state
+                .record_publication(
+                    "executions",
+                    execution_id,
+                    &format!(
+                        "{}\n",
+                        real_execution_snapshot_record_json(&state, execution)
+                    ),
+                )
+                .map_err(CliError::from)?,
+        );
+    }
+    state
+        .save_with_records(repo_root, &records)
+        .map_err(CliError::from)
 }
 
 fn real_execution_relative_cwd(cwd: &str) -> Result<PathBuf, CliError> {
@@ -4825,7 +5025,31 @@ fn real_execution_promote_output(
         &execution.projection_id,
         Path::new(root),
     )?;
-    let bytes = fs::read(root.join(&path)).map_err(|error| {
+    let output_path = root.join(&path);
+    let metadata = fs::symlink_metadata(&output_path).map_err(|error| {
+        invalid_request(format!("failed to inspect execution output: {error}"))
+            .with_detail("path", &path)
+    })?;
+    if !metadata.is_file() {
+        return Err(promotion_error(
+            "promotion_policy_failed",
+            "execution output promotion requires a regular file",
+            &options.execution_id,
+            Some(&path),
+            Some(&session_id),
+            Some(&classification),
+        ));
+    }
+    if metadata.len() > MAX_PROMOTABLE_EXECUTION_OUTPUT_BYTES {
+        return Err(oversized_promotion_error(
+            &options.execution_id,
+            &path,
+            &session_id,
+            &classification,
+            metadata.len(),
+        ));
+    }
+    let bytes = fs::read(&output_path).map_err(|error| {
         invalid_request(format!("failed to read execution output: {error}"))
             .with_detail("path", &path)
     })?;
@@ -5018,8 +5242,13 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
     if options.execute_local {
         let content_files = real_git_export_content_files(&view_state);
         let tree_hash = checkpoint.tree_identity.tree_hash.clone();
-        let input =
-            real_git_export_writer_input(&repo_root, &options, checkpoint.clone(), report.clone())?;
+        let input = real_git_export_writer_input(
+            &repo_root,
+            &state,
+            &options,
+            checkpoint.clone(),
+            report.clone(),
+        )?;
         let mut store = InMemoryGitExportMapStore::default();
         let result = execute_local_git_export_writer(input, content_files, &mut store)
             .map_err(git_export_planning_error)?;
@@ -5033,7 +5262,7 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
             )
         })?;
         let export_id = format!("export_map_{}", checkpoint.id);
-        state.export_maps.push(RealExportMapSnapshot {
+        let export_snapshot = RealExportMapSnapshot {
             export_map_id: export_id.clone(),
             checkpoint_id: checkpoint.id.clone(),
             tree_hash,
@@ -5041,22 +5270,42 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
             git_commit_ids: vec![commit_id.clone()],
             exported_at: real_now_id(),
             validation_report_id: Some(report.id.clone()),
-        });
-        let records = vec![state.record_publication(
-            "export-map",
-            &export_id,
-            &format!(
-                "{{\"record_type\":\"git_export_map\",\"id\":\"{}\",\"repository_id\":\"{}\",\"checkpoint_id\":\"{}\",\"tree_hash\":\"{}\",\"git_ref\":\"{}\",\"git_commit_ids\":[\"{}\"],\"validation_report_id\":\"{}\"}}\n",
-                json_escape(&export_id),
-                json_escape(&state.repository_id),
-                json_escape(&checkpoint.id),
-                json_escape(&checkpoint.tree_identity.tree_hash),
-                json_escape(&git_ref),
-                json_escape(&commit_id),
-                json_escape(&report.id),
-            ),
-        )?];
-        state.save_with_records(&repo_root, &records)?;
+        };
+        if let Some(existing) = state
+            .export_maps
+            .iter()
+            .find(|existing| existing.export_map_id == export_id)
+        {
+            if existing.checkpoint_id != export_snapshot.checkpoint_id
+                || existing.tree_hash != export_snapshot.tree_hash
+                || existing.git_ref != export_snapshot.git_ref
+                || existing.git_commit_ids != export_snapshot.git_commit_ids
+                || existing.validation_report_id != export_snapshot.validation_report_id
+            {
+                return Err(CliError::new(
+                    "export_map_conflict",
+                    "the durable export-map ID already identifies a different Git handoff",
+                )
+                .with_detail("export_map_id", export_id));
+            }
+        } else {
+            state.export_maps.push(export_snapshot);
+            let records = vec![state.record_publication(
+                "export-map",
+                &export_id,
+                &format!(
+                    "{{\"record_type\":\"git_export_map\",\"id\":\"{}\",\"repository_id\":\"{}\",\"checkpoint_id\":\"{}\",\"tree_hash\":\"{}\",\"git_ref\":\"{}\",\"git_commit_ids\":[\"{}\"],\"validation_report_id\":\"{}\"}}\n",
+                    json_escape(&export_id),
+                    json_escape(&state.repository_id),
+                    json_escape(&checkpoint.id),
+                    json_escape(&checkpoint.tree_identity.tree_hash),
+                    json_escape(&git_ref),
+                    json_escape(&commit_id),
+                    json_escape(&report.id),
+                ),
+            )?];
+            state.save_with_records(&repo_root, &records)?;
+        }
         if ctx.json {
             outputln!(ctx,
                 "{{\"ok\":true,\"data\":{{\"command\":\"git.export.execute\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_id\":\"{}\",\"export_map_id\":\"{}\",\"validation_report_id\":\"{}\"}},\"checkpoint_id\":\"{}\",\"git_ref\":\"{}\",\"git_commit_ids\":[\"{}\"],\"validation_report\":{},\"lifecycle_state\":\"exported\"}},\"warnings\":[]}}",
@@ -5208,11 +5457,25 @@ fn reject_real_export_blocked_entries(state: &RealRepoState) -> Result<(), CliEr
 
 fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
     let repo_root = ctx.repo_root.clone();
-    let state = match RealRepoState::load(&repo_root) {
+    let load_result = if ctx.args.len() == 1 {
+        RealRepoState::load_metadata(&repo_root)
+    } else {
+        RealRepoState::load(&repo_root)
+    };
+    let mut state = match load_result {
         Ok(state) => state,
         Err(RepoStateError::NotInitialized { .. }) => return Ok(false),
         Err(error) => return Err(error.into()),
     };
+    if ctx.args.len() == 1
+        && state
+            .projections
+            .iter()
+            .any(|projection| projection.purpose == "compatibility")
+    {
+        state = RealRepoState::load(&repo_root)?;
+    }
+    recover_interrupted_executions(&repo_root, &mut state)?;
     if let [_, flag, value] = ctx.args.as_slice() {
         match flag.as_str() {
             "--projection" => {
@@ -5441,11 +5704,12 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
 }
 
 fn real_inspect(ctx: &CommandContext) -> Result<bool, CliError> {
-    let state = match RealRepoState::load(&ctx.repo_root) {
+    let mut state = match RealRepoState::load(&ctx.repo_root) {
         Ok(state) => state,
         Err(RepoStateError::NotInitialized { .. }) => return Ok(false),
         Err(error) => return Err(error.into()),
     };
+    recover_interrupted_executions(&ctx.repo_root, &mut state)?;
     let selector = match ctx.args.iter().skip(1).find(|arg| !arg.starts_with("--")) {
         Some(selector) => selector,
         None => return Ok(false),
@@ -5693,6 +5957,7 @@ fn real_accept_mutation(
         .map(|tree| tree.tree_hash.clone())
         .unwrap_or_else(|| real_tree_hash(&session_resolved.entries));
     state.resolved_view_id = resolved_view_id.clone();
+    state.current_topic_frontier = session_resolved.result.topic_frontier.clone();
     state.tree_hash = tree_hash;
     state.entries = session_resolved.entries.clone();
     if let Some(session) = state.session_by_id_mut(session_id) {
@@ -6831,6 +7096,7 @@ fn real_git_export_content_files(state: &RealRepoState) -> Vec<GitExportContentF
 
 fn real_git_export_writer_input(
     repo_root: &PathBuf,
+    state: &RealRepoState,
     options: &GitExportOptions,
     checkpoint: CheckpointRecord,
     validation_report: GitExportValidationReport,
@@ -6869,13 +7135,35 @@ fn real_git_export_writer_input(
     let mut request = GitExportRequest::from_checkpoint(&checkpoint);
     request.git_ref = target_ref.clone();
     request.validation_report_id = validation_report.id.clone();
+    let prior_export_maps = state
+        .export_maps
+        .iter()
+        .filter_map(|export_map| {
+            Some(GitExportMapRecord {
+                id: export_map.export_map_id.clone(),
+                repository_id: state.repository_id.clone(),
+                checkpoint_id: export_map.checkpoint_id.clone(),
+                tree_identity: SingleRepoTree {
+                    repository_id: state.repository_id.clone(),
+                    tree_hash: export_map.tree_hash.clone(),
+                },
+                git_remote: None,
+                git_ref: export_map.git_ref.clone(),
+                git_commit_ids: export_map.git_commit_ids.clone(),
+                export_shape: request.export_shape.clone(),
+                validation_report_id: export_map.validation_report_id.clone()?,
+                exported_at: export_map.exported_at.clone(),
+                privacy_class: sunlight_core::records::PrivacyClass::CommitDefault,
+            })
+        })
+        .collect();
     Ok(GitExportWriterInput {
         base_checkpoint_ids: vec!["checkpoint_base_0001".to_string()],
         imported_base_commits: vec![ImportedBaseGitCommit {
             checkpoint_id: "checkpoint_base_0001".to_string(),
             git_commit_id: base_commit_id.clone(),
         }],
-        prior_export_maps: Vec::new(),
+        prior_export_maps,
         planned_commit_id: "planned_commit_id_replaced_by_real_git".to_string(),
         export_map_id: format!("export_map_{}", checkpoint.id),
         exported_at: FIXTURE_CREATED_AT.to_string(),
@@ -7540,8 +7828,11 @@ fn real_execution_record(
         promotions: Vec::new(),
         result: sunlight_core::execution::ExecutionResult {
             status: match execution.status.as_str() {
+                "running" => sunlight_core::execution::ExecutionStatus::Running,
                 "pass" => sunlight_core::execution::ExecutionStatus::Pass,
+                "canceled" => sunlight_core::execution::ExecutionStatus::Canceled,
                 "timeout" => sunlight_core::execution::ExecutionStatus::Timeout,
+                "interrupted" => sunlight_core::execution::ExecutionStatus::Interrupted,
                 "policy_blocked" => sunlight_core::execution::ExecutionStatus::PolicyBlocked,
                 _ => sunlight_core::execution::ExecutionStatus::Fail,
             },
@@ -8447,7 +8738,7 @@ fn real_operational_warnings_json(
         warnings.push("{\"code\":\"state_recovery_rolled_back\",\"message\":\"an interrupted malformed publication was rolled back to the newest fully valid state\",\"details\":{\"evidence_root\":\"local://.sunlight/local/recovery/native-state\"}}".to_string());
     }
     if summary.quarantined_count > 0 {
-        warnings.push(format!("{{\"code\":\"ingest_secrets_quarantined\",\"message\":\"review quarantined ingest records before checkpointing\",\"details\":{{\"count\":{},\"report\":\"local://.sunlight/quarantine/ingest-report.json\"}}}}", summary.quarantined_count));
+        warnings.push(format!("{{\"code\":\"ingest_secrets_quarantined\",\"message\":\"likely secret files were excluded from Sunlight source truth\",\"details\":{{\"count\":{},\"report\":\"local://.sunlight/quarantine/ingest-report.json\",\"next_action\":\"Inspect the report, rotate real credentials, and author only a sanitized non-secret replacement through a Sunlight topic; quarantined bytes were not stored and cannot be restored by Sunlight.\"}}}}", summary.quarantined_count));
     }
     if summary.conflict_count > 0 {
         warnings.push(format!("{{\"code\":\"resolver_conflicts\",\"message\":\"inspect and resolve conflicting topic operations\",\"details\":{{\"count\":{}}}}}", summary.conflict_count));
@@ -8608,7 +8899,7 @@ fn print_real_status_text(
     if summary.quarantined_count > 0 {
         outputln!(
             ctx,
-            "warning[ingest_secrets_quarantined]: review .sunlight/quarantine/ingest-report.json"
+            "warning[ingest_secrets_quarantined]: inspect .sunlight/quarantine/ingest-report.json, rotate real credentials, and author only a sanitized non-secret replacement through a Sunlight topic; quarantined bytes were not stored"
         );
     }
     if summary.conflict_count > 0 {
@@ -13407,6 +13698,39 @@ fn promotion_error(
     ))
 }
 
+fn oversized_promotion_error(
+    execution_id: &str,
+    path: &str,
+    session_id: &str,
+    classification: &str,
+    observed_bytes: u64,
+) -> CliError {
+    CliError::new(
+        "promotion_policy_failed",
+        "execution output exceeds the source-promotion size limit",
+    )
+    .with_raw_details_json(format!(
+        concat!(
+            "{{",
+            "\"execution_id\":\"{}\",",
+            "\"path\":\"{}\",",
+            "\"session_id\":\"{}\",",
+            "\"classification\":\"{}\",",
+            "\"observed_bytes\":{},",
+            "\"maximum_promotable_bytes\":{},",
+            "\"operation_transaction_id\":null,",
+            "\"topic_revision_id\":null",
+            "}}"
+        ),
+        json_escape(execution_id),
+        json_escape(path),
+        json_escape(session_id),
+        json_escape(classification),
+        observed_bytes,
+        MAX_PROMOTABLE_EXECUTION_OUTPUT_BYTES,
+    ))
+}
+
 fn git_export_error(error: GitExportError) -> CliError {
     let message = match error.code.as_str() {
         "export_policy_failed" => "checkpoint failed Git export validation",
@@ -13605,7 +13929,7 @@ fn init_success_envelope(
         "[]".to_string()
     } else {
         format!(
-            "[{{\"code\":\"ingest_secrets_quarantined\",\"message\":\"repo ingestion skipped likely secret files\",\"quarantined_count\":{},\"report\":\"local://.sunlight/quarantine/ingest-report.json\"}}]",
+            "[{{\"code\":\"ingest_secrets_quarantined\",\"message\":\"likely secret files were excluded from Sunlight source truth\",\"quarantined_count\":{},\"report\":\"local://.sunlight/quarantine/ingest-report.json\",\"next_action\":\"Inspect the report, rotate real credentials, and author only a sanitized non-secret replacement through a Sunlight topic; quarantined bytes were not stored and cannot be restored by Sunlight.\"}}]",
             quarantined_count
         )
     };
@@ -18187,11 +18511,106 @@ fn failure_envelope(error: &CliError) -> String {
         .map(str::to_string)
         .unwrap_or_else(|| details_json(&error.details));
     format!(
-        "{{\"ok\":false,\"error\":{{\"code\":\"{}\",\"message\":\"{}\",\"details\":{}}}}}",
+        "{{\"ok\":false,\"error\":{{\"code\":\"{}\",\"message\":\"{}\",\"details\":{},\"next_action\":\"{}\"}}}}",
         json_escape(error.code),
         json_escape(&error.message),
         details,
+        json_escape(next_action_for_error_code(error.code)),
     )
+}
+
+fn next_action_for_error_code(code: &str) -> &'static str {
+    match code {
+        "not_initialized" => {
+            "Call repository_init for this repository, then retry the original operation."
+        }
+        "precondition_failed" | "compat_precondition_failed" | "promotion_precondition_failed" => {
+            "Read the current artifact or inspect the referenced object, use the returned exact hash and IDs, then retry only after adapting the intended change."
+        }
+        "patch_apply_failed" | "patch_parse_failed" => {
+            "Read the current artifact, rebuild the patch with exact unique context, keep the current content hash as the compare-and-swap guard, and retry."
+        }
+        "session_not_found" => {
+            "Inspect repository status for current sessions; start a new session on the intended topic and exact view when the supplied session does not exist."
+        }
+        "topic_completed" | "topic_already_completed" => {
+            "Treat the completed revision as immutable; create a dependent topic and session for any follow-up change."
+        }
+        "topic_session_mismatch" | "topic_head_mismatch" | "topic_conflict" => {
+            "Inspect the topic and session facts, then use the session that owns the topic and its exact current revision; do not guess or reuse another writer's session."
+        }
+        "session_refresh_blocked" | "conflicted_view" | "execution_conflicted_view"
+        | "checkpoint_conflicted_view" => {
+            "Inspect the returned conflict IDs, adapt the overlapping change in its own topic, and resolve a new exact view before retrying."
+        }
+        "checkpoint_stale_view" | "compat_projection_stale" | "resolver_frontier_input_lost"
+        | "persisted_view_mismatch" => {
+            "Inspect the returned staleness or frontier facts, reselect exact completed revisions, and create a fresh resolved view before retrying."
+        }
+        "repository_writer_busy" | "concurrent_state_update" => {
+            "Call repository_status to observe durable state, then retry the same idempotent operation after the bounded writer contention clears."
+        }
+        "request_cancelled" => {
+            "Inspect repository status before retrying; an acknowledged publication may already be durable, so do not assume cancellation rolled it back."
+        }
+        "execution_network_isolation_incompatible_toolchain" => {
+            "Use a toolchain compatible with enforced network isolation, or explicitly request not_enforced only when repository policy permits that weaker guarantee."
+        }
+        "execution_containment_setup_failed" | "execution_filesystem_isolation_setup_failed"
+        | "execution_network_isolation_setup_failed" => {
+            "Inspect the reported platform and policy facts, correct the unavailable containment prerequisite or choose an explicitly permitted policy, then retry."
+        }
+        "execution_network_isolation_cleanup_failed" => {
+            "Inspect the recorded execution and cleanup facts, run the documented bounded cleanup or restart recovery, and do not assume isolation state was removed."
+        }
+        "commit_policy_failed" | "export_policy_failed" | "checkpoint_evidence_failed"
+        | "checkpoint_evidence_view_mismatch" | "checkpoint_evidence_tree_mismatch" => {
+            "Inspect the validation report and exact view/tree identities, satisfy the reported policy or evidence failures, then create or export a matching checkpoint."
+        }
+        "state_recovery_failed" | "publication_outbox_recovery_failed"
+        | "invalid_native_state" | "invalid_repository_config" | "repository_io_failed" => {
+            "Preserve .sunlight, inspect the reported recovery paths and repository status, and use the documented recovery command or backup; do not delete native state."
+        }
+        "projection_cache_integrity_failed" | "projection_quarantine_record_write_failed" => {
+            "Inspect the reported cache or quarantine path, preserve native state, run projection quarantine cleanup, and rematerialize the exact view."
+        }
+        "path_outside_repository" | "path_policy_violation" => {
+            "Use a portable repository-relative artifact path that does not traverse protected state, symlinks, junctions, or repository boundaries."
+        }
+        "shell_not_allowed" => {
+            "Invoke an approved executable directly with a separate argument array; shell interpreters and shell command strings are not accepted."
+        }
+        "mcp_content_too_large" | "mcp_stdout_too_large" | "mcp_stderr_too_large" => {
+            "Narrow the requested content or command output and retry; inspect repository status separately because durable state remains available."
+        }
+        "promotion_policy_failed" => {
+            "Inspect the returned classification and size facts, keep denied output local-only, then correct, reduce, or split a safe source-like candidate before retrying promotion."
+        }
+        "artifact_read_scope_invalid" => {
+            "Supply exactly one scope: a session for topic-bound authoring context or an exact resolved view for read-only access."
+        }
+        "invalid_request" | "unknown_tool" => {
+            "Correct the request using the advertised tool schema or CLI help, then retry; do not repeat unchanged arguments."
+        }
+        _ if code.contains("secret") || code.contains("quarantine") => {
+            "Inspect the quarantine report without copying secret bytes into logs, then explicitly correct the classification or source content before retrying."
+        }
+        _ if code.contains("path") || code.contains("projection") => {
+            "Inspect the reported path and projection facts, keep all access inside the repository-managed boundary, and retry with a valid exact view or relative path."
+        }
+        _ if code.contains("view") || code.contains("resolver") => {
+            "Inspect the exact view, conflict, and staleness facts; resolve a new view from exact completed revisions before retrying."
+        }
+        _ if code.contains("execution") => {
+            "Inspect the durable execution record and policy report, correct the reported command or policy condition, and retry against the same exact view only when safe."
+        }
+        _ if code.contains("git") || code.contains("export") => {
+            "Inspect the checkpoint, validation report, branch, and working-tree facts; correct the reported Git handoff condition without changing existing work, then retry."
+        }
+        _ => {
+            "Inspect error details and repository_status, correct the identified IDs or preconditions, and retry only when the operation is safe and still needed."
+        }
+    }
 }
 
 fn details_json(details: &[(&'static str, String)]) -> String {
@@ -18311,7 +18730,7 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
         "run" => outputln!(ctx, "sun run\n\nUsage:\n  sun run --view <resolved-view-id> [--network disabled|not_enforced] -- <command> [args...]\n\nRuntime bounds come from [execution_policy] in .sunlight/config.toml. Windows runs always use restricted low-integrity filesystem isolation and a dedicated Job Object. Network disabled adds a capability-less per-execution AppContainer; not_enforced retains compatibility with ordinary user toolchains."),
         "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => outputln!(ctx, "sun artifact operations\n\nUsage:\n  sun read <path> (--session <session> | --view <resolved-view>) [--json]\n  sun list [path-prefix] (--session <session> | --view <resolved-view>) [--json]\n  sun search <query> (--session <session> | --view <resolved-view>) [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification <class> [--json]\n\nResolved-view reads are read-only and do not create a session. Mutations always require a topic-bound authoring session."),
         "view" | "view resolve" => outputln!(ctx, "sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nResolves persisted topic selections; conflicts and staleness remain inspectable records."),
-        "project" | "project materialize" | "projection" | "projection create" => outputln!(ctx, "sun project materialize\n\nUsage:\n  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export [--strategy copy|reflink|hardlink_readonly|overlay_copyup] [--no-copy-fallback] [--projection-root <path>] [--json]\n\nManaged projections adapt persisted views for filesystem tools and are not source truth. Automatic selection prefers safe Windows block cloning and falls back to full copy; --no-copy-fallback makes the requested strategy required."),
+        "project" | "project materialize" | "projection" | "projection create" => outputln!(ctx, "sun project materialize\n\nUsage:\n  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export [--strategy copy|reflink|hardlink_readonly|overlay_copyup] [--no-copy-fallback] [--projection-root <path>] [--json]\n\nManaged projections adapt persisted views for filesystem tools and are not source truth. Automatic selection uses verified-cache read-only hardlinks for Windows inspection, prefers safe block cloning for writable purposes, and falls back to private copies; --no-copy-fallback makes the requested strategy required."),
         "execution" | "execution promote-output" => outputln!(ctx, "sun execution promote-output\n\nUsage:\n  sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> [--json]"),
         "mcp" | "mcp serve" => outputln!(ctx, "sun mcp serve\n\nUsage:\n  sun mcp serve --repo <initialized-repo>\n\nRuns MCP JSON-RPC 2.0 over newline-delimited stdio. The server is bound to one canonical initialized repository; stdout contains protocol messages only."),
         _ => print_help(ctx),

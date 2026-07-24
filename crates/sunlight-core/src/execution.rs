@@ -176,24 +176,28 @@ pub struct ExecutionResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionStatus {
+    Running,
     Pass,
     Fail,
     Timeout,
     Canceled,
     Flaky,
     Unknown,
+    Interrupted,
     PolicyBlocked,
 }
 
 impl ExecutionStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Running => "running",
             Self::Pass => "pass",
             Self::Fail => "fail",
             Self::Timeout => "timeout",
             Self::Canceled => "canceled",
             Self::Flaky => "flaky",
             Self::Unknown => "unknown",
+            Self::Interrupted => "interrupted",
             Self::PolicyBlocked => "policy_blocked",
         }
     }

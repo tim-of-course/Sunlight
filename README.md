@@ -5,9 +5,10 @@ topic-owned operations against exact repository views, compose exact revisions,
 run validation, and freeze checkpoints without creating a Git worktree or full
 checkout for every authoring agent.
 
-The current scope is a local, single-repository workflow. Windows has the
-strongest execution containment; other platforms report their enforced and
-unenforced policy dimensions explicitly.
+The open alpha supports **Windows only**. The current product scope is a local,
+single-repository workflow on Windows/NTFS. macOS and Linux builds are not
+supported alpha targets; their compilation or best-effort behavior is not a
+claim of enforced isolation or product support.
 
 ## Build
 

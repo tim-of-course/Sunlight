@@ -1,6 +1,6 @@
 # Sunlight Open Alpha Acceptance
 
-Status: Draft acceptance gate  
+Status: Acceptance in progress — OA-02 through OA-09 pass; OA-01 awaits Cursor
 Created: 2026-07-20  
 Scope: Local, single-repository Sunlight workflows for coding agents
 
@@ -35,30 +35,35 @@ workflow.
 
 ## Current baseline
 
-The 2026-07-20 unscaffolded Codex acceptance run established that a fresh agent
-could discover the repository-local Sunlight skill, inspect and author source
-through MCP, produce two genuine red/green fixes, encounter and resolve an
-exact-integration conflict, validate the combined result, and create an
-unexported checkpoint without changing application source through Git or the
-working tree.
+Eight gates now have final-source evidence in the tested Windows/NTFS scope:
+common-path/error recovery, MCP termination recovery, exact Git handoff,
+repository/execution safety, and realistic four-author scale. The final release
+executable is SHA-256
+`d69c6cb6ddd6e75f76491ab040a6fb3ec723249831635a610157e58cb1de10b8`.
 
-That is strong internal-alpha evidence, but it does not yet cover clean Cursor
-setup, delegated multi-agent orchestration, interruption recovery, a real Git
-handoff, an adversarial repository-boundary review, or realistic scale.
+The previously observed deleted-tracked-path, execution-policy reporting,
+dependency ancestry, invalid-session recovery, projection reuse, and writer
+contention defects are fixed and covered by the final regression. Three
+consecutive fresh Codex runs, a fresh delegated supervisor, and a fresh
+unfamiliar-tester run now pass. Automated installation/documentation checks
+also pass, but they do not replace an actual Cursor run, which OA-01 still
+requires.
 
-Observed findings that must be resolved or explicitly classified before the
-open-alpha decision:
+Current evidence bundle:
 
-- `sun init` failed when a Git-tracked file was intentionally absent from the
-  working tree.
-- An execution requesting `network: disabled` failed before a retry with
-  `network: not_enforced`; the supported behavior and recovery guidance need to
-  be unambiguous.
-- Topics authored from already integrated views produced dependency and
-  same-artifact resolution friction. Two final fixes required consolidation
-  topics to obtain a conflict-free view.
-- Errors for invalid session/view choices must consistently identify the next
-  correct action without requiring workflow guesswork.
+- [OA-01/OA-09 automated evidence](acceptance/evidence/oa01_oa09_automated_2026-07-23.md)
+- [OA-02/OA-06 evidence](acceptance/evidence/oa02_oa06_2026-07-23.md)
+- [OA-04/OA-05 evidence](acceptance/evidence/oa04_oa05_2026-07-23.md)
+- [OA-07 final machine-readable evidence](acceptance/evidence/oa07_2026-07-23.json)
+- [OA-07 attempt and remediation history](acceptance/evidence/oa07_attempts_2026-07-23.md)
+- [OA-08 Windows-only platform evidence](acceptance/evidence/oa08_windows_2026-07-24.md)
+- [Fresh Codex, supervisor, and unfamiliar-tester evidence](acceptance/evidence/oa01_oa03_oa09_fresh_clients_2026-07-24.md)
+- [Banana Split integration feedback](acceptance/banana_split_feedback.md)
+
+Future Sunlight acceptance runs use direct fresh coding-client tasks or a fixed,
+bounded set of workers by default. Banana Split is excluded unless the run is
+specifically testing the Sunlight/Banana Split integration, so orchestration
+failures are not misclassified as Sunlight product failures.
 
 ## Result vocabulary
 
@@ -310,28 +315,33 @@ accurately and the final accepted view is separately validated.
 ## Open-alpha decision checklist
 
 - [ ] OA-01 clean installation and discovery passes.
-- [ ] OA-02 common-path correctness and recovery passes.
-- [ ] OA-03 delegated concurrent integration passes.
-- [ ] OA-04 termination and crash recovery passes.
-- [ ] OA-05 exact validation and Git handoff passes.
-- [ ] OA-06 repository and execution safety passes.
-- [ ] OA-07 realistic scale and storage behavior passes.
-- [ ] OA-08 supported platform contract passes for the declared scope.
-- [ ] OA-09 documentation and unaided recovery passes.
-- [ ] All observed high-severity findings are fixed and retested.
-- [ ] Remaining limitations are non-destructive and documented.
-- [ ] The release evidence bundle identifies the exact tested build.
+- [x] OA-02 common-path correctness and recovery passes.
+- [x] OA-03 delegated concurrent integration passes.
+- [x] OA-04 termination and crash recovery passes.
+- [x] OA-05 exact validation and Git handoff passes.
+- [x] OA-06 repository and execution safety passes.
+- [x] OA-07 realistic scale and storage behavior passes.
+- [x] OA-08 supported platform contract passes for the declared scope.
+- [x] OA-09 documentation and unaided recovery passes.
+- [x] All observed high-severity findings are fixed and retested.
+- [x] Remaining limitations are non-destructive and documented.
+- [x] The release evidence bundle identifies the exact tested build.
 - [ ] The final release decision and approver are recorded below.
 
 ## Decision record
 
-Decision: Pending  
-Date: Pending  
-Build: Pending  
-Approver: Pending  
-Supported platforms: Pending  
-Evidence bundle: Pending  
-Known limitations: Pending
+- Decision: Pending OA-01 actual Cursor run and final approver
+- Date: 2026-07-24
+- Build: `d69c6cb6ddd6e75f76491ab040a6fb3ec723249831635a610157e58cb1de10b8`
+- Approver: Pending
+- Supported platforms: Windows only for open alpha; Windows/NTFS is the tested scope
+- Evidence bundle: `docs/acceptance/evidence/`
+- Known limitations: Actual Cursor discovery remains unproven. `sun` may require
+  an absolute path when it is not on `PATH`; generated client configuration and
+  doctor output expose that path. User-local Bun is not AppContainer-readable
+  on this host, so exact-view builds used the explicitly reported and permitted
+  `network: not_enforced` mode. macOS and Linux are explicitly unsupported in
+  the open alpha.
 
 ## Post-alpha tests
 

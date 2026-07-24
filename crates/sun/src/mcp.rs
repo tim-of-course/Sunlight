@@ -24,6 +24,8 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
+const REPOSITORY_MUTATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+const REPOSITORY_MUTATION_QUEUE_POLL: Duration = Duration::from_millis(10);
 
 pub(crate) fn serve_from_args(args: &[String]) -> Result<(), String> {
     if args == ["mcp", "--help"] || args == ["mcp", "serve", "--help"] {
@@ -146,7 +148,7 @@ fn serve(repo: PathBuf, engine: EngineContext, temp: Arc<PrivateTemp>) -> Result
     let (input_tx, input_rx) = mpsc::channel();
     let reader = thread::spawn(move || read_input(io::stdin().lock(), input_tx));
     let mut stdout = io::BufWriter::new(io::stdout().lock());
-    let mut pending = VecDeque::new();
+    let mut pending: VecDeque<(Value, Instant)> = VecDeque::new();
     let mut active: Option<ActiveCall> = None;
     let mut initialized = false;
     let mut input_closed = false;
@@ -176,9 +178,10 @@ fn serve(repo: PathBuf, engine: EngineContext, temp: Arc<PrivateTemp>) -> Result
         }
 
         if active.is_none() {
-            if let Some(message) = pending.pop_front() {
+            if let Some((message, queued_at)) = pending.pop_front() {
                 handle_message(
                     message,
+                    queued_at,
                     &repo,
                     &engine,
                     &temp,
@@ -204,7 +207,7 @@ fn serve(repo: PathBuf, engine: EngineContext, temp: Arc<PrivateTemp>) -> Result
                     }
                     if let Some(requested) = requested {
                         let before = pending.len();
-                        pending.retain(|queued| queued.get("id") != Some(&requested));
+                        pending.retain(|(queued, _)| queued.get("id") != Some(&requested));
                         if pending.len() != before {
                             write_message(
                                 &mut stdout,
@@ -215,10 +218,11 @@ fn serve(repo: PathBuf, engine: EngineContext, temp: Arc<PrivateTemp>) -> Result
                 } else if active.is_some()
                     && message.get("method").and_then(Value::as_str) == Some("tools/call")
                 {
-                    pending.push_back(message);
+                    pending.push_back((message, Instant::now()));
                 } else {
                     handle_message(
                         message,
+                        Instant::now(),
                         &repo,
                         &engine,
                         &temp,
@@ -266,6 +270,7 @@ fn serve(repo: PathBuf, engine: EngineContext, temp: Arc<PrivateTemp>) -> Result
 
 fn handle_message(
     message: Value,
+    queued_at: Instant,
     repo: &Path,
     engine: &EngineContext,
     temp: &Arc<PrivateTemp>,
@@ -411,14 +416,42 @@ fn handle_message(
             let worker_cancel = Arc::clone(&cancel);
             let (tx, rx) = mpsc::channel();
             let join = thread::spawn(move || {
-                let result = if name == "topic_wait" {
+                let client_queue_ms = queued_at.elapsed().as_millis();
+                let call_started = Instant::now();
+                let mut repository_queue_time = Duration::ZERO;
+                let mut result = if name == "topic_wait" {
                     execute_topic_wait(&engine, &arguments, &worker_cancel)
                 } else {
                     match build_invocation(&name, &arguments, &repo, &temp) {
+                        Ok(invocation) if tool_uses_repository_mutation_queue(&name) => {
+                            let queue_started = Instant::now();
+                            let guard = acquire_repository_mutation_queue(&repo, &worker_cancel);
+                            repository_queue_time = queue_started.elapsed();
+                            match guard {
+                                Ok(_guard) => {
+                                    execute_invocation(&engine, invocation, &worker_cancel)
+                                }
+                                Err(error) => tool_failure_result(error),
+                            }
+                        }
                         Ok(invocation) => execute_invocation(&engine, invocation, &worker_cancel),
                         Err(error) => tool_failure_result(error),
                     }
                 };
+                let concurrency_retries = result
+                    .as_object_mut()
+                    .and_then(|object| object.remove("_automatic_concurrency_retries"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                attach_transport_metrics(
+                    &mut result,
+                    client_queue_ms + repository_queue_time.as_millis(),
+                    call_started
+                        .elapsed()
+                        .saturating_sub(repository_queue_time)
+                        .as_millis(),
+                    concurrency_retries,
+                );
                 let _ = tx.send(result);
             });
             *active = Some(ActiveCall {
@@ -636,9 +669,124 @@ impl ToolFailure {
     }
 }
 
+#[derive(Debug)]
+struct RepositoryMutationQueueGuard {
+    _file: fs::File,
+}
+
+fn tool_uses_repository_mutation_queue(name: &str) -> bool {
+    matches!(
+        name,
+        "repository_init"
+            | "topic_create"
+            | "topic_complete"
+            | "session_start"
+            | "session_refresh"
+            | "artifact_patch"
+            | "artifact_write"
+            | "artifact_move"
+            | "artifact_delete"
+            | "artifact_metadata_set"
+            | "view_resolve"
+            | "execution_promote_output"
+            | "checkpoint_create"
+            | "policy_check_export"
+            | "git_export"
+    )
+}
+
+fn acquire_repository_mutation_queue(
+    repo: &Path,
+    cancel: &AtomicBool,
+) -> Result<RepositoryMutationQueueGuard, ToolFailure> {
+    let lock_path = repo.join(".sunlight/local/mcp-mutation-queue.lock");
+    let parent = lock_path.parent().expect("queue lock has a parent");
+    fs::create_dir_all(parent).map_err(|error| {
+        ToolFailure::new(
+            "repository_queue_io",
+            format!("cannot create the repository mutation queue directory: {error}"),
+        )
+        .detail("lock", lock_path.display().to_string())
+    })?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            ToolFailure::new(
+                "repository_queue_io",
+                format!("cannot open the repository mutation queue: {error}"),
+            )
+            .detail("lock", lock_path.display().to_string())
+        })?;
+    let started = Instant::now();
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err(ToolFailure::new(
+                "request_cancelled",
+                "request was cancelled while waiting for the repository mutation queue",
+            )
+            .detail("lock", lock_path.display().to_string()));
+        }
+        match file.try_lock() {
+            Ok(()) => return Ok(RepositoryMutationQueueGuard { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => {
+                if started.elapsed() >= REPOSITORY_MUTATION_QUEUE_TIMEOUT {
+                    return Err(ToolFailure::new(
+                        "repository_writer_busy",
+                        "timed out waiting for another MCP writer in this repository",
+                    )
+                    .detail("lock", lock_path.display().to_string())
+                    .detail(
+                        "timeout_ms",
+                        REPOSITORY_MUTATION_QUEUE_TIMEOUT.as_millis() as u64,
+                    ));
+                }
+                thread::sleep(REPOSITORY_MUTATION_QUEUE_POLL);
+            }
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(ToolFailure::new(
+                    "repository_queue_io",
+                    format!("cannot lock the repository mutation queue: {error}"),
+                )
+                .detail("lock", lock_path.display().to_string()));
+            }
+        }
+    }
+}
+
 fn tool_failure_result(error: ToolFailure) -> Value {
-    let envelope = json!({"ok":false,"error":{"code":error.code,"message":error.message,"details":error.details}});
+    let envelope = json!({"ok":false,"error":{"code":error.code,"message":error.message,"details":error.details,"next_action":super::next_action_for_error_code(error.code)}});
     json!({"content":[{"type":"text","text":envelope.to_string()}],"structuredContent":envelope,"isError":true})
+}
+
+fn attach_transport_metrics(
+    result: &mut Value,
+    queue_ms: u128,
+    worker_ms: u128,
+    automatic_concurrency_retries: u64,
+) {
+    let Some(mut envelope) = result.get("structuredContent").cloned() else {
+        return;
+    };
+    let transport = json!({
+        "queue_ms": queue_ms,
+        "worker_ms": worker_ms,
+        "automatic_concurrency_retries": automatic_concurrency_retries,
+    });
+    if envelope.get("ok").and_then(Value::as_bool) == Some(true) {
+        envelope["data"]["transport"] = transport;
+    } else {
+        envelope["error"]["details"]["transport"] = transport;
+    }
+    result["content"] = json!([{"type":"text","text":envelope.to_string()}]);
+    result["structuredContent"] = envelope;
+}
+
+fn with_concurrency_retries(mut result: Value, count: usize) -> Value {
+    result["_automatic_concurrency_retries"] = json!(count);
+    result
 }
 
 fn execute_invocation(
@@ -666,42 +814,54 @@ fn execute_invocation(
         },
     );
     if response.stdout_overflowed {
-        return tool_failure_result(
-            ToolFailure::new(
-                "mcp_stdout_too_large",
-                "engine response exceeded the MCP response limit",
-            )
-            .detail("max_bytes", MAX_STDOUT_BYTES as u64),
+        return with_concurrency_retries(
+            tool_failure_result(
+                ToolFailure::new(
+                    "mcp_stdout_too_large",
+                    "engine response exceeded the MCP response limit",
+                )
+                .detail("max_bytes", MAX_STDOUT_BYTES as u64),
+            ),
+            response.concurrency_retry_count,
         );
     }
     if response.stderr_overflowed {
-        return tool_failure_result(
-            ToolFailure::new(
-                "mcp_stderr_too_large",
-                "engine diagnostics exceeded the MCP diagnostic limit",
-            )
-            .detail("max_bytes", MAX_STDERR_BYTES as u64),
+        return with_concurrency_retries(
+            tool_failure_result(
+                ToolFailure::new(
+                    "mcp_stderr_too_large",
+                    "engine diagnostics exceeded the MCP diagnostic limit",
+                )
+                .detail("max_bytes", MAX_STDERR_BYTES as u64),
+            ),
+            response.concurrency_retry_count,
         );
     }
     let parsed: Value = match serde_json::from_str(&response.stdout) {
         Ok(value) => value,
         Err(error) => {
-            return tool_failure_result(
-                ToolFailure::new(
-                    "mcp_invalid_engine_contract",
-                    "command engine did not return one valid JSON contract",
-                )
-                .detail("source", error.to_string())
-                .detail("stderr", response.stderr),
+            return with_concurrency_retries(
+                tool_failure_result(
+                    ToolFailure::new(
+                        "mcp_invalid_engine_contract",
+                        "command engine did not return one valid JSON contract",
+                    )
+                    .detail("source", error.to_string())
+                    .detail("stderr", response.stderr),
+                ),
+                response.concurrency_retry_count,
             );
         }
     };
     let is_error = !response.success || parsed.get("ok").and_then(Value::as_bool) == Some(false);
-    json!({
-        "content":[{"type":"text","text":parsed.to_string()}],
-        "structuredContent":parsed,
-        "isError":is_error
-    })
+    with_concurrency_retries(
+        json!({
+            "content":[{"type":"text","text":parsed.to_string()}],
+            "structuredContent":parsed,
+            "isError":is_error
+        }),
+        response.concurrency_retry_count,
+    )
 }
 
 fn tool_result_with_wait(mut result: Value, outcome: &str, elapsed_ms: u128) -> Value {
@@ -1034,10 +1194,10 @@ fn required_string<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a st
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| ToolFailure::new("invalid_request", format!("`{key}` must be a string")))?;
-    if value.is_empty() || value.len() > MAX_CONTENT_BYTES || value.contains('\0') {
+    if value.is_empty() || value.contains('\0') {
         return Err(ToolFailure::new(
             "invalid_request",
-            format!("`{key}` is empty or exceeds its limit"),
+            format!("`{key}` must be nonempty and contain no NUL bytes"),
         ));
     }
     Ok(value)
@@ -1654,7 +1814,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "project_materialize",
-            "Materialize a managed projection inside the bound repository policy root.",
+            "Materialize a managed projection inside the bound repository policy root. On Windows, automatic read-only inspection uses a verified-cache hardlink strategy; writable purposes prefer copy-on-write and safely fall back to private copies.",
             json!({"view":id_schema("Exact conflict-free resolved_view_id to materialize."),"purpose":{"type":"string","description":"Consumer-specific projection policy and cache namespace.","enum":["execution","compatibility","inspection","export"]},"strategy":{"type":"string","description":"Optional required or preferred filesystem strategy.","enum":["copy","reflink","hardlink_readonly","overlay_copyup"]},"require_strategy":{"type":"boolean","description":"When true, fail instead of using a safe fallback strategy.","default":false}}),
             &["view", "purpose"],
             true,
@@ -1689,7 +1849,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "execution_promote_output",
-            "Promote one classified execution output into a session-owned operation.",
+            "Promote one classified regular-file execution output into a session-owned operation. Ignored, secret, log, cache, and outputs larger than 2 MiB remain local-only and fail closed with recovery facts.",
             json!({"execution":id_schema("Exact execution_id that produced the candidate."),"path":path_schema(),"session":id_schema("Exact authoring session_id that will own the promoted operation."),"classification":class_schema()}),
             &["execution", "path", "session", "classification"],
             true,
@@ -1767,6 +1927,20 @@ fn output_schema(name: &str) -> Value {
         "repository_id".to_string(),
         json!({"type":"string","description":"Canonical repository identity when the command is repository-backed."}),
     );
+    data.insert(
+        "transport".to_string(),
+        json!({
+            "type":"object",
+            "description":"Per-call MCP observability for interactive latency and contention measurement.",
+            "required":["queue_ms","worker_ms","automatic_concurrency_retries"],
+            "properties":{
+                "queue_ms":{"type":"integer","minimum":0,"description":"Time spent in the local server queue plus any cross-process repository mutation queue, excluding worker execution."},
+                "worker_ms":{"type":"integer","minimum":0,"description":"Total time spent validating and executing this tool in its worker."},
+                "automatic_concurrency_retries":{"type":"integer","minimum":0,"description":"Safe engine retries caused by writer-lock or state-sequence contention."}
+            },
+            "additionalProperties":false
+        }),
+    );
 
     let ids = output_ids(name);
     if !ids.is_empty() {
@@ -1796,7 +1970,7 @@ fn output_schema(name: &str) -> Value {
         "properties":{
             "ok":{"type":"boolean"},
             "data":{"type":"object","description":format!("Successful {name} result. Use exact returned IDs and hashes as later inputs."),"properties":data,"additionalProperties":true},
-            "error":{"type":"object","description":"Stable native error with code, message, and inspectable details.","properties":{"code":{"type":"string"},"message":{"type":"string"},"details":{"type":"object"}},"additionalProperties":true},
+            "error":{"type":"object","description":"Stable native error with code, message, inspectable details, and one concrete recovery action.","required":["code","message","details","next_action"],"properties":{"code":{"type":"string"},"message":{"type":"string"},"details":{"type":"object"},"next_action":{"type":"string","description":"The safest normal next action derived from this error code. Inspect returned details and exact IDs before acting."}},"additionalProperties":true},
             "warnings":{"type":["array","object"],"description":"Advisory facts that do not replace hard error states."}
         },
         "additionalProperties":false
@@ -2050,10 +2224,122 @@ mod tests {
         ));
         assert!(validate_repo_relative("../escape", "path", false).is_err());
     }
+
+    #[test]
+    fn oversized_patch_is_rejected_before_any_private_staging_write() {
+        let (root, temp) = private_temp();
+        let oversized = "x".repeat(MAX_CONTENT_BYTES + 1);
+        let invocation = build_invocation(
+            "artifact_patch",
+            &json!({
+                "path":"README.md",
+                "session":"session_a",
+                "expect_hash":format!("sha256:{}", "0".repeat(64)),
+                "patch":oversized
+            }),
+            &root.0,
+            &temp,
+        );
+
+        assert!(matches!(
+            invocation,
+            Err(ToolFailure {
+                code: "mcp_content_too_large",
+                ..
+            })
+        ));
+        assert_eq!(fs::read_dir(&temp.root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn repository_mutation_queue_covers_short_state_writers_only() {
+        for name in [
+            "repository_init",
+            "topic_create",
+            "topic_complete",
+            "session_start",
+            "session_refresh",
+            "artifact_patch",
+            "artifact_write",
+            "artifact_move",
+            "artifact_delete",
+            "artifact_metadata_set",
+            "view_resolve",
+            "execution_promote_output",
+            "checkpoint_create",
+            "policy_check_export",
+            "git_export",
+        ] {
+            assert!(tool_uses_repository_mutation_queue(name), "{name}");
+        }
+        for name in [
+            "repository_status",
+            "topic_wait",
+            "artifact_read",
+            "artifact_list",
+            "artifact_search",
+            "project_materialize",
+            "compat_project",
+            "compat_diff",
+            "compat_import",
+            "execution_run",
+            "policy_check_commit",
+            "policy_explain",
+            "inspect",
+        ] {
+            assert!(!tool_uses_repository_mutation_queue(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn repository_mutation_queue_serializes_independent_file_handles() {
+        let root = TestRoot::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let first = acquire_repository_mutation_queue(&root.0, &cancel).unwrap();
+        let second_root = root.0.clone();
+        let second_cancel = Arc::clone(&cancel);
+        let started = Instant::now();
+        let waiter = thread::spawn(move || {
+            let guard = acquire_repository_mutation_queue(&second_root, &second_cancel).unwrap();
+            let waited = started.elapsed();
+            drop(guard);
+            waited
+        });
+        thread::sleep(Duration::from_millis(40));
+        assert!(!waiter.is_finished());
+        drop(first);
+        assert!(waiter.join().unwrap() >= Duration::from_millis(30));
+    }
+
+    #[test]
+    fn repository_mutation_queue_wait_is_cancellable() {
+        let root = TestRoot::new();
+        let first_cancel = AtomicBool::new(false);
+        let _first = acquire_repository_mutation_queue(&root.0, &first_cancel).unwrap();
+        let cancelled = AtomicBool::new(true);
+        let error = acquire_repository_mutation_queue(&root.0, &cancelled).unwrap_err();
+        assert_eq!(error.code, "request_cancelled");
+    }
+
     #[test]
     fn agent_contract_exposes_creation_patch_and_completion_facts() {
         let advertised = tools();
         let find = |name: &str| advertised.iter().find(|tool| tool["name"] == name).unwrap();
+
+        for tool in &advertised {
+            let error = &tool["outputSchema"]["properties"]["error"];
+            assert!(error["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("next_action")));
+            assert_eq!(error["properties"]["next_action"]["type"], "string");
+            let transport = &tool["outputSchema"]["properties"]["data"]["properties"]["transport"];
+            assert_eq!(transport["properties"]["queue_ms"]["type"], "integer");
+            assert_eq!(
+                transport["properties"]["automatic_concurrency_retries"]["type"],
+                "integer"
+            );
+        }
 
         let write = find("artifact_write");
         let expect = &write["inputSchema"]["properties"]["expect_hash"];
@@ -2096,6 +2382,36 @@ mod tests {
         assert!(wait["outputSchema"]["properties"]["data"]["properties"]
             .get("wait")
             .is_some());
+    }
+
+    #[test]
+    fn structured_errors_include_specific_recovery_actions() {
+        let mut tool_error = tool_failure_result(ToolFailure::new(
+            "artifact_read_scope_invalid",
+            "choose one read scope",
+        ));
+        attach_transport_metrics(&mut tool_error, 7, 11, 2);
+        assert_eq!(
+            tool_error["structuredContent"]["error"]["next_action"],
+            "Supply exactly one scope: a session for topic-bound authoring context or an exact resolved view for read-only access."
+        );
+        assert_eq!(
+            tool_error["structuredContent"]["error"]["details"]["transport"],
+            json!({"queue_ms":7,"worker_ms":11,"automatic_concurrency_retries":2})
+        );
+
+        let native_error = super::super::CliError::new(
+            "precondition_failed",
+            "the artifact changed after it was read",
+        )
+        .with_detail("actual", "sha256:current");
+        let envelope: Value =
+            serde_json::from_str(&super::super::failure_envelope(&native_error)).unwrap();
+        assert_eq!(envelope["error"]["details"]["actual"], "sha256:current");
+        assert!(envelope["error"]["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("returned exact hash and IDs"));
     }
 
     #[test]

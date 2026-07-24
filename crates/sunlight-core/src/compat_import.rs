@@ -2349,6 +2349,7 @@ mod tests {
                 purpose: "compatibility".to_string(),
                 resolved_view_id: "view_test".to_string(),
                 tree_hash: tree_hash.clone(),
+                topic_frontier: BTreeMap::new(),
                 manifest_digest,
                 created_from_content_tree: tree_hash,
                 materialized_root: Some(root.display().to_string()),

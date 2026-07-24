@@ -17,6 +17,19 @@ mix native operations with direct tracked-source edits.
 Moving selectors are convenient for discovery, but durable integration,
 execution, checkpointing, and export must use exact IDs.
 
+## Source inclusion boundary
+
+Sunlight does not scan or hide secret-like filenames or content. Git-tracked
+files are visible under normal Git semantics, while Git-ignored untracked files
+are excluded. Repository-root `.sunignore` patterns explicitly hide additional
+tracked or untracked paths from Sunlight. `.git/` and `.sunlight/` are intrinsic
+exclusions. `.sunignore` is visible but human-owned and cannot be changed through
+Sunlight authoring, execution promotion, or compatibility import. Treat an
+excluded path as human-owned; do not bypass `.sunignore` with direct reads or
+edits. After a human changes the file, call `repository_init`; a clean state is
+refreshed and authored history fails closed with preservation guidance. Secret
+prevention and credential rotation happen outside Sunlight.
+
 ## Author one change
 
 1. Call `repository_status`. If the root is uninitialized, call

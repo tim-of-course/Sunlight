@@ -1256,7 +1256,6 @@ fn classification(args: &Map<String, Value>) -> Result<String, ToolFailure> {
             "source",
             "generated",
             "cache",
-            "secret",
             "local-only",
             "execution-output",
             "lockfile",
@@ -1699,7 +1698,7 @@ fn tools() -> Vec<Value> {
     vec![
         tool(
             "repository_init",
-            "Initialize and ingest the bound repository. Use once for an uninitialized root.",
+            "Initialize and ingest the bound repository. Git-tracked files and non-ignored untracked files are source; human-owned repository-root .sunignore explicitly excludes additional paths, including tracked paths, and remains visible. Sunlight does not scan or hide secret-like content. .git and .sunlight are intrinsic exclusions. Call again after a human changes .sunignore: a clean state refreshes automatically, while authored history fails closed with preservation guidance.",
             json!({}),
             &[],
             true,
@@ -1849,7 +1848,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "execution_promote_output",
-            "Promote one classified regular-file execution output into a session-owned operation. Ignored, secret, log, cache, and outputs larger than 2 MiB remain local-only and fail closed with recovery facts.",
+            "Promote one classified regular-file execution output into a session-owned operation. Ignored, log, cache, and outputs larger than 2 MiB remain local-only and fail closed with recovery facts. Sunlight does not classify content as secret.",
             json!({"execution":id_schema("Exact execution_id that produced the candidate."),"path":path_schema(),"session":id_schema("Exact authoring session_id that will own the promoted operation."),"classification":class_schema()}),
             &["execution", "path", "session", "classification"],
             true,
@@ -2167,7 +2166,7 @@ fn path_schema() -> Value {
     json!({"type":"string","description":"Portable repository-relative artifact path; absolute paths and traversal are rejected.","maxLength":16384})
 }
 fn class_schema() -> Value {
-    json!({"type":"string","enum":["source","generated","cache","secret","local-only","execution-output","lockfile","migration","binary","vendored"]})
+    json!({"type":"string","enum":["source","generated","cache","local-only","execution-output","lockfile","migration","binary","vendored"]})
 }
 
 #[cfg(test)]

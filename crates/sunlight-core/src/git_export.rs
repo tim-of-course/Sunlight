@@ -7,11 +7,12 @@ use crate::checkpoint::{
 use crate::records::PrivacyClass;
 use crate::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use crate::repo_state::{
-    detect_secret_reasons, durable_publish_json_bytes, expanded_operation_order, real_content_hash,
-    real_tree_hash, RealArtifactEntry, RealRepoState,
+    durable_publish_json_bytes, expanded_operation_order, real_content_hash, real_tree_hash,
+    RealArtifactEntry, RealRepoState,
 };
 use crate::repository::{RepositoryConfig, CONSERVATIVE_SUNLIGHT_COMMIT_POLICY};
 use crate::resolver::{ResolvedViewResult, SingleRepoTree};
+use ignore::gitignore::GitignoreBuilder;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -614,7 +615,11 @@ pub fn execute_local_git_export_writer_plan_with_root(
     let git_root = git_root.as_ref();
     let base = GitExportExecutionResultBuilder::new(plan);
 
-    let tree_id = match write_git_tree(git_root, content_files) {
+    let tree_id = match write_git_tree_preserving_sunignored(
+        git_root,
+        &plan.commit.parent_commit_id,
+        content_files,
+    ) {
         Ok(tree_id) => tree_id,
         Err(message) => {
             return Ok(base.failed(
@@ -729,6 +734,105 @@ fn validate_local_git_repository_root(
     }
 
     Ok(())
+}
+
+fn write_git_tree_preserving_sunignored(
+    git_root: &Path,
+    parent_commit_id: &str,
+    content_files: &[GitExportContentFile],
+) -> Result<String, String> {
+    let sunignore_path = git_root.join(".sunignore");
+    match std::fs::symlink_metadata(&sunignore_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(".sunignore must be a regular repository-root file".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return write_git_tree(git_root, content_files)
+        }
+        Err(error) => return Err(format!("failed to inspect repository .sunignore: {error}")),
+    }
+    let sunignore_bytes = std::fs::read(&sunignore_path)
+        .map_err(|error| format!("failed to read repository .sunignore: {error}"))?;
+    let text = std::str::from_utf8(&sunignore_bytes)
+        .map_err(|_| ".sunignore must be UTF-8 text for Git export".to_string())?;
+    let mut builder = GitignoreBuilder::new(git_root);
+    for line in text.lines() {
+        builder
+            .add_line(Some(PathBuf::from(".sunignore")), line)
+            .map_err(|error| format!("failed to parse .sunignore: {error}"))?;
+    }
+    let matcher = builder
+        .build()
+        .map_err(|error| format!("failed to compile .sunignore: {error}"))?;
+
+    let mut entries = content_files
+        .iter()
+        .filter(|file| {
+            file.path == ".sunignore"
+                || !matcher
+                    .matched_path_or_any_parents(git_root.join(&file.path), false)
+                    .is_ignore()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let index_path = temporary_git_index_path();
+    let index_path_string = index_path.to_string_lossy().to_string();
+    let index_env = [("GIT_INDEX_FILE", index_path_string.as_str())];
+    let result = (|| {
+        run_git(git_root, &["read-tree", parent_commit_id], None, &index_env)?;
+        let parent_paths = run_git_bytes(git_root, &["ls-files", "-z"], None, &index_env)?;
+        let mut removals = Vec::new();
+        for raw_path in parent_paths
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let path = std::str::from_utf8(raw_path)
+                .map_err(|_| "Git parent tree contains a non-UTF-8 path".to_string())?;
+            if !matcher
+                .matched_path_or_any_parents(git_root.join(path), false)
+                .is_ignore()
+            {
+                removals.extend_from_slice(path.as_bytes());
+                removals.push(0);
+            }
+        }
+        if !removals.is_empty() {
+            run_git(
+                git_root,
+                &["update-index", "--force-remove", "-z", "--stdin"],
+                Some(&removals),
+                &index_env,
+            )?;
+        }
+
+        let mut index_info = Vec::new();
+        for entry in entries {
+            validate_export_file_path(&entry.path)?;
+            let object_id = run_git(
+                git_root,
+                &["hash-object", "-w", "--stdin"],
+                Some(&entry.bytes),
+                &[],
+            )?;
+            let mode = if entry.executable { "100755" } else { "100644" };
+            index_info.extend_from_slice(mode.as_bytes());
+            index_info.extend_from_slice(b" blob ");
+            index_info.extend_from_slice(object_id.trim().as_bytes());
+            index_info.push(b'\t');
+            index_info.extend_from_slice(entry.path.as_bytes());
+            index_info.push(b'\n');
+        }
+        run_git(
+            git_root,
+            &["update-index", "--index-info"],
+            Some(&index_info),
+            &index_env,
+        )?;
+        run_git(git_root, &["write-tree"], None, &index_env)
+            .map(|tree_id| tree_id.trim().to_string())
+    })();
+    let _ = std::fs::remove_file(index_path);
+    result
 }
 
 fn write_git_tree(
@@ -855,6 +959,16 @@ fn run_git(
     stdin: Option<&[u8]>,
     env: &[(&str, &str)],
 ) -> Result<String, String> {
+    String::from_utf8(run_git_bytes(git_root, args, stdin, env)?)
+        .map_err(|error| format!("git output was not UTF-8: {error}"))
+}
+
+fn run_git_bytes(
+    git_root: &Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    env: &[(&str, &str)],
+) -> Result<Vec<u8>, String> {
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -887,8 +1001,7 @@ fn run_git(
         .wait_with_output()
         .map_err(|error| format!("failed to wait for git {}: {error}", args.join(" ")))?;
     if output.status.success() {
-        return String::from_utf8(output.stdout)
-            .map_err(|error| format!("git output was not UTF-8: {error}"));
+        return Ok(output.stdout);
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1265,28 +1378,14 @@ pub fn validate_persisted_git_export(
                 "persisted checkpoint content bytes do not match their content hash",
             ));
         }
-        let secret_reasons = detect_secret_reasons(&entry.path, &entry.bytes);
-        if !secret_reasons.is_empty() {
-            report.failures.push(failure(
-                GitExportValidationCheck::SecretScan,
-                GitExportValidationFailureCode::SecretDetected,
-                Some("checkpoint.entries[].path"),
-                Some(entry.path.clone()),
-                &format!(
-                    "checkpoint entry contains secret-like content ({})",
-                    secret_reasons.join(",")
-                ),
-            ));
-        }
-
         match entry.classification.as_str() {
-            "source" => {}
-            "secret" | "local_only" | "local-only" => report.failures.push(failure(
+            "source" | "secret" => {}
+            "local_only" | "local-only" => report.failures.push(failure(
                 GitExportValidationCheck::PolicyClass,
                 GitExportValidationFailureCode::SecretOrLocalOnlyRecord,
                 Some("checkpoint.entries[].classification"),
                 Some(entry.path.clone()),
-                "secret and local-only artifacts cannot be exported",
+                "local-only artifacts cannot be exported",
             )),
             "cache" | "ignored" | "log" => report.failures.push(failure(
                 GitExportValidationCheck::ExecutionRawExclusion,
@@ -2517,6 +2616,33 @@ mod tests {
     }
 
     #[test]
+    fn persisted_export_does_not_block_secret_like_content_or_legacy_secret_classification() {
+        let bytes = b"API_KEY=tracked-value-owned-by-the-repository\n".to_vec();
+        let entries = vec![RealArtifactEntry {
+            artifact_id: "artifact_env".to_string(),
+            path: ".env".to_string(),
+            content_hash: real_content_hash(&bytes),
+            executable: false,
+            classification: "secret".to_string(),
+            tombstone: false,
+            bytes,
+        }];
+        let report = persisted_topic_report_with_entries(
+            &[
+                ("topic_auth_nullability", "local"),
+                ("topic_profile_ui", "local"),
+            ],
+            &entries,
+        );
+
+        assert!(report.ok, "{:#?}", report.failures);
+        assert!(!report
+            .failures
+            .iter()
+            .any(|failure| failure.check == GitExportValidationCheck::SecretScan));
+    }
+
+    #[test]
     fn exports_in_memory_response_with_export_map() {
         let checkpoint = fixture_checkpoint();
         let response = fixture_git_export_response_from_checkpoint(&checkpoint).unwrap();
@@ -3275,6 +3401,43 @@ mod tests {
     }
 
     #[test]
+    fn git_export_preserves_parent_files_explicitly_hidden_by_sunignore() {
+        let repo = LocalGitRepo::new();
+        repo.write_worktree_file(".sunignore", b"private/\n");
+        let base_commit_id = repo.create_commit(
+            "base",
+            vec![
+                file("private/server.env", b"human-owned\n", false),
+                file("src/old.rs", b"old\n", false),
+            ],
+            None,
+        );
+        let tree_id = write_git_tree_preserving_sunignored(
+            &repo.path,
+            &base_commit_id,
+            &[
+                file(".sunignore", b"private/\n", false),
+                file("private/server.env", b"stale-sunlight-copy\n", false),
+                file("src/new.rs", b"new\n", false),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            repo.ls_tree(&tree_id),
+            vec![
+                "100644 .sunignore".to_string(),
+                "100644 private/server.env".to_string(),
+                "100644 src/new.rs".to_string(),
+            ]
+        );
+        assert_eq!(
+            repo.cat_file(&tree_id, "private/server.env"),
+            b"human-owned\n"
+        );
+    }
+
+    #[test]
     fn git_export_ignores_working_tree_and_index_files() {
         let repo = LocalGitRepo::new();
         let base_commit_id = repo.create_commit("base", fixture_base_files(), None);
@@ -3689,9 +3852,16 @@ mod tests {
     }
 
     fn persisted_topic_report(topic_visibilities: &[(&str, &str)]) -> GitExportValidationReport {
+        persisted_topic_report_with_entries(topic_visibilities, &[])
+    }
+
+    fn persisted_topic_report_with_entries(
+        topic_visibilities: &[(&str, &str)],
+        entries: &[RealArtifactEntry],
+    ) -> GitExportValidationReport {
         let repo = TestTempDir::new();
         let mut view = conflict_free_view();
-        let tree_hash = real_tree_hash(&[]);
+        let tree_hash = real_tree_hash(entries);
         view.tree_identity.as_mut().unwrap().tree_hash = tree_hash.clone();
         let mut checkpoint = fixture_checkpoint_from_resolved_view(&view, None).unwrap();
         checkpoint.tree_identity.tree_hash = tree_hash;
@@ -3722,7 +3892,7 @@ mod tests {
             config: &config,
             request: &request,
             resolved_view: &view,
-            entries: &[],
+            entries,
             state: &state,
         })
     }

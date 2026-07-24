@@ -1,6 +1,6 @@
 # Sunlight Open Alpha Acceptance
 
-Status: Approved for Windows open alpha
+Status: Complete — approved for Windows open alpha
 Created: 2026-07-20  
 Scope: Local, single-repository Sunlight workflows for coding agents
 
@@ -35,11 +35,11 @@ workflow.
 
 ## Current baseline
 
-All nine gates now have final-source evidence in the tested Windows/NTFS scope:
+All ten gates now have final-source evidence in the tested Windows/NTFS scope:
 common-path/error recovery, MCP termination recovery, exact Git handoff,
-repository/execution safety, and realistic four-author scale. The final release
-executable is SHA-256
-`d69c6cb6ddd6e75f76491ab040a6fb3ec723249831635a610157e58cb1de10b8`.
+repository/execution safety, realistic four-author scale, and explicit-ignore
+source completeness. The final release executable is SHA-256
+`2dfa361b3e8cc23718dad13e431013cdcb0091f8ebf3f7198bb37b977caa7a32`.
 
 The previously observed deleted-tracked-path, execution-policy reporting,
 dependency ancestry, invalid-session recovery, projection reuse, and writer
@@ -49,6 +49,14 @@ supervisor, and a fresh unfamiliar-tester run now pass. The Cursor agent
 discovered the installed repository adapter from a natural engineering prompt,
 authored and validated only through Sunlight, and produced an unexported exact
 checkpoint without tracked working-tree changes.
+
+The initial Windows approval was suspended after automatic secret detection
+excluded legitimate source. That behavior has been removed. Git now supplies
+normal tracked/untracked ignore semantics, repository-root `.sunignore` is the
+only human-authored additional exclusion policy, and `.git/` plus `.sunlight/`
+remain intrinsic exclusions. The remediation passed an independent Sol/high
+review, all follow-on findings were fixed, and the complete 472-test Windows
+workspace suite passed before approval was restored.
 
 Current evidence bundle:
 
@@ -61,6 +69,8 @@ Current evidence bundle:
 - [Fresh Codex, supervisor, and unfamiliar-tester evidence](acceptance/evidence/oa01_oa03_oa09_fresh_clients_2026-07-24.md)
 - [OA-01 Cursor evidence](acceptance/evidence/oa01_cursor_2026-07-24.md)
 - [Windows open-alpha approval](acceptance/evidence/open_alpha_approval_2026-07-24.md)
+- [Windows open-alpha suspension](acceptance/evidence/open_alpha_suspension_2026-07-24.md)
+- [OA-10 explicit-ignore remediation and reinstatement evidence](acceptance/evidence/oa10_source_completeness_2026-07-24.md)
 - [Banana Split integration feedback](acceptance/banana_split_feedback.md)
 
 Future Sunlight acceptance runs use direct fresh coding-client tasks or a fixed,
@@ -202,13 +212,15 @@ Required cases:
 Pass criteria:
 
 - The exported Git tree is content-identical to the checkpoint tree.
-- Generated, ignored, quarantined, and `.sunlight`-internal files do not leak
-  into the commit.
+- Generated or local-only output, `.sunignore`-excluded paths, and
+  `.sunlight`-internal files do not leak into the commit. A hidden tracked path
+  is preserved from the selected parent and remains outside checkpoint
+  ownership.
 - Export never changes an existing branch or dirty working tree silently.
 - A normal Git consumer can inspect and build the result without Sunlight.
 - No push is required for acceptance.
 
-### OA-06: Repository boundary, secrets, and execution safety
+### OA-06: Repository boundary and execution safety
 
 Exercise hostile or malformed inputs against an isolated test repository.
 
@@ -217,21 +229,23 @@ Required cases:
 - `..` traversal and absolute paths outside the repository;
 - symlinks or Windows junctions that point outside the repository;
 - mutations targeting `.git` or protected Sunlight state;
-- secret ingestion, quarantine, false positives, and explicit recovery;
 - execution attempts to write outside the private projection;
 - malformed MCP arguments, oversized patches, and unexpected output volume;
-- promotion attempts for ignored, secret, oversized, and source-like outputs;
+- promotion attempts for explicitly ignored, oversized, and source-like
+  outputs;
 - command, environment, network, CPU, memory, and filesystem policy reporting.
 
 Pass criteria:
 
-- No source, metadata, credential, or execution write escapes its declared
-  boundary.
+- No source, metadata, or execution write escapes its declared boundary.
 - Policy dimensions distinguish enforced, best-effort, and not-enforced states.
-- Secret material does not appear in normal status, logs, checkpoints, or
-  exports.
 - Denials are fail-closed and include safe recovery guidance.
 - No known critical or high-severity safety defect remains.
+
+Sunlight does not classify content as secret. Source-inclusion and explicit
+exclusion behavior is governed by OA-10. Credential prevention, redaction, and
+repository hygiene are responsibilities of the surrounding user, harness, and
+deployment environment.
 
 ### OA-07: Realistic repository scale and storage behavior
 
@@ -293,6 +307,55 @@ Pass criteria:
   important failure modes, and next action documented.
 - Restart requirements and local machine-specific configuration are explicit.
 
+### OA-10: Source completeness and explicit exclusion
+
+Exercise source discovery, compatibility import, execution promotion,
+checkpointing, migration, and Git export with secret-like names and content,
+Git ignore rules, and repository-root `.sunignore` rules.
+
+Required cases:
+
+- tracked files whose names or content resemble credentials, tokens,
+  authentication code, setup code, or environment files;
+- tracked paths matching `.gitignore` and ignored untracked peers;
+- Git discovery failure and Git-ignore probe failure;
+- an ignored or untracked repository-root `.sunignore`;
+- `.sunignore` changes after clean initialization and after authored history;
+- native, compatibility, and execution attempts to mutate or bypass
+  `.sunignore` policy;
+- compatibility paths named `target`, `dist`, `build`, cache, or editor-like
+  names when Git does not ignore them;
+- tracked-but-deleted ignore matches recreated through compatibility import;
+- stale hidden checkpoint content and hidden tracked content in the selected
+  Git parent;
+- clean and authored repositories containing legacy automatic-quarantine
+  state.
+
+Pass criteria:
+
+- Sunlight never scans, quarantines, hides, or blocks content because it looks
+  secret-like; such paths remain ordinary source unless an explicit ignore
+  rule applies.
+- Git-tracked files remain visible even when `.gitignore` matches them; ignored
+  untracked files remain outside Sunlight; Git evaluation failures are
+  fail-closed.
+- Repository-root `.sunignore` remains visible and auditable even when Git
+  ignores it. It is human-owned worktree policy and cannot be mutated through
+  native authoring, compatibility import, or execution promotion.
+- Normal views reject post-initialization `.sunignore` drift. `sun init`
+  refreshes a clean state, but preserves and refuses authored state with an
+  explicit recovery path.
+- Compatibility import and execution classification use authoritative
+  repository policy, preserve tracked semantics, and do not infer exclusion
+  from filenames.
+- Export filters stale hidden checkpoint entries and preserves hidden tracked
+  parent bytes without deletion or overwrite.
+- Clean legacy quarantine state migrates explicitly. Authored legacy state is
+  rejected without changing its persisted bytes.
+- MCP schemas, CLI/status facts, README, portable Agent Skill, and adapters
+  agree on this harness-agnostic contract and expose no public secret
+  classification workflow.
+
 ## Evidence required for every acceptance run
 
 Retain a short Markdown or JSON record containing:
@@ -326,6 +389,7 @@ accurately and the final accepted view is separately validated.
 - [x] OA-07 realistic scale and storage behavior passes.
 - [x] OA-08 supported platform contract passes for the declared scope.
 - [x] OA-09 documentation and unaided recovery passes.
+- [x] OA-10 source completeness and explicit exclusion passes.
 - [x] All observed high-severity findings are fixed and retested.
 - [x] Remaining limitations are non-destructive and documented.
 - [x] The release evidence bundle identifies the exact tested build.
@@ -335,8 +399,10 @@ accurately and the final accepted view is separately validated.
 
 - Decision: Approved for Windows open alpha
 - Date: 2026-07-24
-- Build: `d69c6cb6ddd6e75f76491ab040a6fb3ec723249831635a610157e58cb1de10b8`
+- Build: `2dfa361b3e8cc23718dad13e431013cdcb0091f8ebf3f7198bb37b977caa7a32`
 - Approver: Timothy Cardoza
+- Reinstatement: Restored after explicit-ignore remediation, adversarial
+  regression coverage, and independent Sol/high closure review
 - Supported platforms: Windows only for open alpha; Windows/NTFS is the tested scope
 - Evidence bundle: `docs/acceptance/evidence/`
 - Known limitations: `sun` may require an absolute path when it is not on

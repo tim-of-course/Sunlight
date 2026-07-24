@@ -8,6 +8,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use ignore::gitignore::GitignoreBuilder;
 use sha2::{Digest, Sha256};
 
 use crate::artifacts::{
@@ -494,6 +495,11 @@ pub enum RepoStateError {
         expected_sequence: u64,
         actual_sequence: Option<u64>,
     },
+    SunignorePolicyChanged {
+        path: PathBuf,
+        expected_hash: Option<String>,
+        actual_hash: Option<String>,
+    },
     ProjectionStrategyUnsupported {
         strategy: String,
         path: PathBuf,
@@ -561,6 +567,17 @@ impl Display for RepoStateError {
                     .unwrap_or_else(|| "missing".to_string()),
                 path.display()
             ),
+            Self::SunignorePolicyChanged {
+                path,
+                expected_hash,
+                actual_hash,
+            } => write!(
+                f,
+                ".sunignore changed after Sunlight initialization; path={}, expected={}, actual={}",
+                path.display(),
+                expected_hash.as_deref().unwrap_or("absent"),
+                actual_hash.as_deref().unwrap_or("absent")
+            ),
             Self::ProjectionStrategyUnsupported {
                 strategy,
                 path,
@@ -594,8 +611,7 @@ impl From<RecordError> for RepoStateError {
 impl RealRepoState {
     pub fn ingest(repo_root: &Path, repository_id: &str) -> Result<Self, RepoStateError> {
         let mut entries = Vec::new();
-        let mut quarantine = Vec::new();
-        scan_real_repo_files_with_quarantine(repo_root, repo_root, &mut entries, &mut quarantine)?;
+        scan_real_repo_files(repo_root, repo_root, &mut entries)?;
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         let tree_hash = real_tree_hash(&entries);
         let state = Self {
@@ -625,23 +641,28 @@ impl RealRepoState {
             checkpoints: Vec::new(),
             export_maps: Vec::new(),
             entries,
-            quarantine,
+            quarantine: Vec::new(),
         };
         state.persist_blobs(repo_root)?;
         Ok(state)
     }
 
     pub fn load(repo_root: &Path) -> Result<Self, RepoStateError> {
-        Self::load_with_blob_mode(repo_root, true)
+        Self::load_with_blob_mode(repo_root, true, true)
     }
 
     pub fn load_metadata(repo_root: &Path) -> Result<Self, RepoStateError> {
-        Self::load_with_blob_mode(repo_root, false)
+        Self::load_with_blob_mode(repo_root, false, true)
+    }
+
+    pub fn load_for_reinitialization(repo_root: &Path) -> Result<Self, RepoStateError> {
+        Self::load_with_blob_mode(repo_root, true, false)
     }
 
     fn load_with_blob_mode(
         repo_root: &Path,
         load_blob_bytes: bool,
+        validate_sunignore_policy: bool,
     ) -> Result<Self, RepoStateError> {
         let _writer_lock = RepositoryWriterLock::acquire(repo_root)?;
         recover_state_publication(repo_root)?;
@@ -649,7 +670,56 @@ impl RealRepoState {
         let path = real_state_path(repo_root);
         let state = Self::load_from_path_with_blob_mode(repo_root, &path, load_blob_bytes)?;
         state.reconcile_session_generation_records(repo_root)?;
+        if validate_sunignore_policy {
+            state.ensure_sunignore_policy_unchanged(repo_root)?;
+        }
         Ok(state)
+    }
+
+    pub fn sunignore_policy_changed(&self, repo_root: &Path) -> Result<bool, RepoStateError> {
+        let expected_hash = self
+            .base_entries
+            .iter()
+            .find(|entry| !entry.tombstone && entry.path == ".sunignore")
+            .map(|entry| entry.content_hash.clone());
+        let policy_path = repo_root.join(".sunignore");
+        let actual_hash = match fs::symlink_metadata(&policy_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let bytes = fs::read(&policy_path)
+                    .map_err(|error| io_error(&policy_path, "failed to read .sunignore", error))?;
+                Some(real_content_hash(&bytes))
+            }
+            Ok(_) => Some("non-regular-file".to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(io_error(
+                    &policy_path,
+                    "failed to inspect .sunignore",
+                    error,
+                ))
+            }
+        };
+        Ok(expected_hash != actual_hash)
+    }
+
+    fn ensure_sunignore_policy_unchanged(&self, repo_root: &Path) -> Result<(), RepoStateError> {
+        if !self.sunignore_policy_changed(repo_root)? {
+            return Ok(());
+        }
+        let expected_hash = self
+            .base_entries
+            .iter()
+            .find(|entry| !entry.tombstone && entry.path == ".sunignore")
+            .map(|entry| entry.content_hash.clone());
+        let policy_path = repo_root.join(".sunignore");
+        let actual_hash = fs::read(&policy_path)
+            .ok()
+            .map(|bytes| real_content_hash(&bytes));
+        Err(RepoStateError::SunignorePolicyChanged {
+            path: policy_path,
+            expected_hash,
+            actual_hash,
+        })
     }
 
     fn load_from_path(repo_root: &Path, path: &Path) -> Result<Self, RepoStateError> {
@@ -1867,6 +1937,11 @@ fn scan_real_repo_files_fallback(
         if matches!(name.to_str(), Some(".git" | ".sunlight")) {
             continue;
         }
+        let relative = path
+            .strip_prefix(repo_root)
+            .map_err(|_| invalid_state(repo_root, "failed to normalize worktree path"))?
+            .to_string_lossy()
+            .replace('\\', "/");
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| io_error(&path, "failed to inspect worktree path", error))?;
         if projection_metadata_is_reparse(&metadata) {
@@ -1875,14 +1950,16 @@ fn scan_real_repo_files_fallback(
                 "worktree reparse points and symlinks are not supported by the local scanner",
             ));
         }
+        let is_intrinsic_ignore_file = matches!(relative.as_str(), ".gitignore" | ".sunignore");
+        if !is_intrinsic_ignore_file
+            && (path_is_ignored_by_file(repo_root, &relative, metadata.is_dir(), ".gitignore")?
+                || path_is_sunignored(repo_root, &relative, metadata.is_dir())?)
+        {
+            continue;
+        }
         if metadata.is_dir() {
             scan_real_repo_files_fallback(repo_root, &path, entries, quarantine)?;
         } else if metadata.is_file() {
-            let relative = path
-                .strip_prefix(repo_root)
-                .map_err(|_| invalid_state(repo_root, "failed to normalize worktree path"))?
-                .to_string_lossy()
-                .replace('\\', "/");
             ingest_real_repo_path(repo_root, &relative, entries, quarantine)?;
         }
     }
@@ -1890,6 +1967,8 @@ fn scan_real_repo_files_fallback(
 }
 
 fn git_worktree_file_paths(repo_root: &Path) -> Result<Option<Vec<String>>, RepoStateError> {
+    let git_path = repo_root.join(".git");
+    let git_metadata_present = git_path.is_file() || git_path.join("HEAD").is_file();
     let output = match Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -1903,9 +1982,24 @@ fn git_worktree_file_paths(repo_root: &Path) -> Result<Option<Vec<String>>, Repo
         .output()
     {
         Ok(output) => output,
+        Err(error) if git_metadata_present => {
+            return Err(invalid_state(
+                repo_root,
+                &format!("failed to enumerate Git worktree files: {error}"),
+            ))
+        }
         Err(_) => return Ok(None),
     };
     if !output.status.success() {
+        if git_metadata_present {
+            return Err(invalid_state(
+                repo_root,
+                &format!(
+                    "failed to enumerate Git worktree files: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            ));
+        }
         return Ok(None);
     }
 
@@ -1914,7 +2008,9 @@ fn git_worktree_file_paths(repo_root: &Path) -> Result<Option<Vec<String>>, Repo
         if raw.is_empty() {
             continue;
         }
-        let relative = String::from_utf8_lossy(raw).replace('\\', "/");
+        let relative = String::from_utf8(raw.to_vec())
+            .map_err(|_| invalid_state(repo_root, "Git returned a non-UTF-8 worktree path"))?
+            .replace('\\', "/");
         if relative == ".git"
             || relative == ".sunlight"
             || relative.starts_with(".git/")
@@ -1922,18 +2018,105 @@ fn git_worktree_file_paths(repo_root: &Path) -> Result<Option<Vec<String>>, Repo
         {
             continue;
         }
+        if path_is_sunignored(repo_root, &relative, false)? {
+            continue;
+        }
         paths.push(relative);
+    }
+    if repo_root.join(".sunignore").is_file() {
+        paths.push(".sunignore".to_string());
     }
     paths.sort();
     paths.dedup();
     Ok(Some(paths))
 }
 
+pub fn path_is_sunignored(
+    repo_root: &Path,
+    relative: &str,
+    is_dir: bool,
+) -> Result<bool, RepoStateError> {
+    if relative == ".sunignore" {
+        return Ok(false);
+    }
+    path_is_ignored_by_file(repo_root, relative, is_dir, ".sunignore")
+}
+
+pub fn path_is_gitignored(repo_root: &Path, relative: &str) -> Result<bool, RepoStateError> {
+    if repo_root.join(".git").exists() {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["check-ignore", "--quiet", "--", relative])
+            .output()
+            .map_err(|error| {
+                invalid_state(
+                    repo_root,
+                    &format!("failed to evaluate Git ignore policy: {error}"),
+                )
+            })?;
+        return match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(invalid_state(
+                repo_root,
+                &format!(
+                    "failed to evaluate Git ignore policy: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            )),
+        };
+    }
+    path_is_ignored_by_file(repo_root, relative, false, ".gitignore")
+}
+
+fn path_is_ignored_by_file(
+    repo_root: &Path,
+    relative: &str,
+    is_dir: bool,
+    ignore_file: &str,
+) -> Result<bool, RepoStateError> {
+    let ignore_path = repo_root.join(ignore_file);
+    match fs::symlink_metadata(&ignore_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(invalid_state(
+                &ignore_path,
+                &format!("{ignore_file} must be a regular repository-root file"),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(io_error(
+                &ignore_path,
+                &format!("failed to inspect {ignore_file}"),
+                error,
+            ))
+        }
+    }
+    let mut builder = GitignoreBuilder::new(repo_root);
+    if let Some(error) = builder.add(&ignore_path) {
+        return Err(invalid_state(
+            &ignore_path,
+            &format!("failed to parse {ignore_file}: {error}"),
+        ));
+    }
+    let matcher = builder.build().map_err(|error| {
+        invalid_state(
+            &ignore_path,
+            &format!("failed to compile {ignore_file}: {error}"),
+        )
+    })?;
+    Ok(matcher
+        .matched_path_or_any_parents(repo_root.join(relative), is_dir)
+        .is_ignore())
+}
+
 fn ingest_real_repo_path(
     repo_root: &Path,
     relative: &str,
     entries: &mut Vec<RealArtifactEntry>,
-    quarantine: &mut Vec<RealQuarantineEntry>,
+    _quarantine: &mut Vec<RealQuarantineEntry>,
 ) -> Result<(), RepoStateError> {
     let path = repo_root.join(relative);
     if !validate_worktree_path_components(repo_root, relative)? {
@@ -1955,17 +2138,6 @@ fn ingest_real_repo_path(
     }
     let bytes =
         fs::read(&path).map_err(|error| io_error(&path, "failed to read worktree file", error))?;
-    let secret_reasons = detect_secret_reasons(relative, &bytes);
-    if !secret_reasons.is_empty() {
-        quarantine.push(RealQuarantineEntry {
-            path: relative.to_string(),
-            reason_codes: secret_reasons,
-            classification: "secret".to_string(),
-            content_hash: real_content_hash(&bytes),
-            byte_length: bytes.len(),
-        });
-        return Ok(());
-    }
     entries.push(RealArtifactEntry {
         artifact_id: real_artifact_id_for_path(relative),
         path: relative.to_string(),
@@ -2010,203 +2182,6 @@ fn validate_worktree_path_components(
         }
     }
     Ok(true)
-}
-
-fn looks_like_secret_value(value: &str, quoted: bool) -> bool {
-    let value = value
-        .trim()
-        .trim_end_matches(|character| matches!(character, ',' | ';'))
-        .trim();
-    let unquoted = value.trim_matches(|character| matches!(character, '\'' | '"'));
-    if unquoted.len() < 4 {
-        return false;
-    }
-    let lowered = unquoted.to_ascii_lowercase();
-    let placeholders = [
-        "example",
-        "sample",
-        "placeholder",
-        "changeme",
-        "change-me",
-        "password",
-        "secret",
-        "redacted",
-        "masked",
-        "your_",
-        "your-",
-        "todo",
-        "none",
-        "null",
-        "undefined",
-        "string",
-    ];
-    if placeholders
-        .iter()
-        .any(|placeholder| lowered == *placeholder || lowered.starts_with(placeholder))
-        || lowered.starts_with('<')
-        || lowered.starts_with("${")
-        || lowered.starts_with("process.env")
-        || lowered.starts_with("import.meta.env")
-        || lowered.starts_with("os.environ")
-        || lowered.starts_with("env.")
-    {
-        return false;
-    }
-    if !quoted
-        && lowered.contains('.')
-        && lowered
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '.'))
-    {
-        return false;
-    }
-    true
-}
-
-fn contains_secret_assignment(text: &str) -> bool {
-    const KEYS: &[&str] = &[
-        "api_key",
-        "apikey",
-        "access_token",
-        "auth_token",
-        "secret_key",
-        "client_secret",
-        "private_key",
-        "password",
-    ];
-    for line in text.lines() {
-        let lowered = line.to_ascii_lowercase();
-        for key in KEYS {
-            let mut offset = 0usize;
-            while let Some(relative) = lowered[offset..].find(key) {
-                let start = offset + relative;
-                let end = start + key.len();
-                let before = lowered[..start].chars().next_back();
-                let after = lowered[end..].chars().next();
-                let boundary = |character: Option<char>| {
-                    character.is_none_or(|character| {
-                        !character.is_ascii_alphanumeric() && character != '_'
-                    })
-                };
-                if boundary(before) && boundary(after) {
-                    let tail = line[end..].trim_start_matches(|character: char| {
-                        character.is_ascii_whitespace() || matches!(character, '\'' | '"')
-                    });
-                    let Some(rest) = tail.strip_prefix('=').or_else(|| tail.strip_prefix(':'))
-                    else {
-                        offset = end;
-                        continue;
-                    };
-                    let value = rest.trim_start();
-                    let quoted = matches!(value.chars().next(), Some('\'' | '"'));
-                    if looks_like_secret_value(value, quoted) {
-                        return true;
-                    }
-                }
-                offset = end;
-            }
-        }
-    }
-    false
-}
-
-fn contains_recognizable_secret_token(text: &str) -> bool {
-    let lowered = text.to_ascii_lowercase();
-    lowered.contains("-----begin private key-----")
-        || lowered.contains("-----begin rsa private key-----")
-        || text
-            .split(|character: char| {
-                character.is_ascii_whitespace() || matches!(character, '\'' | '"' | ',' | ';')
-            })
-            .any(|token| {
-                (token.starts_with("sk-") && token.len() >= 24)
-                    || (token.starts_with("ghp_") && token.len() >= 24)
-                    || (token.starts_with("AKIA") && token.len() == 20)
-                    || (token.starts_with("eyJ")
-                        && token.matches('.').count() == 2
-                        && token.len() >= 40)
-            })
-}
-
-pub fn detect_secret_reasons(path: &str, bytes: &[u8]) -> Vec<String> {
-    let mut reasons = Vec::new();
-    let normalized_path = path.replace('\\', "/").to_ascii_lowercase();
-    let file_name = normalized_path.rsplit('/').next().unwrap_or("");
-    let path_secret = file_name == ".env"
-        || file_name.starts_with(".env.")
-        || normalized_path.ends_with("/.env")
-        || normalized_path.contains("/.env.")
-        || file_name.ends_with(".pem")
-        || file_name.ends_with(".key")
-        || file_name == "id_rsa"
-        || file_name == "id_dsa"
-        || file_name == "id_ecdsa"
-        || file_name == "id_ed25519"
-        || normalized_path.contains("secret")
-        || normalized_path.contains("secrets")
-        || normalized_path.contains("credentials");
-    if path_secret {
-        reasons.push("secret_path".to_string());
-    }
-
-    if let Ok(text) = std::str::from_utf8(bytes) {
-        if contains_secret_assignment(text) || contains_recognizable_secret_token(text) {
-            reasons.push("secret_token".to_string());
-        }
-    }
-    reasons.sort();
-    reasons.dedup();
-    reasons
-}
-
-pub fn persist_quarantine_report(
-    repo_root: &Path,
-    quarantine: &[RealQuarantineEntry],
-) -> Result<(), RepoStateError> {
-    let path = repo_root
-        .join(".sunlight")
-        .join("quarantine")
-        .join("ingest-report.json");
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| io_error(parent, "failed to create quarantine directory", error))?;
-    }
-    let body = quarantine_report_bytes(quarantine)?;
-    durable_publish_json_bytes(repo_root, &path, &body, "derived_record_after_prepare")
-}
-
-pub fn quarantine_report_publication(
-    quarantine: &[RealQuarantineEntry],
-) -> Result<DerivedRecordPublication, RepoStateError> {
-    Ok(DerivedRecordPublication {
-        relative_path: ".sunlight/quarantine/ingest-report.json".to_string(),
-        canonical_bytes: quarantine_report_bytes(quarantine)?,
-    })
-}
-
-fn quarantine_report_bytes(quarantine: &[RealQuarantineEntry]) -> Result<Vec<u8>, RepoStateError> {
-    let mut object = BTreeMap::new();
-    object.insert(
-        "record_type".to_string(),
-        JsonValue::String("ingest_quarantine_report".to_string()),
-    );
-    object.insert(
-        "privacy_class".to_string(),
-        JsonValue::String("local_only".to_string()),
-    );
-    object.insert(
-        "classification".to_string(),
-        JsonValue::String("secret".to_string()),
-    );
-    object.insert(
-        "quarantined_count".to_string(),
-        JsonValue::Number(quarantine.len().to_string()),
-    );
-    object.insert(
-        "entries".to_string(),
-        JsonValue::Array(quarantine.iter().map(quarantine_json).collect()),
-    );
-    canonical_json_bytes(&JsonValue::Object(object)).map_err(RepoStateError::from)
 }
 
 pub fn real_state_path(repo_root: &Path) -> PathBuf {
@@ -7939,6 +7914,8 @@ mod tests {
         fs::create_dir_all(repo.join(".cache/sun")).unwrap();
         fs::write(repo.join(".gitignore"), b"target/\n.cache/\n").unwrap();
         fs::write(repo.join("src/lib.rs"), b"pub fn kept() {}\n").unwrap();
+        fs::write(repo.join("target/tracked.txt"), b"tracked despite ignore\n").unwrap();
+        git(&repo, &["add", "-f", "target/tracked.txt"]);
         fs::write(
             repo.join("target/debug/build.log"),
             b"ignored build cache\n",
@@ -7953,11 +7930,84 @@ mod tests {
             .map(|entry| entry.path.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(paths, vec![".gitignore", "src/lib.rs"]);
+        assert_eq!(
+            paths,
+            vec![".gitignore", "src/lib.rs", "target/tracked.txt"]
+        );
         assert!(state.entry("src/lib.rs").is_some());
+        assert!(state.entry("target/tracked.txt").is_some());
         assert!(state.entry("target/debug/build.log").is_none());
         assert!(state.entry(".cache/sun/local.txt").is_none());
 
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn git_ignore_policy_keeps_tracked_matches_visible() {
+        let repo = temp_repo("git-ignore-tracked-semantics");
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join(".gitignore"), b"*.env\n").unwrap();
+        fs::write(repo.join("tracked.env"), b"tracked\n").unwrap();
+        fs::write(repo.join("untracked.env"), b"untracked\n").unwrap();
+        git(&repo, &["add", "-f", "tracked.env"]);
+
+        assert!(!path_is_gitignored(&repo, "tracked.env").unwrap());
+        assert!(path_is_gitignored(&repo, "untracked.env").unwrap());
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn git_ingestion_always_includes_an_ignored_root_sunignore() {
+        let repo = temp_repo("git-ignored-sunignore");
+        git(&repo, &["init", "-b", "main"]);
+        fs::create_dir_all(repo.join("private")).unwrap();
+        fs::write(repo.join(".gitignore"), b".sunignore\n").unwrap();
+        fs::write(repo.join(".sunignore"), b"private/\n").unwrap();
+        fs::write(repo.join("visible.txt"), b"visible\n").unwrap();
+        fs::write(repo.join("private/hidden.txt"), b"hidden\n").unwrap();
+        git(&repo, &["add", ".gitignore", "visible.txt"]);
+
+        let state = RealRepoState::ingest(&repo, "repo_ignored_sunignore").unwrap();
+
+        assert!(state.entry(".sunignore").is_some());
+        assert!(state.entry("visible.txt").is_some());
+        assert!(state.entry("private/hidden.txt").is_none());
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn git_ingestion_fails_closed_when_git_metadata_cannot_be_enumerated() {
+        let repo = temp_repo("invalid-git-enumeration");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(repo.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(repo.join(".gitignore"), b"tracked.env\n").unwrap();
+        fs::write(repo.join("tracked.env"), b"must-not-be-silently-hidden\n").unwrap();
+
+        let error = RealRepoState::ingest(&repo, "repo_invalid_git").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to enumerate Git worktree files"));
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn load_fails_closed_when_sunignore_changes_after_initialization() {
+        let repo = temp_repo("sunignore-policy-change");
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join("visible.txt"), b"visible\n").unwrap();
+        let state = RealRepoState::ingest(&repo, "repo_policy_change").unwrap();
+        state.save(&repo).unwrap();
+        fs::write(repo.join(".sunignore"), b"visible.txt\n").unwrap();
+
+        let error = RealRepoState::load(&repo).unwrap_err();
+        assert!(matches!(
+            error,
+            RepoStateError::SunignorePolicyChanged { .. }
+        ));
+        let state = RealRepoState::load_for_reinitialization(&repo).unwrap();
+        assert!(state.sunignore_policy_changed(&repo).unwrap());
         fs::remove_dir_all(repo).unwrap();
     }
 
@@ -8014,96 +8064,67 @@ mod tests {
     }
 
     #[test]
-    fn ingest_quarantines_secret_path_without_persisting_secret_bytes() {
-        let repo = temp_repo("secret-path");
+    fn ingest_includes_tracked_secret_like_paths_and_bytes() {
+        let repo = temp_repo("secret-like-source");
         git(&repo, &["init", "-b", "main"]);
         fs::create_dir_all(repo.join("src")).unwrap();
         fs::write(repo.join("src/lib.rs"), b"pub fn kept() {}\n").unwrap();
         fs::write(
             repo.join(".env"),
-            b"API_KEY=super-secret-value-that-must-not-persist\n",
+            b"API_KEY=tracked-value-owned-by-the-repository\n",
         )
         .unwrap();
         git(&repo, &["add", "src/lib.rs", ".env"]);
 
-        let state = RealRepoState::ingest(&repo, "repo_secret_path").unwrap();
+        let state = RealRepoState::ingest(&repo, "repo_secret_like_source").unwrap();
         state.save(&repo).unwrap();
-        persist_quarantine_report(&repo, &state.quarantine).unwrap();
 
-        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries.len(), 2);
         assert!(state.entry("src/lib.rs").is_some());
-        assert!(state.entry(".env").is_none());
-        assert_eq!(state.quarantine.len(), 1);
-        assert_eq!(state.quarantine[0].path, ".env");
-        assert!(state.quarantine[0]
-            .reason_codes
-            .contains(&"secret_path".to_string()));
-        assert!(state.quarantine[0]
-            .reason_codes
-            .contains(&"secret_token".to_string()));
+        assert_eq!(
+            state.entry(".env").unwrap().bytes,
+            b"API_KEY=tracked-value-owned-by-the-repository\n"
+        );
+        assert!(state.quarantine.is_empty());
 
-        let state_json = fs::read_to_string(real_state_path(&repo)).unwrap();
-        assert!(state_json.contains("\"path\":\".env\""));
-        assert!(!state_json.contains("super-secret-value-that-must-not-persist"));
-        assert!(!real_blob_path(&repo, &state.quarantine[0].content_hash).exists());
-
-        let report =
-            fs::read_to_string(repo.join(".sunlight/quarantine/ingest-report.json")).unwrap();
-        assert!(report.contains("\"record_type\":\"ingest_quarantine_report\""));
-        assert!(report.contains("\"path\":\".env\""));
-        assert!(report.contains("\"quarantined_count\":1"));
-        assert!(!report.contains("super-secret-value-that-must-not-persist"));
+        let entry = state.entry(".env").unwrap();
+        assert!(real_blob_path(&repo, &entry.content_hash).is_file());
+        let loaded = RealRepoState::load(&repo).unwrap();
+        assert_eq!(loaded.entry(".env").unwrap().bytes, entry.bytes);
 
         fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]
-    fn secret_detection_distinguishes_identifiers_and_documentation_from_values() {
-        for content in [
-            "type Credentials = { password: string };\n",
-            "const password = form.password;\n",
-            "The password field is submitted to the server.\n",
-            "function resetPassword(password: string) { return password.length; }\n",
-            "client_secret = process.env.CLIENT_SECRET\n",
-        ] {
-            assert!(
-                detect_secret_reasons("src/example.ts", content.as_bytes()).is_empty(),
-                "false positive for {content:?}"
-            );
-        }
-
-        assert_eq!(
-            detect_secret_reasons("config/app.toml", b"client_secret = \"abc123\"\n"),
-            vec!["secret_token"]
-        );
-        assert_eq!(
-            detect_secret_reasons(
-                "src/config.ts",
-                b"const api_key = \"sk-123456789012345678901234\";\n"
-            ),
-            vec!["secret_token"]
-        );
-    }
-
-    #[test]
-    fn ingest_quarantines_secret_token_in_unignored_source_like_path() {
-        let repo = temp_repo("secret-token");
+    fn sunignore_explicitly_excludes_tracked_and_untracked_paths() {
+        let repo = temp_repo("sunignore");
+        git(&repo, &["init", "-b", "main"]);
         fs::create_dir_all(repo.join("config")).unwrap();
-        fs::write(
-            repo.join("config/app.toml"),
-            b"client_secret = \"abc123\"\n",
-        )
-        .unwrap();
+        fs::create_dir_all(repo.join("private")).unwrap();
+        fs::write(repo.join(".sunignore"), b"config/private.toml\nprivate/\n").unwrap();
+        fs::write(repo.join("config/private.toml"), b"tracked\n").unwrap();
+        fs::write(repo.join("private/local.txt"), b"untracked\n").unwrap();
+        fs::write(repo.join("config/public.toml"), b"public\n").unwrap();
         fs::write(repo.join("README.md"), b"# public\n").unwrap();
+        git(
+            &repo,
+            &[
+                "add",
+                ".sunignore",
+                "config/private.toml",
+                "config/public.toml",
+                "README.md",
+            ],
+        );
 
-        let state = RealRepoState::ingest(&repo, "repo_secret_token").unwrap();
+        let state = RealRepoState::ingest(&repo, "repo_sunignore").unwrap();
 
-        assert_eq!(state.entries.len(), 1);
+        assert!(state.entry(".sunignore").is_some());
         assert!(state.entry("README.md").is_some());
-        assert!(state.entry("config/app.toml").is_none());
-        assert_eq!(state.quarantine.len(), 1);
-        assert_eq!(state.quarantine[0].path, "config/app.toml");
-        assert_eq!(state.quarantine[0].reason_codes, vec!["secret_token"]);
+        assert!(state.entry("config/public.toml").is_some());
+        assert!(state.entry("config/private.toml").is_none());
+        assert!(state.entry("private/local.txt").is_none());
+        assert!(state.quarantine.is_empty());
 
         fs::remove_dir_all(repo).unwrap();
     }
@@ -8112,9 +8133,15 @@ mod tests {
     fn non_git_ingestion_fallback_still_excludes_sunlight_and_git_dirs() {
         let repo = temp_repo("fallback");
         fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join("ignored")).unwrap();
+        fs::create_dir_all(repo.join("private")).unwrap();
         fs::create_dir_all(repo.join(".git/objects")).unwrap();
         fs::create_dir_all(repo.join(".sunlight/records")).unwrap();
+        fs::write(repo.join(".gitignore"), b"ignored/\n").unwrap();
+        fs::write(repo.join(".sunignore"), b"private/\n").unwrap();
         fs::write(repo.join("src/lib.rs"), b"pub fn kept() {}\n").unwrap();
+        fs::write(repo.join("ignored/cache.txt"), b"ignored\n").unwrap();
+        fs::write(repo.join("private/human.txt"), b"hidden\n").unwrap();
         fs::write(repo.join(".git/config"), b"[core]\n").unwrap();
         fs::write(repo.join(".sunlight/records/native-state.json"), b"{}\n").unwrap();
 
@@ -8125,7 +8152,7 @@ mod tests {
             .map(|entry| entry.path.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(paths, vec!["src/lib.rs"]);
+        assert_eq!(paths, vec![".gitignore", ".sunignore", "src/lib.rs"]);
 
         fs::remove_dir_all(repo).unwrap();
     }

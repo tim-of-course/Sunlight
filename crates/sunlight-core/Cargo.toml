@@ -8,4 +8,5 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+ignore = "0.4"
 sha2 = "0.10"

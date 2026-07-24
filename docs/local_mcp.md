@@ -122,12 +122,22 @@ polls. These are observational facts for diagnosing interactive latency and
 writer contention; they do not change operation semantics. Failed tool calls
 put the same transport object under `error.details.transport`.
 
-Secret-like files found during repository ingestion are excluded from source
-truth; their raw bytes are not stored. Inspect
-`.sunlight/quarantine/ingest-report.json`, rotate any real credentials, and
-author only a sanitized replacement (such as `.env.example`) through a normal
-Sunlight topic. Sunlight cannot restore quarantined bytes because retaining
-them would defeat the quarantine boundary.
+Sunlight does not detect or hide secret-like content. Repository ingest follows
+normal Git semantics: tracked files are included, Git-ignored untracked files
+are excluded, and repository-root `.sunignore` patterns explicitly exclude
+additional tracked or untracked paths. `.git/` and `.sunlight/` are intrinsic
+exclusions. Secret prevention belongs to repository hygiene, permissions,
+deployment tooling, and dedicated scanners outside Sunlight. Status reports
+`automatic_secret_detection: false` and the effective ignore-policy contract.
+`.sunignore` itself remains visible and is human-owned worktree policy. Sunlight
+mutation and compatibility-import paths cannot change it. After a human changes
+it, call `repository_init`: clean state is re-ingested, while authored history
+fails closed with instructions that preserve the existing state.
+
+An old native state containing legacy automatic-quarantine entries can be
+migrated by calling `repository_init` again when it has no authored Sunlight
+history. If history exists, initialization fails with preservation instructions
+instead of silently rewriting prior views.
 
 Tool-specific output schemas describe the main returned IDs and payloads while
 allowing forward-compatible additional fields. The initialization response also
@@ -169,7 +179,7 @@ copy-on-write where available and otherwise isolated private copies.
 
 Requests are limited to 4 MiB, content fields to 2 MiB, execution-output source
 promotion to a 2 MiB regular file, subprocess stdout to 8 MiB, and stderr to
-64 KiB. Ignored, secret, log, cache, and oversized outputs remain local-only;
+64 KiB. Ignored, log, cache, and oversized outputs remain local-only;
 the denial reports classification and size facts. Ordinary calls time out after
 two minutes and runs after fifteen minutes. Malformed messages produce a
 JSON-RPC error without stopping the server where recovery is possible.

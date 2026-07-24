@@ -1,5 +1,10 @@
 # Sunlight Operation Transactions v0.1
 
+> **Historical design record.** Secret detection, secret classification gates,
+> and automatic source quarantine described here are superseded. See the
+> repository README, `docs/local_mcp.md`, portable Agent Skill, and
+> `docs/open_alpha_acceptance.md` for the current explicit-ignore contract.
+
 | Field | Value |
 | --- | --- |
 | Status | Phase 1 mutation contract |

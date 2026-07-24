@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use sunlight_core::records::parse_json_record;
-use sunlight_core::repo_state::RealRepoState;
+use sunlight_core::repo_state::{RealQuarantineEntry, RealRepoState};
 
 fn sun() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sun"))
@@ -1108,6 +1108,7 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
         &["config", "user.email", "sun-cli-test@example.invalid"],
     );
     repo.write_file("README.md", "# Execution repo\n");
+    repo.write_file(".sunignore", "generated/hidden.txt\n");
     git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-m", "base"]);
 
@@ -1175,7 +1176,7 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
         .args([
             "python",
             "-c",
-            "from pathlib import Path; Path('generated').mkdir(exist_ok=True); Path('generated/out.txt').write_bytes(b'promoted needle\\n')",
+            "from pathlib import Path; Path('generated').mkdir(exist_ok=True); Path('generated/out.txt').write_bytes(b'promoted needle\\n'); Path('generated/hidden.txt').write_bytes(b'hidden output\\n')",
         ])
         .current_dir(repo.path())
         .output()
@@ -1239,6 +1240,23 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
         .expect("sun execution promote-output should run");
     assert_failure(&bad_promote);
     assert!(stdout(&bad_promote).contains("\"code\":\"promotion_precondition_failed\""));
+
+    let hidden_promote = sun()
+        .arg("execution")
+        .arg("promote-output")
+        .arg(&execution_id)
+        .arg("--path")
+        .arg("generated/hidden.txt")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--classification")
+        .arg("ignored")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sunignored output promotion should fail closed");
+    assert_failure(&hidden_promote);
+    assert!(stdout(&hidden_promote).contains("\"code\":\"sunignore_excluded\""));
 
     let promote = sun()
         .arg("execution")
@@ -1435,6 +1453,57 @@ fn ignored_execution_outputs_are_batched_bounded_and_not_promotable() {
     let repository_status = run_real_json(&repo, &["status"]);
     assert_success(&repository_status);
     assert!(stdout(&repository_status).contains("\"pending_promotions\":0"));
+}
+
+#[test]
+fn tracked_gitignore_match_modified_by_execution_remains_promotable() {
+    let repo = TestRepo::new("tracked-ignored-execution-output");
+    init_local_git_repo(&repo);
+    repo.write_file(".gitignore", "*.env\n");
+    repo.write_file("tracked.env", "before\n");
+    git(repo.path(), &["add", ".gitignore"]);
+    git(repo.path(), &["add", "-f", "tracked.env"]);
+    git(repo.path(), &["commit", "-m", "track ignored match"]);
+    start_native_session(&repo, "tracked-ignored-execution");
+
+    let run = sun()
+        .args(["run", "--view", "view_base_0001", "--json", "--"])
+        .args([
+            "python",
+            "-c",
+            "from pathlib import Path; Path('tracked.env').write_text('after\\n')",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("execution modifying a tracked ignore match should run");
+    assert_success(&run);
+    let body = stdout(&run);
+    assert!(body.contains("\"output_path\":\"tracked.env\""));
+    assert!(body.contains("\"classification\":\"source_like_delta\""));
+    assert!(body.contains("\"promotion_candidates\":[{"));
+}
+
+#[test]
+fn execution_git_ignore_probe_failure_is_not_treated_as_source() {
+    let repo = TestRepo::new("execution-ignore-probe-failure");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "ignore-probe-failure");
+    fs::write(repo.path().join(".git/index"), b"corrupt-index").unwrap();
+
+    let run = sun()
+        .args(["run", "--view", "view_base_0001", "--json", "--"])
+        .args([
+            "python",
+            "-c",
+            "from pathlib import Path; Path('candidate.txt').write_text('candidate\\n')",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("execution should return a stable Git ignore policy failure");
+    assert_failure(&run);
+    let body = stdout(&run);
+    assert_valid_json(&body);
+    assert!(body.contains("\"code\":\"execution_ignore_policy_failed\""));
 }
 
 #[test]
@@ -4590,8 +4659,181 @@ fn no_fixture_init_respects_git_ignore_policy() {
 }
 
 #[test]
-fn no_fixture_init_quarantines_tracked_secret_without_persisting_or_searching_bytes() {
-    let repo = TestRepo::new("real-secret-quarantine");
+fn no_fixture_sunignore_hides_explicit_paths_and_blocks_native_mutation() {
+    let repo = TestRepo::new("real-sunignore");
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
+    git(
+        repo.path(),
+        &["config", "user.email", "sun-cli-test@example.invalid"],
+    );
+    repo.write_file(".sunignore", "private/\nconfig/hidden.toml\n");
+    write_nested_file(repo.path(), "src/lib.rs", "pub fn visible() {}\n");
+    write_nested_file(repo.path(), "config/hidden.toml", "human-owned\n");
+    write_nested_file(repo.path(), "private/local.txt", "also-hidden\n");
+    git(
+        repo.path(),
+        &["add", ".sunignore", "src/lib.rs", "config/hidden.toml"],
+    );
+    git(repo.path(), &["commit", "-m", "base"]);
+
+    start_native_session(&repo, "sunignore");
+
+    let list = sun()
+        .arg("list")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun list should run");
+    assert_success(&list);
+    let list_stdout = stdout(&list);
+    assert!(list_stdout.contains("\"path\":\".sunignore\""));
+    assert!(list_stdout.contains("\"path\":\"src/lib.rs\""));
+    assert!(!list_stdout.contains("config/hidden.toml"));
+    assert!(!list_stdout.contains("private/local.txt"));
+
+    let policy_read = sun()
+        .arg("read")
+        .arg(".sunignore")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun read .sunignore should run");
+    assert_success(&policy_read);
+    let policy_hash = json_string_field(&stdout(&policy_read), "content_hash");
+    let policy_mutation = sun()
+        .arg("metadata")
+        .arg("set")
+        .arg(".sunignore")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--expect-hash")
+        .arg(policy_hash)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun .sunignore mutation should return a policy fact");
+    assert_failure(&policy_mutation);
+    assert!(stdout(&policy_mutation).contains("\"code\":\"sunignore_policy_external\""));
+
+    let content = repo.write_file("replacement.txt", "should not enter Sunlight\n");
+    let blocked = sun()
+        .arg("write")
+        .arg("config/hidden.toml")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--expect-hash")
+        .arg("new")
+        .arg("--content-file")
+        .arg(content)
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun write should return a policy fact");
+    assert_failure(&blocked);
+    let blocked_stdout = stdout(&blocked);
+    assert!(blocked_stdout.contains("\"code\":\"sunignore_excluded\""));
+    assert!(blocked_stdout.contains("\"policy_file\":\".sunignore\""));
+    assert_eq!(
+        fs::read_to_string(repo.path().join("config/hidden.toml")).unwrap(),
+        "human-owned\n"
+    );
+}
+
+#[test]
+fn no_fixture_sunignore_change_requires_reinit_and_refreshes_a_clean_state() {
+    let repo = TestRepo::new("sunignore-clean-refresh");
+    git(repo.path(), &["init", "-b", "main"]);
+    repo.write_file("visible.txt", "visible-before-policy\n");
+    git(repo.path(), &["add", "visible.txt"]);
+
+    let initialized = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("initial sun init should run");
+    assert_success(&initialized);
+    repo.write_file(".sunignore", "visible.txt\n");
+
+    let blocked_read = sun()
+        .arg("list")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("policy drift should fail closed");
+    assert_failure(&blocked_read);
+    assert!(stdout(&blocked_read).contains("\"code\":\"sunignore_policy_changed\""));
+
+    let refreshed = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("clean policy refresh should run");
+    assert_success(&refreshed);
+    assert!(stdout(&refreshed).contains("\"sunignore_policy_refreshed\":true"));
+
+    let list = sun()
+        .arg("list")
+        .arg("--view")
+        .arg("view_base_0001")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("refreshed view should list");
+    assert_success(&list);
+    let list_stdout = stdout(&list);
+    assert!(list_stdout.contains("\"path\":\".sunignore\""));
+    assert!(!list_stdout.contains("visible.txt"));
+}
+
+#[test]
+fn no_fixture_sunignore_change_preserves_authored_state_and_fails_with_recovery() {
+    let repo = TestRepo::new("sunignore-authored-refusal");
+    git(repo.path(), &["init", "-b", "main"]);
+    repo.write_file("README.md", "baseline\n");
+    git(repo.path(), &["add", "README.md"]);
+    start_native_session(&repo, "authored-policy");
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let state_before = fs::read(&state_path).unwrap();
+    repo.write_file(".sunignore", "README.md\n");
+
+    let blocked = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("authored policy change should fail safely");
+    assert_failure(&blocked);
+    let blocked_stdout = stdout(&blocked);
+    assert!(blocked_stdout.contains("\"code\":\"sunignore_policy_change_blocked\""));
+    assert!(blocked_stdout.contains("\"state_preserved\":\"true\""));
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+
+    fs::remove_file(repo.path().join(".sunignore")).unwrap();
+    let status = sun()
+        .arg("status")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("restoring prior policy should recover state access");
+    assert_success(&status);
+}
+
+#[test]
+fn no_fixture_init_includes_tracked_secret_like_source_without_content_policy() {
+    let repo = TestRepo::new("real-secret-like-source");
     git(repo.path(), &["init", "-b", "main"]);
     git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
     git(
@@ -4599,36 +4841,25 @@ fn no_fixture_init_quarantines_tracked_secret_without_persisting_or_searching_by
         &["config", "user.email", "sun-cli-test@example.invalid"],
     );
     write_nested_file(repo.path(), "src/lib.rs", "pub fn kept() {}\n");
-    repo.write_file(
-        ".env",
-        "API_KEY=tracked-secret-value-that-must-not-persist\n",
-    );
+    repo.write_file(".env", "API_KEY=tracked-value-owned-by-the-repository\n");
     git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-m", "base"]);
 
-    start_native_session(&repo, "secret-quarantine");
+    start_native_session(&repo, "secret-like-source");
 
-    let native_state = fs::read_to_string(repo.path().join(".sunlight/records/native-state.json"))
-        .expect("native state should exist");
-    assert!(native_state.contains("\"path\":\".env\""));
-    assert!(native_state.contains("\"classification\":\"secret\""));
-    assert!(!native_state.contains("tracked-secret-value-that-must-not-persist"));
     let blob_root = repo.path().join(".sunlight/objects/blobs/sha256");
+    let mut tracked_value_persisted = false;
     for blob in fs::read_dir(blob_root).expect("blob directory should exist") {
         let blob = blob.expect("blob entry should be readable");
         let bytes = fs::read(blob.path()).expect("blob should be readable");
-        assert!(
-            !String::from_utf8_lossy(&bytes).contains("tracked-secret-value-that-must-not-persist")
-        );
+        tracked_value_persisted |=
+            String::from_utf8_lossy(&bytes).contains("tracked-value-owned-by-the-repository");
     }
-
-    let report = fs::read_to_string(repo.path().join(".sunlight/quarantine/ingest-report.json"))
-        .expect("quarantine report should exist");
-    assert!(report.contains("\"record_type\":\"ingest_quarantine_report\""));
-    assert!(report.contains("\"quarantined_count\":1"));
-    assert!(report.contains("\"path\":\".env\""));
-    assert!(report.contains("\"reason_codes\":[\"secret_path\",\"secret_token\"]"));
-    assert!(!report.contains("tracked-secret-value-that-must-not-persist"));
+    assert!(tracked_value_persisted);
+    assert!(!repo
+        .path()
+        .join(".sunlight/quarantine/ingest-report.json")
+        .exists());
 
     let status = sun()
         .arg("status")
@@ -4638,9 +4869,8 @@ fn no_fixture_init_quarantines_tracked_secret_without_persisting_or_searching_by
         .expect("sun status should run");
     assert_success(&status);
     let status_stdout = stdout(&status);
-    assert!(status_stdout.contains("\"quarantined_secret_count\":1"));
-    assert!(status_stdout.contains("\"code\":\"ingest_secrets_quarantined\""));
-    assert!(status_stdout.contains("\"next_action\":\"Inspect the report, rotate real credentials, and author only a sanitized non-secret replacement through a Sunlight topic; quarantined bytes were not stored and cannot be restored by Sunlight.\""));
+    assert!(status_stdout.contains("\"automatic_secret_detection\":false"));
+    assert!(status_stdout.contains("\"legacy_quarantine_excluded_count\":0"));
 
     let list_root = sun()
         .arg("list")
@@ -4653,7 +4883,7 @@ fn no_fixture_init_quarantines_tracked_secret_without_persisting_or_searching_by
     assert_success(&list_root);
     let list_stdout = stdout(&list_root);
     assert!(list_stdout.contains("\"path\":\"src/lib.rs\""));
-    assert!(!list_stdout.contains("\"path\":\".env\""));
+    assert!(list_stdout.contains("\"path\":\".env\""));
 
     let read_secret = sun()
         .arg("read")
@@ -4663,16 +4893,15 @@ fn no_fixture_init_quarantines_tracked_secret_without_persisting_or_searching_by
         .arg("--json")
         .current_dir(repo.path())
         .output()
-        .expect("sun read secret should run");
-    assert_failure(&read_secret);
+        .expect("sun read tracked source should run");
+    assert_success(&read_secret);
     let read_stdout = stdout(&read_secret);
-    assert!(read_stdout.contains("\"code\":\"path_not_found\""));
     assert!(read_stdout.contains("\"path\":\".env\""));
-    assert!(!read_stdout.contains("tracked-secret-value-that-must-not-persist"));
+    assert!(read_stdout.contains("tracked-value-owned-by-the-repository"));
 
     let search_secret = sun()
         .arg("search")
-        .arg("tracked-secret-value-that-must-not-persist")
+        .arg("tracked-value-owned-by-the-repository")
         .arg("--session")
         .arg("session_agent_a")
         .arg("--json")
@@ -4681,12 +4910,102 @@ fn no_fixture_init_quarantines_tracked_secret_without_persisting_or_searching_by
         .expect("sun search secret should run");
     assert_success(&search_secret);
     let search_stdout = stdout(&search_secret);
-    assert!(!search_stdout.contains(".env"));
-    assert!(!search_stdout.contains("tracked-secret-value-that-must-not-persist"));
+    assert!(search_stdout.contains(".env"));
+    assert!(search_stdout.contains("tracked-value-owned-by-the-repository"));
 }
 
 #[test]
-fn no_fixture_git_export_uses_persisted_checkpoint_when_current_head_is_secret_classified() {
+fn no_fixture_init_migrates_clean_legacy_quarantine_state() {
+    let repo = TestRepo::new("legacy-quarantine-migration");
+    git(repo.path(), &["init", "-b", "main"]);
+    repo.write_file(".env.example", "TOKEN=example-value\n");
+    repo.write_file("README.md", "baseline\n");
+    git(repo.path(), &["add", "."]);
+
+    let initialized = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("initial sun init should run");
+    assert_success(&initialized);
+
+    let mut legacy = RealRepoState::load(repo.path()).unwrap();
+    let excluded = legacy.entry(".env.example").unwrap().clone();
+    legacy.entries.retain(|entry| entry.path != ".env.example");
+    legacy
+        .base_entries
+        .retain(|entry| entry.path != ".env.example");
+    legacy.tree_hash = sunlight_core::repo_state::real_tree_hash(&legacy.entries);
+    legacy.quarantine.push(RealQuarantineEntry {
+        path: ".env.example".to_string(),
+        reason_codes: vec!["secret_path".to_string()],
+        classification: "secret".to_string(),
+        content_hash: excluded.content_hash,
+        byte_length: excluded.bytes.len(),
+    });
+    legacy.save(repo.path()).unwrap();
+
+    let migrated = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("migration sun init should run");
+    assert_success(&migrated);
+    let migrated_stdout = stdout(&migrated);
+    assert!(migrated_stdout.contains("\"legacy_quarantine_migrated\":true"));
+    assert!(migrated_stdout.contains("\"automatic_secret_detection\":false"));
+
+    let state = RealRepoState::load(repo.path()).unwrap();
+    assert!(state.quarantine.is_empty());
+    assert_eq!(
+        state.entry(".env.example").unwrap().bytes,
+        b"TOKEN=example-value\n"
+    );
+}
+
+#[test]
+fn no_fixture_legacy_quarantine_with_authored_history_fails_without_state_changes() {
+    let repo = TestRepo::new("legacy-quarantine-authored-refusal");
+    git(repo.path(), &["init", "-b", "main"]);
+    repo.write_file(".env.example", "TOKEN=example-value\n");
+    repo.write_file("README.md", "baseline\n");
+    git(repo.path(), &["add", "."]);
+    start_native_session(&repo, "legacy-authored");
+
+    let mut legacy = RealRepoState::load(repo.path()).unwrap();
+    let excluded = legacy.entry(".env.example").unwrap().clone();
+    legacy.entries.retain(|entry| entry.path != ".env.example");
+    legacy
+        .base_entries
+        .retain(|entry| entry.path != ".env.example");
+    legacy.tree_hash = sunlight_core::repo_state::real_tree_hash(&legacy.entries);
+    legacy.quarantine.push(RealQuarantineEntry {
+        path: ".env.example".to_string(),
+        reason_codes: vec!["secret_path".to_string()],
+        classification: "secret".to_string(),
+        content_hash: excluded.content_hash,
+        byte_length: excluded.bytes.len(),
+    });
+    legacy.save(repo.path()).unwrap();
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let state_before = fs::read(&state_path).unwrap();
+
+    let blocked = sun()
+        .arg("init")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("authored legacy migration should fail safely");
+    assert_failure(&blocked);
+    let blocked_stdout = stdout(&blocked);
+    assert!(blocked_stdout.contains("\"code\":\"legacy_quarantine_migration_blocked\""));
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+}
+
+#[test]
+fn no_fixture_secret_classification_does_not_hide_or_block_checkpoint_export() {
     let repo = TestRepo::new("real-secret-export-gate");
     git(repo.path(), &["init", "-b", "main"]);
     git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
@@ -4698,18 +5017,6 @@ fn no_fixture_git_export_uses_persisted_checkpoint_when_current_head_is_secret_c
     git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-m", "base"]);
     start_native_session(&repo, "secret-export");
-
-    let checkpoint = sun()
-        .arg("checkpoint")
-        .arg("create")
-        .arg("--view")
-        .arg("view_base_0001")
-        .arg("--json")
-        .current_dir(repo.path())
-        .output()
-        .expect("sun checkpoint create should run");
-    assert_success(&checkpoint);
-    let checkpoint_id = json_string_field(&stdout(&checkpoint), "checkpoint_id");
 
     let read = sun()
         .arg("read")
@@ -4738,6 +5045,19 @@ fn no_fixture_git_export_uses_persisted_checkpoint_when_current_head_is_secret_c
         .output()
         .expect("sun metadata set should run");
     assert_success(&metadata);
+    let resolved_view_id = json_string_field(&stdout(&metadata), "resolved_view_id");
+
+    let checkpoint = sun()
+        .arg("checkpoint")
+        .arg("create")
+        .arg("--view")
+        .arg(resolved_view_id)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("sun checkpoint create should run");
+    assert_success(&checkpoint);
+    let checkpoint_id = json_string_field(&stdout(&checkpoint), "checkpoint_id");
 
     let export = sun()
         .arg("git")
@@ -5177,7 +5497,7 @@ fn no_fixture_compat_project_diff_import_flows_into_native_consumers() {
 }
 
 #[test]
-fn no_fixture_compat_import_rejects_secret_and_stale_generation_without_partial_state() {
+fn no_fixture_compat_import_accepts_secret_like_source_and_rejects_stale_generation() {
     let repo = TestRepo::new("real-compat-atomic");
     git(repo.path(), &["init", "-b", "main"]);
     git(repo.path(), &["config", "user.name", "Sun CLI Test"]);
@@ -5196,9 +5516,7 @@ fn no_fixture_compat_import_rejects_secret_and_stale_generation_without_partial_
     let diff = real_compat_diff(&repo, &projection);
     let safe_candidate = candidate_id_for_path(&diff, "README.md");
     let secret_candidate = candidate_id_for_path(&diff, ".env");
-    let state_path = repo.path().join(".sunlight/records/native-state.json");
-    let before_blocked = fs::read(&state_path).unwrap();
-    let blocked = sun()
+    let imported = sun()
         .arg("compat")
         .arg("import")
         .arg("--projection")
@@ -5210,17 +5528,15 @@ fn no_fixture_compat_import_rejects_secret_and_stale_generation_without_partial_
         .arg("--json")
         .current_dir(repo.path())
         .output()
-        .expect("blocked sun compat import should run");
-    assert_failure(&blocked);
-    assert!(stdout(&blocked).contains("\"code\":\"compat_secret_detected\""));
-    assert_eq!(before_blocked, fs::read(&state_path).unwrap());
-    assert!(!fs::read_to_string(&state_path)
-        .unwrap()
-        .contains("projection-secret"));
+        .expect("sun compat import should run");
+    assert_success(&imported);
+    let imported_stdout = stdout(&imported);
+    assert!(imported_stdout.contains("\"path\":\".env\""));
+    assert!(imported_stdout.contains("\"classification\":\"source\""));
 
     let read = sun()
         .arg("read")
-        .arg("README.md")
+        .arg(".env")
         .arg("--session")
         .arg("session_agent_a")
         .arg("--json")
@@ -5228,24 +5544,9 @@ fn no_fixture_compat_import_rejects_secret_and_stale_generation_without_partial_
         .output()
         .expect("sun read should run");
     assert_success(&read);
-    let hash = json_string_field(&stdout(&read), "content_hash");
-    let native_content = repo.write_file("native-content.txt", "native advance\n");
-    let advance = sun()
-        .arg("write")
-        .arg("README.md")
-        .arg("--session")
-        .arg("session_agent_a")
-        .arg("--expect-hash")
-        .arg(&hash)
-        .arg("--content-file")
-        .arg(native_content)
-        .arg("--classification")
-        .arg("source")
-        .arg("--json")
-        .current_dir(repo.path())
-        .output()
-        .expect("sun write should run");
-    assert_success(&advance);
+    assert!(stdout(&read).contains("projection-secret"));
+
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
     let before_stale = fs::read(&state_path).unwrap();
     let stale = real_compat_import(&repo, &projection, &safe_candidate, Some(&generation));
     assert_failure(&stale);

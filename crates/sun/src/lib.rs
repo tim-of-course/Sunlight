@@ -96,9 +96,9 @@ use sunlight_core::projection::{
 };
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repo_state::{
-    materialize_real_projection, native_session_generation_id, process_may_be_live,
-    quarantine_report_publication, read_real_blob, real_artifact_id_for_path, real_content_hash,
-    real_execution_environment_summary_digest, real_tree_hash,
+    materialize_real_projection, native_session_generation_id, path_is_gitignored,
+    path_is_sunignored, process_may_be_live, read_real_blob, real_artifact_id_for_path,
+    real_content_hash, real_execution_environment_summary_digest, real_tree_hash,
     scan_real_projection_files_with_quarantine, validate_topic_metadata,
     verify_real_readonly_projection, DerivedRecordPublication, RealArtifactEntry,
     RealCheckpointSnapshot, RealExecutionEnvironmentSummary, RealExecutionOutputSnapshot,
@@ -385,6 +385,27 @@ impl From<RepoStateError> for CliError {
                     .map(|sequence| sequence.to_string())
                     .unwrap_or_else(|| "missing".to_string()),
             ),
+            RepoStateError::SunignorePolicyChanged {
+                path,
+                expected_hash,
+                actual_hash,
+            } => CliError::new(
+                "sunignore_policy_changed",
+                ".sunignore changed after Sunlight initialization, so persisted views cannot be exposed safely",
+            )
+            .with_detail("path", path.display().to_string())
+            .with_detail(
+                "expected_hash",
+                expected_hash.unwrap_or_else(|| "absent".to_string()),
+            )
+            .with_detail(
+                "actual_hash",
+                actual_hash.unwrap_or_else(|| "absent".to_string()),
+            )
+            .with_detail(
+                "recovery",
+                "Run sun init. A repository without authored Sunlight history is refreshed automatically; otherwise restore the prior .sunignore, preserve or export authored work, then back up and reinitialize .sunlight.",
+            ),
             RepoStateError::ProjectionStrategyUnsupported {
                 strategy,
                 path,
@@ -662,16 +683,50 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
     let report = init_repository(&repo_root).map_err(|error| {
         invalid_request(error.to_string()).with_detail("command", "repository.init")
     })?;
-    let mut quarantine_count = 0;
-    let state_exists = match RealRepoState::load(&report.repo_root) {
+    let mut legacy_quarantine_migrated = false;
+    let mut sunignore_policy_refreshed = false;
+    let state_exists = match RealRepoState::load_for_reinitialization(&report.repo_root) {
         Ok(state) => {
-            quarantine_count = state.quarantine.len();
             if state.repository_id != report.repository_id {
                 return Err(invalid_request(
                     "persisted Sunlight state belongs to a different repository",
                 )
                 .with_detail("config_repository_id", report.repository_id.clone())
                 .with_detail("state_repository_id", state.repository_id));
+            }
+            let sunignore_policy_changed = state.sunignore_policy_changed(&report.repo_root)?;
+            if !state.quarantine.is_empty() || sunignore_policy_changed {
+                let has_authored_state = !state.topics.is_empty()
+                    || !state.sessions.is_empty()
+                    || !state.operations.is_empty()
+                    || !state.projections.is_empty()
+                    || !state.executions.is_empty()
+                    || !state.promotions.is_empty()
+                    || !state.checkpoints.is_empty()
+                    || !state.export_maps.is_empty();
+                if has_authored_state {
+                    if sunignore_policy_changed {
+                        return Err(CliError::new(
+                            "sunignore_policy_change_blocked",
+                            ".sunignore changed after initialization in a repository with authored Sunlight history",
+                        )
+                        .with_detail("policy_file", ".sunignore")
+                        .with_detail("state_preserved", "true")
+                        .with_detail("recovery", "Restore the previous .sunignore to continue using this state. To adopt the new policy, first preserve or export authored work, back up .sunlight, then remove only .sunlight and rerun sun init."));
+                    }
+                    return Err(CliError::new(
+                        "legacy_quarantine_migration_blocked",
+                        "legacy secret quarantine excluded source from a repository that now contains authored Sunlight history",
+                    )
+                    .with_detail("excluded_path_count", state.quarantine.len().to_string())
+                    .with_detail("recovery", "Preserve or export needed historical work, back up .sunlight, then remove only .sunlight and rerun sun init with this build."));
+                }
+                let mut ingest = RealRepoState::ingest(&report.repo_root, &report.repository_id)?;
+                ingest.publication_sequence = state.publication_sequence;
+                let records = base_ingest_publications(&ingest)?;
+                ingest.save_with_records(&report.repo_root, &records)?;
+                legacy_quarantine_migrated = !state.quarantine.is_empty();
+                sunignore_policy_refreshed = sunignore_policy_changed;
             }
             true
         }
@@ -680,32 +735,7 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
     };
     if !state_exists {
         let ingest = RealRepoState::ingest(&report.repo_root, &report.repository_id)?;
-        quarantine_count = ingest.quarantine.len();
-        let records = vec![
-            quarantine_report_publication(&ingest.quarantine)?,
-            ingest.record_publication(
-                "checkpoints",
-                &ingest.base_checkpoint_id,
-                &format!(
-                "{{\"record_type\":\"checkpoint\",\"id\":\"{}\",\"repository_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"source\":\"worktree_ingest\"}}\n",
-                json_escape(&ingest.base_checkpoint_id),
-                json_escape(&ingest.repository_id),
-                json_escape(&ingest.base_resolved_view_id),
-                json_escape(&ingest.tree_hash),
-                ),
-            )?,
-            ingest.record_publication(
-                "views",
-                &ingest.base_resolved_view_id,
-                &format!(
-                "{{\"record_type\":\"resolved_view\",\"id\":\"{}\",\"repository_id\":\"{}\",\"base_checkpoint_ids\":[\"{}\"],\"tree_hash\":\"{}\"}}\n",
-                json_escape(&ingest.base_resolved_view_id),
-                json_escape(&ingest.repository_id),
-                json_escape(&ingest.base_checkpoint_id),
-                json_escape(&ingest.tree_hash),
-                ),
-            )?,
-        ];
+        let records = base_ingest_publications(&ingest)?;
         match ingest.save_with_records(&report.repo_root, &records) {
             Ok(()) => {}
             Err(RepoStateError::ConcurrentStateUpdate { .. }) => {
@@ -733,7 +763,9 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
                 report.created_config,
                 report.created_gitignore,
                 report.created_directories.len(),
-                quarantine_count,
+                0,
+                legacy_quarantine_migrated,
+                sunignore_policy_refreshed,
             )
         );
     } else {
@@ -748,12 +780,44 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
             "created_directories = {}",
             report.created_directories.len()
         );
-        if quarantine_count != 0 {
-            outputln!(ctx, "quarantined_secrets = {}", quarantine_count);
+        if legacy_quarantine_migrated {
+            outputln!(ctx, "legacy_quarantine_migrated = true");
+        }
+        if sunignore_policy_refreshed {
+            outputln!(ctx, "sunignore_policy_refreshed = true");
         }
     }
 
     Ok(())
+}
+
+fn base_ingest_publications(
+    ingest: &RealRepoState,
+) -> Result<Vec<DerivedRecordPublication>, CliError> {
+    Ok(vec![
+        ingest.record_publication(
+            "checkpoints",
+            &ingest.base_checkpoint_id,
+            &format!(
+                "{{\"record_type\":\"checkpoint\",\"id\":\"{}\",\"repository_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"source\":\"worktree_ingest\"}}\n",
+                json_escape(&ingest.base_checkpoint_id),
+                json_escape(&ingest.repository_id),
+                json_escape(&ingest.base_resolved_view_id),
+                json_escape(&ingest.tree_hash),
+            ),
+        )?,
+        ingest.record_publication(
+            "views",
+            &ingest.base_resolved_view_id,
+            &format!(
+                "{{\"record_type\":\"resolved_view\",\"id\":\"{}\",\"repository_id\":\"{}\",\"base_checkpoint_ids\":[\"{}\"],\"tree_hash\":\"{}\"}}\n",
+                json_escape(&ingest.base_resolved_view_id),
+                json_escape(&ingest.repository_id),
+                json_escape(&ingest.base_checkpoint_id),
+                json_escape(&ingest.tree_hash),
+            ),
+        )?,
+    ])
 }
 
 fn topic_create(ctx: &CommandContext) -> Result<(), CliError> {
@@ -1934,6 +1998,10 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
         .map_err(compat_import_error)?;
     let mut changes = Vec::new();
     for candidate in &selected {
+        ensure_path_visible_to_sunlight(&repo_root, &candidate.path)?;
+        if let Some(source_path) = candidate.source_path.as_deref() {
+            ensure_path_visible_to_sunlight(&repo_root, source_path)?;
+        }
         let before_path = candidate
             .source_path
             .as_deref()
@@ -3359,6 +3427,29 @@ fn real_artifact_search_view(
     Ok(())
 }
 
+fn ensure_path_visible_to_sunlight(repo_root: &Path, path: &str) -> Result<(), CliError> {
+    if path == ".sunignore" {
+        return Err(CliError::new(
+            "sunignore_policy_external",
+            ".sunignore is human-owned worktree policy and cannot be mutated through Sunlight",
+        )
+        .with_detail("path", path)
+        .with_detail(
+            "recovery",
+            "Edit .sunignore in the worktree, then run sun init to adopt the policy change.",
+        ));
+    }
+    if path_is_sunignored(repo_root, path, false)? {
+        return Err(CliError::new(
+            "sunignore_excluded",
+            "the path is explicitly excluded from Sunlight by .sunignore",
+        )
+        .with_detail("path", path)
+        .with_detail("policy_file", ".sunignore"));
+    }
+    Ok(())
+}
+
 fn real_artifact_patch(
     ctx: &CommandContext,
     options: MutationCommandOptions,
@@ -3368,6 +3459,7 @@ fn real_artifact_patch(
     let session = real_session(&state, &options.session_id)?.clone();
     let resolved = state.resolve_session_view(&session);
     let path = options.operands[0].clone();
+    ensure_path_visible_to_sunlight(&ctx.repo_root, &path)?;
     let before = real_entry(&state, &resolved.entries, &path)?.clone();
     if before.content_hash != options.expect_hash.as_deref().unwrap_or("") {
         return Err(real_precondition_error(
@@ -3406,6 +3498,7 @@ fn real_artifact_write(
     let session = real_session(&state, &options.session_id)?.clone();
     let resolved = state.resolve_session_view(&session);
     let path = options.operands[0].clone();
+    ensure_path_visible_to_sunlight(&ctx.repo_root, &path)?;
     let existing = resolved
         .entries
         .iter()
@@ -3481,6 +3574,8 @@ fn real_artifact_move(
     let resolved = state.resolve_session_view(&session);
     let source = options.operands[0].clone();
     let target = options.operands[1].clone();
+    ensure_path_visible_to_sunlight(&ctx.repo_root, &source)?;
+    ensure_path_visible_to_sunlight(&ctx.repo_root, &target)?;
     let before = real_entry(&state, &resolved.entries, &source)?.clone();
     if before.content_hash != expected {
         return Err(real_precondition_error(&state, &before, &expected));
@@ -3507,6 +3602,7 @@ fn real_artifact_delete(
     let session = real_session(&state, &options.session_id)?.clone();
     let resolved = state.resolve_session_view(&session);
     let path = options.operands[0].clone();
+    ensure_path_visible_to_sunlight(&ctx.repo_root, &path)?;
     let before = real_entry(&state, &resolved.entries, &path)?.clone();
     if before.content_hash != expected {
         return Err(real_precondition_error(&state, &before, &expected));
@@ -3534,6 +3630,7 @@ fn real_artifact_metadata_set(
     let session = real_session(&state, &options.session_id)?.clone();
     let resolved = state.resolve_session_view(&session);
     let path = options.operands[0].clone();
+    ensure_path_visible_to_sunlight(&ctx.repo_root, &path)?;
     let before = real_entry(&state, &resolved.entries, &path)?.clone();
     if before.content_hash != expected {
         return Err(real_precondition_error(&state, &before, &expected));
@@ -4641,7 +4738,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
             &view_state.entries,
             &projected_entries,
             &ctx.cancellation,
-        )
+        )?
     };
     let output_scan_ms = output_scan_started.elapsed().as_millis();
     state = RealRepoState::load(&repo_root)?;
@@ -4927,6 +5024,7 @@ fn real_execution_promote_output(
     let path = options.path.clone().ok_or_else(|| {
         invalid_request("usage: sun execution promote-output requires --path <path>")
     })?;
+    ensure_path_visible_to_sunlight(&repo_root, &path)?;
     let session_id = options.session_id.clone().ok_or_else(|| {
         invalid_request("usage: sun execution promote-output requires --session <session>")
     })?;
@@ -4976,10 +5074,10 @@ fn real_execution_promote_output(
             Some(&classification),
         ));
     }
-    if classification == "secret" || classification == "log" || classification == "cache" {
+    if classification == "ignored" || classification == "log" || classification == "cache" {
         return Err(promotion_error(
             "promotion_policy_failed",
-            "local-only or secret execution outputs cannot be promoted",
+            "ignored, log, and cache execution outputs cannot be promoted",
             &options.execution_id,
             Some(&path),
             Some(&session_id),
@@ -5053,16 +5151,6 @@ fn real_execution_promote_output(
         invalid_request(format!("failed to read execution output: {error}"))
             .with_detail("path", &path)
     })?;
-    if !sunlight_core::repo_state::detect_secret_reasons(&path, &bytes).is_empty() {
-        return Err(promotion_error(
-            "promotion_policy_failed",
-            "secret-like execution output cannot be promoted",
-            &options.execution_id,
-            Some(&path),
-            Some(&session_id),
-            Some(&classification),
-        ));
-    }
     let resolved = state.resolve_session_view(&session);
     let before = resolved
         .entries
@@ -5426,11 +5514,7 @@ fn reject_real_export_blocked_entries(state: &RealRepoState) -> Result<(), CliEr
         .entries
         .iter()
         .filter(|entry| {
-            !entry.tombstone
-                && matches!(
-                    entry.classification.as_str(),
-                    "secret" | "local_only" | "local-only"
-                )
+            !entry.tombstone && matches!(entry.classification.as_str(), "local_only" | "local-only")
         })
         .collect::<Vec<_>>();
     if blocked.is_empty() {
@@ -5448,7 +5532,7 @@ fn reject_real_export_blocked_entries(state: &RealRepoState) -> Result<(), CliEr
         .join(",");
     Err(CliError::new(
         "export_policy_failed",
-        "state contains secret or local-only artifacts and cannot be checkpointed or exported",
+        "state contains local-only artifacts and cannot be checkpointed or exported",
     )
     .with_detail("blocked_count", blocked.len().to_string())
     .with_detail("blocked_paths", paths)
@@ -6234,9 +6318,18 @@ fn repository_ignored_execution_paths(
     repo_root: &Path,
     paths: &[String],
     cancellation: &AtomicBool,
-) -> BTreeSet<String> {
+) -> Result<BTreeSet<String>, CliError> {
     if paths.is_empty() {
-        return BTreeSet::new();
+        return Ok(BTreeSet::new());
+    }
+    if !repo_root.join(".git").exists() {
+        let mut ignored = BTreeSet::new();
+        for path in paths {
+            if path_is_gitignored(repo_root, path)? {
+                ignored.insert(path.clone());
+            }
+        }
+        return Ok(ignored);
     }
     let mut child = match Command::new("git")
         .args([
@@ -6245,7 +6338,6 @@ fn repository_ignored_execution_paths(
             "-c",
             "core.untrackedCache=false",
             "check-ignore",
-            "--no-index",
             "--stdin",
             "-z",
         ])
@@ -6253,16 +6345,24 @@ fn repository_ignored_execution_paths(
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(child) => child,
-        Err(_) => return BTreeSet::new(),
+        Err(error) => {
+            return Err(CliError::new(
+                "execution_ignore_policy_failed",
+                format!("failed to start Git ignore evaluation: {error}"),
+            ))
+        }
     };
     let Some(mut stdin) = child.stdin.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return BTreeSet::new();
+        return Err(CliError::new(
+            "execution_ignore_policy_failed",
+            "failed to open Git ignore policy input",
+        ));
     };
     let input_written = paths
         .iter()
@@ -6277,17 +6377,40 @@ fn repository_ignored_execution_paths(
             })
             .ok()
     });
+    let stderr_reader = child.stderr.take().and_then(|mut stderr| {
+        thread::Builder::new()
+            .name("sun-git-ignore-stderr-reader".to_string())
+            .spawn(move || {
+                let mut bytes = Vec::new();
+                stderr.read_to_end(&mut bytes).map(|_| bytes)
+            })
+            .ok()
+    });
     if !input_written {
         let _ = child.kill();
         let _ = child.wait();
-        return BTreeSet::new();
+        return Err(CliError::new(
+            "execution_ignore_policy_failed",
+            "failed to send paths to Git ignore evaluation",
+        ));
     }
     let deadline = Instant::now() + Duration::from_secs(2);
     let status = loop {
         if cancellation.load(Ordering::Acquire) || Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return BTreeSet::new();
+            return Err(CliError::new(
+                if cancellation.load(Ordering::Acquire) {
+                    "request_cancelled"
+                } else {
+                    "execution_ignore_policy_failed"
+                },
+                if cancellation.load(Ordering::Acquire) {
+                    "request cancelled during Git ignore evaluation"
+                } else {
+                    "Git ignore evaluation exceeded its two-second deadline"
+                },
+            ));
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -6295,22 +6418,79 @@ fn repository_ignored_execution_paths(
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return BTreeSet::new();
+                return Err(CliError::new(
+                    "execution_ignore_policy_failed",
+                    "failed while waiting for Git ignore evaluation",
+                ));
             }
         }
     };
-    if !status.success() {
-        return BTreeSet::new();
+    let stdout = stdout_reader
+        .ok_or_else(|| {
+            CliError::new(
+                "execution_ignore_policy_failed",
+                "failed to capture Git ignore evaluation output",
+            )
+        })?
+        .join()
+        .map_err(|_| {
+            CliError::new(
+                "execution_ignore_policy_failed",
+                "Git ignore output reader stopped unexpectedly",
+            )
+        })?
+        .map_err(|error| {
+            CliError::new(
+                "execution_ignore_policy_failed",
+                format!("failed to read Git ignore evaluation output: {error}"),
+            )
+        })?;
+    let stderr = stderr_reader
+        .ok_or_else(|| {
+            CliError::new(
+                "execution_ignore_policy_failed",
+                "failed to capture Git ignore evaluation diagnostics",
+            )
+        })?
+        .join()
+        .map_err(|_| {
+            CliError::new(
+                "execution_ignore_policy_failed",
+                "Git ignore diagnostic reader stopped unexpectedly",
+            )
+        })?
+        .map_err(|error| {
+            CliError::new(
+                "execution_ignore_policy_failed",
+                format!("failed to read Git ignore evaluation diagnostics: {error}"),
+            )
+        })?;
+    if !matches!(status.code(), Some(0 | 1)) {
+        return Err(CliError::new(
+            "execution_ignore_policy_failed",
+            format!(
+                "Git ignore evaluation failed: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        ));
     }
-    stdout_reader
-        .and_then(|reader| reader.join().ok())
-        .and_then(Result::ok)
-        .unwrap_or_default()
+    let mut ignored = BTreeSet::new();
+    for path in stdout
         .split(|byte| *byte == 0)
-        .filter_map(|path| std::str::from_utf8(path).ok())
         .filter(|path| !path.is_empty())
-        .map(str::to_string)
-        .collect()
+    {
+        ignored.insert(
+            std::str::from_utf8(path)
+                .map_err(|_| {
+                    CliError::new(
+                        "execution_ignore_policy_failed",
+                        "Git returned a non-UTF-8 ignored path",
+                    )
+                })?
+                .to_string(),
+        );
+    }
+    Ok(ignored)
 }
 
 fn common_created_output_classification(path: &str) -> Option<&'static str> {
@@ -6367,7 +6547,7 @@ fn real_execution_outputs(
     before: &[RealArtifactEntry],
     after: &[RealArtifactEntry],
     cancellation: &AtomicBool,
-) -> Vec<RealExecutionOutputSnapshot> {
+) -> Result<Vec<RealExecutionOutputSnapshot>, CliError> {
     let changed = after
         .iter()
         .filter(|entry| !entry.tombstone)
@@ -6393,9 +6573,14 @@ fn real_execution_outputs(
         })
         .map(|(entry, _)| entry.path.clone())
         .collect::<Vec<_>>();
-    let ignored_paths =
-        repository_ignored_execution_paths(repo_root, &paths_needing_git, cancellation);
-    changed
+    let mut ignored_paths =
+        repository_ignored_execution_paths(repo_root, &paths_needing_git, cancellation)?;
+    for path in &paths_needing_git {
+        if path_is_sunignored(repo_root, path, false)? {
+            ignored_paths.insert(path.clone());
+        }
+    }
+    Ok(changed
         .into_iter()
         .map(|(entry, before_entry)| RealExecutionOutputSnapshot {
             path: entry.path.clone(),
@@ -6408,7 +6593,7 @@ fn real_execution_outputs(
             after_hash: entry.content_hash.clone(),
             byte_length: entry.bytes.len() as u64,
         })
-        .collect()
+        .collect())
 }
 
 fn real_output_classification(value: &str) -> OutputClassification {
@@ -8666,7 +8851,7 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
     format!(
         concat!(
             "{{\"repository\":{{\"repository_id\":\"{}\",\"base_checkpoint_id\":\"{}\",\"base_resolved_view_id\":\"{}\",\"current_resolved_view_id\":\"{}\",\"tree_hash\":\"{}\"}},",
-            "\"artifacts\":{{\"active\":{},\"quarantined\":{}}},",
+            "\"artifacts\":{{\"active\":{},\"legacy_quarantine_excluded\":{}}},",
             "\"topics\":{{\"count\":{},\"heads\":{}}},",
             "\"sessions\":{{\"count\":{},\"heads\":{}}},",
             "\"resolution\":{{\"conflicts\":{},\"staleness\":{}}},",
@@ -8738,7 +8923,7 @@ fn real_operational_warnings_json(
         warnings.push("{\"code\":\"state_recovery_rolled_back\",\"message\":\"an interrupted malformed publication was rolled back to the newest fully valid state\",\"details\":{\"evidence_root\":\"local://.sunlight/local/recovery/native-state\"}}".to_string());
     }
     if summary.quarantined_count > 0 {
-        warnings.push(format!("{{\"code\":\"ingest_secrets_quarantined\",\"message\":\"likely secret files were excluded from Sunlight source truth\",\"details\":{{\"count\":{},\"report\":\"local://.sunlight/quarantine/ingest-report.json\",\"next_action\":\"Inspect the report, rotate real credentials, and author only a sanitized non-secret replacement through a Sunlight topic; quarantined bytes were not stored and cannot be restored by Sunlight.\"}}}}", summary.quarantined_count));
+        warnings.push(format!("{{\"code\":\"legacy_ingest_quarantine\",\"message\":\"legacy automatic secret detection excluded files from this native state\",\"details\":{{\"count\":{},\"next_action\":\"Run repository_init with the current build to migrate a clean state, or follow its preservation instructions when authored history exists.\"}}}}", summary.quarantined_count));
     }
     if summary.conflict_count > 0 {
         warnings.push(format!("{{\"code\":\"resolver_conflicts\",\"message\":\"inspect and resolve conflicting topic operations\",\"details\":{{\"count\":{}}}}}", summary.conflict_count));
@@ -8795,7 +8980,7 @@ fn print_real_status_text(
     );
     outputln!(
         ctx,
-        "artifacts {}  quarantined {}  topics {}  sessions {}",
+        "artifacts {}  legacy-quarantine-excluded {}  topics {}  sessions {}",
         summary.artifact_count,
         summary.quarantined_count,
         state.topics.len(),
@@ -8899,7 +9084,7 @@ fn print_real_status_text(
     if summary.quarantined_count > 0 {
         outputln!(
             ctx,
-            "warning[ingest_secrets_quarantined]: inspect .sunlight/quarantine/ingest-report.json, rotate real credentials, and author only a sanitized non-secret replacement through a Sunlight topic; quarantined bytes were not stored"
+            "warning[legacy_ingest_quarantine]: run sun init with the current build to migrate a clean state, or follow its preservation instructions when authored history exists"
         );
     }
     if summary.conflict_count > 0 {
@@ -9026,7 +9211,7 @@ fn real_status_envelope(
         })
         .unwrap_or_default();
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"quarantined_secret_count\":{},\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"}},\"topic\":{},\"handoff\":{},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"automatic_secret_detection\":false,\"legacy_quarantine_excluded_count\":{},\"ignore_policy\":{{\"gitignore\":\"git_semantics\",\"sunignore\":\".sunignore\",\"sunignore_owner\":\"human_worktree\",\"sunignore_change_command\":\"sun init\",\"intrinsic\":[\".git/\",\".sunlight/\"]}}}},\"topic\":{},\"handoff\":{},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
         command,
         json_escape(&state.repository_id),
         json_escape(&state.repository_id),
@@ -13923,16 +14108,10 @@ fn init_success_envelope(
     created_config: bool,
     created_gitignore: bool,
     created_directories: usize,
-    quarantined_count: usize,
+    _quarantined_count: usize,
+    legacy_quarantine_migrated: bool,
+    sunignore_policy_refreshed: bool,
 ) -> String {
-    let warnings = if quarantined_count == 0 {
-        "[]".to_string()
-    } else {
-        format!(
-            "[{{\"code\":\"ingest_secrets_quarantined\",\"message\":\"likely secret files were excluded from Sunlight source truth\",\"quarantined_count\":{},\"report\":\"local://.sunlight/quarantine/ingest-report.json\",\"next_action\":\"Inspect the report, rotate real credentials, and author only a sanitized non-secret replacement through a Sunlight topic; quarantined bytes were not stored and cannot be restored by Sunlight.\"}}]",
-            quarantined_count
-        )
-    };
     format!(
         concat!(
             "{{\"ok\":true,",
@@ -13954,11 +14133,13 @@ fn init_success_envelope(
             "\"created_config\":{},",
             "\"created_gitignore\":{},",
             "\"created_directories\":{},",
-            "\"quarantined_secret_count\":{},",
-            "\"quarantine_report\":\"local://.sunlight/quarantine/ingest-report.json\"",
+            "\"automatic_secret_detection\":false,",
+            "\"legacy_quarantine_migrated\":{},",
+            "\"sunignore_policy_refreshed\":{},",
+            "\"ignore_policy\":{{\"gitignore\":\"git_semantics\",\"sunignore\":\".sunignore\",\"sunignore_owner\":\"human_worktree\",\"sunignore_change_command\":\"sun init\",\"intrinsic\":[\".git/\",\".sunlight/\"]}}",
             "}}",
             "}},",
-            "\"warnings\":{}",
+            "\"warnings\":[]",
             "}}"
         ),
         json_escape(repository_id),
@@ -13969,8 +14150,8 @@ fn init_success_envelope(
         created_config,
         created_gitignore,
         created_directories,
-        quarantined_count,
-        warnings,
+        legacy_quarantine_migrated,
+        sunignore_policy_refreshed,
     )
 }
 
@@ -18523,6 +18704,21 @@ fn next_action_for_error_code(code: &str) -> &'static str {
     match code {
         "not_initialized" => {
             "Call repository_init for this repository, then retry the original operation."
+        }
+        "sunignore_excluded" => {
+            "Treat the path as outside Sunlight ownership, or have a human update .sunignore and reinitialize Sunlight before retrying."
+        }
+        "sunignore_policy_external" => {
+            "Have a human edit .sunignore in the repository worktree, then call repository_init to adopt the policy change."
+        }
+        "sunignore_policy_changed" => {
+            "Call repository_init. A clean state refreshes automatically; for authored history, follow the preservation instructions returned by repository_init."
+        }
+        "sunignore_policy_change_blocked" => {
+            "Restore the prior .sunignore to continue, or preserve authored work, back up .sunlight, remove only .sunlight, and call repository_init to adopt the new policy."
+        }
+        "legacy_quarantine_migration_blocked" => {
+            "Preserve or export needed historical work, back up .sunlight, then remove only .sunlight and rerun repository_init with this build."
         }
         "precondition_failed" | "compat_precondition_failed" | "promotion_precondition_failed" => {
             "Read the current artifact or inspect the referenced object, use the returned exact hash and IDs, then retry only after adapting the intended change."

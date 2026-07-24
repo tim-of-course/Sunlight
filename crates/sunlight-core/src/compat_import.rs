@@ -12,7 +12,8 @@ use crate::artifacts::{
 use crate::projection::{ProjectionPurpose, ProjectionRecord};
 use crate::records::PrivacyClass;
 use crate::repo_state::{
-    detect_secret_reasons, real_content_hash, RealArtifactEntry, RealProjectionSnapshot,
+    path_is_gitignored, path_is_sunignored, real_content_hash, RealArtifactEntry,
+    RealProjectionSnapshot,
 };
 use crate::resolver::{ResolvedViewResult, SingleRepoTree};
 
@@ -197,6 +198,25 @@ pub fn diff_real_compat_projection(
 
     for (path, entry) in &baseline {
         match scanned.remove(*path) {
+            None if *path == ".sunignore" => candidates.push(real_candidate(
+                projection,
+                CompatCandidateKind::PathPolicyBlocked,
+                CompatFileOperationKind::Delete,
+                Some(entry.artifact_id.clone()),
+                (*path).to_string(),
+                Some(entry.content_hash.clone()),
+                None,
+                0,
+                entry.executable,
+                "policy".to_string(),
+                PrivacyClass::LocalOnly,
+                CompatPathPolicyResult {
+                    allowed: false,
+                    normalized_path: Some((*path).to_string()),
+                    reason: Some("sunignore_policy_external".to_string()),
+                },
+                None,
+            )),
             None => candidates.push(real_candidate(
                 projection,
                 CompatCandidateKind::DeletedSource,
@@ -223,7 +243,7 @@ pub fn diff_real_compat_projection(
                 let after_hash = real_content_hash(&file.bytes);
                 if after_hash != entry.content_hash || file.executable != entry.executable {
                     let (kind, classification, privacy, quarantine, policy) =
-                        classify_projection_path(projection, path, &file.bytes);
+                        classify_projection_path(repo_root, projection, path, &file.bytes, false);
                     let operation_kind = if after_hash == entry.content_hash {
                         CompatFileOperationKind::Metadata
                     } else {
@@ -265,7 +285,7 @@ pub fn diff_real_compat_projection(
         }
         let after_hash = real_content_hash(&file.bytes);
         let (kind, classification, privacy, quarantine, policy) =
-            classify_projection_path(projection, &path, &file.bytes);
+            classify_projection_path(repo_root, projection, &path, &file.bytes, true);
         let candidate = real_candidate(
             projection,
             kind,
@@ -543,9 +563,11 @@ fn scan_projection_files(
 }
 
 fn classify_projection_path(
-    projection: &RealProjectionSnapshot,
+    repo_root: &Path,
+    _projection: &RealProjectionSnapshot,
     path: &str,
     bytes: &[u8],
+    is_new: bool,
 ) -> (
     CompatCandidateKind,
     String,
@@ -554,7 +576,6 @@ fn classify_projection_path(
     CompatPathPolicyResult,
 ) {
     let normalized = path.replace('\\', "/");
-    let lower = normalized.to_ascii_lowercase();
     if let Err(ArtifactIoError::PathPolicyViolation { reason, .. }) =
         PathPolicy::posix_case_sensitive().validate(&normalized)
     {
@@ -570,47 +591,70 @@ fn classify_projection_path(
             },
         );
     }
-    let secret_reasons = detect_secret_reasons(&normalized, bytes);
-    if !secret_reasons.is_empty() {
+    if normalized == ".sunignore" {
         return (
-            CompatCandidateKind::SecretLike,
-            "secret".to_string(),
-            PrivacyClass::Secret,
-            Some(format!(
-                "local://.sunlight/quarantine/compat/{}/{}",
-                projection.projection_id,
-                real_content_hash(normalized.as_bytes()).trim_start_matches("sha256:")
-            )),
-            allowed_path(&normalized),
-        );
-    }
-    let segments = lower.split('/').collect::<Vec<_>>();
-    if segments.iter().any(|segment| {
-        matches!(
-            *segment,
-            "target" | "dist" | "build" | "coverage" | "node_modules" | ".cache"
-        )
-    }) {
-        return (
-            CompatCandidateKind::CacheOrBuildOutput,
-            "cache".to_string(),
+            CompatCandidateKind::PathPolicyBlocked,
+            "policy".to_string(),
             PrivacyClass::LocalOnly,
             None,
-            allowed_path(&normalized),
+            CompatPathPolicyResult {
+                allowed: false,
+                normalized_path: Some(normalized),
+                reason: Some("sunignore_policy_external".to_string()),
+            },
         );
     }
-    let file_name = lower.rsplit('/').next().unwrap_or("");
-    if file_name.ends_with(".swp")
-        || file_name.ends_with('~')
-        || matches!(file_name, ".ds_store" | "thumbs.db")
-    {
-        return (
-            CompatCandidateKind::IgnoredPath,
-            "ignored".to_string(),
-            PrivacyClass::LocalOnly,
-            None,
-            allowed_path(&normalized),
-        );
+    match path_is_sunignored(repo_root, &normalized, false) {
+        Ok(true) => {
+            return (
+                CompatCandidateKind::IgnoredPath,
+                "ignored".to_string(),
+                PrivacyClass::LocalOnly,
+                None,
+                allowed_path(&normalized),
+            )
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return (
+                CompatCandidateKind::PathPolicyBlocked,
+                "policy".to_string(),
+                PrivacyClass::LocalOnly,
+                None,
+                CompatPathPolicyResult {
+                    allowed: false,
+                    normalized_path: Some(normalized),
+                    reason: Some(format!("failed to evaluate .sunignore: {error}")),
+                },
+            )
+        }
+    }
+    if is_new {
+        match path_is_gitignored(repo_root, &normalized) {
+            Ok(true) => {
+                return (
+                    CompatCandidateKind::IgnoredPath,
+                    "ignored".to_string(),
+                    PrivacyClass::LocalOnly,
+                    None,
+                    allowed_path(&normalized),
+                )
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return (
+                    CompatCandidateKind::PathPolicyBlocked,
+                    "policy".to_string(),
+                    PrivacyClass::LocalOnly,
+                    None,
+                    CompatPathPolicyResult {
+                        allowed: false,
+                        normalized_path: Some(normalized),
+                        reason: Some(format!("failed to evaluate Git ignore policy: {error}")),
+                    },
+                )
+            }
+        }
     }
     (
         if bytes.len() > 10 * 1024 * 1024 || bytes.iter().any(|byte| *byte == 0) {
@@ -2265,20 +2309,46 @@ mod tests {
     }
 
     #[test]
-    fn real_projection_selection_blocks_secret_cache_and_reserved_candidates() {
+    fn real_projection_selection_uses_explicit_ignore_not_secret_content() {
         let (repo, projection) = real_projection_fixture();
         let root = PathBuf::from(projection.materialized_root.as_ref().unwrap());
         fs::write(root.join(".env"), b"API_KEY=do-not-import\n").unwrap();
+        fs::write(repo.join(".gitignore"), b"target/\n").unwrap();
         fs::create_dir_all(root.join("target")).unwrap();
         fs::write(root.join("target/output.txt"), b"cache\n").unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("dist/source.txt"), b"ordinary source\n").unwrap();
         fs::create_dir_all(root.join(".sunlight")).unwrap();
         fs::write(root.join(".sunlight/config.toml"), b"blocked\n").unwrap();
 
         let diff =
             diff_real_compat_projection(&repo, &repo.join(".sunlight/projections"), &projection)
                 .unwrap();
+        let env_id = diff
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == ".env")
+            .unwrap()
+            .candidate_delta_id
+            .clone();
+        let env = validate_real_compat_selection(&projection, &[env_id], &diff).unwrap();
+        assert_eq!(env[0].classification, "source");
+        assert_eq!(env[0].kind, CompatCandidateKind::CreatedSource);
+
+        let dist = diff
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == "dist/source.txt")
+            .unwrap();
+        assert_eq!(dist.kind, CompatCandidateKind::CreatedSource);
+        validate_real_compat_selection(
+            &projection,
+            std::slice::from_ref(&dist.candidate_delta_id),
+            &diff,
+        )
+        .unwrap();
+
         for (path, expected) in [
-            (".env", CompatImportErrorCode::SecretDetected),
             ("target/output.txt", CompatImportErrorCode::CacheBlocked),
             (
                 ".sunlight/config.toml",
@@ -2295,6 +2365,90 @@ mod tests {
             let error = validate_real_compat_selection(&projection, &[id], &diff).unwrap_err();
             assert_eq!(error.code, expected);
         }
+
+        fs::write(repo.join(".sunignore"), b".env\n").unwrap();
+        fs::write(
+            root.join(".sunignore"),
+            b"# projection cannot weaken policy\n",
+        )
+        .unwrap();
+        let ignored_diff =
+            diff_real_compat_projection(&repo, &repo.join(".sunlight/projections"), &projection)
+                .unwrap();
+        let ignored_env = ignored_diff
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == ".env")
+            .unwrap();
+        assert_eq!(ignored_env.kind, CompatCandidateKind::IgnoredPath);
+        let error = validate_real_compat_selection(
+            &projection,
+            std::slice::from_ref(&ignored_env.candidate_delta_id),
+            &ignored_diff,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, CompatImportErrorCode::CacheBlocked);
+
+        let policy_candidate = ignored_diff
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == ".sunignore")
+            .unwrap();
+        assert_eq!(
+            policy_candidate.kind,
+            CompatCandidateKind::PathPolicyBlocked
+        );
+        let policy_error = validate_real_compat_selection(
+            &projection,
+            std::slice::from_ref(&policy_candidate.candidate_delta_id),
+            &ignored_diff,
+        )
+        .unwrap_err();
+        assert_eq!(policy_error.code, CompatImportErrorCode::PathPolicyFailed);
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn real_projection_recreation_keeps_git_tracked_ignore_match_visible() {
+        let (repo, projection) = real_projection_fixture();
+        let root = PathBuf::from(projection.materialized_root.as_ref().unwrap());
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        fs::write(repo.join(".gitignore"), b"*.env\n").unwrap();
+        fs::write(repo.join("tracked.env"), b"tracked baseline\n").unwrap();
+        git(&["add", "-f", "tracked.env"]);
+        fs::remove_file(repo.join("tracked.env")).unwrap();
+        fs::write(root.join("tracked.env"), b"recreated through projection\n").unwrap();
+
+        let diff =
+            diff_real_compat_projection(&repo, &repo.join(".sunlight/projections"), &projection)
+                .unwrap();
+        let recreated = diff
+            .candidates
+            .iter()
+            .find(|candidate| candidate.path == "tracked.env")
+            .unwrap();
+        assert_eq!(recreated.kind, CompatCandidateKind::CreatedSource);
+        validate_real_compat_selection(
+            &projection,
+            std::slice::from_ref(&recreated.candidate_delta_id),
+            &diff,
+        )
+        .unwrap();
+
         fs::remove_dir_all(repo).unwrap();
     }
 
@@ -2316,9 +2470,11 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn value() -> u32 { 1 }\n").unwrap();
         fs::write(root.join("README.md"), b"# baseline\n").unwrap();
+        fs::write(root.join(".sunignore"), b"").unwrap();
         let entries = [
             ("src/lib.rs", b"pub fn value() -> u32 { 1 }\n".as_slice()),
             ("README.md", b"# baseline\n".as_slice()),
+            (".sunignore", b"".as_slice()),
         ]
         .into_iter()
         .map(|(path, bytes)| RealArtifactEntry {

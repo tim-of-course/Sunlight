@@ -1,6 +1,11 @@
 # Sunlight: Consolidated Architecture and Local MVP Plan
 Native source database for parallel human and agent development
 
+> **Historical design record.** Secret detection, secret classification gates,
+> and automatic source quarantine described here are superseded. See the
+> repository README, `docs/local_mcp.md`, portable Agent Skill, and
+> `docs/open_alpha_acceptance.md` for the current explicit-ignore contract.
+
 | Field | Value |
 | --- | --- |
 | Status | Architecture decision draft. Intended to replace fragmented handoff plus MVP notes with one working product and implementation plan; updated with resolver, projection-safety, Git-transport, execution-promotion, cross-repo identity, and session-freshness decisions. |

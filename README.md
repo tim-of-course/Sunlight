@@ -47,6 +47,23 @@ cannot switch to a different repository root.
 Use `--force` only to replace an older Sunlight-managed skill or MCP entry.
 Existing unrelated client configuration is preserved.
 
+## Source inclusion and secrets
+
+Sunlight is a source-artifact system, not a secret scanner. It does not inspect
+filenames or content to decide whether a human-owned file is safe for agents.
+Git-tracked files are included under normal Git semantics; untracked files
+ignored by `.gitignore` are excluded. Add repository-root `.sunignore` patterns
+when a tracked or otherwise visible path must be explicitly hidden from
+Sunlight. `.sunignore` is visible but human-owned: agents cannot mutate it
+through Sunlight. After a human changes it, run `sun init`; clean state is
+re-ingested, while authored state fails closed with preservation instructions.
+`.git/` and `.sunlight/` are always excluded.
+
+Secret prevention belongs in repository hygiene, permissions, deployment
+tooling, and dedicated secret scanning outside Sunlight. A tracked credential
+or other sensitive value that is not matched by `.sunignore` is ordinary source
+to Sunlight and may be read, persisted, projected, validated, and exported.
+
 ## Agent workflow
 
 The harness-neutral skill source is

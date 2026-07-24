@@ -60,3 +60,14 @@ Sunlight-managed files or entries and preserves unrelated client configuration.
 If the tools remain unavailable after a successful doctor result, restart the
 client and inspect its MCP diagnostics. Do not paste TOML or JSON configuration
 lines into a shell prompt; they belong in the generated client file.
+
+If an older repository status reports `legacy_ingest_quarantine`, call
+`repository_init` again. A clean legacy state is re-ingested without automatic
+secret detection. A state with authored history fails closed with explicit
+preservation and reinitialization instructions.
+
+If a human adds, removes, or edits repository-root `.sunignore` after
+initialization, normal tools fail with `sunignore_policy_changed` before exposing
+persisted views. Call `repository_init` to adopt it. Clean state refreshes
+automatically; authored state returns `sunignore_policy_change_blocked` and
+remains byte-for-byte unchanged until its preservation steps are followed.

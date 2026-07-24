@@ -1,6 +1,6 @@
 # Sunlight Open Alpha Acceptance
 
-Status: Acceptance in progress — OA-02 through OA-09 pass; OA-01 awaits Cursor
+Status: Approved for Windows open alpha
 Created: 2026-07-20  
 Scope: Local, single-repository Sunlight workflows for coding agents
 
@@ -35,7 +35,7 @@ workflow.
 
 ## Current baseline
 
-Eight gates now have final-source evidence in the tested Windows/NTFS scope:
+All nine gates now have final-source evidence in the tested Windows/NTFS scope:
 common-path/error recovery, MCP termination recovery, exact Git handoff,
 repository/execution safety, and realistic four-author scale. The final release
 executable is SHA-256
@@ -44,10 +44,11 @@ executable is SHA-256
 The previously observed deleted-tracked-path, execution-policy reporting,
 dependency ancestry, invalid-session recovery, projection reuse, and writer
 contention defects are fixed and covered by the final regression. Three
-consecutive fresh Codex runs, a fresh delegated supervisor, and a fresh
-unfamiliar-tester run now pass. Automated installation/documentation checks
-also pass, but they do not replace an actual Cursor run, which OA-01 still
-requires.
+consecutive fresh Codex runs, a fresh Cursor Agent run, a fresh delegated
+supervisor, and a fresh unfamiliar-tester run now pass. The Cursor agent
+discovered the installed repository adapter from a natural engineering prompt,
+authored and validated only through Sunlight, and produced an unexported exact
+checkpoint without tracked working-tree changes.
 
 Current evidence bundle:
 
@@ -58,6 +59,8 @@ Current evidence bundle:
 - [OA-07 attempt and remediation history](acceptance/evidence/oa07_attempts_2026-07-23.md)
 - [OA-08 Windows-only platform evidence](acceptance/evidence/oa08_windows_2026-07-24.md)
 - [Fresh Codex, supervisor, and unfamiliar-tester evidence](acceptance/evidence/oa01_oa03_oa09_fresh_clients_2026-07-24.md)
+- [OA-01 Cursor evidence](acceptance/evidence/oa01_cursor_2026-07-24.md)
+- [Windows open-alpha approval](acceptance/evidence/open_alpha_approval_2026-07-24.md)
 - [Banana Split integration feedback](acceptance/banana_split_feedback.md)
 
 Future Sunlight acceptance runs use direct fresh coding-client tasks or a fixed,
@@ -314,7 +317,7 @@ accurately and the final accepted view is separately validated.
 
 ## Open-alpha decision checklist
 
-- [ ] OA-01 clean installation and discovery passes.
+- [x] OA-01 clean installation and discovery passes.
 - [x] OA-02 common-path correctness and recovery passes.
 - [x] OA-03 delegated concurrent integration passes.
 - [x] OA-04 termination and crash recovery passes.
@@ -326,22 +329,25 @@ accurately and the final accepted view is separately validated.
 - [x] All observed high-severity findings are fixed and retested.
 - [x] Remaining limitations are non-destructive and documented.
 - [x] The release evidence bundle identifies the exact tested build.
-- [ ] The final release decision and approver are recorded below.
+- [x] The final release decision and approver are recorded below.
 
 ## Decision record
 
-- Decision: Pending OA-01 actual Cursor run and final approver
+- Decision: Approved for Windows open alpha
 - Date: 2026-07-24
 - Build: `d69c6cb6ddd6e75f76491ab040a6fb3ec723249831635a610157e58cb1de10b8`
-- Approver: Pending
+- Approver: Timothy Cardoza
 - Supported platforms: Windows only for open alpha; Windows/NTFS is the tested scope
 - Evidence bundle: `docs/acceptance/evidence/`
-- Known limitations: Actual Cursor discovery remains unproven. `sun` may require
-  an absolute path when it is not on `PATH`; generated client configuration and
-  doctor output expose that path. User-local Bun is not AppContainer-readable
-  on this host, so exact-view builds used the explicitly reported and permitted
-  `network: not_enforced` mode. macOS and Linux are explicitly unsupported in
-  the open alpha.
+- Known limitations: `sun` may require an absolute path when it is not on
+  `PATH`; generated client configuration and doctor output expose that path.
+  User-local Bun is not AppContainer-readable on this host, so exact-view builds
+  used the explicitly reported and permitted `network: not_enforced` mode.
+  Status currently describes expected untracked client/state directories with
+  the generic `git_working_tree_changed` warning. A topic completed before its
+  validation retains its immutable pre-validation handoff summary, although
+  later exact-view executions and checkpoint evidence remain authoritative.
+  macOS and Linux are explicitly unsupported in the open alpha.
 
 ## Post-alpha tests
 

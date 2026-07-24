@@ -7,7 +7,9 @@ Host: Windows NT 10.0.26200, Windows/NTFS supported scope
 Harness/model: five fresh Codex desktop tasks, `gpt-5.6-terra`, high effort  
 Target: disposable CheckChecker commit `796c191e8c2e129da75b048678a9d938c2bdc2da`, 34 tracked files, 266,745 tracked bytes, no remote
 
-Result: **OA-01 partial (Codex pass, Cursor pending); OA-03 pass; OA-09 pass**.
+Campaign result: **OA-01 partial (Codex pass, Cursor pending); OA-03 pass;
+OA-09 pass**. The subsequent actual Cursor run passed and is recorded in
+[OA-01 Cursor evidence](oa01_cursor_2026-07-24.md).
 
 The target was reset to its original disposable baseline before the campaign.
 Each run started with fresh native Sunlight state while retaining only the
@@ -186,13 +188,14 @@ gap and no tracked-source access outside Sunlight. The only caveat—`sun` not o
 `PATH`—is already covered by the public absolute-path instructions and managed
 client configuration. OA-09 passes.
 
-## Final classification and remaining action
+## Campaign classification and follow-up
 
-- OA-01: **partial** — three consecutive fresh Codex runs pass; actual Cursor
-  run remains required.
+- OA-01 at campaign close: **partial** — three consecutive fresh Codex runs
+  passed and the actual Cursor run remained required.
 - OA-03: **pass**.
 - OA-09: **pass**.
 - Source/worktree safety: **pass** — no Git handoff or remote action occurred.
 
-The only user-operated open-alpha gate remaining from this campaign is one
-fresh Cursor agent run using the installed Cursor adapter.
+The follow-up fresh Cursor Agent run passed. Combined OA-01 evidence and final
+classification are recorded in
+[OA-01 Cursor evidence](oa01_cursor_2026-07-24.md).

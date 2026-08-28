@@ -32,15 +32,19 @@ sun agent install --client cursor
 ```
 
 Use one client value per installation. `generic` installs only
-`.agents/skills/sunlight`; Codex also manages `.codex/config.toml`, and Cursor
+`.agents/skills/sunlight`; its doctor does not verify a client transport or live
+tools. Configure a generic client separately to launch `sun mcp serve --repo
+<repository-directory>`. Codex also manages `.codex/config.toml`, and Cursor
 also manages `.cursor/mcp.json`. Existing unrelated client configuration is
-preserved. Verify the result with:
+preserved. Verify an adapter-managed result with:
 
 ```powershell
 sun agent doctor --client codex
 ```
 
-Restart or reload the client after its MCP configuration changes. The generated
+Restart or reload the client after its MCP configuration changes. Setup is
+complete when `repository_status` and the artifact tools are visible for the
+intended repository. The generated
 configuration contains local absolute paths and should be treated as
 machine-local unless the team intentionally replaces them with a portable
 installation convention.
@@ -108,12 +112,25 @@ The server exposes these typed tools:
 
 `session_start` accepts an exact persisted checkpoint view as well as the base
 or current view, so a follow-up topic can retain an earlier validated frontier.
+For durable integration, pass exact topic revisions to `view_resolve.include`;
+omitting `include` is discovery-only and resolves moving current heads.
+`compat_diff` re-echoes the projection's `session_generation_id`, and MCP
+requires that value for the immediately following `compat_import`.
 For `execution_promote_output`, pass the candidate classification returned by
 `execution_run` verbatim (`source_like_delta` or `generated_artifact`); those
 execution provenance classes are distinct from artifact classifications.
+Artifact mutations expose `source` and `generated`: both checkpoint, but a
+generated artifact exports only with reachable execution-output promotion
+provenance. Relabeling does not create provenance.
+`policy_check_commit` validates `.sunlight/**` metadata candidates, or the
+managed `.gitignore` block when paths are omitted. It returns an inline report,
+not a persisted `validation_report_id`. Source-artifact safety uses
+`policy_check_export` with both an exact checkpoint and target ref; its persisted
+report can be passed to `policy_explain`.
 When a target ref points to a prior Sunlight export on that same ref, a later
 checkpoint export appends to the mapped commit and writes a new export map.
-Unrecognized ref tips still fail closed.
+Unrecognized ref tips still fail closed. A Git handoff is complete when export
+returns the new `export_map_id` for that checkpoint and ref.
 
 Every successful or native command-error result includes both MCP text content
 and `structuredContent` containing the existing `sun --json` envelope. Native
@@ -131,22 +148,11 @@ polls. These are observational facts for diagnosing interactive latency and
 writer contention; they do not change operation semantics. Failed tool calls
 put the same transport object under `error.details.transport`.
 
-Sunlight does not detect or hide secret-like content. Repository ingest follows
-normal Git semantics: tracked files are included, Git-ignored untracked files
-are excluded, and repository-root `.sunignore` patterns explicitly exclude
-additional tracked or untracked paths. `.git/` and `.sunlight/` are intrinsic
-exclusions. Secret prevention belongs to repository hygiene, permissions,
-deployment tooling, and dedicated scanners outside Sunlight. Status reports
-`automatic_secret_detection: false` and the effective ignore-policy contract.
-`.sunignore` itself remains visible and is human-owned worktree policy. Sunlight
-mutation and compatibility-import paths cannot change it. After a human changes
-it, call `repository_init`: clean state is re-ingested, while authored history
-fails closed with instructions that preserve the existing state.
-
-An old native state containing legacy automatic-quarantine entries can be
-migrated by calling `repository_init` again when it has no authored Sunlight
-history. If history exists, initialization fails with preservation instructions
-instead of silently rewriting prior views.
+Source inclusion follows the [repository README](../README.md) and the portable
+skill's [workflow reference](../integrations/agent-skills/sunlight/references/workflow.md).
+`repository_init` and `repository_status` expose the effective policy and return
+exact recovery steps when human-owned `.sunignore` changes require re-ingest or
+preservation.
 
 Tool-specific output schemas describe the main returned IDs and payloads while
 allowing forward-compatible additional fields. The initialization response also

@@ -12,6 +12,13 @@ sun agent install --client generic
 sun agent doctor --client generic
 ```
 
+`generic` installs and checks the portable skill only. It does not create or
+verify a client transport. Configure the generic client separately to launch:
+
+```text
+sun mcp serve --repo <repository-directory>
+```
+
 Or select a supported adapter:
 
 ```text
@@ -29,8 +36,8 @@ machine-local unless your team intentionally replaces those paths with a
 portable installation convention. The portable skill itself is safe to share.
 
 Restart the client after the first MCP installation or after changing the
-server executable. Then verify that a server exposes `repository_status` and
-the artifact tools.
+server executable. Setup is complete when that client exposes
+`repository_status` and the artifact tools for the intended repository.
 
 ## Codex plugin
 
@@ -47,12 +54,15 @@ tools UI.
 
 ## Doctor results
 
-`sun agent doctor` checks that:
+`sun agent doctor` always checks that:
 
 - the portable skill and references match the running Sunlight build;
-- the selected client's repository-bound MCP entry matches the running
-  executable and repository;
 - the repository is initialized, or is ready for the MCP agent to initialize.
+
+For Codex and Cursor it also checks that the managed repository-bound MCP entry
+matches the running executable and repository. Generic doctor reports
+`mcp_binding_verified: false`: it did not inspect client configuration, start a
+server, or verify live tool visibility.
 
 If doctor reports stale files, rerun install with `--force`. This replaces only
 Sunlight-managed files or entries and preserves unrelated client configuration.
@@ -60,11 +70,6 @@ Sunlight-managed files or entries and preserves unrelated client configuration.
 If the tools remain unavailable after a successful doctor result, restart the
 client and inspect its MCP diagnostics. Do not paste TOML or JSON configuration
 lines into a shell prompt; they belong in the generated client file.
-
-If an older repository status reports `legacy_ingest_quarantine`, call
-`repository_init` again. A clean legacy state is re-ingested without automatic
-secret detection. A state with authored history fails closed with explicit
-preservation and reinitialization instructions.
 
 If a human adds, removes, or edits repository-root `.sunignore` after
 initialization, normal tools fail with `sunignore_policy_changed` before exposing

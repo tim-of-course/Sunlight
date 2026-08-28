@@ -524,6 +524,9 @@ fn agent_install(ctx: &CommandContext) -> Result<(), CliError> {
             invalid_request(error.to_string()).with_detail("command", "agent.install")
         })?;
     let repository = agent_setup::display_path(&ctx.repo_root);
+    let generic_warning = (report.client == agent_setup::AgentClient::Generic).then_some(
+        "generic installs the portable skill only; configure a client transport that runs `sun mcp serve --repo <repository>` separately",
+    );
 
     if ctx.json {
         outputln!(
@@ -540,7 +543,7 @@ fn agent_install(ctx: &CommandContext) -> Result<(), CliError> {
                     "restart_required": report.restart_required,
                     "next_command": format!("sun agent doctor --client {} --repo \"{}\"", report.client.as_str(), repository),
                 },
-                "warnings": []
+                "warnings": generic_warning.into_iter().collect::<Vec<_>>()
             })
         );
     } else {
@@ -560,6 +563,13 @@ fn agent_install(ctx: &CommandContext) -> Result<(), CliError> {
             outputln!(
                 ctx,
                 "Restart or reload the client before verifying MCP tools."
+            );
+        }
+        if report.client == agent_setup::AgentClient::Generic {
+            outputln!(
+                ctx,
+                "Generic setup installed the portable skill only. Configure the client to run `sun mcp serve --repo \"{}\"`, then confirm repository_status and artifact tools are visible.",
+                repository
             );
         }
         outputln!(
@@ -592,11 +602,34 @@ fn agent_doctor(ctx: &CommandContext) -> Result<(), CliError> {
                 "repository": repository,
                 "current": report.current,
                 "missing_or_stale": report.missing_or_stale,
+                "mcp_binding_verified": report.mcp_binding_verified,
                 "repository_initialized": report.repository_initialized,
             })
             .to_string(),
         ));
     }
+
+    let generic = report.client == agent_setup::AgentClient::Generic;
+    let next_action = if generic {
+        format!(
+            "configure the client to run `sun mcp serve --repo \"{repository}\"`, restart it, and confirm repository_status and artifact tools are visible"
+        )
+    } else if report.repository_initialized {
+        "restart the client and confirm repository_status and artifact tools are visible"
+            .to_string()
+    } else {
+        "restart the client, confirm repository_init is visible, initialize the repository, and then confirm repository_status and artifact tools are visible".to_string()
+    };
+    let warnings = if generic {
+        vec!["generic doctor verified the portable skill only; it did not verify any MCP client configuration or live tool visibility".to_string()]
+    } else if report.repository_initialized {
+        Vec::new()
+    } else {
+        vec![
+            "repository is not initialized; the verified bound MCP server can initialize it"
+                .to_string(),
+        ]
+    };
 
     if ctx.json {
         outputln!(
@@ -609,22 +642,32 @@ fn agent_doctor(ctx: &CommandContext) -> Result<(), CliError> {
                     "repository": repository,
                     "client": report.client.as_str(),
                     "healthy": true,
+                    "mcp_binding_verified": report.mcp_binding_verified,
                     "repository_initialized": report.repository_initialized,
                     "current": report.current,
                     "missing_or_stale": report.missing_or_stale,
-                    "next_action": if report.repository_initialized { "restart the client and call repository_status" } else { "restart the client and call repository_init" },
+                    "next_action": next_action,
                 },
-                "warnings": if report.repository_initialized { Vec::<String>::new() } else { vec!["repository is not initialized; the bound MCP server can initialize it".to_string()] }
+                "warnings": warnings
             })
         );
     } else {
         outputln!(
             ctx,
-            "Sunlight agent setup is healthy for {} in {}",
+            "Sunlight agent files are current for {} in {}",
             report.client.as_str(),
             repository
         );
         outputln!(ctx, "  portable skill: current");
+        outputln!(
+            ctx,
+            "  MCP binding: {}",
+            if report.mcp_binding_verified {
+                "verified"
+            } else {
+                "not verified by generic doctor"
+            }
+        );
         outputln!(
             ctx,
             "  repository: {}",
@@ -634,6 +677,7 @@ fn agent_doctor(ctx: &CommandContext) -> Result<(), CliError> {
                 "ready for repository_init"
             }
         );
+        outputln!(ctx, "  Next: {next_action}");
     }
     Ok(())
 }
@@ -1010,10 +1054,9 @@ fn artifact_write(ctx: &CommandContext) -> Result<(), CliError> {
         .content_file
         .clone()
         .ok_or_else(|| invalid_request("usage: sun write requires --content-file <file>"))?;
-    let classification = options
-        .classification
-        .clone()
-        .ok_or_else(|| invalid_request("usage: sun write requires --classification <class>"))?;
+    let classification = options.classification.clone().ok_or_else(|| {
+        invalid_request("usage: sun write requires --classification source|generated")
+    })?;
     let content = fs::read(ctx.command_file_path(&content_file)).map_err(|error| {
         invalid_request(format!("failed to read content file `{content_file}`"))
             .with_detail("source", error.to_string())
@@ -1115,7 +1158,7 @@ fn artifact_metadata_set(ctx: &CommandContext) -> Result<(), CliError> {
         .clone()
         .ok_or_else(|| invalid_request("usage: sun metadata set requires --expect-hash <hash>"))?;
     let classification = options.classification.clone().ok_or_else(|| {
-        invalid_request("usage: sun metadata set requires --classification <class>")
+        invalid_request("usage: sun metadata set requires --classification source|generated")
     })?;
     let Some(fixture) = &options.fixture else {
         return real_artifact_metadata_set(ctx, options, expect_hash, classification);
@@ -1986,6 +2029,11 @@ fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Res
             "compatibility projection baseline no longer matches the session view",
         )
         .with_detail("projection_id", projection.projection_id)
+        .with_detail("session_id", session.session_id)
+        .with_detail(
+            "current_session_generation_id",
+            session.session_generation_id,
+        )
         .with_detail("baseline_resolved_view_id", projection.resolved_view_id)
         .with_detail("current_resolved_view_id", resolved.result.resolved_view_id));
     }
@@ -5036,7 +5084,9 @@ fn real_execution_promote_output(
         invalid_request("usage: sun execution promote-output requires --session <session>")
     })?;
     let classification = options.classification.clone().ok_or_else(|| {
-        invalid_request("usage: sun execution promote-output requires --classification <class>")
+        invalid_request(
+            "usage: sun execution promote-output requires --classification source_like_delta|generated_artifact",
+        )
     })?;
     let execution = state
         .executions
@@ -7681,12 +7731,15 @@ fn real_compat_diff_envelope(
         .iter()
         .filter_map(|candidate| candidate.quarantine_ref.as_deref());
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"compat.diff\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"projection_id\":\"{}\",\"baseline\":{{\"resolved_view_id\":\"{}\",\"tree_identity\":{},\"manifest_digest\":\"{}\"}},\"candidate_counts\":{},\"selected_candidate_delta_ids\":{},\"quarantine_refs\":{},\"candidates\":[{}],\"native_operation_ids\":[],\"native_revision_ids\":[]}},\"warnings\":[]}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"compat.diff\",\"repository_id\":\"{}\",\"ids\":{{\"projection_id\":\"{}\",\"resolved_view_id\":\"{}\",\"session_generation_id\":{}}},\"projection_id\":\"{}\",\"session_generation_id\":{},\"baseline\":{{\"resolved_view_id\":\"{}\",\"session_generation_id\":{},\"tree_identity\":{},\"manifest_digest\":\"{}\"}},\"candidate_counts\":{},\"selected_candidate_delta_ids\":{},\"quarantine_refs\":{},\"candidates\":[{}],\"native_operation_ids\":[],\"native_revision_ids\":[]}},\"warnings\":[]}}",
         json_escape(&state.repository_id),
         json_escape(&projection.projection_id),
         json_escape(&projection.resolved_view_id),
+        optional_string_json(projection.session_generation_id.as_deref()),
         json_escape(&projection.projection_id),
+        optional_string_json(projection.session_generation_id.as_deref()),
         json_escape(&projection.resolved_view_id),
+        optional_string_json(projection.session_generation_id.as_deref()),
         single_repo_tree_json(&SingleRepoTree {
             repository_id: state.repository_id.clone(),
             tree_hash: projection.tree_hash.clone(),
@@ -10534,7 +10587,7 @@ fn parse_execution_promote_output_options(
             "--classification" => {
                 let value = args.next().ok_or_else(|| {
                     invalid_request(
-                        "usage: sun execution promote-output requires --classification <class>",
+                        "usage: sun execution promote-output requires --classification source_like_delta|generated_artifact",
                     )
                 })?;
                 classification = Some(value.clone());
@@ -10570,7 +10623,7 @@ fn parse_execution_promote_output_options(
 
     let execution_id = execution_id.ok_or_else(|| {
         invalid_request(
-            "usage: sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> --fixture basic-app",
+            "usage: sun execution promote-output <execution-id> --path <path> --session <session> --classification source_like_delta|generated_artifact --fixture basic-app",
         )
     })?;
 
@@ -12996,7 +13049,7 @@ fn artifact_usage(command: &str) -> String {
             "usage: sun patch <path> --session <session> [--fixture basic-app] --expect-hash <hash> --patch-file <file>"
         }
         "write" => {
-            "usage: sun write <path> --session <session> [--fixture basic-app] --expect-hash <hash-or-new> --content-file <file> --classification <class>"
+            "usage: sun write <path> --session <session> [--fixture basic-app] --expect-hash <hash-or-new> --content-file <file> --classification source|generated"
         }
         "move" => {
             "usage: sun move <from> <to> --session <session> [--fixture basic-app] --expect-hash <hash>"
@@ -13005,7 +13058,7 @@ fn artifact_usage(command: &str) -> String {
             "usage: sun delete <path> --session <session> [--fixture basic-app] --expect-hash <hash>"
         }
         "metadata set" => {
-            "usage: sun metadata set <path> --session <session> [--fixture basic-app] --expect-hash <hash> --classification <class>"
+            "usage: sun metadata set <path> --session <session> [--fixture basic-app] --expect-hash <hash> --classification source|generated"
         }
         _ => "usage: sun <artifact-command> --session <session> --fixture basic-app",
     }
@@ -13072,7 +13125,7 @@ fn parse_mutation_options_with_skip(
             "--classification" => {
                 let value = args.next().ok_or_else(|| {
                     invalid_request(format!(
-                        "usage: sun {command} requires --classification <class>"
+                        "usage: sun {command} requires --classification source|generated"
                     ))
                 })?;
                 classification = Some(value.clone());
@@ -14658,15 +14711,18 @@ fn compat_diff_success_envelope(
             "\"repository_id\":\"{}\",",
             "\"ids\":{{",
             "\"projection_id\":\"{}\",",
-            "\"resolved_view_id\":\"{}\"",
+            "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":{}",
             "}},",
             "\"view\":{{",
             "\"resolved_view_id\":\"{}\",",
             "\"tree_identity\":{}",
             "}},",
             "\"projection_id\":\"{}\",",
+            "\"session_generation_id\":{},",
             "\"baseline\":{{",
             "\"resolved_view_id\":\"{}\",",
+            "\"session_generation_id\":{},",
             "\"tree_identity\":{},",
             "\"manifest_ref\":{},",
             "\"manifest_digest\":\"{}\"",
@@ -14685,10 +14741,13 @@ fn compat_diff_success_envelope(
         json_escape(&projection.repository_id),
         json_escape(&projection.id),
         json_escape(&projection.resolved_view_id),
+        optional_string_json(projection.session_generation_id.as_deref()),
         json_escape(&current_view.resolved_view_id),
         optional_single_repo_tree_json(current_view.tree_identity.as_ref()),
         json_escape(&projection.id),
+        optional_string_json(projection.session_generation_id.as_deref()),
         json_escape(&projection.resolved_view_id),
+        optional_string_json(projection.session_generation_id.as_deref()),
         single_repo_tree_json(&projection.tree_identity),
         optional_string_json(projection.baseline_manifest_ref.as_deref()),
         json_escape(FIXTURE_COMPAT_BASELINE_MANIFEST_DIGEST),
@@ -18785,8 +18844,10 @@ fn next_action_for_error_code(code: &str) -> &'static str {
         | "checkpoint_conflicted_view" => {
             "Inspect the returned conflict IDs, adapt the overlapping change in its own topic, and resolve a new exact view before retrying."
         }
-        "checkpoint_stale_view" | "compat_projection_stale" | "resolver_frontier_input_lost"
-        | "persisted_view_mismatch" => {
+        "compat_projection_stale" => {
+            "Create a fresh compatibility projection from the returned session's current generation, reapply the remaining filesystem change to that projection, call compat_diff, then import the selected candidates with the re-echoed session_generation_id."
+        }
+        "checkpoint_stale_view" | "resolver_frontier_input_lost" | "persisted_view_mismatch" => {
             "Inspect the returned staleness or frontier facts, reselect exact completed revisions, and create a fresh resolved view before retrying."
         }
         "repository_writer_busy" | "concurrent_state_update" => {
@@ -18805,7 +18866,10 @@ fn next_action_for_error_code(code: &str) -> &'static str {
         "execution_network_isolation_cleanup_failed" => {
             "Inspect the recorded execution and cleanup facts, run the documented bounded cleanup or restart recovery, and do not assume isolation state was removed."
         }
-        "commit_policy_failed" | "export_policy_failed" | "checkpoint_evidence_failed"
+        "commit_policy_failed" => {
+            "Inspect the inline metadata-policy failures, then correct the supplied .sunlight metadata candidate paths or restore the managed .gitignore block before rerunning policy_check_commit."
+        }
+        "export_policy_failed" | "checkpoint_evidence_failed"
         | "checkpoint_evidence_view_mismatch" | "checkpoint_evidence_tree_mismatch" => {
             "Inspect the validation report and exact view/tree identities, satisfy the reported policy or evidence failures, then create or export a matching checkpoint."
         }
@@ -18833,9 +18897,6 @@ fn next_action_for_error_code(code: &str) -> &'static str {
         }
         "invalid_request" | "unknown_tool" => {
             "Correct the request using the advertised tool schema or CLI help, then retry; do not repeat unchanged arguments."
-        }
-        _ if code.contains("secret") || code.contains("quarantine") => {
-            "Inspect the quarantine report without copying secret bytes into logs, then explicitly correct the classification or source content before retrying."
         }
         _ if code.contains("path") || code.contains("projection") => {
             "Inspect the reported path and projection facts, keep all access inside the repository-managed boundary, and retry with a valid exact view or relative path."
@@ -18904,17 +18965,17 @@ Usage:
   sun project materialize --view <view> --purpose execution|compatibility|inspection|export [--strategy copy|reflink|hardlink_readonly|overlay_copyup] [--no-copy-fallback] [--projection-root <path>] [--json]
   sun compat project --session <session> [--json]
   sun compat diff --projection <projection> [--json]
-  sun compat import --projection <projection> --candidate <candidate> [--json]
+  sun compat import --projection <projection> --candidate <candidate> --session-generation <generation> [--json]
   sun run --view <view> [runtime policy options] -- <command> [args...]
-  sun execution promote-output <execution> --path <path> --session <session> --classification <class> [--json]
+  sun execution promote-output <execution> --path <path> --session <session> --classification source_like_delta|generated_artifact [--json]
   sun checkpoint create --view <view> [--execution <execution>] [--json]
-  sun policy check-export --checkpoint <checkpoint> [--branch <ref>] [--json]
-  sun policy check-commit [--paths <path>...] [--json]
+  sun policy check-export --checkpoint <checkpoint> --branch <ref> [--json]
+  sun policy check-commit [--paths <.sunlight/path>...] [--json]
   sun policy explain <validation-report> [--json]
   sun git export --checkpoint <checkpoint> --branch <ref> [--execute-local] [--json]
   sun status [--topic|--session|--view|--projection|--execution|--checkpoint|--export <id>] [--json]
   sun inspect <typed-selector> [--json]
-  sun mcp serve --repo <initialized-repo>
+  sun mcp serve --repo <repository-directory>
 
 Commands:
   init       Ingest the repository into persisted Sunlight native state
@@ -18941,10 +19002,19 @@ Typical journey:
   sun init
   sun topic create auth-fix --display-name \"Auth fix\"
   sun session start --topic auth-fix --view view_base_0001 --actor agent-a
-  sun status
-  sun checkpoint create --view <resolved-view-id>
-  sun policy check-export --checkpoint <checkpoint-id> --branch sunlight/auth-fix
-  sun git export --checkpoint <checkpoint-id> --branch sunlight/auth-fix --execute-local
+  sun read <path> --session <session-id>
+  sun patch <path> --session <session-id> --expect-hash <sha256> --patch-file <file>
+  sun topic complete --topic <topic-id> --revision <revision-id> --session <session-id>
+  sun view resolve --base <base-checkpoint-id> --include <topic-id>:<revision-id>
+  sun run --view <resolved-view-id> -- <test-program> <args...>
+  sun checkpoint create --view <resolved-view-id> --execution <passing-execution-id>
+  sun policy check-export --checkpoint <checkpoint-id> --branch refs/heads/sunlight/auth-fix
+  sun git export --checkpoint <checkpoint-id> --branch refs/heads/sunlight/auth-fix --execute-local
+
+If validation returns an intentional promotion candidate, promote it with the
+exact returned classification, resolve its new topic revision into an exact
+view, rerun validation, and checkpoint that matching view. Git handoff is done
+only when export returns an export-map ID for the checkpoint and target ref.
 
 Compatibility/testing:
   Add --fixture basic-app to supported commands only when exercising the legacy
@@ -18955,8 +19025,8 @@ Compatibility/testing:
 
 fn print_command_help(ctx: &CommandContext, command: &str) {
     match command {
-        "agent" | "agent install" => outputln!(ctx, "sun agent install\n\nUsage:\n  sun agent install --client generic|codex|cursor [--force] [--repo <path>] [--json]\n\nInstalls the portable Sunlight Agent Skill. Codex and Cursor also receive a repository-bound local MCP entry. Existing unrelated client configuration is preserved."),
-        "agent doctor" => outputln!(ctx, "sun agent doctor\n\nUsage:\n  sun agent doctor --client generic|codex|cursor [--repo <path>] [--json]\n\nVerifies that the portable skill and selected client MCP entry match the running Sunlight build and repository."),
+        "agent" | "agent install" => outputln!(ctx, "sun agent install\n\nUsage:\n  sun agent install --client generic|codex|cursor [--force] [--repo <path>] [--json]\n\nInstalls the portable Sunlight Agent Skill. Codex and Cursor also receive a repository-bound local MCP entry. Generic installs the skill only; configure a client transport for sun mcp serve separately. Existing unrelated client configuration is preserved."),
+        "agent doctor" => outputln!(ctx, "sun agent doctor\n\nUsage:\n  sun agent doctor --client generic|codex|cursor [--repo <path>] [--json]\n\nVerifies the portable skill and, for Codex or Cursor, the selected client MCP entry. Generic doctor does not inspect client transport or live tool visibility. Setup is complete when repository_status and artifact tools are visible in the client."),
         "status" => outputln!(ctx, "sun status\n\nUsage:\n  sun status [--json]\n  sun status --topic <topic> [--json]\n  sun status --session <session> [--json]\n  sun status --view <view> [--json]\n  sun status --projection <projection> [--json]\n  sun status --execution <execution> [--json]\n  sun status --checkpoint <checkpoint> [--json]\n  sun status --export <export-map> [--json]\n\nRepository status is derived from persisted Sunlight state, not git status or the main working tree."),
         "inspect" => outputln!(ctx, "sun inspect\n\nUsage:\n  sun inspect repository [--json]\n  sun inspect topic:<topic>|session:<session>|view:<view> [--json]\n  sun inspect artifact:<path>|operation:<id>|conflict:<id> [--json]\n  sun inspect projection:<id>|execution:<id>|checkpoint:<id>|export:<id> [--json]"),
         "topic" => outputln!(ctx, "sun topic\n\nUsage:\n  sun topic create <slug> --display-name <name> [options] [--json]\n  sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]"),
@@ -18965,16 +19035,16 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
         "session" => outputln!(ctx, "sun session\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]\n  sun session refresh <session> --policy manual|follow|none [--json]"),
         "session start" => outputln!(ctx, "sun session start\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]\n\nThe exact view may be the repository base, current head, or a persisted checkpoint view."),
         "session refresh" => outputln!(ctx, "sun session refresh\n\nUsage:\n  sun session refresh <session> --policy manual|follow|none [--json]\n\nmanual and follow immediately advance already-selected non-write topics to current heads; none pins them. The write topic always remains at the session revision. An unchanged policy/frontier is an idempotent no-op."),
-        "compat" | "compat project" | "compat diff" | "compat import" => outputln!(ctx, "sun compat\n\nUsage:\n  sun compat project --session <session> [--json]\n  sun compat diff --projection <projection> [--json]\n  sun compat import --projection <projection> --candidate <candidate> [--json]\n\nCompatibility projections are adapters. Only explicit import creates native operations."),
-        "policy" | "policy check-export" | "policy check-commit" | "policy explain" => outputln!(ctx, "sun policy\n\nUsage:\n  sun policy check-export --checkpoint <checkpoint> [--branch <ref>] [--json]\n  sun policy check-commit [--paths <path>...] [--json]\n  sun policy explain <validation-report> [--json]"),
+        "compat" | "compat project" | "compat diff" | "compat import" => outputln!(ctx, "sun compat\n\nUsage:\n  sun compat project --session <session> [--json]\n  sun compat diff --projection <projection> [--json]\n  sun compat import --projection <projection> --candidate <candidate> --session-generation <generation> [--json]\n\nCompatibility projections are adapters. compat diff returns the baseline session generation required for explicit native import."),
+        "policy" | "policy check-export" | "policy check-commit" | "policy explain" => outputln!(ctx, "sun policy\n\nUsage:\n  sun policy check-export --checkpoint <checkpoint> --branch <ref> [--json]\n  sun policy check-commit [--paths <.sunlight/path>...] [--json]\n  sun policy explain <validation-report> [--json]\n\ncheck-commit validates only Sunlight metadata or, with no paths, the managed .gitignore block. It returns an inline report. Source-artifact safety uses a checkpoint plus check-export; that persisted export report can be passed to policy explain."),
         "git" | "git export" => outputln!(ctx, "sun git export\n\nUsage:\n  sun git export --checkpoint <checkpoint> --branch <ref> [--write-plan|--execute-local] [--repo <path>] [--json]"),
         "checkpoint" | "checkpoint create" => outputln!(ctx, "sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--execution <passing-execution-id>] [--json]\n\nWhen supplied, execution evidence must pass and exactly match the resolved view and tree."),
         "run" => outputln!(ctx, "sun run\n\nUsage:\n  sun run --view <resolved-view-id> [--network disabled|not_enforced] -- <command> [args...]\n\nRuntime bounds come from [execution_policy] in .sunlight/config.toml. Windows runs always use restricted low-integrity filesystem isolation and a dedicated Job Object. Network disabled adds a capability-less per-execution AppContainer; not_enforced retains compatibility with ordinary user toolchains."),
-        "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => outputln!(ctx, "sun artifact operations\n\nUsage:\n  sun read <path> (--session <session> | --view <resolved-view>) [--json]\n  sun list [path-prefix] (--session <session> | --view <resolved-view>) [--json]\n  sun search <query> (--session <session> | --view <resolved-view>) [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification <class> [--json]\n\nResolved-view reads are read-only and do not create a session. Mutations always require a topic-bound authoring session."),
-        "view" | "view resolve" => outputln!(ctx, "sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nResolves persisted topic selections; conflicts and staleness remain inspectable records."),
+        "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => outputln!(ctx, "sun artifact operations\n\nUsage:\n  sun read <path> (--session <session> | --view <resolved-view>) [--json]\n  sun list [path-prefix] (--session <session> | --view <resolved-view>) [--json]\n  sun search <query> (--session <session> | --view <resolved-view>) [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification source|generated [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification source|generated [--json]\n\nsource checkpoints and exports normally. generated checkpoints normally but exports only with reachable execution-output promotion provenance; relabeling does not create provenance."),
+        "view" | "view resolve" => outputln!(ctx, "sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nSupply exact include selections for durable integration. Omitting include is discovery-only and resolves moving current heads. Conflicts and staleness remain inspectable records."),
         "project" | "project materialize" | "projection" | "projection create" => outputln!(ctx, "sun project materialize\n\nUsage:\n  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export [--strategy copy|reflink|hardlink_readonly|overlay_copyup] [--no-copy-fallback] [--projection-root <path>] [--json]\n\nManaged projections adapt persisted views for filesystem tools and are not source truth. Automatic selection uses verified-cache read-only hardlinks for Windows inspection, prefers safe block cloning for writable purposes, and falls back to private copies; --no-copy-fallback makes the requested strategy required."),
         "execution" | "execution promote-output" => outputln!(ctx, "sun execution promote-output\n\nUsage:\n  sun execution promote-output <execution-id> --path <path> --session <session> --classification source_like_delta|generated_artifact [--json]\n\nPass the exact promotion-candidate classification returned by sun run."),
-        "mcp" | "mcp serve" => outputln!(ctx, "sun mcp serve\n\nUsage:\n  sun mcp serve --repo <initialized-repo>\n\nRuns MCP JSON-RPC 2.0 over newline-delimited stdio. The server is bound to one canonical initialized repository; stdout contains protocol messages only."),
+        "mcp" | "mcp serve" => outputln!(ctx, "sun mcp serve\n\nUsage:\n  sun mcp serve --repo <repository-directory>\n\nRuns MCP JSON-RPC 2.0 over newline-delimited stdio. The server is bound to one canonical directory, which may be uninitialized so repository_init can perform first ingest; stdout contains protocol messages only."),
         _ => print_help(ctx),
     }
 }

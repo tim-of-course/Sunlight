@@ -26,16 +26,41 @@ const MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const REPOSITORY_MUTATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 const REPOSITORY_MUTATION_QUEUE_POLL: Duration = Duration::from_millis(10);
+const ARTIFACT_CLASSIFICATIONS: &[&str] = &["source", "generated"];
+const PROMOTION_CLASSIFICATIONS: &[&str] = &["source_like_delta", "generated_artifact"];
+const STATUS_SCOPE_FLAGS: &[(&str, Option<&str>)] = &[
+    ("repository", None),
+    ("topic", Some("--topic")),
+    ("session", Some("--session")),
+    ("view", Some("--view")),
+    ("projection", Some("--projection")),
+    ("execution", Some("--execution")),
+    ("checkpoint", Some("--checkpoint")),
+    ("export", Some("--export")),
+    ("compat_import", Some("--compat-import")),
+];
+const INSPECT_SELECTOR_PREFIXES: &[&str] = &[
+    "topic:",
+    "session:",
+    "view:",
+    "artifact:",
+    "operation:",
+    "conflict:",
+    "projection:",
+    "execution:",
+    "checkpoint:",
+    "export:",
+];
 
 pub(crate) fn serve_from_args(args: &[String]) -> Result<(), String> {
     if args == ["mcp", "--help"] || args == ["mcp", "serve", "--help"] {
         println!(
-            "sun mcp serve\n\nUsage:\n  sun mcp serve --repo <initialized-repo>\n\nRuns newline-delimited MCP JSON-RPC 2.0 on stdio. Protocol messages use stdout; diagnostics use stderr."
+            "sun mcp serve\n\nUsage:\n  sun mcp serve --repo <repository-directory>\n\nRuns newline-delimited MCP JSON-RPC 2.0 on stdio, bound to one canonical directory. The directory may be uninitialized so repository_init can perform first ingest. Protocol messages use stdout; diagnostics use stderr."
         );
         return Ok(());
     }
     if args.len() != 4 || args[0] != "mcp" || args[1] != "serve" || args[2] != "--repo" {
-        return Err("usage: sun mcp serve --repo <initialized-repo>".to_string());
+        return Err("usage: sun mcp serve --repo <repository-directory>".to_string());
     }
     let requested = PathBuf::from(&args[3]);
     let repo = fs::canonicalize(&requested).map_err(|error| {
@@ -348,7 +373,7 @@ fn handle_message(
                             "version": env!("CARGO_PKG_VERSION"),
                             "description": "Repository-confined Sunlight v0.3 authoring and operation tools"
                         },
-                        "instructions": "All tools are bound to the canonical repository supplied when this server started. Typical authoring lifecycle: repository_status, topic_create, session_start, artifact_read/search, artifact_patch/write, topic_complete, then topic_wait or view_resolve, execution_run, and checkpoint_create. artifact_read/list/search accept exactly one scope: session for the authoring frontier or view for session-free read-only access to an exact resolved view. topic_complete and completed topic status return a structured handoff with summary, operations, changed paths, and hashes; use topic_wait instead of polling when another agent owns the topic. Transient repository writer and state-sequence races are retried automatically for safe native and read commands; commands that can replay external side effects are never automatically retried. Use exact IDs and sha256 hashes returned by tools. artifact_write uses expect_hash \"new\" only when the path must be absent. Sessions have fixed topic scope: session_refresh advances only non-write topics already in that session frontier and does not discover newly created topics. execution_run returns bounded stdout/stderr text in that response, phase timings, and only source-like or explicitly generated promotion candidates. No fixture tools or arbitrary host paths are available."
+                        "instructions": "All tools are bound to the canonical repository supplied when this server started. Author with repository_status, topic_create, session_start, scoped artifact reads and mutations, and topic_complete. Integrate with topic_wait and view_resolve using exact selected revisions; omitting include is discovery-only and resolves moving current heads. Validate the exact combined view with execution_run. Promote each intentional output with execution_promote_output using its returned candidate classification and a live topic-owned session over the validated view; resolve the resulting exact revision and create a checkpoint from matching passing evidence. For a requested Git handoff, call policy_check_export with the exact checkpoint and target ref, then git_export; completion is a returned export_map_id for that checkpoint and ref. artifact_read/list/search accept exactly one scope: session for the authoring frontier or view for session-free read-only access to an exact resolved view. topic_complete and completed topic status return a structured handoff with summary, operations, changed paths, and hashes; use topic_wait instead of polling when another agent owns the topic. Transient repository writer and state-sequence races are retried automatically for safe native and read commands; commands that can replay external side effects are never automatically retried. Use exact IDs and sha256 hashes returned by tools. artifact_write uses expect_hash \"new\" only when the path must be absent. Sessions have fixed topic scope: session_refresh advances only non-write topics already in that session frontier and does not discover newly created topics. execution_run returns bounded stdout/stderr text in that response, phase timings, and only source-like or explicitly generated promotion candidates. No fixture tools or arbitrary host paths are available."
                     }),
                 ),
             )
@@ -1249,28 +1274,10 @@ fn enumeration(
     }
 }
 fn classification(args: &Map<String, Value>) -> Result<String, ToolFailure> {
-    enumeration(
-        args,
-        "classification",
-        &[
-            "source",
-            "generated",
-            "cache",
-            "local-only",
-            "execution-output",
-            "lockfile",
-            "migration",
-            "binary",
-            "vendored",
-        ],
-    )
+    enumeration(args, "classification", ARTIFACT_CLASSIFICATIONS)
 }
 fn promotion_classification(args: &Map<String, Value>) -> Result<String, ToolFailure> {
-    enumeration(
-        args,
-        "classification",
-        &["source_like_delta", "generated_artifact"],
-    )
+    enumeration(args, "classification", PROMOTION_CLASSIFICATIONS)
 }
 fn expected_hash(args: &Map<String, Value>) -> Result<String, ToolFailure> {
     identifier(args, "expect_hash")
@@ -1379,7 +1386,11 @@ fn status_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFailure> {
         let scope = scope_value
             .as_str()
             .ok_or_else(|| ToolFailure::new("invalid_request", "`scope` must be a string"))?;
-        if scope == "repository" {
+        let flag = STATUS_SCOPE_FLAGS
+            .iter()
+            .find_map(|(name, flag)| (*name == scope).then_some(*flag))
+            .ok_or_else(|| ToolFailure::new("invalid_request", "unknown status scope"))?;
+        if flag.is_none() {
             if args.contains_key("id") {
                 return Err(ToolFailure::new(
                     "invalid_request",
@@ -1389,19 +1400,10 @@ fn status_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFailure> {
             return Ok(v);
         }
         let id = identifier(args, "id")?;
-        let flag = match scope {
-            "topic" => "--topic",
-            "session" => "--session",
-            "view" => "--view",
-            "projection" => "--projection",
-            "execution" => "--execution",
-            "checkpoint" => "--checkpoint",
-            "export" => "--export",
-            "git" => "--git",
-            "compat_import" => "--compat-import",
-            _ => return Err(ToolFailure::new("invalid_request", "unknown status scope")),
-        };
-        v.extend([flag.into(), id]);
+        v.extend([
+            flag.expect("non-repository status scope has a flag").into(),
+            id,
+        ]);
     } else if args.contains_key("id") {
         return Err(ToolFailure::new(
             "invalid_request",
@@ -1413,21 +1415,7 @@ fn status_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFailure> {
 fn selector(args: &Map<String, Value>) -> Result<String, ToolFailure> {
     let v = text(args, "selector")?;
     if v == "repository"
-        || ([
-            "topic:",
-            "session:",
-            "view:",
-            "artifact:",
-            "operation:",
-            "conflict:",
-            "projection:",
-            "execution:",
-            "checkpoint:",
-            "export:",
-            "git:",
-        ]
-        .iter()
-        .any(|p| v.starts_with(p))
+        || (INSPECT_SELECTOR_PREFIXES.iter().any(|p| v.starts_with(p))
             && !v.contains("..")
             && !v.contains('\\')
             && !v.contains('\0'))
@@ -1519,9 +1507,10 @@ fn compat_import_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFail
         }
         v.extend(["--candidate".into(), c]);
     }
-    if let Some(g) = optional_identifier(args, "session_generation")? {
-        v.extend(["--session-generation".into(), g]);
-    }
+    v.extend([
+        "--session-generation".into(),
+        identifier(args, "session_generation")?,
+    ]);
     Ok(v)
 }
 fn run_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFailure> {
@@ -1577,16 +1566,14 @@ fn run_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFailure> {
     Ok(v)
 }
 fn policy_export_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFailure> {
-    let mut v = vec![
+    Ok(vec![
         "policy".into(),
         "check-export".into(),
         "--checkpoint".into(),
         identifier(args, "checkpoint")?,
-    ];
-    if let Some(branch) = optional_identifier(args, "branch")? {
-        v.extend(["--branch".into(), branch]);
-    }
-    Ok(v)
+        "--branch".into(),
+        identifier(args, "branch")?,
+    ])
 }
 fn policy_commit_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFailure> {
     let mut v = vec!["policy".into(), "check-commit".into()];
@@ -1622,83 +1609,188 @@ fn git_export_argv(args: &Map<String, Value>, repo: &Path) -> Result<Vec<String>
     Ok(v)
 }
 
-fn allowed_fields(name: &str) -> &'static [&'static str] {
-    match name {
-        "repository_init" => &[],
-        "repository_status" => &["scope", "id"],
-        "topic_create" => &[
+struct ToolContract {
+    name: &'static str,
+    allowed: &'static [&'static str],
+    required: &'static [&'static str],
+}
+
+const TOOL_CONTRACTS: &[ToolContract] = &[
+    ToolContract {
+        name: "repository_init",
+        allowed: &[],
+        required: &[],
+    },
+    ToolContract {
+        name: "repository_status",
+        allowed: &["scope", "id"],
+        required: &[],
+    },
+    ToolContract {
+        name: "topic_create",
+        allowed: &[
             "slug",
             "display_name",
             "owner",
             "visibility",
             "acceptance_criteria",
         ],
-        "topic_complete" => &["topic", "revision", "session", "summary"],
-        "topic_wait" => &["topic", "timeout_ms", "poll_interval_ms"],
-        "session_start" => &["topic", "view", "actor"],
-        "session_refresh" => &["session", "policy"],
-        "artifact_read" => &["path", "session", "view"],
-        "artifact_list" => &["prefix", "session", "view"],
-        "artifact_search" => &["query", "session", "view"],
-        "artifact_patch" => &["path", "session", "expect_hash", "patch"],
-        "artifact_write" => &[
+        required: &["slug", "display_name"],
+    },
+    ToolContract {
+        name: "topic_complete",
+        allowed: &["topic", "revision", "session", "summary"],
+        required: &["topic", "revision", "session"],
+    },
+    ToolContract {
+        name: "topic_wait",
+        allowed: &["topic", "timeout_ms", "poll_interval_ms"],
+        required: &["topic"],
+    },
+    ToolContract {
+        name: "session_start",
+        allowed: &["topic", "view", "actor"],
+        required: &["topic", "view", "actor"],
+    },
+    ToolContract {
+        name: "session_refresh",
+        allowed: &["session", "policy"],
+        required: &["session", "policy"],
+    },
+    ToolContract {
+        name: "artifact_read",
+        allowed: &["path", "session", "view"],
+        required: &["path"],
+    },
+    ToolContract {
+        name: "artifact_list",
+        allowed: &["prefix", "session", "view"],
+        required: &[],
+    },
+    ToolContract {
+        name: "artifact_search",
+        allowed: &["query", "session", "view"],
+        required: &["query"],
+    },
+    ToolContract {
+        name: "artifact_patch",
+        allowed: &["path", "session", "expect_hash", "patch"],
+        required: &["path", "session", "expect_hash", "patch"],
+    },
+    ToolContract {
+        name: "artifact_write",
+        allowed: &[
             "path",
             "session",
             "expect_hash",
             "content",
             "classification",
         ],
-        "artifact_move" => &["from", "to", "session", "expect_hash"],
-        "artifact_delete" => &["path", "session", "expect_hash"],
-        "artifact_metadata_set" => &["path", "session", "expect_hash", "classification"],
-        "view_resolve" => &["base", "include"],
-        "project_materialize" => &["view", "purpose", "strategy", "require_strategy"],
-        "compat_project" => &["session"],
-        "compat_diff" => &["projection"],
-        "compat_import" => &["projection", "candidates", "session_generation"],
-        "execution_run" => &["view", "program", "args", "cwd", "network"],
-        "execution_promote_output" => &["execution", "path", "session", "classification"],
-        "checkpoint_create" => &["view", "execution"],
-        "policy_check_export" => &["checkpoint", "branch"],
-        "policy_check_commit" => &["paths"],
-        "policy_explain" => &["validation_report"],
-        "git_export" => &["checkpoint", "branch", "mode"],
-        "inspect" => &["selector", "session"],
-        _ => &[],
-    }
+        required: &[
+            "path",
+            "session",
+            "expect_hash",
+            "content",
+            "classification",
+        ],
+    },
+    ToolContract {
+        name: "artifact_move",
+        allowed: &["from", "to", "session", "expect_hash"],
+        required: &["from", "to", "session", "expect_hash"],
+    },
+    ToolContract {
+        name: "artifact_delete",
+        allowed: &["path", "session", "expect_hash"],
+        required: &["path", "session", "expect_hash"],
+    },
+    ToolContract {
+        name: "artifact_metadata_set",
+        allowed: &["path", "session", "expect_hash", "classification"],
+        required: &["path", "session", "expect_hash", "classification"],
+    },
+    ToolContract {
+        name: "view_resolve",
+        allowed: &["base", "include"],
+        required: &["base"],
+    },
+    ToolContract {
+        name: "project_materialize",
+        allowed: &["view", "purpose", "strategy", "require_strategy"],
+        required: &["view", "purpose"],
+    },
+    ToolContract {
+        name: "compat_project",
+        allowed: &["session"],
+        required: &["session"],
+    },
+    ToolContract {
+        name: "compat_diff",
+        allowed: &["projection"],
+        required: &["projection"],
+    },
+    ToolContract {
+        name: "compat_import",
+        allowed: &["projection", "candidates", "session_generation"],
+        required: &["projection", "candidates", "session_generation"],
+    },
+    ToolContract {
+        name: "execution_run",
+        allowed: &["view", "program", "args", "cwd", "network"],
+        required: &["view", "program"],
+    },
+    ToolContract {
+        name: "execution_promote_output",
+        allowed: &["execution", "path", "session", "classification"],
+        required: &["execution", "path", "session", "classification"],
+    },
+    ToolContract {
+        name: "checkpoint_create",
+        allowed: &["view", "execution"],
+        required: &["view"],
+    },
+    ToolContract {
+        name: "policy_check_export",
+        allowed: &["checkpoint", "branch"],
+        required: &["checkpoint", "branch"],
+    },
+    ToolContract {
+        name: "policy_check_commit",
+        allowed: &["paths"],
+        required: &[],
+    },
+    ToolContract {
+        name: "policy_explain",
+        allowed: &["validation_report"],
+        required: &["validation_report"],
+    },
+    ToolContract {
+        name: "git_export",
+        allowed: &["checkpoint", "branch", "mode"],
+        required: &["checkpoint", "branch", "mode"],
+    },
+    ToolContract {
+        name: "inspect",
+        allowed: &["selector", "session"],
+        required: &["selector"],
+    },
+];
+
+fn tool_contract(name: &str) -> Option<&'static ToolContract> {
+    TOOL_CONTRACTS.iter().find(|contract| contract.name == name)
 }
 
-fn tool_names() -> &'static [&'static str] {
-    &[
-        "repository_init",
-        "repository_status",
-        "topic_create",
-        "topic_complete",
-        "topic_wait",
-        "session_start",
-        "session_refresh",
-        "artifact_read",
-        "artifact_list",
-        "artifact_search",
-        "artifact_patch",
-        "artifact_write",
-        "artifact_move",
-        "artifact_delete",
-        "artifact_metadata_set",
-        "view_resolve",
-        "project_materialize",
-        "compat_project",
-        "compat_diff",
-        "compat_import",
-        "execution_run",
-        "execution_promote_output",
-        "checkpoint_create",
-        "policy_check_export",
-        "policy_check_commit",
-        "policy_explain",
-        "git_export",
-        "inspect",
-    ]
+fn allowed_fields(name: &str) -> &'static [&'static str] {
+    tool_contract(name)
+        .map(|contract| contract.allowed)
+        .unwrap_or_default()
+}
+
+fn tool_names() -> Vec<&'static str> {
+    TOOL_CONTRACTS
+        .iter()
+        .map(|contract| contract.name)
+        .collect()
 }
 
 fn tools() -> Vec<Value> {
@@ -1713,7 +1805,7 @@ fn tools() -> Vec<Value> {
         tool(
             "repository_status",
             "Read persisted repository or object status. Omit id for repository scope; every other scope requires the exact matching object id. Completed topic status includes its structured handoff.",
-            json!({"scope":{"type":"string","description":"Select repository for the whole repository, or an object type paired with id.","enum":["repository","topic","session","view","projection","execution","checkpoint","export","git","compat_import"],"default":"repository"},"id":id_schema("Required exact object id whenever scope is not repository; omit for repository scope.")}),
+            json!({"scope":status_scope_schema(),"id":id_schema("Required exact object id whenever scope is not repository; omit for repository scope.")}),
             &[],
             false,
         ),
@@ -1806,15 +1898,15 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "artifact_metadata_set",
-            "Set artifact classification with CAS.",
+            "Set artifact classification with CAS. source checkpoints and exports normally. generated checkpoints normally but exports only with reachable execution-output promotion provenance; relabeling an artifact as generated does not create that provenance.",
             json!({"path":path_schema(),"session":id_schema("Exact authoring session_id."),"expect_hash":existing_hash_schema(),"classification":class_schema()}),
             &["path", "session", "expect_hash", "classification"],
             true,
         ),
         tool(
             "view_resolve",
-            "Resolve one exact revision per topic over the base checkpoint. Every supplied selection is echoed as requested_frontier and normalized_frontier; dependencies, conflicts, and staleness are returned as facts rather than merged implicitly.",
-            json!({"base":id_schema("Exact base checkpoint_id."),"include":{"type":"array","maxItems":128,"description":"Exact topic revision selections. Omit to resolve current heads. A topic may appear at most once.","items":{"type":"object","additionalProperties":false,"properties":{"topic":id_schema("Exact topic_id, not a slug."),"revision":id_schema("Exact topic_revision_id belonging to topic.")},"required":["topic","revision"]}}}),
+            "Resolve one exact revision per topic over the base checkpoint. Supply include for durable integration. Omitting include is discovery-only and resolves moving current heads. Every supplied selection is echoed as requested_frontier and normalized_frontier; dependencies, conflicts, and staleness are returned as facts rather than merged implicitly.",
+            json!({"base":id_schema("Exact base checkpoint_id."),"include":{"type":"array","maxItems":128,"description":"Exact topic revision selections for durable integration. Omit only to discover the current heads. A topic may appear at most once.","items":{"type":"object","additionalProperties":false,"properties":{"topic":id_schema("Exact topic_id, not a slug."),"revision":id_schema("Exact topic_revision_id belonging to topic.")},"required":["topic","revision"]}}}),
             &["base"],
             true,
         ),
@@ -1827,14 +1919,14 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "compat_project",
-            "Create a compatibility projection for a session.",
+            "Create a fresh compatibility projection from a session's current generation. Filesystem changes remain adapter-local until compat_diff and compat_import create a native operation.",
             json!({"session":id_schema("Exact session_id whose current generation becomes the compatibility baseline.")}),
             &["session"],
             true,
         ),
         tool(
             "compat_diff",
-            "Diff a managed compatibility projection against its persisted baseline.",
+            "Diff a managed compatibility projection against its persisted baseline. Re-echoes the baseline session_generation_id required by compat_import.",
             json!({"projection":id_schema("Exact compatibility projection_id returned by compat_project.")}),
             &["projection"],
             false,
@@ -1843,7 +1935,7 @@ fn tools() -> Vec<Value> {
             "compat_import",
             "Import selected compatibility candidates as one native transaction.",
             json!({"projection":id_schema("Exact compatibility projection_id returned by compat_project."),"candidates":{"type":"array","description":"Exact candidate_delta_id values returned by compat_diff.","minItems":1,"maxItems":128,"items":id_schema("One exact candidate_delta_id.")},"session_generation":id_schema("Exact session_generation_id that owns the compatibility baseline.")}),
-            &["projection", "candidates"],
+            &["projection", "candidates", "session_generation"],
             true,
         ),
         tool(
@@ -1862,35 +1954,35 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "checkpoint_create",
-            "Freeze an exact resolved view with optional validated passing execution evidence.",
+            "Freeze an exact resolved view with optional validated passing execution evidence. source and generated artifacts are both checkpointed; export later requires reachable promotion provenance for each generated artifact.",
             json!({"view":id_schema("Exact conflict-free resolved_view_id to freeze."),"execution":id_schema("Optional passing execution_id whose view and tree exactly match.")}),
             &["view"],
             true,
         ),
         tool(
             "policy_check_export",
-            "Validate a checkpoint for export policy.",
-            json!({"checkpoint":id_schema("Exact checkpoint_id to validate."),"branch":{"type":"string","description":"Optional target Git branch or ref to validate."}}),
-            &["checkpoint"],
+            "Validate and persist export policy for an exact checkpoint and target Git ref. This is the source-artifact safety gate; a passing result returns the validation_report_id accepted by policy_explain and Git export.",
+            json!({"checkpoint":id_schema("Exact checkpoint_id to validate."),"branch":{"type":"string","description":"Required target Git branch or fully qualified ref for this validation.","minLength":1,"maxLength":16384}}),
+            &["checkpoint", "branch"],
             false,
         ),
         tool(
             "policy_check_commit",
-            "Validate repository-relative paths for Sunlight commit policy.",
-            json!({"paths":{"type":"array","maxItems":256,"items":path_schema()}}),
+            "Validate Sunlight's own commit metadata, not application source. Omit paths to check the managed .gitignore block, or supply only .sunlight/** metadata candidates. For exact source safety, create a checkpoint and call policy_check_export with its target ref. This check returns an inline report and does not persist a validation_report_id.",
+            json!({"paths":{"type":"array","maxItems":256,"description":"Optional .sunlight/** metadata paths. Application-source paths are outside this tool's scope.","items":sunlight_metadata_path_schema()}}),
             &[],
             false,
         ),
         tool(
             "policy_explain",
-            "Explain a persisted policy validation report.",
-            json!({"validation_report":id_schema("Exact validation_report_id returned by a policy check.")}),
+            "Explain a persisted export-policy validation report.",
+            json!({"validation_report":id_schema("Exact persisted validation_report_id returned by policy_check_export or git_export.")}),
             &["validation_report"],
             false,
         ),
         tool(
             "git_export",
-            "Plan or execute Git export of a checkpoint to a branch in the bound repository.",
+            "Plan or execute Git export of a checkpoint to a branch in the bound repository. A completed handoff returns an export_map_id that maps the exact checkpoint and target ref to the resulting commit.",
             json!({"checkpoint":id_schema("Exact checkpoint_id to export."),"branch":{"type":"string","description":"Target Git branch or ref."},"mode":{"type":"string","description":"Plan without Git mutation or execute the validated local export.","enum":["plan","execute"]}}),
             &["checkpoint", "branch", "mode"],
             true,
@@ -1898,7 +1990,7 @@ fn tools() -> Vec<Value> {
         tool(
             "inspect",
             "Inspect persisted repository objects with a typed selector.",
-            json!({"selector":{"type":"string","description":"repository or topic:/session:/view:/artifact:/operation:/conflict:/projection:/execution:/checkpoint:/export:/git: selector"},"session":id_schema("Optional exact session_id used to disambiguate session-relative artifact inspection.")}),
+            json!({"selector":inspect_selector_schema(),"session":id_schema("Optional exact session_id used to disambiguate session-relative artifact inspection.")}),
             &["selector"],
             false,
         ),
@@ -1920,7 +2012,9 @@ fn tool(
     required: &[&str],
     mutating: bool,
 ) -> Value {
-    json!({"name":name,"description":description,"inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":required},"outputSchema":output_schema(name),"annotations":{"readOnlyHint":!mutating,"destructiveHint":matches!(name,"artifact_delete"|"git_export"),"idempotentHint":matches!(name,"repository_init"|"repository_status"|"topic_complete"|"topic_wait"|"artifact_read"|"artifact_list"|"artifact_search"|"compat_diff"|"policy_check_export"|"policy_check_commit"|"policy_explain"|"inspect")}})
+    let contract = tool_contract(name).expect("every advertised tool has one contract row");
+    debug_assert_eq!(required, contract.required);
+    json!({"name":name,"description":description,"inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":contract.required},"outputSchema":output_schema(name),"annotations":{"readOnlyHint":!mutating,"destructiveHint":matches!(name,"artifact_delete"|"git_export"),"idempotentHint":matches!(name,"repository_init"|"repository_status"|"topic_complete"|"topic_wait"|"artifact_read"|"artifact_list"|"artifact_search"|"compat_diff"|"policy_check_export"|"policy_check_commit"|"policy_explain"|"inspect")}})
 }
 
 fn output_schema(name: &str) -> Value {
@@ -2011,14 +2105,13 @@ fn output_ids(name: &str) -> &'static [&'static str] {
         ],
         "view_resolve" => &["resolved_view_id"],
         "project_materialize" | "compat_project" => &["projection_id", "resolved_view_id"],
-        "compat_diff" => &["projection_id"],
+        "compat_diff" => &["projection_id", "resolved_view_id", "session_generation_id"],
         "execution_run" => &["execution_id", "projection_id", "resolved_view_id"],
         "execution_promote_output" => &["execution_id", "operation_transaction_id"],
         "checkpoint_create" => &["checkpoint_id", "resolved_view_id", "execution_id"],
-        "policy_check_export" | "policy_check_commit" | "policy_explain" => {
-            &["validation_report_id"]
-        }
-        "git_export" => &["checkpoint_id", "export_map_id", "git_commit_id"],
+        "policy_check_export" | "policy_explain" => &["validation_report_id"],
+        "policy_check_commit" => &["repository_id"],
+        "git_export" => &["checkpoint_id", "export_map_id", "validation_report_id"],
         "inspect" => &[],
         _ => &[],
     }
@@ -2124,14 +2217,30 @@ fn output_payloads(name: &str) -> &'static [(&'static str, &'static str)] {
             "checkpoint",
             "Frozen exact view, tree, and selected evidence.",
         )],
-        "policy_check_export" | "policy_check_commit" | "policy_explain" => &[(
+        "policy_check_export" | "policy_explain" => &[(
             "validation_report",
-            "Persisted policy checks, warnings, and blocking failures.",
+            "Persisted export-policy checks, warnings, and blocking failures.",
         )],
-        "git_export" => &[(
-            "git_export",
-            "Export plan or persisted Git mapping and ref result.",
+        "policy_check_commit" => &[(
+            "validation_report",
+            "Inline Sunlight-metadata commit checks; this report is not persisted.",
         )],
+        "git_export" => &[
+            (
+                "validation_report",
+                "Persisted export-policy report used by the handoff when returned.",
+            ),
+            (
+                "export_map",
+                "Planned or persisted checkpoint-to-Git mapping when returned.",
+            ),
+            ("planned_commit", "Planned Git commit for plan mode."),
+            ("ref_update", "Planned Git ref update for plan mode."),
+            (
+                "created_commit_id",
+                "Created Git commit identity for completed execute mode.",
+            ),
+        ],
         "inspect" => &[(
             "object",
             "Typed persisted object or provenance response selected by the caller.",
@@ -2173,10 +2282,42 @@ fn path_schema() -> Value {
     json!({"type":"string","description":"Portable repository-relative artifact path; absolute paths and traversal are rejected.","maxLength":16384})
 }
 fn class_schema() -> Value {
-    json!({"type":"string","enum":["source","generated","cache","local-only","execution-output","lockfile","migration","binary","vendored"]})
+    json!({
+        "type":"string",
+        "enum":ARTIFACT_CLASSIFICATIONS,
+        "description":"Artifact lifecycle class. source is checkpointed and exportable. generated is checkpointed but exportable only with reachable execution-output promotion provenance."
+    })
 }
 fn promotion_class_schema() -> Value {
-    json!({"type":"string","enum":["source_like_delta","generated_artifact"],"description":"Exact classification returned for this promotion candidate by execution_run."})
+    json!({"type":"string","enum":PROMOTION_CLASSIFICATIONS,"description":"Exact classification returned for this promotion candidate by execution_run."})
+}
+fn status_scope_schema() -> Value {
+    let scopes = STATUS_SCOPE_FLAGS
+        .iter()
+        .map(|(scope, _)| *scope)
+        .collect::<Vec<_>>();
+    json!({
+        "type":"string",
+        "description":"Select repository for the whole repository, or a persisted native object type paired with id.",
+        "enum":scopes,
+        "default":"repository"
+    })
+}
+fn inspect_selector_schema() -> Value {
+    json!({
+        "type":"string",
+        "description":format!(
+            "repository or a persisted native object selector beginning with {}",
+            INSPECT_SELECTOR_PREFIXES.join(", ")
+        )
+    })
+}
+fn sunlight_metadata_path_schema() -> Value {
+    json!({
+        "type":"string",
+        "pattern":r"^\.sunlight(?:/|$)",
+        "description":"Repository-relative .sunlight metadata path; application artifacts are not accepted."
+    })
 }
 
 #[cfg(test)]
@@ -2336,6 +2477,21 @@ mod tests {
         let find = |name: &str| advertised.iter().find(|tool| tool["name"] == name).unwrap();
 
         for tool in &advertised {
+            let name = tool["name"].as_str().unwrap();
+            let contract = tool_contract(name).unwrap();
+            assert_eq!(tool["inputSchema"]["required"], json!(contract.required));
+            let advertised_fields = tool["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            let contract_fields = contract
+                .allowed
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(advertised_fields, contract_fields, "{name}");
             let error = &tool["outputSchema"]["properties"]["error"];
             assert!(error["required"]
                 .as_array()
@@ -2401,6 +2557,75 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("returned by execution_run verbatim"));
+
+        let write = find("artifact_write");
+        assert_eq!(
+            write["inputSchema"]["properties"]["classification"]["enum"],
+            json!(["source", "generated"])
+        );
+        assert!(
+            write["inputSchema"]["properties"]["classification"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("promotion provenance")
+        );
+
+        let status = find("repository_status");
+        assert!(!status["inputSchema"]["properties"]["scope"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("git")));
+        let inspect = find("inspect");
+        assert!(
+            !inspect["inputSchema"]["properties"]["selector"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("git:")
+        );
+
+        let export_policy = find("policy_check_export");
+        assert_eq!(
+            export_policy["inputSchema"]["required"],
+            json!(["checkpoint", "branch"])
+        );
+        let commit_policy = find("policy_check_commit");
+        assert_eq!(
+            commit_policy["outputSchema"]["properties"]["data"]["properties"]["ids"]["properties"]
+                .get("validation_report_id"),
+            None
+        );
+        assert!(commit_policy["description"]
+            .as_str()
+            .unwrap()
+            .contains("does not persist a validation_report_id"));
+
+        let compat_diff = find("compat_diff");
+        assert!(
+            compat_diff["outputSchema"]["properties"]["data"]["properties"]["ids"]["properties"]
+                .get("session_generation_id")
+                .is_some()
+        );
+        assert_eq!(
+            find("compat_import")["inputSchema"]["required"],
+            json!(["projection", "candidates", "session_generation"])
+        );
+    }
+
+    #[test]
+    fn fixture_only_git_lookup_is_not_an_mcp_contract() {
+        let root = TestRoot::new();
+        let temp = PrivateTemp::new(&root.0).unwrap();
+
+        for (name, arguments) in [
+            ("repository_status", json!({"scope":"git","id":"HEAD"})),
+            ("inspect", json!({"selector":"git:HEAD"})),
+        ] {
+            let error = match build_invocation(name, &arguments, &root.0, &temp) {
+                Ok(_) => panic!("{name} must reject fixture-only Git lookup"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, "invalid_request");
+        }
     }
 
     #[test]
@@ -2452,6 +2677,28 @@ mod tests {
         assert!(error
             .message
             .contains("source_like_delta, generated_artifact"));
+    }
+
+    #[test]
+    fn artifact_invocation_accepts_only_lifecycle_classes() {
+        let root = TestRoot::new();
+        let temp = PrivateTemp::new(&root.0).unwrap();
+        let error = match build_invocation(
+            "artifact_metadata_set",
+            &json!({
+                "path":"Cargo.lock",
+                "session":"session_agent_a",
+                "expect_hash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "classification":"lockfile"
+            }),
+            &root.0,
+            &temp,
+        ) {
+            Ok(_) => panic!("non-lifecycle artifact class must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "invalid_request");
+        assert!(error.message.contains("source, generated"));
     }
 
     #[test]

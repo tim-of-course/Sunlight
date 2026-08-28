@@ -53,8 +53,10 @@ sun agent doctor --client generic --repo C:\src\my-repo
 ```
 
 `generic` installs the portable Agent Skills version under
-`.agents/skills/sunlight`. Use a client adapter to install that same skill plus
-repository-bound MCP configuration:
+`.agents/skills/sunlight`; generic doctor verifies those files only. Configure
+the client separately to run `sun mcp serve --repo <repository-directory>`, or
+use an adapter to install that same skill plus repository-bound MCP
+configuration:
 
 ```powershell
 sun agent install --client codex --repo C:\src\my-repo
@@ -63,7 +65,8 @@ sun agent install --client cursor --repo C:\src\my-repo
 
 Restart the coding client after adding MCP configuration. The bound server can
 initialize an existing uninitialized repository through `repository_init`; it
-cannot switch to a different repository root.
+cannot switch to a different repository root. Setup is complete when the client
+shows `repository_status` and the Sunlight artifact tools for that repository.
 
 Use `--force` only to replace an older Sunlight-managed skill or MCP entry.
 Existing unrelated client configuration is preserved.

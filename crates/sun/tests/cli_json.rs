@@ -32,10 +32,13 @@ fn global_and_primary_help_describe_repo_backed_operator_workflow() {
     for expected in [
         "sun init",
         "sun topic create <slug> --display-name <name> [--owner <actor>]",
-        "sun compat import --projection <projection> --candidate <candidate>",
+        "sun compat import --projection <projection> --candidate <candidate> --session-generation <generation>",
         "sun run --view <view>",
-        "sun policy check-export --checkpoint <checkpoint>",
+        "sun policy check-export --checkpoint <checkpoint> --branch <ref>",
         "sun git export --checkpoint <checkpoint> --branch <ref>",
+        "sun mcp serve --repo <repository-directory>",
+        "sun topic complete --topic <topic-id> --revision <revision-id>",
+        "only when export returns an export-map ID",
         "status     Summarize repository health and object lifecycle state",
         "Compatibility/testing:",
     ] {
@@ -53,6 +56,15 @@ fn global_and_primary_help_describe_repo_backed_operator_workflow() {
         assert_success(&output);
         assert!(!stdout(&output).contains("--fixture basic-app"));
     }
+
+    let mcp_help = sun()
+        .args(["mcp", "serve", "--help"])
+        .output()
+        .expect("sun mcp serve --help should run");
+    assert_success(&mcp_help);
+    let mcp_help = stdout(&mcp_help);
+    assert!(mcp_help.contains("--repo <repository-directory>"));
+    assert!(mcp_help.contains("may be uninitialized"));
 }
 
 #[test]
@@ -84,6 +96,7 @@ fn agent_install_and_doctor_create_a_discoverable_cursor_setup() {
     assert_success(&doctor);
     let value: serde_json::Value = serde_json::from_str(&stdout(&doctor)).unwrap();
     assert_eq!(value["data"]["healthy"], true);
+    assert_eq!(value["data"]["mcp_binding_verified"], true);
     assert_eq!(value["data"]["repository_initialized"], false);
     assert!(value["warnings"][0]
         .as_str()
@@ -99,6 +112,32 @@ fn agent_install_and_doctor_create_a_discoverable_cursor_setup() {
     assert_failure(&stale);
     assert!(stdout(&stale).contains("agent_setup_incomplete"));
     assert!(stdout(&stale).contains(".agents/skills/sunlight/SKILL.md"));
+}
+
+#[test]
+fn generic_doctor_reports_skill_only_scope_and_live_tool_completion_criterion() {
+    let repo = TestRepo::new("agent-install-generic");
+    let install = run_real_json(&repo, &["agent", "install", "--client", "generic"]);
+    assert_success(&install);
+    let installed: serde_json::Value = serde_json::from_str(&stdout(&install)).unwrap();
+    assert!(installed["warnings"][0]
+        .as_str()
+        .unwrap()
+        .contains("portable skill only"));
+
+    let doctor = run_real_json(&repo, &["agent", "doctor", "--client", "generic"]);
+    assert_success(&doctor);
+    let checked: serde_json::Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    assert_eq!(checked["data"]["healthy"], true);
+    assert_eq!(checked["data"]["mcp_binding_verified"], false);
+    assert!(checked["warnings"][0]
+        .as_str()
+        .unwrap()
+        .contains("did not verify any MCP client configuration"));
+    assert!(checked["data"]["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("confirm repository_status and artifact tools are visible"));
 }
 
 #[test]
@@ -5325,6 +5364,15 @@ fn no_fixture_compat_project_diff_import_flows_into_native_consumers() {
     repo.write_file("main-worktree-only.txt", "not compatibility truth\n");
     let modified_diff = real_compat_diff(&repo, &modified_projection);
     assert!(modified_diff.contains("\"kind\":\"modified_source\""));
+    let modified_diff_json: serde_json::Value = serde_json::from_str(&modified_diff).unwrap();
+    assert_eq!(
+        modified_diff_json["data"]["ids"]["session_generation_id"],
+        modified_generation
+    );
+    assert_eq!(
+        modified_diff_json["data"]["baseline"]["session_generation_id"],
+        modified_generation
+    );
     assert!(!modified_diff.contains("main-worktree-only.txt"));
     let projection_status = sun()
         .arg("status")
@@ -5560,6 +5608,10 @@ fn no_fixture_compat_import_accepts_secret_like_source_and_rejects_stale_generat
     let imported_stdout = stdout(&imported);
     assert!(imported_stdout.contains("\"path\":\".env\""));
     assert!(imported_stdout.contains("\"classification\":\"source\""));
+    let imported_json: serde_json::Value = serde_json::from_str(&imported_stdout).unwrap();
+    let current_generation = imported_json["data"]["ids"]["session_generation_id"]
+        .as_str()
+        .unwrap();
 
     let read = sun()
         .arg("read")
@@ -5575,6 +5627,19 @@ fn no_fixture_compat_import_accepts_secret_like_source_and_rejects_stale_generat
 
     let state_path = repo.path().join(".sunlight/records/native-state.json");
     let before_stale = fs::read(&state_path).unwrap();
+    let stale_projection = real_compat_import(
+        &repo,
+        &projection,
+        &safe_candidate,
+        Some(current_generation),
+    );
+    assert_failure(&stale_projection);
+    let stale_projection_stdout = stdout(&stale_projection);
+    assert!(stale_projection_stdout.contains("\"code\":\"compat_projection_stale\""));
+    assert!(stale_projection_stdout.contains("\"session_id\":\"session_agent_a\""));
+    assert!(stale_projection_stdout.contains("\"current_session_generation_id\":"));
+    assert!(stale_projection_stdout.contains("Create a fresh compatibility projection"));
+    assert!(stale_projection_stdout.contains("reapply the remaining filesystem change"));
     let stale = real_compat_import(&repo, &projection, &safe_candidate, Some(&generation));
     assert_failure(&stale);
     assert!(stdout(&stale).contains("\"code\":\"compat_precondition_failed\""));
@@ -5951,6 +6016,8 @@ fn policy_check_commit_json_paths_rejects_blocked_local_path() {
     assert!(stdout.contains("\"check\":\"policy_class\""));
     assert!(stdout.contains("\"code\":\"blocked_local_path\""));
     assert!(stdout.contains("\"path\":\".sunlight/local/lease.json\""));
+    assert!(stdout.contains("correct the supplied .sunlight metadata candidate paths"));
+    assert!(!stdout.contains("create or export a matching checkpoint"));
 }
 
 #[test]

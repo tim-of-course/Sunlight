@@ -830,6 +830,57 @@ fn stdio_mcp_domain_calls_do_not_respawn_the_server_executable() {
 }
 
 #[test]
+fn stdio_mcp_no_fixture_contract_omits_git_lookup_and_states_policy_scope() {
+    let temp = TempDir::new("sun-mcp-public-contract");
+    let repo = temp.path().join("repository");
+    fs::create_dir_all(&repo).unwrap();
+    let mut mcp = initialized_mcp(&repo);
+
+    let listed = mcp.request(2, "tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    let find = |name: &str| tools.iter().find(|tool| tool["name"] == name).unwrap();
+
+    let status_scopes = find("repository_status")["inputSchema"]["properties"]["scope"]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(!status_scopes.contains(&json!("git")));
+    assert!(
+        !find("inspect")["inputSchema"]["properties"]["selector"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("git:")
+    );
+
+    assert_eq!(
+        find("policy_check_export")["inputSchema"]["required"],
+        json!(["checkpoint", "branch"])
+    );
+    assert!(find("policy_check_commit")["description"]
+        .as_str()
+        .unwrap()
+        .contains(".sunlight"));
+    assert!(
+        find("policy_check_commit")["outputSchema"]["properties"]["data"]["properties"]["ids"]
+            ["properties"]
+            .get("validation_report_id")
+            .is_none()
+    );
+
+    let status_error = mcp.call_error(3, "repository_status", json!({"scope":"git","id":"HEAD"}));
+    assert_eq!(status_error["error"]["code"], "invalid_request");
+    let inspect_error = mcp.call_error(4, "inspect", json!({"selector":"git:HEAD"}));
+    assert_eq!(inspect_error["error"]["code"], "invalid_request");
+    let policy_error = mcp.call_error(
+        5,
+        "policy_check_export",
+        json!({"checkpoint":"checkpoint_missing"}),
+    );
+    assert_eq!(policy_error["error"]["code"], "invalid_request");
+
+    mcp.shutdown();
+}
+
+#[test]
 fn cli_and_mcp_share_read_mutation_and_error_contracts() {
     let temp = TempDir::new("sun-engine-contract-equivalence");
     let cli_repo = temp.path().join("cli-repository");

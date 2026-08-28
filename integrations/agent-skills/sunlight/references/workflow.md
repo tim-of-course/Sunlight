@@ -13,6 +13,10 @@ mix native operations with direct tracked-source edits.
 - A **checkpoint** freezes a conflict-free exact view with optional passing
   execution evidence.
 - A **projection** is a managed filesystem adapter. It is never source truth.
+- A `source` artifact checkpoints and exports normally. A `generated` artifact
+  checkpoints normally and exports only when its exact bytes have reachable
+  `execution_promote_output` provenance. Relabeling an artifact as `generated`
+  does not create that provenance.
 
 Moving selectors are convenient for discovery, but durable integration,
 execution, checkpointing, and export must use exact IDs.
@@ -42,7 +46,8 @@ prevention and credential rotation happen outside Sunlight.
 5. Mutate with `artifact_patch`, `artifact_write`, `artifact_move`,
    `artifact_delete`, or `artifact_metadata_set`. Pass the exact current
    `content_hash` as the compare-and-swap precondition. Use `new` only when a
-   written path must be absent.
+   written path must be absent. Classify authored source as `source`; reserve
+   `generated` for output promoted from a recorded execution.
 6. Re-read important changes from the session view. If a focused validation is
    useful before integration, resolve the topic revision into an exact view and
    run it there.
@@ -58,7 +63,8 @@ bypass a failed CAS by writing outside Sunlight.
 1. Wait for an owned dependency with `topic_wait`; do not poll status in a
    loop. Consume the returned structured handoff.
 2. Call `view_resolve` with the base checkpoint and exactly one selected
-   revision for every topic being integrated.
+   revision for every topic being integrated. Omitting `include` resolves moving
+   current heads and is discovery-only.
 3. Stop on conflicts or staleness and report the structured records. Adapt
    through new topic-owned operations rather than editing a projection.
 4. Inspect combined artifacts through view-scoped reads.
@@ -70,12 +76,21 @@ bypass a failed CAS by writing outside Sunlight.
    artifact classes `source` and `generated`. Ignored build/cache output should
    not be promoted. Promotion accepts one classified regular file up to 2 MiB;
    keep denied output local-only and reduce or split legitimate larger
-   generated source before retrying.
+   generated source before retrying. Promotion creates a native operation, so
+   use a live topic-owned session over the validated view; when integrated
+   topics are already complete, create a follow-up topic and session for the
+   promotion. Resolve its returned revision into a new exact view and rerun the
+   matching validation.
 7. Create a checkpoint using passing evidence that matches the exact view and
    tree. Materialize an inspection projection only when a filesystem consumer
    needs one.
-8. Run export policy checks and `git_export` only when the user requests a Git
-   handoff. Git is a compatibility/export surface, not native authorship.
+8. For a requested Git handoff, call `policy_check_export` with the exact
+   checkpoint and target Git ref, then call `git_export`. `policy_check_commit`
+   checks only `.sunlight/**` metadata candidates (or the managed `.gitignore`
+   block when paths are omitted); it is not application-source validation and
+   does not create a persisted report for `policy_explain`. Git is a
+   compatibility/export surface, not native authorship. The handoff is complete
+   when export returns an `export_map_id` for the checkpoint and target ref.
 
 ## Failure handling
 
@@ -86,6 +101,9 @@ bypass a failed CAS by writing outside Sunlight.
   explicit adaptation; do not choose moving heads implicitly.
 - execution failure: use bounded output text and phase timings as diagnostics;
   make the correction in a topic session and resolve a new exact view.
+- stale compatibility projection: create a fresh projection from the session's
+  current generation, reapply the remaining filesystem change, rediff, and
+  import with the generation returned by `compat_diff`.
 - Git export failure: preserve the validated checkpoint and report the native
   handoff as blocked. A completed native handoff has a returned export-map ID;
   Git plumbing outside Sunlight does not substitute for that provenance.

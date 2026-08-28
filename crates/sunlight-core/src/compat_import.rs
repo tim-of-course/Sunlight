@@ -1983,6 +1983,8 @@ mod tests {
     use crate::resolver::{fixture_base_entries, fixture_resolver_input, resolve_fixture_view};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     #[test]
     fn fixture_import_modified_file_creates_one_operation_plan() {
         let view = base_view();
@@ -2469,8 +2471,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = NEXT_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let repo = std::env::temp_dir().join(format!(
-            "sunlight-real-compat-core-{}-{suffix}",
+            "sunlight-real-compat-core-{}-{suffix}-{sequence}",
             std::process::id()
         ));
         let root = repo

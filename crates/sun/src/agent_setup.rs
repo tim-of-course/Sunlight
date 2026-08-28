@@ -53,6 +53,7 @@ pub(crate) struct AgentInstallReport {
 pub(crate) struct AgentDoctorReport {
     pub(crate) client: AgentClient,
     pub(crate) healthy: bool,
+    pub(crate) mcp_binding_verified: bool,
     pub(crate) repository_initialized: bool,
     pub(crate) current: Vec<String>,
     pub(crate) missing_or_stale: Vec<String>,
@@ -107,6 +108,7 @@ pub(crate) fn doctor(
     let mut report = AgentDoctorReport {
         client,
         healthy: true,
+        mcp_binding_verified: false,
         repository_initialized: repository.join(".sunlight/config.toml").is_file(),
         current: Vec::new(),
         missing_or_stale: Vec::new(),
@@ -121,7 +123,9 @@ pub(crate) fn doctor(
             let relative = ".codex/config.toml";
             let expected = codex_block(repository, executable);
             let current = fs::read_to_string(repository.join(relative)).unwrap_or_default();
-            record_check(current.contains(&expected), relative, &mut report);
+            let matches = current.contains(&expected);
+            record_check(matches, relative, &mut report);
+            report.mcp_binding_verified = matches;
         }
         AgentClient::Cursor => {
             let relative = ".cursor/mcp.json";
@@ -135,6 +139,7 @@ pub(crate) fn doctor(
                 .and_then(|value| value.get("sunlight"))
                 == Some(&expected);
             record_check(matches, relative, &mut report);
+            report.mcp_binding_verified = matches;
         }
     }
     report.healthy = report.missing_or_stale.is_empty();
@@ -348,8 +353,11 @@ mod tests {
 
     impl TempDir {
         fn new() -> Self {
+            static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let sequence = NEXT_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "sun-agent-setup-{}-{}",
+                "sun-agent-setup-{}-{}-{sequence}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -377,6 +385,7 @@ mod tests {
         assert!(second.changed.is_empty());
         assert_eq!(second.unchanged.len(), 3);
         assert!(doctor(&temp.0, &executable, AgentClient::Generic).healthy);
+        assert!(!doctor(&temp.0, &executable, AgentClient::Generic).mcp_binding_verified);
     }
 
     #[test]

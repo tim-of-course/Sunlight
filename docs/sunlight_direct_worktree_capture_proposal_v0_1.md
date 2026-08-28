@@ -4,7 +4,7 @@
 
 **Approved:** 2026-08-27
 
-**Implementation status:** Pending explicit authorization
+**Implementation status:** Implemented in the v0.3 local CLI and MCP workflow
 
 This document is an approved addendum to
 [`sunlight_consolidated_architecture_v0_3.md`](sunlight_consolidated_architecture_v0_3.md)
@@ -227,3 +227,15 @@ filesystem contents into source truth.
   next action while retaining Git transitions as separate diagnostics.
 - Uncaptured edits never affect native reads, execution, checkpoints, or Git
   export.
+
+## Implementation record
+
+Implemented on 2026-08-27. The local CLI exposes `sun compat diff --worktree`
+and `sun compat capture --worktree`; MCP exposes the equivalent
+`worktree_diff` and `worktree_capture` tools. `repository_status` reports the
+anchor and exact current candidate summary.
+
+Repository-backed regression coverage exercises the complete change set,
+partial and repeated capture, stale anchors, ignored paths, native-source
+isolation, concurrent topic independence, durable provenance, and MCP discovery
+and execution.

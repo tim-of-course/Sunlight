@@ -15,7 +15,11 @@ preconditions, and handoffs rather than following a rigid script.
    artifact tools. Server names may be repository-specific.
 2. Call `repository_status`. Initialize through `repository_init` only when the
    bound root is uninitialized.
-3. If the tools are missing, stop instead of silently editing tracked source by
+3. Read `repository.worktree`. If it reports external changes, use
+   `worktree_diff` to understand them. Call `worktree_capture` only when those
+   edits should enter Sunlight; it returns a completed topic revision for the
+   normal integration workflow.
+4. If the tools are missing, stop instead of silently editing tracked source by
    another route. Read [references/setup.md](references/setup.md) and give the
    user the relevant install or doctor command.
 

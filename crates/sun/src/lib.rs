@@ -39,8 +39,9 @@ use sunlight_core::checkpoint::{
     FIXTURE_VALIDATION_REPORT_ID,
 };
 use sunlight_core::compat_import::{
-    diff_real_compat_projection, fixture_basic_app_candidate_deltas, plan_fixture_basic_app_import,
-    real_compat_baseline_manifest_digest, validate_real_compat_selection, CompatCandidateDelta,
+    diff_real_compat_projection, diff_real_worktree, fixture_basic_app_candidate_deltas,
+    plan_fixture_basic_app_import, real_compat_baseline_manifest_digest,
+    validate_real_compat_selection, validate_real_worktree_selection, CompatCandidateDelta,
     CompatCandidateKind, CompatFileOperationKind, CompatImportErrorCode, CompatImportRequest,
     CompatImportResponse, CompatImportValidationError, CompatImportedArtifact,
     FIXTURE_COMPAT_BASELINE_MANIFEST_DIGEST, FIXTURE_COMPAT_IMPORT_OPERATION_ID,
@@ -106,8 +107,8 @@ use sunlight_core::repo_state::{
     RealExportMapSnapshot, RealOperationEffect, RealOperationRecord, RealProjectionMaterialization,
     RealProjectionMaterializationMetrics, RealProjectionMaterializationRequest,
     RealProjectionSnapshot, RealProjectionStrategy, RealRepoState, RealResolvedRepoView,
-    RealSessionGenerationRecord, RealSessionRecord, RealTopicRecord, RepoStateError,
-    TopicMetadataValidationError,
+    RealSessionGenerationRecord, RealSessionRecord, RealTopicRecord, RealWorktreeAnchor,
+    RepoStateError, TopicMetadataValidationError,
 };
 use sunlight_core::repository::{
     init_repository, resolve_projection_policy, ExecutionPolicy, RepositoryConfig,
@@ -491,6 +492,7 @@ fn run(ctx: &CommandContext) -> Result<(), CliError> {
         [scope, command, ..] if scope == "compat" && command == "project" => compat_project(&ctx),
         [scope, command, ..] if scope == "compat" && command == "diff" => compat_diff(&ctx),
         [scope, command, ..] if scope == "compat" && command == "import" => compat_import(&ctx),
+        [scope, command, ..] if scope == "compat" && command == "capture" => worktree_capture(&ctx),
         [scope, command, ..] if scope == "execution" && command == "promote-output" => {
             execution_promote_output(&ctx)
         }
@@ -767,6 +769,15 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
                 }
                 let mut ingest = RealRepoState::ingest(&report.repo_root, &report.repository_id)?;
                 ingest.publication_sequence = state.publication_sequence;
+                ingest.worktree_anchor.generation = state
+                    .worktree_anchor
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        invalid_request(
+                            "worktree anchor generation overflow during reinitialization",
+                        )
+                    })?;
                 let records = base_ingest_publications(&ingest)?;
                 ingest.save_with_records(&report.repo_root, &records)?;
                 legacy_quarantine_migrated = !state.quarantine.is_empty();
@@ -861,7 +872,38 @@ fn base_ingest_publications(
                 json_escape(&ingest.tree_hash),
             ),
         )?,
+        real_worktree_anchor_publication(ingest)?,
     ])
+}
+
+fn real_worktree_anchor_publication(
+    state: &RealRepoState,
+) -> Result<DerivedRecordPublication, CliError> {
+    let anchor = &state.worktree_anchor;
+    state
+        .record_publication(
+            "worktree-anchors",
+            &anchor.id(),
+            &format!("{}\n", real_worktree_anchor_record_json(state, anchor)),
+        )
+        .map_err(Into::into)
+}
+
+fn real_worktree_anchor_record_json(state: &RealRepoState, anchor: &RealWorktreeAnchor) -> String {
+    format!(
+        "{{\"schema_version\":1,\"record_type\":\"worktree_anchor\",\"id\":\"{}\",\"repository_id\":\"{}\",\"generation\":{},\"base_checkpoint_ids\":{},\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"topic_frontier\":{},\"manifest_digest\":\"{}\",\"path_policy_id\":\"{}\",\"operation_semantics_version\":\"{}\",\"sunignore_policy_hash\":{},\"privacy_class\":\"local_only\",\"source_truth\":\"sunlight_persisted_resolved_view\"}}",
+        json_escape(&anchor.id()),
+        json_escape(&state.repository_id),
+        anchor.generation,
+        string_array_json(anchor.base_checkpoint_ids.iter().map(String::as_str)),
+        json_escape(&anchor.resolved_view_id),
+        json_escape(&anchor.tree_hash),
+        string_map_object_json(&anchor.topic_frontier),
+        json_escape(&anchor.manifest_digest),
+        json_escape(&anchor.path_policy_id),
+        json_escape(&anchor.operation_semantics_version),
+        optional_string_json(anchor.sunignore_policy_hash.as_deref()),
+    )
 }
 
 fn topic_create(ctx: &CommandContext) -> Result<(), CliError> {
@@ -1780,6 +1822,9 @@ fn compat_project(ctx: &CommandContext) -> Result<(), CliError> {
 
 fn compat_diff(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_compat_diff_options(ctx)?;
+    if options.worktree {
+        return real_worktree_diff(ctx);
+    }
     let Some(fixture) = options.fixture.as_deref() else {
         return real_compat_diff(ctx, options);
     };
@@ -1789,15 +1834,19 @@ fn compat_diff(ctx: &CommandContext) -> Result<(), CliError> {
         );
     }
 
-    let projection = fixture_compat_import_projection_by_id(&options.projection_id)
-        .ok_or_else(|| object_not_found("projection", &options.projection_id))?
+    let projection_id = options
+        .projection_id
+        .as_deref()
+        .expect("validated compatibility projection");
+    let projection = fixture_compat_import_projection_by_id(projection_id)
+        .ok_or_else(|| object_not_found("projection", projection_id))?
         .map_err(projection_error)?;
     if projection.id != FIXTURE_COMPATIBILITY_PROJECTION_ID {
         return Err(CliError::new(
             "compat_projection_invalid",
             "compat diff requires a compatibility projection",
         )
-        .with_detail("projection_id", options.projection_id));
+        .with_detail("projection_id", projection_id));
     }
     let current_view = fixture_compat_import_view_for_projection(&projection);
     let candidates = fixture_basic_app_candidate_deltas();
@@ -1946,16 +1995,20 @@ fn real_compat_diff(ctx: &CommandContext, options: CompatDiffOptions) -> Result<
     let repo_root = ctx.repo_root.clone();
     let projection_policy = require_projection_policy(&repo_root)?;
     let state = RealRepoState::load(&repo_root)?;
+    let projection_id = options
+        .projection_id
+        .as_deref()
+        .expect("validated compatibility projection");
     let projection = state
         .projections
         .iter()
-        .find(|projection| projection.projection_id == options.projection_id)
+        .find(|projection| projection.projection_id == projection_id)
         .ok_or_else(|| {
             CliError::new(
                 "compat_projection_not_found",
                 "compatibility projection was not found",
             )
-            .with_detail("projection_id", options.projection_id.clone())
+            .with_detail("projection_id", projection_id)
         })?;
     let diff = diff_real_compat_projection(&repo_root, &projection_policy.managed_root, projection)
         .map_err(compat_import_error)?;
@@ -1974,6 +2027,524 @@ fn real_compat_diff(ctx: &CommandContext, options: CompatDiffOptions) -> Result<
         );
     }
     Ok(())
+}
+
+fn real_worktree_diff(ctx: &CommandContext) -> Result<(), CliError> {
+    let state = RealRepoState::load(&ctx.repo_root)?;
+    let anchored = state.resolve_worktree_anchor_view()?;
+    let diff = diff_real_worktree(
+        &ctx.repo_root,
+        &state.repository_id,
+        &state.worktree_anchor,
+        &anchored.entries,
+    )
+    .map_err(worktree_capture_error)?;
+    if ctx.json {
+        outputln!(
+            ctx,
+            "{}",
+            real_worktree_diff_envelope(&state, &diff.candidates)
+        );
+    } else {
+        outputln!(
+            ctx,
+            "{} generation={} candidates={}",
+            if diff.candidates.is_empty() {
+                "worktree clean"
+            } else {
+                "worktree dirty"
+            },
+            state.worktree_anchor.generation,
+            diff.candidates.len()
+        );
+    }
+    Ok(())
+}
+
+fn worktree_capture(ctx: &CommandContext) -> Result<(), CliError> {
+    real_worktree_capture(ctx, parse_worktree_capture_options(ctx)?)
+}
+
+fn real_worktree_capture(
+    ctx: &CommandContext,
+    options: WorktreeCaptureOptions,
+) -> Result<(), CliError> {
+    TopicSlug::new(options.topic_slug.clone()).map_err(|error| {
+        invalid_request(error.to_string()).with_detail("slug", options.topic_slug.clone())
+    })?;
+    validate_topic_metadata(&options.actor_id, "local", &[]).map_err(|error| {
+        invalid_request(error.to_string()).with_detail("actor_id", options.actor_id.clone())
+    })?;
+
+    let repo_root = ctx.repo_root.clone();
+    let mut state = RealRepoState::load(&repo_root)?;
+    let anchor_before = state.worktree_anchor.clone();
+    if options
+        .anchor_generation
+        .is_some_and(|expected| expected != anchor_before.generation)
+    {
+        return Err(CliError::new(
+            "worktree_anchor_stale",
+            "the requested worktree anchor generation is stale",
+        )
+        .with_detail(
+            "expected_anchor_generation",
+            options
+                .anchor_generation
+                .expect("checked generation")
+                .to_string(),
+        )
+        .with_detail(
+            "actual_anchor_generation",
+            anchor_before.generation.to_string(),
+        )
+        .with_detail(
+            "next_action",
+            "Call worktree_diff and retry with current candidate IDs.",
+        ));
+    }
+    let anchored = state.resolve_worktree_anchor_view()?;
+    let diff = diff_real_worktree(
+        &repo_root,
+        &state.repository_id,
+        &anchor_before,
+        &anchored.entries,
+    )
+    .map_err(worktree_capture_error)?;
+    if diff.candidates.is_empty() {
+        if ctx.json {
+            outputln!(ctx, "{}", real_worktree_capture_noop_envelope(&state));
+        } else {
+            outputln!(ctx, "worktree clean; no capture created");
+        }
+        return Ok(());
+    }
+
+    let selected_ids = selected_worktree_candidate_ids(&options, &diff.candidates)?;
+    let selected = validate_real_worktree_selection(
+        &state.repository_id,
+        &anchor_before,
+        &anchored.entries,
+        &selected_ids,
+        &diff,
+    )
+    .map_err(worktree_capture_error)?;
+    let verified = diff_real_worktree(
+        &repo_root,
+        &state.repository_id,
+        &anchor_before,
+        &anchored.entries,
+    )
+    .map_err(worktree_capture_error)?;
+    if verified.candidates != diff.candidates {
+        return Err(CliError::new(
+            "worktree_changed_during_capture",
+            "the worktree changed while capture was preparing its exact candidate set",
+        )
+        .with_detail("anchor_generation", anchor_before.generation.to_string())
+        .with_detail("next_action", "Call worktree_diff and retry."));
+    }
+
+    let topic_id = format!("topic_{}", options.topic_slug.replace('-', "_"));
+    if state.topic_by_id_or_slug(&options.topic_slug).is_some()
+        || state.topic_by_id_or_slug(&topic_id).is_some()
+    {
+        return Err(CliError::new(
+            "topic_conflict",
+            format!("topic slug `{}` already exists", options.topic_slug),
+        )
+        .with_detail("slug", options.topic_slug)
+        .with_detail("topic_id", topic_id));
+    }
+
+    let mut changes = Vec::new();
+    for candidate in &selected {
+        ensure_path_visible_to_sunlight(&repo_root, &candidate.path)?;
+        if let Some(source_path) = candidate.source_path.as_deref() {
+            ensure_path_visible_to_sunlight(&repo_root, source_path)?;
+        }
+        let before_path = candidate
+            .source_path
+            .as_deref()
+            .unwrap_or(candidate.path.as_str());
+        let before = candidate.before_hash.as_ref().and_then(|_| {
+            anchored
+                .entries
+                .iter()
+                .find(|entry| entry.path == before_path && !entry.tombstone)
+                .cloned()
+        });
+        match (&candidate.before_hash, &before) {
+            (Some(expected), Some(entry)) if expected == &entry.content_hash => {}
+            (Some(_), _) | (None, Some(_)) => {
+                return Err(CliError::new(
+                    "worktree_capture_precondition_failed",
+                    "a selected candidate no longer matches the anchored artifact",
+                )
+                .with_detail("candidate_delta_id", candidate.candidate_delta_id.clone())
+                .with_detail("path", before_path));
+            }
+            (None, None) => {}
+        }
+        let after = match candidate.operation_kind {
+            CompatFileOperationKind::Delete => {
+                let mut entry = before.clone().expect("validated worktree delete");
+                entry.tombstone = true;
+                entry
+            }
+            CompatFileOperationKind::Patch
+            | CompatFileOperationKind::Write
+            | CompatFileOperationKind::Metadata
+            | CompatFileOperationKind::Move => {
+                let bytes = diff
+                    .after_bytes
+                    .get(&candidate.candidate_delta_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        CliError::new(
+                            "worktree_diff_failed",
+                            "selected worktree candidate bytes were not available",
+                        )
+                        .with_detail("candidate_delta_id", candidate.candidate_delta_id.clone())
+                    })?;
+                RealArtifactEntry {
+                    artifact_id: before
+                        .as_ref()
+                        .map(|entry| entry.artifact_id.clone())
+                        .or_else(|| candidate.artifact_id.clone())
+                        .unwrap_or_else(|| real_artifact_id_for_path(&candidate.path)),
+                    path: candidate.path.clone(),
+                    content_hash: real_content_hash(&bytes),
+                    executable: candidate.executable,
+                    classification: candidate.classification.clone(),
+                    tombstone: false,
+                    bytes,
+                }
+            }
+        };
+        changes.push((candidate.clone(), before, after));
+    }
+
+    let session_id = worktree_capture_session_id(&options.actor_id, &options.topic_slug);
+    let initial_session_generation_id = native_session_generation_id(&session_id, 1);
+    state.topics.push(RealTopicRecord {
+        topic_id: topic_id.clone(),
+        slug: options.topic_slug.clone(),
+        display_name: format!("Worktree capture: {}", options.topic_slug),
+        owner_actor_id: options.actor_id.clone(),
+        visibility: "local".to_string(),
+        acceptance_criteria: Vec::new(),
+        base_checkpoint_id: anchor_before
+            .base_checkpoint_ids
+            .first()
+            .cloned()
+            .unwrap_or_else(|| state.base_checkpoint_id.clone()),
+        head_revision_id: None,
+        completed_revision_id: None,
+        revision_number: 0,
+    });
+    state.sessions.push(RealSessionRecord {
+        session_id: session_id.clone(),
+        actor_id: options.actor_id.clone(),
+        write_topic_id: topic_id.clone(),
+        resolved_view_id: anchor_before.resolved_view_id.clone(),
+        session_generation_id: initial_session_generation_id.clone(),
+        generation_number: 1,
+        topic_frontier: anchor_before.topic_frontier.clone(),
+        refresh_policy: "none".to_string(),
+    });
+    state.session_generations.push(RealSessionGenerationRecord {
+        session_generation_id: initial_session_generation_id.clone(),
+        session_id: session_id.clone(),
+        write_topic_id: topic_id.clone(),
+        base_resolved_view_id: anchor_before.resolved_view_id.clone(),
+        resolved_view_id: anchor_before.resolved_view_id.clone(),
+        topic_frontier: anchor_before.topic_frontier.clone(),
+        generation_number: 1,
+        refresh_policy: "none".to_string(),
+        created_by: "worktree_capture_start".to_string(),
+    });
+
+    let (_, primary_before, primary_after) = changes
+        .first()
+        .cloned()
+        .expect("validated worktree candidates");
+    let mut response = real_accept_mutation(
+        &mut state,
+        &session_id,
+        "worktree_capture",
+        selected[0]
+            .source_path
+            .as_deref()
+            .unwrap_or(&selected[0].path),
+        primary_before,
+        primary_after,
+    )?;
+    let operation = state.operations.last_mut().expect("accepted operation");
+    operation.worktree_candidate_delta_ids = selected
+        .iter()
+        .map(|candidate| candidate.candidate_delta_id.clone())
+        .collect();
+    operation.worktree_anchor_generation = Some(anchor_before.generation);
+    operation.worktree_anchor_resolved_view_id = Some(anchor_before.resolved_view_id.clone());
+    operation.worktree_anchor_tree_hash = Some(anchor_before.tree_hash.clone());
+    operation.worktree_anchor_manifest_digest = Some(anchor_before.manifest_digest.clone());
+    operation.effects = changes
+        .iter()
+        .flat_map(|(candidate, before, after)| {
+            let mut effects = Vec::new();
+            if candidate.operation_kind == CompatFileOperationKind::Move {
+                let source = before.as_ref().expect("validated worktree move");
+                effects.push(RealOperationEffect {
+                    artifact_id: source.artifact_id.clone(),
+                    path: source.path.clone(),
+                    base_content_hash: Some(source.content_hash.clone()),
+                    result_content_hash: source.content_hash.clone(),
+                    classification: source.classification.clone(),
+                    executable: source.executable,
+                    tombstone: true,
+                    bytes: source.bytes.clone(),
+                });
+            }
+            effects.push(RealOperationEffect {
+                artifact_id: after.artifact_id.clone(),
+                path: after.path.clone(),
+                base_content_hash: before.as_ref().map(|entry| entry.content_hash.clone()),
+                result_content_hash: after.content_hash.clone(),
+                classification: after.classification.clone(),
+                executable: after.executable,
+                tombstone: after.tombstone,
+                bytes: after.bytes.clone(),
+            });
+            effects
+        })
+        .collect();
+
+    let refreshed = state.resolve_session_view(real_session(&state, &session_id)?);
+    if !refreshed.result.conflict_free() {
+        return Err(CliError::new(
+            "worktree_capture_resolution_failed",
+            "the selected worktree changes did not resolve to one exact view",
+        ));
+    }
+    state.resolved_view_id = refreshed.result.resolved_view_id.clone();
+    state.current_topic_frontier = refreshed.result.topic_frontier.clone();
+    state.tree_hash = refreshed
+        .result
+        .tree_identity
+        .as_ref()
+        .map(|tree| tree.tree_hash.clone())
+        .unwrap_or_else(|| real_tree_hash(&refreshed.entries));
+    state.entries = refreshed.entries.clone();
+    response.view.tree_identity.tree_hash = state.tree_hash.clone();
+    let topic_index = state
+        .topics
+        .iter()
+        .position(|topic| topic.topic_id == topic_id)
+        .expect("capture topic exists");
+    state.topics[topic_index].completed_revision_id = Some(response.topic_revision.id.clone());
+    state.advance_worktree_anchor(&refreshed)?;
+    state.sync_compat_fields();
+
+    let operation = state.operations.last().expect("captured operation");
+    let capture_record = real_worktree_capture_record_json(
+        &state,
+        &anchor_before,
+        &state.worktree_anchor,
+        operation,
+        &selected,
+        &response,
+    );
+    let topic = state.topics[topic_index].clone();
+    let summary = format!(
+        "Captured {} external worktree change{} from anchor generation {}.",
+        selected.len(),
+        if selected.len() == 1 { "" } else { "s" },
+        anchor_before.generation
+    );
+    let completion_id = format!("completion_{}", topic.topic_id);
+    let records = vec![
+        state.record_publication(
+            "records",
+            &session_id,
+            &format!(
+                "{{\"record_type\":\"session\",\"id\":\"{}\",\"repository_id\":\"{}\",\"write_topic_id\":\"{}\",\"resolved_view_id\":\"{}\",\"session_generation_id\":\"{}\",\"actor_id\":\"{}\"}}\n",
+                json_escape(&session_id),
+                json_escape(&state.repository_id),
+                json_escape(&topic_id),
+                json_escape(&response.view.resolved_view_id),
+                json_escape(&response.view.session_generation_id),
+                json_escape(&options.actor_id),
+            ),
+        )?,
+        real_session_generation_publication(
+            &state,
+            &session_id,
+            &initial_session_generation_id,
+        )?,
+        real_session_generation_publication(
+            &state,
+            &session_id,
+            &response.session_generation.id,
+        )?,
+        state.record_publication(
+            "operations",
+            &response.operation.id,
+            &format!("{capture_record}\n"),
+        )?,
+        state.record_publication(
+            "worktree-captures",
+            &response.operation.id,
+            &format!("{capture_record}\n"),
+        )?,
+        state.record_publication(
+            "topics",
+            &topic.topic_id,
+            &format!(
+                "{{\"record_type\":\"topic\",\"id\":\"{}\",\"repository_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"owner_actor_id\":\"{}\",\"visibility\":\"{}\",\"acceptance_criteria\":[],\"base_checkpoint_id\":\"{}\",\"head_revision_id\":\"{}\",\"completed_revision_id\":\"{}\"}}\n",
+                json_escape(&topic.topic_id),
+                json_escape(&state.repository_id),
+                json_escape(&topic.slug),
+                json_escape(&topic.display_name),
+                json_escape(&topic.owner_actor_id),
+                json_escape(&topic.visibility),
+                json_escape(&topic.base_checkpoint_id),
+                json_escape(&response.topic_revision.id),
+                json_escape(&response.topic_revision.id),
+            ),
+        )?,
+        state.record_publication(
+            "topics",
+            &response.topic_revision.id,
+            &format!("{}\n", topic_revision_json(&response)),
+        )?,
+        state.record_publication(
+            "topics",
+            &completion_id,
+            &format!(
+                "{{\"record_type\":\"topic_completion\",\"id\":\"{}\",\"repository_id\":\"{}\",\"topic_id\":\"{}\",\"completed_revision_id\":\"{}\",\"session_id\":\"{}\",\"actor_id\":\"{}\",\"summary\":\"{}\",\"immutable\":true}}\n",
+                json_escape(&completion_id),
+                json_escape(&state.repository_id),
+                json_escape(&topic.topic_id),
+                json_escape(&response.topic_revision.id),
+                json_escape(&session_id),
+                json_escape(&options.actor_id),
+                json_escape(&summary),
+            ),
+        )?,
+        state.record_publication(
+            "views",
+            &refreshed.result.resolved_view_id,
+            &format!("{}\n", resolved_view_record_json(&refreshed.result)),
+        )?,
+        real_worktree_anchor_publication(&state)?,
+    ];
+    state.save_with_records(&repo_root, &records)?;
+
+    let remaining_count = diff.candidates.len().saturating_sub(selected.len());
+    if ctx.json {
+        outputln!(
+            ctx,
+            "{}",
+            real_worktree_capture_envelope(
+                &repo_root,
+                &state,
+                &anchor_before,
+                &selected,
+                &response,
+                remaining_count,
+            )
+        );
+    } else {
+        outputln!(
+            ctx,
+            "captured {} candidates as completed topic {} at {}; anchor generation={}",
+            selected.len(),
+            topic.topic_id,
+            response.topic_revision.id,
+            state.worktree_anchor.generation
+        );
+    }
+    Ok(())
+}
+
+fn selected_worktree_candidate_ids(
+    options: &WorktreeCaptureOptions,
+    candidates: &[CompatCandidateDelta],
+) -> Result<Vec<String>, CliError> {
+    if !options.candidate_delta_ids.is_empty() {
+        return Ok(options.candidate_delta_ids.clone());
+    }
+    if !options.paths.is_empty() {
+        let mut selected = Vec::new();
+        let mut missing = Vec::new();
+        for path in &options.paths {
+            let matches = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.path == *path || candidate.source_path.as_deref() == Some(path)
+                })
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                missing.push(path.clone());
+            } else {
+                selected.extend(
+                    matches
+                        .into_iter()
+                        .map(|candidate| candidate.candidate_delta_id.clone()),
+                );
+            }
+        }
+        if !missing.is_empty() {
+            return Err(CliError::new(
+                "worktree_candidate_not_found",
+                "one or more selected paths have no current worktree candidate",
+            )
+            .with_detail("paths", missing.join(","))
+            .with_detail(
+                "next_action",
+                "Call worktree_diff and select returned paths.",
+            ));
+        }
+        selected.sort();
+        selected.dedup();
+        return Ok(selected);
+    }
+    let selected = candidates
+        .iter()
+        .filter(|candidate| is_safe_default_compat_candidate(candidate))
+        .map(|candidate| candidate.candidate_delta_id.clone())
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Err(CliError::new(
+            "worktree_no_eligible_changes",
+            "the worktree has differences but none are eligible for default capture",
+        )
+        .with_detail("candidate_count", candidates.len().to_string())
+        .with_detail(
+            "next_action",
+            "Call worktree_diff and review candidate classifications.",
+        ));
+    }
+    Ok(selected)
+}
+
+fn worktree_capture_session_id(actor_id: &str, topic_slug: &str) -> String {
+    let actor = actor_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!(
+        "session_worktree_{}_{}",
+        actor.trim_matches('_'),
+        topic_slug.replace('-', "_")
+    )
 }
 
 fn real_compat_import(ctx: &CommandContext, options: CompatImportOptions) -> Result<(), CliError> {
@@ -6080,6 +6651,11 @@ fn real_accept_mutation(
         bytes: after.bytes.clone(),
         compat_projection_id: None,
         compat_candidate_delta_ids: Vec::new(),
+        worktree_candidate_delta_ids: Vec::new(),
+        worktree_anchor_generation: None,
+        worktree_anchor_resolved_view_id: None,
+        worktree_anchor_tree_hash: None,
+        worktree_anchor_manifest_digest: None,
         effects: Vec::new(),
     });
     let session_after = state
@@ -7756,6 +8332,167 @@ fn real_compat_diff_envelope(
     )
 }
 
+fn real_worktree_diff_id(
+    anchor: &RealWorktreeAnchor,
+    candidates: &[CompatCandidateDelta],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(anchor.id().as_bytes());
+    hasher.update([0]);
+    hasher.update(anchor.manifest_digest.as_bytes());
+    for candidate in candidates {
+        hasher.update([0]);
+        hasher.update(candidate.candidate_delta_id.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("worktree_diff_{}", &digest[..24])
+}
+
+fn real_worktree_anchor_summary_json(anchor: &RealWorktreeAnchor) -> String {
+    format!(
+        "{{\"worktree_anchor_id\":\"{}\",\"generation\":{},\"base_checkpoint_ids\":{},\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"topic_frontier\":{},\"manifest_digest\":\"{}\",\"path_policy_id\":\"{}\",\"operation_semantics_version\":\"{}\"}}",
+        json_escape(&anchor.id()),
+        anchor.generation,
+        string_array_json(anchor.base_checkpoint_ids.iter().map(String::as_str)),
+        json_escape(&anchor.resolved_view_id),
+        json_escape(&anchor.tree_hash),
+        string_map_object_json(&anchor.topic_frontier),
+        json_escape(&anchor.manifest_digest),
+        json_escape(&anchor.path_policy_id),
+        json_escape(&anchor.operation_semantics_version),
+    )
+}
+
+fn real_worktree_diff_envelope(
+    state: &RealRepoState,
+    candidates: &[CompatCandidateDelta],
+) -> String {
+    let anchor = &state.worktree_anchor;
+    let safe = candidates
+        .iter()
+        .filter(|candidate| is_safe_default_compat_candidate(candidate))
+        .map(|candidate| candidate.candidate_delta_id.as_str());
+    let worktree_state = if candidates.is_empty() {
+        "clean"
+    } else {
+        "dirty"
+    };
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"worktree.diff\",\"repository_id\":\"{}\",\"ids\":{{\"worktree_anchor_id\":\"{}\",\"resolved_view_id\":\"{}\",\"worktree_diff_id\":\"{}\"}},\"worktree_state\":\"{}\",\"anchor\":{},\"candidate_counts\":{},\"selected_candidate_delta_ids\":{},\"candidates\":[{}],\"native_operation_ids\":[],\"native_revision_ids\":[],\"next_action\":{}}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(&anchor.id()),
+        json_escape(&anchor.resolved_view_id),
+        json_escape(&real_worktree_diff_id(anchor, candidates)),
+        worktree_state,
+        real_worktree_anchor_summary_json(anchor),
+        compat_candidate_counts_json(candidates),
+        string_array_json(safe),
+        candidates
+            .iter()
+            .map(compat_candidate_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        if candidates.is_empty() {
+            "null".to_string()
+        } else {
+            "\"Call worktree_capture with a topic slug and actor; omit selection to capture eligible source candidates.\"".to_string()
+        },
+    )
+}
+
+fn real_worktree_capture_noop_envelope(state: &RealRepoState) -> String {
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"worktree.capture\",\"repository_id\":\"{}\",\"ids\":{{\"worktree_anchor_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"captured\":false,\"reason\":\"worktree_clean\",\"anchor\":{},\"selected_delta_count\":0,\"candidate_delta_ids\":[],\"remaining_candidate_count\":0,\"native_operation_ids\":[],\"native_revision_ids\":[]}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(&state.worktree_anchor.id()),
+        json_escape(&state.worktree_anchor.resolved_view_id),
+        real_worktree_anchor_summary_json(&state.worktree_anchor),
+    )
+}
+
+fn real_worktree_capture_record_json(
+    state: &RealRepoState,
+    anchor_before: &RealWorktreeAnchor,
+    anchor_after: &RealWorktreeAnchor,
+    operation: &RealOperationRecord,
+    candidates: &[CompatCandidateDelta],
+    response: &MutationResponse,
+) -> String {
+    format!(
+        "{{\"schema_version\":1,\"record_type\":\"operation_transaction\",\"id\":\"{}\",\"repository_id\":\"{}\",\"topic_id\":\"{}\",\"topic_revision_id\":\"{}\",\"session_id\":\"{}\",\"session_generation_id\":\"{}\",\"actor_id\":\"{}\",\"authored_context_id\":\"{}\",\"mutation\":\"worktree_capture\",\"preconditions\":{{\"worktree_anchor_id\":\"{}\",\"worktree_anchor_generation\":{},\"worktree_anchor_resolved_view_id\":\"{}\",\"worktree_anchor_tree_hash\":\"{}\",\"worktree_anchor_manifest_digest\":\"{}\",\"selected_candidate_delta_ids\":{}}},\"mutation_payload\":{{\"kind\":\"worktree_capture\",\"selected_deltas\":[{}]}},\"after_refs\":{{\"resolved_view_id\":\"{}\",\"tree_identity\":{},\"worktree_anchor\":{}}}}}",
+        json_escape(&operation.operation_transaction_id),
+        json_escape(&state.repository_id),
+        json_escape(&operation.topic_id),
+        json_escape(&operation.topic_revision_id),
+        json_escape(&operation.session_id),
+        json_escape(&response.view.session_generation_id),
+        json_escape(&response.operation.actor_id),
+        json_escape(&operation.authored_context_id),
+        json_escape(&anchor_before.id()),
+        anchor_before.generation,
+        json_escape(&anchor_before.resolved_view_id),
+        json_escape(&anchor_before.tree_hash),
+        json_escape(&anchor_before.manifest_digest),
+        string_array_json(candidates.iter().map(|candidate| candidate.candidate_delta_id.as_str())),
+        candidates
+            .iter()
+            .map(real_compat_selected_delta_json)
+            .collect::<Vec<_>>()
+            .join(","),
+        json_escape(&response.view.resolved_view_id),
+        single_repo_tree_json(&SingleRepoTree {
+            repository_id: response.view.tree_identity.repository_id.clone(),
+            tree_hash: response.view.tree_identity.tree_hash.clone(),
+        }),
+        real_worktree_anchor_summary_json(anchor_after),
+    )
+}
+
+fn real_worktree_capture_envelope(
+    repo_root: &Path,
+    state: &RealRepoState,
+    anchor_before: &RealWorktreeAnchor,
+    candidates: &[CompatCandidateDelta],
+    response: &MutationResponse,
+    remaining_candidate_count: usize,
+) -> String {
+    let topic = state
+        .topics
+        .iter()
+        .find(|topic| topic.topic_id == response.operation.topic_id)
+        .expect("capture topic");
+    let operation = state.operations.last().expect("capture operation");
+    format!(
+        "{{\"ok\":true,\"data\":{{\"command\":\"worktree.capture\",\"repository_id\":\"{}\",\"ids\":{{\"worktree_anchor_id\":\"{}\",\"topic_id\":\"{}\",\"session_id\":\"{}\",\"operation_transaction_id\":\"{}\",\"topic_revision_id\":\"{}\",\"session_generation_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"captured\":true,\"anchor_before\":{},\"anchor_after\":{},\"view\":{},\"selected_delta_count\":{},\"candidate_delta_ids\":{},\"remaining_candidate_count\":{},\"topic\":{},\"handoff\":{},\"operation\":{},\"topic_revision\":{},\"session_generation\":{}}},\"warnings\":[]}}",
+        json_escape(&state.repository_id),
+        json_escape(&state.worktree_anchor.id()),
+        json_escape(&topic.topic_id),
+        json_escape(&response.session_id),
+        json_escape(&response.operation.id),
+        json_escape(&response.topic_revision.id),
+        json_escape(&response.view.session_generation_id),
+        json_escape(&response.view.resolved_view_id),
+        real_worktree_anchor_summary_json(anchor_before),
+        real_worktree_anchor_summary_json(&state.worktree_anchor),
+        view_json(&response.view),
+        candidates.len(),
+        string_array_json(candidates.iter().map(|candidate| candidate.candidate_delta_id.as_str())),
+        remaining_candidate_count,
+        real_topic_metadata_json(topic),
+        real_topic_handoff_json(repo_root, state, topic),
+        real_worktree_capture_record_json(
+            state,
+            anchor_before,
+            &state.worktree_anchor,
+            operation,
+            candidates,
+            response,
+        ),
+        topic_revision_json(response),
+        session_generation_json(response),
+    )
+}
+
 fn real_compat_import_record_json(
     state: &RealRepoState,
     projection: &RealProjectionSnapshot,
@@ -7878,6 +8615,31 @@ fn real_compat_provenance_json(operation: &RealOperationRecord) -> String {
     )
 }
 
+fn real_worktree_provenance_json(operation: &RealOperationRecord) -> String {
+    let anchor_id = operation
+        .worktree_anchor_generation
+        .map(|generation| format!("worktree_anchor_{generation:04}"));
+    format!(
+        "{{\"operation_transaction_id\":\"{}\",\"candidate_delta_ids\":{},\"anchor_id\":{},\"anchor_generation\":{},\"anchor_resolved_view_id\":{},\"anchor_tree_hash\":{},\"anchor_manifest_digest\":{},\"authored_context_id\":\"{}\"}}",
+        json_escape(&operation.operation_transaction_id),
+        string_array_json(
+            operation
+                .worktree_candidate_delta_ids
+                .iter()
+                .map(String::as_str)
+        ),
+        optional_string_json(anchor_id.as_deref()),
+        operation
+            .worktree_anchor_generation
+            .map(|generation| generation.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        optional_string_json(operation.worktree_anchor_resolved_view_id.as_deref()),
+        optional_string_json(operation.worktree_anchor_tree_hash.as_deref()),
+        optional_string_json(operation.worktree_anchor_manifest_digest.as_deref()),
+        json_escape(&operation.authored_context_id),
+    )
+}
+
 fn real_compat_operation_inspect_envelope(
     state: &RealRepoState,
     operation: &RealOperationRecord,
@@ -7892,8 +8654,18 @@ fn real_compat_operation_inspect_envelope(
                 .iter()
                 .find(|projection| projection.projection_id == projection_id)
         });
+    let selected_candidate_ids = if operation.compat_projection_id.is_some() {
+        &operation.compat_candidate_delta_ids
+    } else {
+        &operation.worktree_candidate_delta_ids
+    };
+    let worktree_provenance = if operation.worktree_candidate_delta_ids.is_empty() {
+        "null".to_string()
+    } else {
+        real_worktree_provenance_json(operation)
+    };
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"operation_transaction_id\":\"{}\",\"topic_revision_id\":\"{}\",\"projection_id\":{}}},\"operation\":{{\"operation_transaction_id\":\"{}\",\"topic_id\":\"{}\",\"topic_revision_id\":\"{}\",\"session_id\":\"{}\",\"artifact_id\":\"{}\",\"path\":\"{}\",\"mutation\":\"{}\",\"authored_context_id\":\"{}\",\"base_content_hash\":{},\"result_content_hash\":\"{}\",\"tombstone\":{},\"artifact_effects\":{},\"mutation_payload\":{{\"kind\":\"{}\",\"projection_id\":{},\"selected_candidate_delta_ids\":{}}}}},\"projection\":{}}},\"warnings\":[]}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"operation_transaction_id\":\"{}\",\"topic_revision_id\":\"{}\",\"projection_id\":{}}},\"operation\":{{\"operation_transaction_id\":\"{}\",\"topic_id\":\"{}\",\"topic_revision_id\":\"{}\",\"session_id\":\"{}\",\"artifact_id\":\"{}\",\"path\":\"{}\",\"mutation\":\"{}\",\"authored_context_id\":\"{}\",\"base_content_hash\":{},\"result_content_hash\":\"{}\",\"tombstone\":{},\"artifact_effects\":{},\"mutation_payload\":{{\"kind\":\"{}\",\"projection_id\":{},\"selected_candidate_delta_ids\":{}}},\"worktree_capture_provenance\":{}}},\"projection\":{}}},\"warnings\":[]}}",
         json_escape(command),
         json_escape(&state.repository_id),
         json_escape(&operation.operation_transaction_id),
@@ -7917,12 +8689,8 @@ fn real_compat_operation_inspect_envelope(
             operation.mutation.as_str()
         },
         optional_string_json(operation.compat_projection_id.as_deref()),
-        string_array_json(
-            operation
-                .compat_candidate_delta_ids
-                .iter()
-                .map(String::as_str)
-        ),
+        string_array_json(selected_candidate_ids.iter().map(String::as_str)),
+        worktree_provenance,
         projection
             .map(|projection| real_projection_snapshot_json(state, projection))
             .unwrap_or_else(|| "null".to_string()),
@@ -8689,6 +9457,11 @@ struct RealPolicyStatus {
 struct RealOperationalSummary {
     recovery_rollback_evidence: bool,
     git_working_tree_changed: bool,
+    worktree_state: String,
+    worktree_candidate_count: usize,
+    worktree_candidate_counts: BTreeMap<String, usize>,
+    worktree_diff_id: Option<String>,
+    worktree_scan_error: Option<String>,
     artifact_count: usize,
     quarantined_count: usize,
     conflict_count: usize,
@@ -8725,8 +9498,44 @@ fn real_operational_summary(repo_root: &Path, state: &RealRepoState) -> RealOper
         quarantined_count: state.quarantine.len(),
         conflict_count: resolved.result.conflicts().count(),
         staleness_count: resolved.result.staleness().count(),
+        worktree_state: "scan_required".to_string(),
         ..RealOperationalSummary::default()
     };
+    match state.resolve_worktree_anchor_view().and_then(|anchored| {
+        diff_real_worktree(
+            repo_root,
+            &state.repository_id,
+            &state.worktree_anchor,
+            &anchored.entries,
+        )
+        .map_err(|error| RepoStateError::InvalidState {
+            path: repo_root.to_path_buf(),
+            message: error.message,
+        })
+    }) {
+        Ok(diff) => {
+            summary.worktree_state = if diff.candidates.is_empty() {
+                "clean".to_string()
+            } else {
+                "dirty".to_string()
+            };
+            summary.worktree_candidate_count = diff.candidates.len();
+            for candidate in &diff.candidates {
+                *summary
+                    .worktree_candidate_counts
+                    .entry(candidate.kind.as_str().to_string())
+                    .or_default() += 1;
+            }
+            summary.worktree_diff_id = Some(real_worktree_diff_id(
+                &state.worktree_anchor,
+                &diff.candidates,
+            ));
+        }
+        Err(error) => {
+            summary.worktree_state = "unavailable".to_string();
+            summary.worktree_scan_error = Some(error.to_string());
+        }
+    }
     let projection_policy = require_repository_config(repo_root.to_path_buf())
         .ok()
         .and_then(|config| resolve_projection_policy(repo_root, &config).ok());
@@ -8914,9 +9723,16 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
         })
         .collect::<Vec<_>>()
         .join(",");
+    let worktree_counts = summary
+        .worktree_candidate_counts
+        .iter()
+        .map(|(kind, count)| format!("\"{}\":{}", json_escape(kind), count))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         concat!(
             "{{\"repository\":{{\"repository_id\":\"{}\",\"base_checkpoint_id\":\"{}\",\"base_resolved_view_id\":\"{}\",\"current_resolved_view_id\":\"{}\",\"tree_hash\":\"{}\"}},",
+            "\"worktree\":{{\"state\":\"{}\",\"anchor\":{},\"candidate_count\":{},\"candidate_counts\":{{{}}},\"worktree_diff_id\":{},\"scan_error\":{}}},",
             "\"artifacts\":{{\"active\":{},\"legacy_quarantine_excluded\":{}}},",
             "\"topics\":{{\"count\":{},\"heads\":{}}},",
             "\"sessions\":{{\"count\":{},\"heads\":{}}},",
@@ -8933,6 +9749,12 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
         json_escape(&state.base_resolved_view_id),
         json_escape(&head.result.resolved_view_id),
         json_escape(&head_tree_hash),
+        json_escape(&summary.worktree_state),
+        real_worktree_anchor_summary_json(&state.worktree_anchor),
+        summary.worktree_candidate_count,
+        worktree_counts,
+        optional_string_json(summary.worktree_diff_id.as_deref()),
+        optional_string_json(summary.worktree_scan_error.as_deref()),
         summary.artifact_count,
         summary.quarantined_count,
         state.topics.len(),
@@ -8984,6 +9806,22 @@ fn real_operational_warnings_json(
         && summary.git_working_tree_changed
     {
         warnings.push("{\"code\":\"git_working_tree_changed\",\"message\":\"the Git working tree changed outside Sunlight; native Sunlight state remains authoritative\",\"details\":{}}".to_string());
+    }
+    if matches!(command, "status.repository" | "inspect.repository")
+        && summary.worktree_state == "dirty"
+    {
+        warnings.push(format!(
+            "{{\"code\":\"uncaptured_worktree_changes\",\"message\":\"the repository worktree has changes outside native Sunlight history\",\"details\":{{\"candidate_count\":{},\"anchor_generation\":{},\"next_action\":\"Call worktree_diff, then worktree_capture if these edits should enter Sunlight.\"}}}}",
+            summary.worktree_candidate_count,
+            state.worktree_anchor.generation,
+        ));
+    } else if matches!(command, "status.repository" | "inspect.repository")
+        && summary.worktree_state == "unavailable"
+    {
+        warnings.push(format!(
+            "{{\"code\":\"worktree_scan_unavailable\",\"message\":\"Sunlight could not compare the worktree with its anchor\",\"details\":{{\"reason\":{}}}}}",
+            optional_string_json(summary.worktree_scan_error.as_deref()),
+        ));
     }
     if summary.recovery_rollback_evidence {
         warnings.push("{\"code\":\"state_recovery_rolled_back\",\"message\":\"an interrupted malformed publication was rolled back to the newest fully valid state\",\"details\":{\"evidence_root\":\"local://.sunlight/local/recovery/native-state\"}}".to_string());
@@ -9043,6 +9881,13 @@ fn print_real_status_text(
         state.base_checkpoint_id,
         head.result.resolved_view_id,
         head_tree_hash
+    );
+    outputln!(
+        ctx,
+        "worktree {}  anchor-generation={}  candidates={}",
+        summary.worktree_state,
+        state.worktree_anchor.generation,
+        summary.worktree_candidate_count
     );
     outputln!(
         ctx,
@@ -9143,6 +9988,15 @@ fn print_real_status_text(
         && summary.git_working_tree_changed
     {
         outputln!(ctx, "warning[git_working_tree_changed]: the Git working tree changed outside Sunlight; native Sunlight state remains authoritative");
+    }
+    if matches!(command, "status.repository" | "inspect.repository")
+        && summary.worktree_state == "dirty"
+    {
+        outputln!(ctx, "warning[uncaptured_worktree_changes]: call sun compat diff --worktree, then capture the edits if they should enter Sunlight");
+    } else if matches!(command, "status.repository" | "inspect.repository")
+        && summary.worktree_state == "unavailable"
+    {
+        outputln!(ctx, "warning[worktree_scan_unavailable]: call sun compat diff --worktree for exact scan diagnostics");
     }
     if summary.recovery_rollback_evidence {
         outputln!(ctx, "warning[state_recovery_rolled_back]: inspect .sunlight/local/recovery/native-state before the next successful state publication cleans the evidence");
@@ -9277,7 +10131,7 @@ fn real_status_envelope(
         })
         .unwrap_or_default();
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"automatic_secret_detection\":false,\"legacy_quarantine_excluded_count\":{},\"ignore_policy\":{{\"gitignore\":\"git_semantics\",\"sunignore\":\".sunignore\",\"sunignore_owner\":\"human_worktree\",\"sunignore_change_command\":\"sun init\",\"intrinsic\":[\".git/\",\".sunlight/\"]}}}},\"topic\":{},\"handoff\":{},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"automatic_secret_detection\":false,\"legacy_quarantine_excluded_count\":{},\"ignore_policy\":{{\"gitignore\":\"git_semantics\",\"sunignore\":\".sunignore\",\"sunignore_owner\":\"human_worktree\",\"sunignore_change_command\":\"sun init\",\"intrinsic\":[\".git/\",\".sunlight/\"]}},\"worktree\":{}}},\"topic\":{},\"handoff\":{},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
         command,
         json_escape(&state.repository_id),
         json_escape(&state.repository_id),
@@ -9289,6 +10143,7 @@ fn real_status_envelope(
         json_escape(&state.tree_hash),
         json_escape(&state.base_checkpoint_id),
         state.quarantine.len(),
+        real_worktree_status_json(state, summary),
         topic_json,
         handoff_json,
         optional_string_json(session_id),
@@ -9297,6 +10152,34 @@ fn real_status_envelope(
         session_context,
         summary_extension,
         warnings,
+    )
+}
+
+fn real_worktree_status_json(state: &RealRepoState, summary: &RealOperationalSummary) -> String {
+    let next_action = match summary.worktree_state.as_str() {
+        "dirty" => optional_string_json(Some(
+            "Call worktree_diff, then worktree_capture if these edits should enter Sunlight.",
+        )),
+        "unavailable" => optional_string_json(Some(
+            "Call worktree_diff to inspect the scan failure before changing native state.",
+        )),
+        _ => "null".to_string(),
+    };
+    let candidate_counts = summary
+        .worktree_candidate_counts
+        .iter()
+        .map(|(kind, count)| format!("\"{}\":{}", json_escape(kind), count))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"state\":\"{}\",\"anchor\":{},\"candidate_count\":{},\"candidate_counts\":{{{}}},\"worktree_diff_id\":{},\"scan_error\":{},\"next_action\":{}}}",
+        json_escape(&summary.worktree_state),
+        real_worktree_anchor_summary_json(&state.worktree_anchor),
+        summary.worktree_candidate_count,
+        candidate_counts,
+        optional_string_json(summary.worktree_diff_id.as_deref()),
+        optional_string_json(summary.worktree_scan_error.as_deref()),
+        next_action,
     )
 }
 
@@ -9356,8 +10239,12 @@ fn real_inspect_envelope(
             .filter(|operation| operation.compat_projection_id.is_some())
             .map(real_compat_provenance_json)
             .unwrap_or_else(|| "null".to_string());
+        let worktree_provenance = latest_operation
+            .filter(|operation| !operation.worktree_candidate_delta_ids.is_empty())
+            .map(real_worktree_provenance_json)
+            .unwrap_or_else(|| "null".to_string());
         return Ok(format!(
-            "{{\"ok\":true,\"data\":{{\"command\":\"inspect.artifact\",\"repository_id\":\"{}\",\"ids\":{{\"artifact_id\":\"{}\"}},\"view\":{},\"artifact\":{},\"path_history\":{},\"latest_operation_id\":{},\"compat_import_provenance\":{}}},\"warnings\":[]}}",
+            "{{\"ok\":true,\"data\":{{\"command\":\"inspect.artifact\",\"repository_id\":\"{}\",\"ids\":{{\"artifact_id\":\"{}\"}},\"view\":{},\"artifact\":{},\"path_history\":{},\"latest_operation_id\":{},\"compat_import_provenance\":{},\"worktree_capture_provenance\":{}}},\"warnings\":[]}}",
             json_escape(&state.repository_id),
             json_escape(&entry.artifact_id),
             view_resolve_view_json(&resolved.result),
@@ -9367,6 +10254,7 @@ fn real_inspect_envelope(
                 latest_operation.map(|operation| operation.operation_transaction_id.as_str())
             ),
             compat_provenance,
+            worktree_provenance,
         ));
     }
     if selector == format!("repository:{}", state.repository_id) || selector == "repository" {
@@ -9739,7 +10627,8 @@ struct CompatProjectOptions {
 #[derive(Debug)]
 struct CompatDiffOptions {
     fixture: Option<String>,
-    projection_id: String,
+    projection_id: Option<String>,
+    worktree: bool,
 }
 
 #[derive(Debug)]
@@ -9748,6 +10637,15 @@ struct CompatImportOptions {
     projection_id: String,
     session_generation_id: Option<String>,
     candidate_delta_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+struct WorktreeCaptureOptions {
+    topic_slug: String,
+    actor_id: String,
+    anchor_generation: Option<u64>,
+    candidate_delta_ids: Vec<String>,
+    paths: Vec<String>,
 }
 
 fn parse_compat_project_options(ctx: &CommandContext) -> Result<CompatProjectOptions, CliError> {
@@ -9798,6 +10696,7 @@ fn parse_compat_project_options(ctx: &CommandContext) -> Result<CompatProjectOpt
 fn parse_compat_diff_options(ctx: &CommandContext) -> Result<CompatDiffOptions, CliError> {
     let mut fixture = None;
     let mut projection_id = None;
+    let mut worktree = false;
     let mut args = ctx.args.iter().skip(2);
 
     while let Some(arg) = args.next() {
@@ -9814,6 +10713,7 @@ fn parse_compat_diff_options(ctx: &CommandContext) -> Result<CompatDiffOptions, 
                 })?;
                 projection_id = Some(value.clone());
             }
+            "--worktree" => worktree = true,
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
                     "unknown flag `{flag}` for sun compat diff"
@@ -9827,12 +10727,107 @@ fn parse_compat_diff_options(ctx: &CommandContext) -> Result<CompatDiffOptions, 
         }
     }
 
-    let usage = "usage: sun compat diff --projection <projection-id> [--fixture basic-app]";
-    let projection_id = projection_id.ok_or_else(|| invalid_request(usage))?;
+    let usage =
+        "usage: sun compat diff (--projection <projection-id> [--fixture basic-app] | --worktree)";
+    if worktree == projection_id.is_some() || (worktree && fixture.is_some()) {
+        return Err(invalid_request(usage));
+    }
 
     Ok(CompatDiffOptions {
         fixture,
         projection_id,
+        worktree,
+    })
+}
+
+fn parse_worktree_capture_options(
+    ctx: &CommandContext,
+) -> Result<WorktreeCaptureOptions, CliError> {
+    let mut worktree = false;
+    let mut topic_slug = None;
+    let mut actor_id = None;
+    let mut anchor_generation = None;
+    let mut candidate_delta_ids = Vec::new();
+    let mut paths = Vec::new();
+    let mut args = ctx.args.iter().skip(2);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--worktree" => worktree = true,
+            "--topic" => {
+                topic_slug = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request("sun compat capture requires --topic <slug>")
+                        })?
+                        .clone(),
+                );
+            }
+            "--actor" => {
+                actor_id = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request("sun compat capture requires --actor <actor-id>")
+                        })?
+                        .clone(),
+                );
+            }
+            "--anchor-generation" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "sun compat capture --anchor-generation requires a positive integer",
+                    )
+                })?;
+                anchor_generation = Some(value.parse::<u64>().map_err(|_| {
+                    invalid_request("worktree anchor generation must be a positive integer")
+                })?);
+            }
+            "--candidate" => {
+                candidate_delta_ids.push(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request(
+                                "sun compat capture --candidate requires a candidate ID",
+                            )
+                        })?
+                        .clone(),
+                );
+            }
+            "--path" => {
+                paths.push(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request("sun compat capture --path requires a repository path")
+                        })?
+                        .clone(),
+                );
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun compat capture"
+                )));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected compat capture argument `{value}`"
+                )));
+            }
+        }
+    }
+    let usage = "usage: sun compat capture --worktree --topic <slug> --actor <actor-id> [--anchor-generation <number>] [--candidate <candidate-id> ... | --path <path> ...]";
+    if !worktree || topic_slug.is_none() || actor_id.is_none() || anchor_generation == Some(0) {
+        return Err(invalid_request(usage));
+    }
+    if !candidate_delta_ids.is_empty() && !paths.is_empty() {
+        return Err(invalid_request(
+            "select worktree changes with candidate IDs or paths, not both",
+        ));
+    }
+    Ok(WorktreeCaptureOptions {
+        topic_slug: topic_slug.expect("validated topic"),
+        actor_id: actor_id.expect("validated actor"),
+        anchor_generation,
+        candidate_delta_ids,
+        paths,
     })
 }
 
@@ -14200,6 +15195,30 @@ fn compat_import_error(error: CompatImportValidationError) -> CliError {
     ))
 }
 
+fn worktree_capture_error(error: CompatImportValidationError) -> CliError {
+    let code = match error.code {
+        CompatImportErrorCode::NoSelectedChanges => "worktree_no_selected_changes",
+        CompatImportErrorCode::DiffFailed => "worktree_diff_failed",
+        CompatImportErrorCode::SecretDetected => "worktree_secret_detected",
+        CompatImportErrorCode::CacheBlocked => "worktree_candidate_blocked",
+        CompatImportErrorCode::PathPolicyFailed => "worktree_path_policy_failed",
+        CompatImportErrorCode::PreconditionFailed => "worktree_capture_precondition_failed",
+        CompatImportErrorCode::ConflictedDelta => "worktree_candidate_conflicted",
+        CompatImportErrorCode::AmbiguousRename => "worktree_rename_ambiguous",
+        CompatImportErrorCode::PolicyFailed => "worktree_candidate_policy_failed",
+        CompatImportErrorCode::PartialWriteBlocked => "worktree_partial_capture_blocked",
+        CompatImportErrorCode::ProjectionNotFound
+        | CompatImportErrorCode::ProjectionInvalid
+        | CompatImportErrorCode::ProjectionStale
+        | CompatImportErrorCode::ProjectionIntegrityFailed => "worktree_anchor_invalid",
+    };
+    CliError::new(code, error.message).with_raw_details_json(format!(
+        "{{\"worktree_anchor_id\":\"{}\",\"candidate_delta_ids\":{},\"native_operation_ids\":[],\"native_revision_ids\":[]}}",
+        json_escape(&error.projection_id),
+        string_array_json(error.candidate_delta_ids.iter().map(String::as_str)),
+    ))
+}
+
 fn init_success_envelope(
     repository_id: &str,
     repo_root: &str,
@@ -15373,13 +16392,16 @@ fn compat_path_policy_result_json(candidate: &CompatCandidateDelta) -> String {
 }
 
 fn is_safe_default_compat_candidate(candidate: &CompatCandidateDelta) -> bool {
-    matches!(
+    (matches!(
         candidate.kind,
         CompatCandidateKind::ModifiedSource
             | CompatCandidateKind::CreatedSource
             | CompatCandidateKind::DeletedSource
             | CompatCandidateKind::MetadataChanged
-    ) && candidate.classification == "source"
+    ) || (candidate.kind == CompatCandidateKind::MovedOrRenamed
+        && candidate.source_path.is_some()
+        && candidate.before_hash == candidate.after_hash))
+        && candidate.classification == "source"
         && candidate.path_policy_result.allowed
         && candidate.quarantine_ref.is_none()
 }
@@ -18847,6 +19869,28 @@ fn next_action_for_error_code(code: &str) -> &'static str {
         "compat_projection_stale" => {
             "Create a fresh compatibility projection from the returned session's current generation, reapply the remaining filesystem change to that projection, call compat_diff, then import the selected candidates with the re-echoed session_generation_id."
         }
+        "worktree_anchor_stale"
+        | "worktree_changed_during_capture"
+        | "worktree_capture_precondition_failed" => {
+            "Call worktree_diff again, reconsider the exact current candidates and anchor generation, then retry deliberately."
+        }
+        "worktree_candidate_not_found"
+        | "worktree_no_eligible_changes"
+        | "worktree_no_selected_changes" => {
+            "Call worktree_diff, inspect the returned classifications and exact candidate IDs or paths, then select only the intended eligible changes."
+        }
+        "worktree_candidate_blocked"
+        | "worktree_path_policy_failed"
+        | "worktree_secret_detected"
+        | "worktree_candidate_conflicted"
+        | "worktree_rename_ambiguous"
+        | "worktree_candidate_policy_failed"
+        | "worktree_partial_capture_blocked" => {
+            "Inspect worktree_diff candidate facts, correct or exclude the blocked worktree change, then retry with an exact safe selection."
+        }
+        "worktree_anchor_invalid" | "worktree_diff_failed" => {
+            "Inspect repository_status and the reported worktree path or anchor facts; correct the unsafe filesystem condition before retrying worktree_diff."
+        }
         "checkpoint_stale_view" | "resolver_frontier_input_lost" | "persisted_view_mismatch" => {
             "Inspect the returned staleness or frontier facts, reselect exact completed revisions, and create a fresh resolved view before retrying."
         }
@@ -18966,6 +20010,8 @@ Usage:
   sun compat project --session <session> [--json]
   sun compat diff --projection <projection> [--json]
   sun compat import --projection <projection> --candidate <candidate> --session-generation <generation> [--json]
+  sun compat diff --worktree [--json]
+  sun compat capture --worktree --topic <slug> --actor <actor> [--candidate <candidate>...|--path <path>...] [--json]
   sun run --view <view> [runtime policy options] -- <command> [args...]
   sun execution promote-output <execution> --path <path> --session <session> --classification source_like_delta|generated_artifact [--json]
   sun checkpoint create --view <view> [--execution <execution>] [--json]
@@ -18988,7 +20034,7 @@ Commands:
              Author native operations with explicit preconditions
   view       Resolve persisted topic heads into an exact view or conflicts
   project    Materialize a managed tool projection; it is not source truth
-  compat     Project, review, and explicitly import compatibility edits
+  compat     Review and adopt compatibility-projection or direct worktree edits
   run        Execute a command against an exact persisted view
   execution  Promote approved execution outputs into native operations
   checkpoint Freeze a resolved view for validation and export
@@ -19027,7 +20073,7 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
     match command {
         "agent" | "agent install" => outputln!(ctx, "sun agent install\n\nUsage:\n  sun agent install --client generic|codex|cursor [--force] [--repo <path>] [--json]\n\nInstalls the portable Sunlight Agent Skill. Codex and Cursor also receive a repository-bound local MCP entry. Generic installs the skill only; configure a client transport for sun mcp serve separately. Existing unrelated client configuration is preserved."),
         "agent doctor" => outputln!(ctx, "sun agent doctor\n\nUsage:\n  sun agent doctor --client generic|codex|cursor [--repo <path>] [--json]\n\nVerifies the portable skill and, for Codex or Cursor, the selected client MCP entry. Generic doctor does not inspect client transport or live tool visibility. Setup is complete when repository_status and artifact tools are visible in the client."),
-        "status" => outputln!(ctx, "sun status\n\nUsage:\n  sun status [--json]\n  sun status --topic <topic> [--json]\n  sun status --session <session> [--json]\n  sun status --view <view> [--json]\n  sun status --projection <projection> [--json]\n  sun status --execution <execution> [--json]\n  sun status --checkpoint <checkpoint> [--json]\n  sun status --export <export-map> [--json]\n\nRepository status is derived from persisted Sunlight state, not git status or the main working tree."),
+        "status" => outputln!(ctx, "sun status\n\nUsage:\n  sun status [--json]\n  sun status --topic <topic> [--json]\n  sun status --session <session> [--json]\n  sun status --view <view> [--json]\n  sun status --projection <projection> [--json]\n  sun status --execution <execution> [--json]\n  sun status --checkpoint <checkpoint> [--json]\n  sun status --export <export-map> [--json]\n\nRepository status reports native state plus direct worktree differences relative to Sunlight's durable anchor. Git state remains a separate diagnostic."),
         "inspect" => outputln!(ctx, "sun inspect\n\nUsage:\n  sun inspect repository [--json]\n  sun inspect topic:<topic>|session:<session>|view:<view> [--json]\n  sun inspect artifact:<path>|operation:<id>|conflict:<id> [--json]\n  sun inspect projection:<id>|execution:<id>|checkpoint:<id>|export:<id> [--json]"),
         "topic" => outputln!(ctx, "sun topic\n\nUsage:\n  sun topic create <slug> --display-name <name> [options] [--json]\n  sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]"),
         "topic create" => outputln!(ctx, "sun topic create\n\nUsage:\n  sun topic create <slug> --display-name <name> [--owner <actor>] [--visibility local|private] [--acceptance-criterion <text>...] [--json]\n\nCreates a durable topic in the initialized repository. Defaults: owner=local, visibility=local."),
@@ -19035,7 +20081,7 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
         "session" => outputln!(ctx, "sun session\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]\n  sun session refresh <session> --policy manual|follow|none [--json]"),
         "session start" => outputln!(ctx, "sun session start\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]\n\nThe exact view may be the repository base, current head, or a persisted checkpoint view."),
         "session refresh" => outputln!(ctx, "sun session refresh\n\nUsage:\n  sun session refresh <session> --policy manual|follow|none [--json]\n\nmanual and follow immediately advance already-selected non-write topics to current heads; none pins them. The write topic always remains at the session revision. An unchanged policy/frontier is an idempotent no-op."),
-        "compat" | "compat project" | "compat diff" | "compat import" => outputln!(ctx, "sun compat\n\nUsage:\n  sun compat project --session <session> [--json]\n  sun compat diff --projection <projection> [--json]\n  sun compat import --projection <projection> --candidate <candidate> --session-generation <generation> [--json]\n\nCompatibility projections are adapters. compat diff returns the baseline session generation required for explicit native import."),
+        "compat" | "compat project" | "compat diff" | "compat import" | "compat capture" => outputln!(ctx, "sun compat\n\nUsage:\n  sun compat project --session <session> [--json]\n  sun compat diff --projection <projection> [--json]\n  sun compat import --projection <projection> --candidate <candidate> --session-generation <generation> [--json]\n  sun compat diff --worktree [--json]\n  sun compat capture --worktree --topic <slug> --actor <actor> [--anchor-generation <number>] [--candidate <candidate>...|--path <path>...] [--json]\n\nProjection imports enter an existing session. Direct worktree capture creates one completed topic and advances the durable worktree anchor without rewriting repository files."),
         "policy" | "policy check-export" | "policy check-commit" | "policy explain" => outputln!(ctx, "sun policy\n\nUsage:\n  sun policy check-export --checkpoint <checkpoint> --branch <ref> [--json]\n  sun policy check-commit [--paths <.sunlight/path>...] [--json]\n  sun policy explain <validation-report> [--json]\n\ncheck-commit validates only Sunlight metadata or, with no paths, the managed .gitignore block. It returns an inline report. Source-artifact safety uses a checkpoint plus check-export; that persisted export report can be passed to policy explain."),
         "git" | "git export" => outputln!(ctx, "sun git export\n\nUsage:\n  sun git export --checkpoint <checkpoint> --branch <ref> [--write-plan|--execute-local] [--repo <path>] [--json]"),
         "checkpoint" | "checkpoint create" => outputln!(ctx, "sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--execution <passing-execution-id>] [--json]\n\nWhen supplied, execution evidence must pass and exactly match the resolved view and tree."),

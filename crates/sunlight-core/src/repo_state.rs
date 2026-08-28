@@ -65,6 +65,8 @@ const DERIVED_RECORD_NAMESPACES: &[&str] = &[
     "session-generations",
     "topics",
     "views",
+    "worktree-anchors",
+    "worktree-captures",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +84,7 @@ pub struct RealRepoState {
     pub resolved_view_id: String,
     pub tree_hash: String,
     pub current_topic_frontier: BTreeMap<String, String>,
+    pub worktree_anchor: RealWorktreeAnchor,
     pub topic_id: Option<String>,
     pub topic_slug: Option<String>,
     pub topic_display_name: Option<String>,
@@ -102,6 +105,25 @@ pub struct RealRepoState {
     pub export_maps: Vec<RealExportMapSnapshot>,
     pub entries: Vec<RealArtifactEntry>,
     pub quarantine: Vec<RealQuarantineEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealWorktreeAnchor {
+    pub generation: u64,
+    pub base_checkpoint_ids: Vec<String>,
+    pub resolved_view_id: String,
+    pub tree_hash: String,
+    pub topic_frontier: BTreeMap<String, String>,
+    pub manifest_digest: String,
+    pub path_policy_id: String,
+    pub operation_semantics_version: String,
+    pub sunignore_policy_hash: Option<String>,
+}
+
+impl RealWorktreeAnchor {
+    pub fn id(&self) -> String {
+        format!("worktree_anchor_{:04}", self.generation)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +251,11 @@ pub struct RealOperationRecord {
     pub bytes: Vec<u8>,
     pub compat_projection_id: Option<String>,
     pub compat_candidate_delta_ids: Vec<String>,
+    pub worktree_candidate_delta_ids: Vec<String>,
+    pub worktree_anchor_generation: Option<u64>,
+    pub worktree_anchor_resolved_view_id: Option<String>,
+    pub worktree_anchor_tree_hash: Option<String>,
+    pub worktree_anchor_manifest_digest: Option<String>,
     pub effects: Vec<RealOperationEffect>,
 }
 
@@ -614,14 +641,38 @@ impl RealRepoState {
         scan_real_repo_files(repo_root, repo_root, &mut entries)?;
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         let tree_hash = real_tree_hash(&entries);
+        let base_checkpoint_id = "checkpoint_base_0001".to_string();
+        let base_resolved_view_id = "view_base_0001".to_string();
+        let topic_frontier = BTreeMap::new();
+        let worktree_anchor = RealWorktreeAnchor {
+            generation: 1,
+            base_checkpoint_ids: vec![base_checkpoint_id.clone()],
+            resolved_view_id: base_resolved_view_id.clone(),
+            tree_hash: tree_hash.clone(),
+            topic_frontier: topic_frontier.clone(),
+            manifest_digest: real_worktree_manifest_digest(
+                repository_id,
+                &base_resolved_view_id,
+                &tree_hash,
+                &topic_frontier,
+                &entries,
+            ),
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            sunignore_policy_hash: entries
+                .iter()
+                .find(|entry| !entry.tombstone && entry.path == ".sunignore")
+                .map(|entry| entry.content_hash.clone()),
+        };
         let state = Self {
             publication_sequence: 0,
             repository_id: repository_id.to_string(),
-            base_checkpoint_id: "checkpoint_base_0001".to_string(),
-            base_resolved_view_id: "view_base_0001".to_string(),
-            resolved_view_id: "view_base_0001".to_string(),
+            base_checkpoint_id,
+            base_resolved_view_id: base_resolved_view_id.clone(),
+            resolved_view_id: base_resolved_view_id,
             tree_hash,
-            current_topic_frontier: BTreeMap::new(),
+            current_topic_frontier: topic_frontier,
+            worktree_anchor,
             topic_id: None,
             topic_slug: None,
             topic_display_name: None,
@@ -823,6 +874,37 @@ impl RealRepoState {
             .iter()
             .map(|export_map| parse_export_map_snapshot(export_map, &path))
             .collect::<Result<Vec<_>, _>>()?;
+        let worktree_anchor = match object.get("worktree_anchor") {
+            Some(value) => parse_worktree_anchor(value, &path)?,
+            None => {
+                let repository_id = required_string(&object, "repository_id", &path)?;
+                let base_checkpoint_id = required_string(&object, "base_checkpoint_id", &path)?;
+                let base_resolved_view_id =
+                    required_string(&object, "base_resolved_view_id", &path)?;
+                let tree_hash = real_tree_hash(&base_entries);
+                let topic_frontier = BTreeMap::new();
+                RealWorktreeAnchor {
+                    generation: 1,
+                    base_checkpoint_ids: vec![base_checkpoint_id],
+                    resolved_view_id: base_resolved_view_id.clone(),
+                    tree_hash: tree_hash.clone(),
+                    topic_frontier: topic_frontier.clone(),
+                    manifest_digest: real_worktree_manifest_digest(
+                        &repository_id,
+                        &base_resolved_view_id,
+                        &tree_hash,
+                        &topic_frontier,
+                        &base_entries,
+                    ),
+                    path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+                    operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+                    sunignore_policy_hash: base_entries
+                        .iter()
+                        .find(|entry| !entry.tombstone && entry.path == ".sunignore")
+                        .map(|entry| entry.content_hash.clone()),
+                }
+            }
+        };
 
         if topics.is_empty() {
             if let Some(legacy_topic_id) = topic_id.clone() {
@@ -930,6 +1012,7 @@ impl RealRepoState {
             resolved_view_id: required_string(&object, "resolved_view_id", &path)?,
             tree_hash: required_string(&object, "tree_hash", &path)?,
             current_topic_frontier,
+            worktree_anchor,
             topic_id,
             topic_slug,
             topic_display_name,
@@ -1003,6 +1086,12 @@ impl RealRepoState {
                 state.entries = resolved.entries;
             }
         }
+        state.resolve_worktree_anchor_view().map_err(|_| {
+            invalid_state(
+                &path,
+                "worktree anchor does not reproduce its exact persisted view, tree, and manifest",
+            )
+        })?;
         if load_blob_bytes {
             state.hydrate_compact_snapshot_entries(&path)?;
         }
@@ -1319,6 +1408,10 @@ impl RealRepoState {
             "current_topic_frontier".to_string(),
             string_map_json(&self.current_topic_frontier),
         );
+        object.insert(
+            "worktree_anchor".to_string(),
+            worktree_anchor_json(&self.worktree_anchor),
+        );
         object.insert("entries_compact".to_string(), JsonValue::Bool(true));
         object.insert("topic_id".to_string(), optional_json(&self.topic_id));
         object.insert("topic_slug".to_string(), optional_json(&self.topic_slug));
@@ -1507,6 +1600,112 @@ impl RealRepoState {
 
     pub fn resolve_view(&self, frontier: Vec<TopicRevisionSelection>) -> RealResolvedRepoView {
         resolve_real_repo_view(self, frontier)
+    }
+
+    pub fn resolve_worktree_anchor_view(&self) -> Result<RealResolvedRepoView, RepoStateError> {
+        let anchor = &self.worktree_anchor;
+        if anchor.path_policy_id != POSIX_CASE_SENSITIVE_PATH_POLICY_ID
+            || anchor.operation_semantics_version != FILE_OPERATION_SEMANTICS_VERSION
+        {
+            return Err(invalid_state(
+                &real_state_path(Path::new(".")),
+                "worktree anchor uses unsupported path-policy or operation-semantics versions",
+            ));
+        }
+        let expected_sunignore_hash = self
+            .base_entries
+            .iter()
+            .find(|entry| !entry.tombstone && entry.path == ".sunignore")
+            .map(|entry| entry.content_hash.clone());
+        if anchor.sunignore_policy_hash != expected_sunignore_hash {
+            return Err(invalid_state(
+                &real_state_path(Path::new(".")),
+                "worktree anchor does not match the persisted .sunignore policy",
+            ));
+        }
+        let mut resolved = self.resolve_view(
+            anchor
+                .topic_frontier
+                .iter()
+                .map(|(topic_id, revision_id)| TopicRevisionSelection {
+                    topic_id: topic_id.clone(),
+                    revision_id: revision_id.clone(),
+                })
+                .collect(),
+        );
+        if anchor.topic_frontier.is_empty() && anchor.resolved_view_id == self.base_resolved_view_id
+        {
+            resolved.result.resolved_view_id = self.base_resolved_view_id.clone();
+        }
+        let actual_tree = resolved
+            .result
+            .tree_identity
+            .as_ref()
+            .map(|tree| tree.tree_hash.as_str());
+        let actual_manifest = real_worktree_manifest_digest(
+            &self.repository_id,
+            &resolved.result.resolved_view_id,
+            actual_tree.unwrap_or(""),
+            &resolved.result.topic_frontier,
+            &resolved.entries,
+        );
+        if !resolved.result.conflict_free()
+            || resolved.result.resolved_view_id != anchor.resolved_view_id
+            || actual_tree != Some(anchor.tree_hash.as_str())
+            || resolved.result.topic_frontier != anchor.topic_frontier
+            || actual_manifest != anchor.manifest_digest
+        {
+            return Err(invalid_state(
+                &real_state_path(Path::new(".")),
+                "worktree anchor does not reproduce its exact persisted view, tree, and manifest",
+            ));
+        }
+        Ok(resolved)
+    }
+
+    pub fn advance_worktree_anchor(
+        &mut self,
+        resolved: &RealResolvedRepoView,
+    ) -> Result<(), RepoStateError> {
+        let tree_hash = resolved
+            .result
+            .tree_identity
+            .as_ref()
+            .map(|tree| tree.tree_hash.clone())
+            .ok_or_else(|| {
+                invalid_state(
+                    &real_state_path(Path::new(".")),
+                    "cannot advance the worktree anchor to a conflicted view",
+                )
+            })?;
+        let generation = self
+            .worktree_anchor
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| {
+                invalid_state(
+                    &real_state_path(Path::new(".")),
+                    "worktree anchor generation overflow",
+                )
+            })?;
+        self.worktree_anchor = RealWorktreeAnchor {
+            generation,
+            base_checkpoint_ids: vec![self.base_checkpoint_id.clone()],
+            resolved_view_id: resolved.result.resolved_view_id.clone(),
+            tree_hash: tree_hash.clone(),
+            topic_frontier: resolved.result.topic_frontier.clone(),
+            manifest_digest: real_worktree_manifest_digest(
+                &self.repository_id,
+                &resolved.result.resolved_view_id,
+                &tree_hash,
+                &resolved.result.topic_frontier,
+                &resolved.entries,
+            ),
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            sunignore_policy_hash: self.worktree_anchor.sunignore_policy_hash.clone(),
+        };
+        Ok(())
     }
 }
 
@@ -1851,6 +2050,34 @@ pub fn scan_real_repo_files(
 ) -> Result<(), RepoStateError> {
     let mut quarantine = Vec::new();
     scan_real_repo_files_with_quarantine(repo_root, current, entries, &mut quarantine)
+}
+
+pub fn scan_real_worktree_files(
+    repo_root: &Path,
+    baseline: &[RealArtifactEntry],
+) -> Result<Vec<RealArtifactEntry>, RepoStateError> {
+    let mut entries = Vec::new();
+    scan_real_repo_files(repo_root, repo_root, &mut entries)?;
+    let mut by_path = entries
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    for baseline_entry in baseline.iter().filter(|entry| !entry.tombstone) {
+        if by_path.contains_key(&baseline_entry.path) {
+            continue;
+        }
+        let mut anchored_path = Vec::new();
+        ingest_real_repo_path(
+            repo_root,
+            &baseline_entry.path,
+            &mut anchored_path,
+            &mut Vec::new(),
+        )?;
+        if let Some(entry) = anchored_path.pop() {
+            by_path.insert(entry.path.clone(), entry);
+        }
+    }
+    Ok(by_path.into_values().collect())
 }
 
 pub fn scan_real_repo_files_with_quarantine(
@@ -3561,6 +3788,48 @@ pub fn real_tree_hash(entries: &[RealArtifactEntry]) -> String {
     format!("tree_{:x}", hasher.finalize())
 }
 
+pub fn real_worktree_manifest_digest(
+    repository_id: &str,
+    resolved_view_id: &str,
+    tree_hash: &str,
+    topic_frontier: &BTreeMap<String, String>,
+    entries: &[RealArtifactEntry],
+) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        repository_id,
+        resolved_view_id,
+        tree_hash,
+        POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
+        FILE_OPERATION_SEMANTICS_VERSION,
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    for (topic_id, revision_id) in topic_frontier {
+        hasher.update(topic_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(revision_id.as_bytes());
+        hasher.update([0]);
+    }
+    let mut visible = entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .collect::<Vec<_>>();
+    visible.sort_by(|left, right| left.path.cmp(&right.path));
+    for entry in visible {
+        hasher.update(entry.path.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.artifact_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.content_hash.as_bytes());
+        hasher.update([u8::from(entry.executable)]);
+        hasher.update(entry.classification.as_bytes());
+        hasher.update([0]);
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 pub fn real_artifact_id_for_path(path: &str) -> String {
     format!("artifact_{}", path.replace(['/', '.', '-'], "_"))
 }
@@ -5041,6 +5310,56 @@ fn parse_entry(
     })
 }
 
+fn parse_worktree_anchor(
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealWorktreeAnchor, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(
+            state_path,
+            "worktree_anchor must be a JSON object",
+        ));
+    };
+    let base_checkpoint_ids = required_array(object, "base_checkpoint_ids", state_path)?
+        .iter()
+        .map(|value| match value {
+            JsonValue::String(checkpoint_id) => Ok(checkpoint_id.clone()),
+            _ => Err(invalid_state(
+                state_path,
+                "worktree_anchor base_checkpoint_ids must be strings",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if base_checkpoint_ids.is_empty() {
+        return Err(invalid_state(
+            state_path,
+            "worktree_anchor must contain at least one base checkpoint",
+        ));
+    }
+    let generation = required_u64(object, "generation", state_path)?;
+    if generation == 0 {
+        return Err(invalid_state(
+            state_path,
+            "worktree_anchor generation must be positive",
+        ));
+    }
+    Ok(RealWorktreeAnchor {
+        generation,
+        base_checkpoint_ids,
+        resolved_view_id: required_string(object, "resolved_view_id", state_path)?,
+        tree_hash: required_string(object, "tree_hash", state_path)?,
+        topic_frontier: parse_string_map(object, "topic_frontier", state_path)?,
+        manifest_digest: required_string(object, "manifest_digest", state_path)?,
+        path_policy_id: required_string(object, "path_policy_id", state_path)?,
+        operation_semantics_version: required_string(
+            object,
+            "operation_semantics_version",
+            state_path,
+        )?,
+        sunignore_policy_hash: optional_string(object, "sunignore_policy_hash", state_path)?,
+    })
+}
+
 fn parse_compact_entry(
     repo_root: &Path,
     value: &JsonValue,
@@ -5257,6 +5576,36 @@ fn parse_operation(
             )),
         })
         .collect::<Result<Vec<_>, _>>()?,
+        worktree_candidate_delta_ids: optional_array(
+            object,
+            "worktree_candidate_delta_ids",
+            state_path,
+        )?
+        .iter()
+        .map(|value| match value {
+            JsonValue::String(candidate_id) => Ok(candidate_id.clone()),
+            _ => Err(invalid_state(
+                state_path,
+                "operation worktree_candidate_delta_ids must be strings",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?,
+        worktree_anchor_generation: optional_u64(object, "worktree_anchor_generation", state_path)?,
+        worktree_anchor_resolved_view_id: optional_string(
+            object,
+            "worktree_anchor_resolved_view_id",
+            state_path,
+        )?,
+        worktree_anchor_tree_hash: optional_string(
+            object,
+            "worktree_anchor_tree_hash",
+            state_path,
+        )?,
+        worktree_anchor_manifest_digest: optional_string(
+            object,
+            "worktree_anchor_manifest_digest",
+            state_path,
+        )?,
         effects,
     })
 }
@@ -5795,6 +6144,55 @@ fn compact_entry_json(entry: &RealArtifactEntry) -> JsonValue {
         JsonValue::String(entry.classification.clone()),
         JsonValue::Bool(entry.tombstone),
     ])
+}
+
+fn worktree_anchor_json(anchor: &RealWorktreeAnchor) -> JsonValue {
+    let mut object = BTreeMap::new();
+    object.insert("id".to_string(), JsonValue::String(anchor.id()));
+    object.insert(
+        "generation".to_string(),
+        JsonValue::Number(anchor.generation.to_string()),
+    );
+    object.insert(
+        "base_checkpoint_ids".to_string(),
+        JsonValue::Array(
+            anchor
+                .base_checkpoint_ids
+                .iter()
+                .cloned()
+                .map(JsonValue::String)
+                .collect(),
+        ),
+    );
+    object.insert(
+        "resolved_view_id".to_string(),
+        JsonValue::String(anchor.resolved_view_id.clone()),
+    );
+    object.insert(
+        "tree_hash".to_string(),
+        JsonValue::String(anchor.tree_hash.clone()),
+    );
+    object.insert(
+        "topic_frontier".to_string(),
+        string_map_json(&anchor.topic_frontier),
+    );
+    object.insert(
+        "manifest_digest".to_string(),
+        JsonValue::String(anchor.manifest_digest.clone()),
+    );
+    object.insert(
+        "path_policy_id".to_string(),
+        JsonValue::String(anchor.path_policy_id.clone()),
+    );
+    object.insert(
+        "operation_semantics_version".to_string(),
+        JsonValue::String(anchor.operation_semantics_version.clone()),
+    );
+    object.insert(
+        "sunignore_policy_hash".to_string(),
+        optional_json(&anchor.sunignore_policy_hash),
+    );
+    JsonValue::Object(object)
 }
 
 fn projection_snapshot_json(projection: &RealProjectionSnapshot) -> JsonValue {
@@ -6460,6 +6858,36 @@ fn operation_json(operation: &RealOperationRecord) -> JsonValue {
                 .map(|candidate_id| JsonValue::String(candidate_id.clone()))
                 .collect(),
         ),
+    );
+    object.insert(
+        "worktree_candidate_delta_ids".to_string(),
+        JsonValue::Array(
+            operation
+                .worktree_candidate_delta_ids
+                .iter()
+                .cloned()
+                .map(JsonValue::String)
+                .collect(),
+        ),
+    );
+    object.insert(
+        "worktree_anchor_generation".to_string(),
+        operation
+            .worktree_anchor_generation
+            .map(|value| JsonValue::Number(value.to_string()))
+            .unwrap_or(JsonValue::Null),
+    );
+    object.insert(
+        "worktree_anchor_resolved_view_id".to_string(),
+        optional_json(&operation.worktree_anchor_resolved_view_id),
+    );
+    object.insert(
+        "worktree_anchor_tree_hash".to_string(),
+        optional_json(&operation.worktree_anchor_tree_hash),
+    );
+    object.insert(
+        "worktree_anchor_manifest_digest".to_string(),
+        optional_json(&operation.worktree_anchor_manifest_digest),
     );
     object.insert(
         "effects".to_string(),
@@ -8179,6 +8607,7 @@ mod tests {
             resolved_view_id: "view_base_0001".to_string(),
             tree_hash: real_tree_hash(&entries),
             current_topic_frontier: BTreeMap::new(),
+            worktree_anchor: base_anchor("repo_paths", &entries),
             topic_id: None,
             topic_slug: None,
             topic_display_name: None,
@@ -8226,6 +8655,7 @@ mod tests {
             resolved_view_id: "view_base_0001".to_string(),
             tree_hash: real_tree_hash(&[readme.clone(), lib.clone()]),
             current_topic_frontier: BTreeMap::new(),
+            worktree_anchor: base_anchor("repo_resolve", &[readme.clone(), lib.clone()]),
             topic_id: None,
             topic_slug: None,
             topic_display_name: None,
@@ -8423,6 +8853,28 @@ mod tests {
         }
     }
 
+    fn base_anchor(repository_id: &str, entries: &[RealArtifactEntry]) -> RealWorktreeAnchor {
+        let tree_hash = real_tree_hash(entries);
+        let topic_frontier = BTreeMap::new();
+        RealWorktreeAnchor {
+            generation: 1,
+            base_checkpoint_ids: vec!["checkpoint_base_0001".to_string()],
+            resolved_view_id: "view_base_0001".to_string(),
+            tree_hash: tree_hash.clone(),
+            topic_frontier: topic_frontier.clone(),
+            manifest_digest: real_worktree_manifest_digest(
+                repository_id,
+                "view_base_0001",
+                &tree_hash,
+                &topic_frontier,
+                entries,
+            ),
+            path_policy_id: POSIX_CASE_SENSITIVE_PATH_POLICY_ID.to_string(),
+            operation_semantics_version: FILE_OPERATION_SEMANTICS_VERSION.to_string(),
+            sunignore_policy_hash: None,
+        }
+    }
+
     fn operation(
         operation_id: &str,
         topic_id: &str,
@@ -8448,6 +8900,11 @@ mod tests {
             bytes: after_bytes.to_vec(),
             compat_projection_id: None,
             compat_candidate_delta_ids: Vec::new(),
+            worktree_candidate_delta_ids: Vec::new(),
+            worktree_anchor_generation: None,
+            worktree_anchor_resolved_view_id: None,
+            worktree_anchor_tree_hash: None,
+            worktree_anchor_manifest_digest: None,
             effects: Vec::new(),
         }
     }

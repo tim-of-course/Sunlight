@@ -33,6 +33,8 @@ fn global_and_primary_help_describe_repo_backed_operator_workflow() {
         "sun init",
         "sun topic create <slug> --display-name <name> [--owner <actor>]",
         "sun compat import --projection <projection> --candidate <candidate> --session-generation <generation>",
+        "sun compat diff --worktree",
+        "sun compat capture --worktree --topic <slug> --actor <actor>",
         "sun run --view <view>",
         "sun policy check-export --checkpoint <checkpoint> --branch <ref>",
         "sun git export --checkpoint <checkpoint> --branch <ref>",
@@ -438,6 +440,380 @@ fn no_fixture_repository_status_clean_initial_and_active_human_journey() {
 }
 
 #[test]
+fn no_fixture_worktree_capture_adopts_external_changes_once_with_exact_provenance() {
+    let repo = TestRepo::new("direct-worktree-capture");
+    init_local_git_repo(&repo);
+    repo.write_file("rename-source.txt", "rename me\n");
+    repo.write_file("delete-me.txt", "delete me\n");
+    repo.write_file("metadata.txt", "metadata\n");
+    repo.write_file(".gitignore", "ignored.tmp\n");
+    repo.write_file(".sunignore", "private/**\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "add capture fixtures"]);
+    assert_success(&run_real_json(&repo, &["init"]));
+
+    repo.write_file("base.txt", "changed outside sunlight\n");
+    repo.write_file("added.txt", "added outside sunlight\n");
+    repo.write_file("ignored.tmp", "ignored by Git\n");
+    write_nested_file(repo.path(), "private/hidden.txt", "hidden by Sunlight\n");
+    fs::remove_file(repo.path().join("delete-me.txt")).unwrap();
+    fs::rename(
+        repo.path().join("rename-source.txt"),
+        repo.path().join("renamed.txt"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(repo.path().join("metadata.txt"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(repo.path().join("metadata.txt"), permissions).unwrap();
+    }
+
+    let status = run_real_json(&repo, &["status"]);
+    assert_success(&status);
+    let status: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(status["data"]["repository"]["worktree"]["state"], "dirty");
+    assert_eq!(
+        status["data"]["repository"]["worktree"]["anchor"]["generation"],
+        1
+    );
+
+    let diff = run_real_json(&repo, &["compat", "diff", "--worktree"]);
+    assert_success(&diff);
+    let diff: serde_json::Value = serde_json::from_str(&stdout(&diff)).unwrap();
+    let candidates = diff["data"]["candidates"].as_array().unwrap();
+    let expected_count = if cfg!(unix) { 5 } else { 4 };
+    assert_eq!(candidates.len(), expected_count);
+    assert!(!candidates.iter().any(|candidate| {
+        matches!(
+            candidate["path"].as_str(),
+            Some("ignored.tmp" | "private/hidden.txt")
+        )
+    }));
+    for operation_kind in ["patch", "write", "delete", "move"] {
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate["operation_kind"] == operation_kind));
+    }
+    #[cfg(unix)]
+    assert!(candidates
+        .iter()
+        .any(|candidate| candidate["operation_kind"] == "metadata"));
+
+    let before_capture = run_real_json(&repo, &["read", "base.txt", "--view", "view_base_0001"]);
+    assert_success(&before_capture);
+    assert!(stdout(&before_capture).contains("base\\n"));
+    assert!(!stdout(&before_capture).contains("changed outside sunlight"));
+
+    let capture = run_real_json(
+        &repo,
+        &[
+            "compat",
+            "capture",
+            "--worktree",
+            "--topic",
+            "external-batch",
+            "--actor",
+            "editor-agent",
+            "--anchor-generation",
+            "1",
+        ],
+    );
+    assert_success(&capture);
+    let capture: serde_json::Value = serde_json::from_str(&stdout(&capture)).unwrap();
+    assert_eq!(capture["data"]["captured"], true);
+    assert_eq!(capture["data"]["selected_delta_count"], expected_count);
+    assert_eq!(capture["data"]["remaining_candidate_count"], 0);
+    assert_eq!(capture["data"]["anchor_before"]["generation"], 1);
+    assert_eq!(capture["data"]["anchor_after"]["generation"], 2);
+    assert_eq!(capture["data"]["topic"]["status"], "completed");
+    assert_eq!(capture["data"]["operation"]["mutation"], "worktree_capture");
+    let captured_view = capture["data"]["ids"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let captured_operation = capture["data"]["ids"]["operation_transaction_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let inspected_operation = run_real_json(
+        &repo,
+        &["inspect", &format!("operation:{captured_operation}")],
+    );
+    assert_success(&inspected_operation);
+    let inspected_operation: serde_json::Value =
+        serde_json::from_str(&stdout(&inspected_operation)).unwrap();
+    assert_eq!(
+        inspected_operation["data"]["operation"]["worktree_capture_provenance"]
+            ["anchor_generation"],
+        1
+    );
+    assert_eq!(
+        inspected_operation["data"]["operation"]["mutation_payload"]
+            ["selected_candidate_delta_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        expected_count
+    );
+
+    let state = RealRepoState::load(repo.path()).unwrap();
+    assert_eq!(state.worktree_anchor.generation, 2);
+    assert_eq!(state.topics.len(), 1);
+    assert_eq!(state.operations.len(), 1);
+    assert_eq!(
+        state.operations[0].worktree_candidate_delta_ids.len(),
+        expected_count
+    );
+    assert_eq!(state.operations[0].worktree_anchor_generation, Some(1));
+    assert!(repo
+        .path()
+        .join(format!(
+            ".sunlight/worktree-captures/{}.json",
+            state.operations[0].operation_transaction_id
+        ))
+        .is_file());
+
+    let captured = run_real_json(
+        &repo,
+        &["read", "base.txt", "--view", captured_view.as_str()],
+    );
+    assert_success(&captured);
+    assert!(stdout(&captured).contains("changed outside sunlight\\n"));
+    assert_eq!(
+        fs::read_to_string(repo.path().join("base.txt")).unwrap(),
+        "changed outside sunlight\n"
+    );
+    assert!(state.entry("rename-source.txt").is_none());
+    assert!(state.entry("renamed.txt").is_some());
+    assert!(state.entry("delete-me.txt").is_none());
+    assert!(state.entry("added.txt").is_some());
+    #[cfg(unix)]
+    assert!(state.entry("metadata.txt").unwrap().executable);
+
+    let noop = run_real_json(
+        &repo,
+        &[
+            "compat",
+            "capture",
+            "--worktree",
+            "--topic",
+            "unused-noop",
+            "--actor",
+            "editor-agent",
+        ],
+    );
+    assert_success(&noop);
+    let noop: serde_json::Value = serde_json::from_str(&stdout(&noop)).unwrap();
+    assert_eq!(noop["data"]["captured"], false);
+    assert_eq!(noop["data"]["reason"], "worktree_clean");
+    let state_after_noop = RealRepoState::load(repo.path()).unwrap();
+    assert_eq!(state_after_noop.worktree_anchor.generation, 2);
+    assert_eq!(state_after_noop.topics.len(), 1);
+    assert_eq!(state_after_noop.operations.len(), 1);
+}
+
+#[test]
+fn no_fixture_worktree_capture_supports_partial_paths_and_rejects_stale_anchor() {
+    let repo = TestRepo::new("partial-worktree-capture");
+    init_local_git_repo(&repo);
+    repo.write_file("second.txt", "second base\n");
+    git(repo.path(), &["add", "second.txt"]);
+    git(repo.path(), &["commit", "-m", "add second source"]);
+    assert_success(&run_real_json(&repo, &["init"]));
+
+    repo.write_file("base.txt", "base external\n");
+    repo.write_file("second.txt", "second external\n");
+    let first = run_real_json(
+        &repo,
+        &[
+            "compat",
+            "capture",
+            "--worktree",
+            "--topic",
+            "first-path",
+            "--actor",
+            "editor-agent",
+            "--path",
+            "base.txt",
+        ],
+    );
+    assert_success(&first);
+    let first: serde_json::Value = serde_json::from_str(&stdout(&first)).unwrap();
+    assert_eq!(first["data"]["selected_delta_count"], 1);
+    assert_eq!(first["data"]["remaining_candidate_count"], 1);
+    assert_eq!(first["data"]["anchor_after"]["generation"], 2);
+
+    let remaining = run_real_json(&repo, &["compat", "diff", "--worktree"]);
+    assert_success(&remaining);
+    let remaining: serde_json::Value = serde_json::from_str(&stdout(&remaining)).unwrap();
+    assert_eq!(remaining["data"]["candidate_counts"]["total"], 1);
+    assert_eq!(remaining["data"]["candidates"][0]["path"], "second.txt");
+
+    let before_stale = fs::read(repo.path().join(".sunlight/records/native-state.json")).unwrap();
+    let stale = run_real_json(
+        &repo,
+        &[
+            "compat",
+            "capture",
+            "--worktree",
+            "--topic",
+            "stale-capture",
+            "--actor",
+            "editor-agent",
+            "--anchor-generation",
+            "1",
+        ],
+    );
+    assert_failure(&stale);
+    assert!(stdout(&stale).contains("\"code\":\"worktree_anchor_stale\""));
+    assert_eq!(
+        fs::read(repo.path().join(".sunlight/records/native-state.json")).unwrap(),
+        before_stale
+    );
+    assert!(!repo
+        .path()
+        .join(".sunlight/topics/topic_stale_capture.json")
+        .exists());
+
+    let second = run_real_json(
+        &repo,
+        &[
+            "compat",
+            "capture",
+            "--worktree",
+            "--topic",
+            "second-path",
+            "--actor",
+            "editor-agent",
+            "--anchor-generation",
+            "2",
+        ],
+    );
+    assert_success(&second);
+    let second: serde_json::Value = serde_json::from_str(&stdout(&second)).unwrap();
+    assert_eq!(second["data"]["anchor_after"]["generation"], 3);
+    let state = RealRepoState::load(repo.path()).unwrap();
+    assert_eq!(state.topics.len(), 2);
+    assert_eq!(state.operations.len(), 2);
+    assert_eq!(state.worktree_anchor.generation, 3);
+}
+
+#[test]
+fn no_fixture_worktree_capture_keeps_concurrent_native_topic_independent() {
+    let repo = TestRepo::new("concurrent-worktree-capture");
+    init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "topic",
+            "create",
+            "native-concurrent",
+            "--display-name",
+            "Native concurrent",
+        ],
+    ));
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "native-concurrent",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "native-agent",
+        ],
+    ));
+    let native_content = repo
+        .path()
+        .join(".sunlight/local/native-concurrent-content.txt");
+    fs::write(&native_content, "native topic only\n").unwrap();
+    let native = run_real_json_os(
+        &repo,
+        &[
+            "write".as_ref(),
+            "native-only.txt".as_ref(),
+            "--session".as_ref(),
+            "session_native_agent".as_ref(),
+            "--expect-hash".as_ref(),
+            "new".as_ref(),
+            "--content-file".as_ref(),
+            native_content.as_os_str(),
+            "--classification".as_ref(),
+            "source".as_ref(),
+        ],
+    );
+    assert_success(&native);
+    let native: serde_json::Value = serde_json::from_str(&stdout(&native)).unwrap();
+    let native_revision = native["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    repo.write_file("base.txt", "external topic only\n");
+    let capture = run_real_json(
+        &repo,
+        &[
+            "compat",
+            "capture",
+            "--worktree",
+            "--topic",
+            "external-independent",
+            "--actor",
+            "editor-agent",
+        ],
+    );
+    assert_success(&capture);
+    let capture: serde_json::Value = serde_json::from_str(&stdout(&capture)).unwrap();
+    let capture_revision = capture["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let frontier = capture["data"]["anchor_after"]["topic_frontier"]
+        .as_object()
+        .unwrap();
+    assert_eq!(frontier.len(), 1);
+    assert_eq!(frontier["topic_external_independent"], capture_revision);
+    assert!(!frontier.contains_key("topic_native_concurrent"));
+
+    let combined = run_real_json(
+        &repo,
+        &[
+            "view",
+            "resolve",
+            "--base",
+            "checkpoint_base_0001",
+            "--include",
+            &format!("topic_native_concurrent:{native_revision}"),
+            "--include",
+            &format!("topic_external_independent:{capture_revision}"),
+        ],
+    );
+    assert_success(&combined);
+    let combined: serde_json::Value = serde_json::from_str(&stdout(&combined)).unwrap();
+    assert!(combined["data"]["conflicts"].as_array().unwrap().is_empty());
+    assert!(combined["data"]["staleness"].as_array().unwrap().is_empty());
+    assert!(combined["data"]["tree_identity"].is_object());
+    let combined_view = combined["data"]["ids"]["resolved_view_id"]
+        .as_str()
+        .unwrap();
+    assert_success(&run_real_json(
+        &repo,
+        &["read", "native-only.txt", "--view", combined_view],
+    ));
+    let external = run_real_json(&repo, &["read", "base.txt", "--view", combined_view]);
+    assert_success(&external);
+    assert!(stdout(&external).contains("external topic only\\n"));
+}
+
+#[test]
 fn no_fixture_repository_status_warns_about_external_git_working_tree_changes() {
     let repo = TestRepo::new("repository-status-git-working-tree-warning");
     init_local_git_repo(&repo);
@@ -520,14 +896,24 @@ fn init_json_returns_repository_success_envelope() {
         .expect("sun init should run");
 
     assert_success(&output);
-    let stdout = stdout(&output);
-    assert!(stdout.contains("\"ok\":true"));
-    assert!(stdout.contains("\"command\":\"repository.init\""));
-    assert!(stdout.contains("\"repository_id\":\"repo-"));
-    assert!(stdout.contains("\"ids\":{\"repository_id\":\"repo-"));
-    assert!(stdout.contains("\"view\":null"));
-    assert!(stdout.contains("\"warnings\":[]"));
+    let body = stdout(&output);
+    assert!(body.contains("\"ok\":true"));
+    assert!(body.contains("\"command\":\"repository.init\""));
+    assert!(body.contains("\"repository_id\":\"repo-"));
+    assert!(body.contains("\"ids\":{\"repository_id\":\"repo-"));
+    assert!(body.contains("\"view\":null"));
+    assert!(body.contains("\"warnings\":[]"));
     assert!(repo.path().join(".sunlight/config.toml").is_file());
+    let initialized_state = RealRepoState::load(repo.path()).unwrap();
+    assert_eq!(initialized_state.worktree_anchor.generation, 1);
+    assert!(repo
+        .path()
+        .join(".sunlight/worktree-anchors/worktree_anchor_0001.json")
+        .is_file());
+    let status = run_real_json(&repo, &["status"]);
+    assert_success(&status);
+    let status: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(status["data"]["repository"]["worktree"]["state"], "clean");
 
     let state_path = repo.path().join(".sunlight/records/native-state.json");
     let state_before = fs::read(&state_path).unwrap();
@@ -4849,6 +5235,12 @@ fn no_fixture_sunignore_change_requires_reinit_and_refreshes_a_clean_state() {
         .expect("clean policy refresh should run");
     assert_success(&refreshed);
     assert!(stdout(&refreshed).contains("\"sunignore_policy_refreshed\":true"));
+    let refreshed_state = RealRepoState::load(repo.path()).unwrap();
+    assert_eq!(refreshed_state.worktree_anchor.generation, 2);
+    assert!(repo
+        .path()
+        .join(".sunlight/worktree-anchors/worktree_anchor_0002.json")
+        .is_file());
 
     let list = sun()
         .arg("list")
@@ -5003,6 +5395,15 @@ fn no_fixture_init_migrates_clean_legacy_quarantine_state() {
         .base_entries
         .retain(|entry| entry.path != ".env.example");
     legacy.tree_hash = sunlight_core::repo_state::real_tree_hash(&legacy.entries);
+    legacy.worktree_anchor.tree_hash = legacy.tree_hash.clone();
+    legacy.worktree_anchor.manifest_digest =
+        sunlight_core::repo_state::real_worktree_manifest_digest(
+            &legacy.repository_id,
+            &legacy.worktree_anchor.resolved_view_id,
+            &legacy.worktree_anchor.tree_hash,
+            &legacy.worktree_anchor.topic_frontier,
+            &legacy.base_entries,
+        );
     legacy.quarantine.push(RealQuarantineEntry {
         path: ".env.example".to_string(),
         reason_codes: vec!["secret_path".to_string()],
@@ -5047,6 +5448,15 @@ fn no_fixture_legacy_quarantine_with_authored_history_fails_without_state_change
         .base_entries
         .retain(|entry| entry.path != ".env.example");
     legacy.tree_hash = sunlight_core::repo_state::real_tree_hash(&legacy.entries);
+    legacy.worktree_anchor.tree_hash = legacy.tree_hash.clone();
+    legacy.worktree_anchor.manifest_digest =
+        sunlight_core::repo_state::real_worktree_manifest_digest(
+            &legacy.repository_id,
+            &legacy.worktree_anchor.resolved_view_id,
+            &legacy.worktree_anchor.tree_hash,
+            &legacy.worktree_anchor.topic_frontier,
+            &legacy.base_entries,
+        );
     legacy.quarantine.push(RealQuarantineEntry {
         path: ".env.example".to_string(),
         reason_codes: vec!["secret_path".to_string()],
@@ -11354,16 +11764,30 @@ fn no_fixture_persisted_local_only_checkpoint_entry_is_export_blocked() {
     init_local_git_repo(&repo);
     start_native_session(&repo, "local-only-export-block");
     let checkpoint_id = create_real_base_checkpoint(&repo);
-    let state_path = repo.path().join(".sunlight/records/native-state.json");
-    let mut state = fs::read_to_string(&state_path).unwrap();
-    let base_entries_offset = state.find("\"base_entries_compact\":[[").unwrap();
-    let classification_offset =
-        state[base_entries_offset..].find("\"source\"").unwrap() + base_entries_offset;
-    state.replace_range(
-        classification_offset..classification_offset + "\"source\"".len(),
-        "\"local_only\"",
-    );
-    fs::write(&state_path, state).unwrap();
+    let mut state = RealRepoState::load(repo.path()).unwrap();
+    for entry in state
+        .base_entries
+        .iter_mut()
+        .chain(state.entries.iter_mut())
+        .chain(
+            state
+                .checkpoints
+                .iter_mut()
+                .flat_map(|checkpoint| checkpoint.entries.iter_mut()),
+        )
+        .filter(|entry| entry.path == "base.txt")
+    {
+        entry.classification = "local_only".to_string();
+    }
+    state.worktree_anchor.manifest_digest =
+        sunlight_core::repo_state::real_worktree_manifest_digest(
+            &state.repository_id,
+            &state.worktree_anchor.resolved_view_id,
+            &state.worktree_anchor.tree_hash,
+            &state.worktree_anchor.topic_frontier,
+            &state.base_entries,
+        );
+    state.save(repo.path()).unwrap();
 
     let check = sun()
         .arg("policy")

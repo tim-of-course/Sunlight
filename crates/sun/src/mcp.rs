@@ -373,7 +373,7 @@ fn handle_message(
                             "version": env!("CARGO_PKG_VERSION"),
                             "description": "Repository-confined Sunlight v0.3 authoring and operation tools"
                         },
-                        "instructions": "All tools are bound to the canonical repository supplied when this server started. Author with repository_status, topic_create, session_start, scoped artifact reads and mutations, and topic_complete. Integrate with topic_wait and view_resolve using exact selected revisions; omitting include is discovery-only and resolves moving current heads. Validate the exact combined view with execution_run. Promote each intentional output with execution_promote_output using its returned candidate classification and a live topic-owned session over the validated view; resolve the resulting exact revision and create a checkpoint from matching passing evidence. For a requested Git handoff, call policy_check_export with the exact checkpoint and target ref, then git_export; completion is a returned export_map_id for that checkpoint and ref. artifact_read/list/search accept exactly one scope: session for the authoring frontier or view for session-free read-only access to an exact resolved view. topic_complete and completed topic status return a structured handoff with summary, operations, changed paths, and hashes; use topic_wait instead of polling when another agent owns the topic. Transient repository writer and state-sequence races are retried automatically for safe native and read commands; commands that can replay external side effects are never automatically retried. Use exact IDs and sha256 hashes returned by tools. artifact_write uses expect_hash \"new\" only when the path must be absent. Sessions have fixed topic scope: session_refresh advances only non-write topics already in that session frontier and does not discover newly created topics. execution_run returns bounded stdout/stderr text in that response, phase timings, and only source-like or explicitly generated promotion candidates. No fixture tools or arbitrary host paths are available."
+                        "instructions": "All tools are bound to the canonical repository supplied when this server started. Start with repository_status. Its repository.worktree field reports whether ordinary editor or agent changes exist outside Sunlight; call worktree_diff to inspect them and worktree_capture only when those edits should enter native history. Capture returns a completed topic revision with exact provenance, which can be combined through view_resolve like any other topic. For native authoring, use topic_create, session_start, scoped artifact reads and mutations, and topic_complete. Integrate with topic_wait and view_resolve using exact selected revisions; omitting include is discovery-only and resolves moving current heads. Validate the exact combined view with execution_run. Promote each intentional output with execution_promote_output using its returned candidate classification and a live topic-owned session over the validated view; resolve the resulting exact revision and create a checkpoint from matching passing evidence. For a requested Git handoff, call policy_check_export with the exact checkpoint and target ref, then git_export; completion is a returned export_map_id for that checkpoint and ref. artifact_read/list/search accept exactly one scope: session for the authoring frontier or view for session-free read-only access to an exact resolved view. topic_complete and completed topic status return a structured handoff with summary, operations, changed paths, and hashes; use topic_wait instead of polling when another agent owns the topic. Transient repository writer and state-sequence races are retried automatically for safe native and read commands; commands that can replay external side effects are never automatically retried. Use exact IDs and sha256 hashes returned by tools. artifact_write uses expect_hash \"new\" only when the path must be absent. Sessions have fixed topic scope: session_refresh advances only non-write topics already in that session frontier and does not discover newly created topics. execution_run returns bounded stdout/stderr text in that response, phase timings, and only source-like or explicitly generated promotion candidates. No fixture tools or arbitrary host paths are available."
                     }),
                 ),
             )
@@ -713,6 +713,7 @@ fn tool_uses_repository_mutation_queue(name: &str) -> bool {
             | "artifact_delete"
             | "artifact_metadata_set"
             | "view_resolve"
+            | "worktree_capture"
             | "execution_promote_output"
             | "checkpoint_create"
             | "policy_check_export"
@@ -1148,6 +1149,8 @@ fn build_invocation(
             "--projection".into(),
             identifier(args, "projection")?,
         ],
+        "worktree_diff" => vec!["compat".into(), "diff".into(), "--worktree".into()],
+        "worktree_capture" => worktree_capture_argv(args)?,
         "compat_import" => compat_import_argv(args)?,
         "execution_run" => run_argv(args)?,
         "execution_promote_output" => vec![
@@ -1513,6 +1516,67 @@ fn compat_import_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFail
     ]);
     Ok(v)
 }
+
+fn worktree_capture_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFailure> {
+    if args.contains_key("candidates") && args.contains_key("paths") {
+        return Err(ToolFailure::new(
+            "invalid_request",
+            "select worktree changes with candidate IDs or paths, not both",
+        ));
+    }
+    let mut argv = vec![
+        "compat".into(),
+        "capture".into(),
+        "--worktree".into(),
+        "--topic".into(),
+        identifier(args, "topic")?,
+        "--actor".into(),
+        identifier(args, "actor")?,
+    ];
+    if let Some(value) = args.get("anchor_generation") {
+        let generation = value.as_u64().filter(|value| *value > 0).ok_or_else(|| {
+            ToolFailure::new(
+                "invalid_request",
+                "`anchor_generation` must be a positive integer",
+            )
+        })?;
+        argv.extend(["--anchor-generation".into(), generation.to_string()]);
+    }
+    if args.contains_key("candidates") {
+        let candidates = string_array(args, "candidates", 128)?;
+        if candidates.is_empty() {
+            return Err(ToolFailure::new(
+                "invalid_request",
+                "`candidates` must not be empty",
+            ));
+        }
+        for candidate in candidates {
+            if candidate.starts_with('-') {
+                return Err(ToolFailure::new(
+                    "invalid_request",
+                    "candidate is not a safe identifier",
+                ));
+            }
+            argv.extend(["--candidate".into(), candidate]);
+        }
+    }
+    if args.contains_key("paths") {
+        let paths = string_array(args, "paths", 128)?;
+        if paths.is_empty() {
+            return Err(ToolFailure::new(
+                "invalid_request",
+                "`paths` must not be empty",
+            ));
+        }
+        for path in paths {
+            argv.extend([
+                "--path".into(),
+                validate_repo_relative(&path, "paths", false)?,
+            ]);
+        }
+    }
+    Ok(argv)
+}
 fn run_argv(args: &Map<String, Value>) -> Result<Vec<String>, ToolFailure> {
     let program = identifier(args, "program")?;
     let lower = program.trim_end_matches(".exe").to_ascii_lowercase();
@@ -1730,6 +1794,16 @@ const TOOL_CONTRACTS: &[ToolContract] = &[
         required: &["projection"],
     },
     ToolContract {
+        name: "worktree_diff",
+        allowed: &[],
+        required: &[],
+    },
+    ToolContract {
+        name: "worktree_capture",
+        allowed: &["topic", "actor", "anchor_generation", "candidates", "paths"],
+        required: &["topic", "actor"],
+    },
+    ToolContract {
         name: "compat_import",
         allowed: &["projection", "candidates", "session_generation"],
         required: &["projection", "candidates", "session_generation"],
@@ -1932,6 +2006,26 @@ fn tools() -> Vec<Value> {
             false,
         ),
         tool(
+            "worktree_diff",
+            "Compare ordinary repository-root files with Sunlight's durable worktree anchor. This is read-only: returned candidates remain outside native history until worktree_capture. Use exact candidate IDs or paths from this result for partial capture.",
+            json!({}),
+            &[],
+            false,
+        ),
+        tool(
+            "worktree_capture",
+            "Adopt current external worktree edits as one atomic native operation in a new actor-owned, completed topic, then advance the worktree anchor without rewriting repository files. Omit candidates and paths to capture every eligible source candidate. Supply anchor_generation when you need an explicit stale-scan guard. A clean worktree is an idempotent no-op.",
+            json!({
+                "topic":{"type":"string","description":"New unique topic slug for this capture.","pattern":r"^[a-z0-9]+(?:-[a-z0-9]+)*$","minLength":1,"maxLength":128},
+                "actor":id_schema("Stable caller-chosen actor identifier used for capture provenance."),
+                "anchor_generation":{"type":"integer","minimum":1,"description":"Optional exact anchor generation returned by repository_status or worktree_diff."},
+                "candidates":{"type":"array","description":"Optional exact candidate_delta_id selection from worktree_diff. Do not combine with paths.","minItems":1,"maxItems":128,"items":id_schema("One exact worktree candidate_delta_id.")},
+                "paths":{"type":"array","description":"Optional repository-relative path selection from worktree_diff. A rename may match its source or target. Do not combine with candidates.","minItems":1,"maxItems":128,"items":path_schema()}
+            }),
+            &["topic", "actor"],
+            true,
+        ),
+        tool(
             "compat_import",
             "Import selected compatibility candidates as one native transaction.",
             json!({"projection":id_schema("Exact compatibility projection_id returned by compat_project."),"candidates":{"type":"array","description":"Exact candidate_delta_id values returned by compat_diff.","minItems":1,"maxItems":128,"items":id_schema("One exact candidate_delta_id.")},"session_generation":id_schema("Exact session_generation_id that owns the compatibility baseline.")}),
@@ -2014,7 +2108,7 @@ fn tool(
 ) -> Value {
     let contract = tool_contract(name).expect("every advertised tool has one contract row");
     debug_assert_eq!(required, contract.required);
-    json!({"name":name,"description":description,"inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":contract.required},"outputSchema":output_schema(name),"annotations":{"readOnlyHint":!mutating,"destructiveHint":matches!(name,"artifact_delete"|"git_export"),"idempotentHint":matches!(name,"repository_init"|"repository_status"|"topic_complete"|"topic_wait"|"artifact_read"|"artifact_list"|"artifact_search"|"compat_diff"|"policy_check_export"|"policy_check_commit"|"policy_explain"|"inspect")}})
+    json!({"name":name,"description":description,"inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":contract.required},"outputSchema":output_schema(name),"annotations":{"readOnlyHint":!mutating,"destructiveHint":matches!(name,"artifact_delete"|"git_export"),"idempotentHint":matches!(name,"repository_init"|"repository_status"|"topic_complete"|"topic_wait"|"artifact_read"|"artifact_list"|"artifact_search"|"compat_diff"|"worktree_diff"|"policy_check_export"|"policy_check_commit"|"policy_explain"|"inspect")}})
 }
 
 fn output_schema(name: &str) -> Value {
@@ -2106,6 +2200,16 @@ fn output_ids(name: &str) -> &'static [&'static str] {
         "view_resolve" => &["resolved_view_id"],
         "project_materialize" | "compat_project" => &["projection_id", "resolved_view_id"],
         "compat_diff" => &["projection_id", "resolved_view_id", "session_generation_id"],
+        "worktree_diff" => &["worktree_anchor_id", "worktree_diff_id", "resolved_view_id"],
+        "worktree_capture" => &[
+            "worktree_anchor_id",
+            "topic_id",
+            "session_id",
+            "operation_transaction_id",
+            "topic_revision_id",
+            "session_generation_id",
+            "resolved_view_id",
+        ],
         "execution_run" => &["execution_id", "projection_id", "resolved_view_id"],
         "execution_promote_output" => &["execution_id", "operation_transaction_id"],
         "checkpoint_create" => &["checkpoint_id", "resolved_view_id", "execution_id"],
@@ -2186,6 +2290,22 @@ fn output_payloads(name: &str) -> &'static [(&'static str, &'static str)] {
             "candidates",
             "Explicit compatibility deltas available for import.",
         )],
+        "worktree_diff" => &[
+            ("anchor", "Exact durable worktree baseline."),
+            (
+                "candidates",
+                "External worktree deltas available for capture.",
+            ),
+        ],
+        "worktree_capture" => &[
+            ("anchor", "Current anchor when capture is a clean no-op."),
+            ("anchor_before", "Exact pre-capture worktree baseline."),
+            ("anchor_after", "Exact post-capture worktree baseline."),
+            ("topic", "Completed topic created by capture."),
+            ("handoff", "Immutable factual capture handoff."),
+            ("operation", "Atomic multi-effect capture transaction."),
+            ("view", "Exact post-capture resolved view."),
+        ],
         "compat_import" => &[
             ("operation", "Atomic native import transaction."),
             (
@@ -2415,6 +2535,7 @@ mod tests {
             "artifact_delete",
             "artifact_metadata_set",
             "view_resolve",
+            "worktree_capture",
             "execution_promote_output",
             "checkpoint_create",
             "policy_check_export",
@@ -2431,6 +2552,7 @@ mod tests {
             "project_materialize",
             "compat_project",
             "compat_diff",
+            "worktree_diff",
             "compat_import",
             "execution_run",
             "policy_check_commit",
@@ -2609,6 +2731,24 @@ mod tests {
             find("compat_import")["inputSchema"]["required"],
             json!(["projection", "candidates", "session_generation"])
         );
+
+        let worktree_diff = find("worktree_diff");
+        assert_eq!(worktree_diff["annotations"]["readOnlyHint"], true);
+        assert_eq!(worktree_diff["annotations"]["idempotentHint"], true);
+        assert!(worktree_diff["description"]
+            .as_str()
+            .unwrap()
+            .contains("remain outside native history"));
+        let worktree_capture = find("worktree_capture");
+        assert_eq!(
+            worktree_capture["inputSchema"]["required"],
+            json!(["topic", "actor"])
+        );
+        assert_eq!(worktree_capture["annotations"]["readOnlyHint"], false);
+        assert!(worktree_capture["description"]
+            .as_str()
+            .unwrap()
+            .contains("completed topic"));
     }
 
     #[test]

@@ -34,6 +34,25 @@ edits. After a human changes the file, call `repository_init`; a clean state is
 refreshed and authored history fails closed with preservation guidance. Secret
 prevention and credential rotation happen outside Sunlight.
 
+## Adopt existing worktree edits
+
+`repository_status` compares ordinary repository-root files with Sunlight's
+durable worktree anchor. A dirty worktree is outside native history: it cannot
+affect Sunlight reads, execution, checkpoints, or export until captured.
+
+1. Call `worktree_diff` and inspect the returned paths, classifications, and
+   exact candidate IDs.
+2. If the user wants those edits adopted, call `worktree_capture` with a new
+   topic slug and stable actor ID. Omit selection to capture all eligible source
+   candidates, or pass exact candidate IDs or paths for a partial capture.
+3. Use the returned completed topic revision like any other topic: combine it
+   explicitly with `view_resolve`, validate the exact combined view, and
+   checkpoint only after the normal lifecycle succeeds.
+
+A clean capture is a no-op. Do not capture merely to clear a warning, do not
+claim validation from capture, and do not fold unrelated concurrent topics into
+the captured revision.
+
 ## Author one change
 
 1. Call `repository_status`. If the root is uninitialized, call
@@ -104,6 +123,8 @@ bypass a failed CAS by writing outside Sunlight.
 - stale compatibility projection: create a fresh projection from the session's
   current generation, reapply the remaining filesystem change, rediff, and
   import with the generation returned by `compat_diff`.
+- stale worktree anchor or changed capture candidates: call `worktree_diff`
+  again, reconsider the exact current candidates, and retry deliberately.
 - Git export failure: preserve the validated checkpoint and report the native
   handoff as blocked. A completed native handoff has a returned export-map ID;
   Git plumbing outside Sunlight does not substitute for that provenance.

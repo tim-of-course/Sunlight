@@ -12,8 +12,8 @@ use crate::artifacts::{
 use crate::projection::{ProjectionPurpose, ProjectionRecord};
 use crate::records::PrivacyClass;
 use crate::repo_state::{
-    path_is_gitignored, path_is_sunignored, real_content_hash, RealArtifactEntry,
-    RealProjectionSnapshot,
+    path_is_gitignored, path_is_sunignored, real_content_hash, scan_real_worktree_files,
+    RealArtifactEntry, RealProjectionSnapshot, RealWorktreeAnchor,
 };
 use crate::resolver::{ResolvedViewResult, SingleRepoTree};
 
@@ -187,6 +187,86 @@ pub fn diff_real_compat_projection(
             message,
         )
     })?;
+    diff_real_scanned_files(repo_root, projection, scanned)
+}
+
+pub fn diff_real_worktree(
+    repo_root: &Path,
+    repository_id: &str,
+    anchor: &RealWorktreeAnchor,
+    baseline_entries: &[RealArtifactEntry],
+) -> Result<RealCompatDiff, CompatImportValidationError> {
+    let projection = worktree_anchor_projection(repository_id, anchor, baseline_entries);
+    let scanned = scan_real_worktree_files(repo_root, baseline_entries)
+        .map_err(|error| {
+            real_error(
+                CompatImportErrorCode::DiffFailed,
+                &projection,
+                Vec::new(),
+                format!("failed to scan repository worktree: {error}"),
+            )
+        })?
+        .into_iter()
+        .filter(|entry| !entry.tombstone)
+        .map(|entry| {
+            (
+                entry.path,
+                ScannedProjectionFile {
+                    bytes: entry.bytes,
+                    executable: entry.executable,
+                    blocked_reason: None,
+                },
+            )
+        })
+        .collect();
+    diff_real_scanned_files(repo_root, &projection, scanned)
+}
+
+pub fn validate_real_worktree_selection(
+    repository_id: &str,
+    anchor: &RealWorktreeAnchor,
+    baseline_entries: &[RealArtifactEntry],
+    selected_candidate_delta_ids: &[String],
+    diff: &RealCompatDiff,
+) -> Result<Vec<CompatCandidateDelta>, CompatImportValidationError> {
+    let projection = worktree_anchor_projection(repository_id, anchor, baseline_entries);
+    validate_real_compat_selection(&projection, selected_candidate_delta_ids, diff)
+}
+
+fn worktree_anchor_projection(
+    repository_id: &str,
+    anchor: &RealWorktreeAnchor,
+    entries: &[RealArtifactEntry],
+) -> RealProjectionSnapshot {
+    RealProjectionSnapshot {
+        projection_id: anchor.id(),
+        repository_id: repository_id.to_string(),
+        purpose: ProjectionPurpose::Compatibility.as_str().to_string(),
+        resolved_view_id: anchor.resolved_view_id.clone(),
+        tree_hash: anchor.tree_hash.clone(),
+        topic_frontier: anchor.topic_frontier.clone(),
+        manifest_digest: anchor.manifest_digest.clone(),
+        created_from_content_tree: anchor.tree_hash.clone(),
+        materialized_root: None,
+        session_id: None,
+        session_generation_id: None,
+        path_policy_id: anchor.path_policy_id.clone(),
+        operation_semantics_version: anchor.operation_semantics_version.clone(),
+        cache_key: String::new(),
+        strategy: "direct_worktree".to_string(),
+        materialization: None,
+        retention_state: "active".to_string(),
+        privacy_class: "local_only".to_string(),
+        last_import_operation_id: None,
+        entries: entries.to_vec(),
+    }
+}
+
+fn diff_real_scanned_files(
+    repo_root: &Path,
+    projection: &RealProjectionSnapshot,
+    mut scanned: BTreeMap<String, ScannedProjectionFile>,
+) -> Result<RealCompatDiff, CompatImportValidationError> {
     let baseline = projection
         .entries
         .iter()
@@ -475,7 +555,12 @@ fn infer_exact_content_renames(
             );
             let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
             let mut rename = target.clone();
-            rename.candidate_delta_id = format!("compat_delta_{}", &digest[..24]);
+            let prefix = if projection.strategy == "direct_worktree" {
+                "worktree_delta"
+            } else {
+                "compat_delta"
+            };
+            rename.candidate_delta_id = format!("{prefix}_{}", &digest[..24]);
             rename.kind = CompatCandidateKind::MovedOrRenamed;
             rename.operation_kind = CompatFileOperationKind::Move;
             rename.artifact_id = source.and_then(|candidate| candidate.artifact_id.clone());
@@ -742,8 +827,13 @@ fn real_candidate(
         classification,
     );
     let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    let prefix = if projection.strategy == "direct_worktree" {
+        "worktree_delta"
+    } else {
+        "compat_delta"
+    };
     CompatCandidateDelta {
-        candidate_delta_id: format!("compat_delta_{}", &digest[..24]),
+        candidate_delta_id: format!("{prefix}_{}", &digest[..24]),
         kind,
         operation_kind,
         artifact_id,

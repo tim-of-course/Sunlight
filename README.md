@@ -101,6 +101,12 @@ The MCP server is independently self-describing. A connected client receives
 the normal lifecycle in the initialization response and precise contracts from
 the tool schemas.
 
+If a human, editor, or non-Sunlight agent has already changed repository-root
+files, `repository_status` reports those differences relative to a durable
+Sunlight anchor. Agents can inspect them with `worktree_diff` and, when asked to
+adopt them, use `worktree_capture` to create one completed topic without making
+the worktree itself source truth.
+
 ## Client adapters
 
 - Portable Agent Skill: `integrations/agent-skills/sunlight`

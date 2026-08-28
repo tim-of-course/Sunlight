@@ -105,6 +105,7 @@ The server exposes these typed tools:
   `artifact_metadata_set`
 - `view_resolve`, `project_materialize`
 - `compat_project`, `compat_diff`, `compat_import`
+- `worktree_diff`, `worktree_capture`
 - `execution_run`, `execution_promote_output`
 - `checkpoint_create`
 - `policy_check_export`, `policy_check_commit`, `policy_explain`
@@ -116,6 +117,11 @@ For durable integration, pass exact topic revisions to `view_resolve.include`;
 omitting `include` is discovery-only and resolves moving current heads.
 `compat_diff` re-echoes the projection's `session_generation_id`, and MCP
 requires that value for the immediately following `compat_import`.
+Repository status also compares ordinary repository-root files with Sunlight's
+durable worktree anchor. `worktree_diff` inspects those external changes without
+mutation. `worktree_capture` adopts all eligible candidates, or an explicit
+candidate/path selection, as one operation in a new completed topic and advances
+the anchor without rewriting the files. A clean capture creates no records.
 For `execution_promote_output`, pass the candidate classification returned by
 `execution_run` verbatim (`source_like_delta` or `generated_artifact`); those
 execution provenance classes are distinct from artifact classifications.
@@ -176,7 +182,8 @@ network limits remain those reported by Sunlight's existing execution policy;
 on Windows, the delegated `sun` process tree is additionally placed in a
 kill-on-close Job Object.
 
-Each server serializes its own active calls. Short state-mutating calls from
+Each server serializes its own active calls. Short state-mutating calls,
+including `worktree_capture`, from
 independent servers additionally wait on the crash-released OS lock
 `.sunlight/local/mcp-mutation-queue.lock` for at most ten seconds. The file is a
 stable lock identity and is never deleted. Read-only calls, `topic_wait`, and

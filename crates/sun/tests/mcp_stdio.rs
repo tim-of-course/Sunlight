@@ -158,7 +158,7 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
 
     let listed = mcp.request(2, "tools/list", json!({}));
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 28);
+    assert_eq!(tools.len(), 30);
     let advertised = serde_json::to_string(tools).unwrap();
     assert!(!advertised.to_ascii_lowercase().contains("fixture"));
     for required in [
@@ -170,6 +170,8 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
         "session_refresh",
         "artifact_read",
         "artifact_write",
+        "worktree_diff",
+        "worktree_capture",
         "topic_complete",
         "execution_run",
         "checkpoint_create",
@@ -398,6 +400,74 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
     let sent = mcp.sent.join("\n");
     assert!(!sent.contains("--fixture"));
     assert!(!sent.contains("\"fixture\""));
+    mcp.shutdown();
+}
+
+#[test]
+fn stdio_mcp_discovers_and_captures_external_worktree_edits() {
+    let temp = TempDir::new("sun-mcp-worktree-capture");
+    let repo = temp.path().join("repository");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    git(&repo, &["config", "user.name", "Sun MCP Test"]);
+    git(&repo, &["config", "user.email", "sun-mcp@example.invalid"]);
+    fs::write(repo.join("README.md"), "before\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+
+    let mut mcp = Mcp::start(&repo);
+    let initialized = mcp.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-11-25",
+            "capabilities":{},
+            "clientInfo":{"name":"sun-worktree-capture-test","version":"1"}
+        }),
+    );
+    assert!(initialized["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("worktree_diff"));
+    mcp.notify("notifications/initialized", json!({}));
+    assert_eq!(mcp.call(2, "repository_init", json!({}))["ok"], true);
+
+    fs::write(repo.join("README.md"), "changed outside sunlight\n").unwrap();
+    let status = mcp.call(3, "repository_status", json!({}));
+    assert_eq!(status["data"]["repository"]["worktree"]["state"], "dirty");
+    assert_eq!(
+        status["data"]["repository"]["worktree"]["anchor"]["generation"],
+        1
+    );
+    let diff = mcp.call(4, "worktree_diff", json!({}));
+    assert_eq!(diff["data"]["command"], "worktree.diff");
+    assert_eq!(diff["data"]["candidates"].as_array().unwrap().len(), 1);
+    let captured = mcp.call(
+        5,
+        "worktree_capture",
+        json!({
+            "topic":"mcp-external-edit",
+            "actor":"mcp-editor",
+            "anchor_generation":1
+        }),
+    );
+    assert_eq!(captured["data"]["command"], "worktree.capture");
+    assert_eq!(captured["data"]["captured"], true);
+    assert_eq!(captured["data"]["topic"]["status"], "completed");
+    assert_eq!(captured["data"]["anchor_after"]["generation"], 2);
+    let view = captured["data"]["ids"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let read = mcp.call(6, "artifact_read", json!({"path":"README.md","view":view}));
+    assert_eq!(
+        read["data"]["content"]["bytes"],
+        "changed outside sunlight\n"
+    );
+    assert_eq!(
+        mcp.call(7, "worktree_diff", json!({}))["data"]["worktree_state"],
+        "clean"
+    );
     mcp.shutdown();
 }
 

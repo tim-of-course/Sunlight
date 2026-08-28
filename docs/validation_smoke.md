@@ -6,7 +6,7 @@ installation. It builds the existing `sun` CLI with Cargo, creates only
 temporary files for command inputs, and checks the current JSON command
 envelopes used by `crates/sun/tests/cli_json.rs`.
 
-Run on Linux or WSL:
+Run on macOS, Linux, or WSL:
 
 ```sh
 scripts/validation-smoke.sh
@@ -42,10 +42,11 @@ same Bash script runs on Windows/WSL. Set `SUNLIGHT_SMOKE_USE_WSL=0` to run the
 native PowerShell implementation instead. If the paired Bash script has CRLF
 line endings, the wrapper warns and uses the native lane.
 
-The Linux/WSL lane expects a local Rust toolchain, `cargo`, and `git` on
-`PATH`. The Windows-native lane expects those tools on the Windows `PATH`; when
-WSL `rustfmt` is unavailable, run the aggregate smoke suite in native
-PowerShell as the formatting gate because it starts with `cargo fmt --check`.
+The macOS/Linux/WSL lane expects a local Rust toolchain, `cargo`, `rustfmt`,
+`git`, and `python3` on `PATH`. The Windows-native lane expects Rust and Git on
+the Windows `PATH`; when WSL `rustfmt` is unavailable, run the aggregate smoke
+suite in native PowerShell as the formatting gate because it starts with
+`cargo fmt --check`.
 
 The smoke covers init idempotency, commit policy validation of the generated
 managed `.sunlight/.gitignore` block, fixture read/list/search, fixture

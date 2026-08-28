@@ -506,7 +506,7 @@ pub fn plan_git_export_writer(
     validate_writer_repository(&input)?;
     validate_writer_report(&input)?;
 
-    let parent = select_base_parent(&input)?;
+    let parent = select_export_parent(&input)?;
     let ref_update = plan_ref_update(&input, &parent)?;
     let commit = GitExportCommitPlan {
         checkpoint_id: input.request.checkpoint.id.clone(),
@@ -2053,9 +2053,64 @@ fn validate_writer_report(input: &GitExportWriterInput) -> Result<(), GitExportP
     Ok(())
 }
 
-fn select_base_parent(
+fn select_export_parent(
     input: &GitExportWriterInput,
 ) -> Result<GitExportParentPlan, GitExportPlanningError> {
+    if let Some(existing) = input
+        .repository
+        .refs
+        .iter()
+        .find(|state| state.git_ref == input.request.git_ref)
+    {
+        let mut prior = input
+            .prior_export_maps
+            .iter()
+            .filter(|export_map| {
+                export_map.repository_id == input.request.checkpoint.repository_id
+                    && export_map.git_ref == input.request.git_ref
+                    && export_map.checkpoint_id != input.request.checkpoint.id
+                    && export_map
+                        .git_commit_ids
+                        .iter()
+                        .any(|commit_id| commit_id == &existing.commit_id)
+            })
+            .collect::<Vec<_>>();
+        prior.sort_by(|left, right| left.checkpoint_id.cmp(&right.checkpoint_id));
+        prior.dedup_by(|left, right| left.checkpoint_id == right.checkpoint_id);
+
+        match prior.as_slice() {
+            [export_map] => {
+                if !input
+                    .repository
+                    .reachable_commit_ids
+                    .contains(&existing.commit_id)
+                {
+                    return Err(planning_error(
+                        GitExportErrorCode::ExportRepositoryInvalid,
+                        input,
+                        Some(existing.commit_id.clone()),
+                        None,
+                        "prior Sunlight export tip is not reachable in the target repository object database",
+                    ));
+                }
+                return Ok(GitExportParentPlan {
+                    checkpoint_id: export_map.checkpoint_id.clone(),
+                    commit_id: existing.commit_id.clone(),
+                });
+            }
+            [] => {}
+            _ => {
+                return Err(planning_error(
+                    GitExportErrorCode::ExportParentAmbiguous,
+                    input,
+                    None,
+                    None,
+                    "more than one prior Sunlight checkpoint maps to the existing target ref tip",
+                ));
+            }
+        }
+    }
+
     select_git_export_base_parent(GitExportParentSelectionInput {
         base_checkpoint_ids: input.base_checkpoint_ids.clone(),
         imported_base_commits: input.imported_base_commits.clone(),
@@ -3064,6 +3119,47 @@ mod tests {
     }
 
     #[test]
+    fn writer_plan_appends_new_checkpoint_to_prior_export_on_same_ref() {
+        let mut input = writer_input();
+        let prior_commit_id = "git_sha1_prior_checkpoint_export".to_string();
+        input.repository.refs = vec![GitRefState {
+            git_ref: FIXTURE_EXPORTED_GIT_REF.to_string(),
+            commit_id: prior_commit_id.clone(),
+        }];
+        input
+            .repository
+            .reachable_commit_ids
+            .push(prior_commit_id.clone());
+        input.prior_export_maps = vec![GitExportMapRecord {
+            id: "export_map_prior_checkpoint".to_string(),
+            repository_id: input.request.checkpoint.repository_id.clone(),
+            checkpoint_id: "checkpoint_prior_0001".to_string(),
+            tree_identity: input.request.checkpoint.tree_identity.clone(),
+            git_remote: None,
+            git_ref: FIXTURE_EXPORTED_GIT_REF.to_string(),
+            git_commit_ids: vec![prior_commit_id.clone()],
+            export_shape: input.request.export_shape.clone(),
+            validation_report_id: FIXTURE_VALIDATION_REPORT_ID.to_string(),
+            exported_at: FIXTURE_CREATED_AT.to_string(),
+            privacy_class: PrivacyClass::CommitDefault,
+        }];
+
+        let plan = plan_git_export_writer(input).unwrap();
+
+        assert_eq!(plan.parent.checkpoint_id, "checkpoint_prior_0001");
+        assert_eq!(plan.parent.commit_id, prior_commit_id);
+        assert_eq!(plan.commit.parent_commit_id, plan.parent.commit_id);
+        assert_eq!(
+            plan.ref_update.allowed_reason,
+            GitExportRefUpdateReason::ReplaceSelectedParent
+        );
+        assert_eq!(
+            plan.ref_update.expected_old_commit_id,
+            Some(plan.parent.commit_id.clone())
+        );
+    }
+
+    #[test]
     fn writer_plan_missing_parent_fails_before_commit_plan() {
         let mut input = writer_input();
         input.imported_base_commits.clear();
@@ -3809,12 +3905,15 @@ mod tests {
 
     impl TestTempDir {
         fn new() -> Self {
+            static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
+            let sequence = NEXT_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "sunlight-git-export-test-{}-{unique}",
+                "sunlight-git-export-test-{}-{unique}-{sequence}",
                 std::process::id()
             ));
             fs::create_dir_all(&path).unwrap();

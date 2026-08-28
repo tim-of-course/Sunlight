@@ -6,6 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+#[cfg(windows)]
+const PYTHON: &str = "python";
+#[cfg(not(windows))]
+const PYTHON: &str = "python3";
+
 #[test]
 fn stdio_mcp_topic_create_matches_cli_durable_intent_metadata() {
     let temp = TempDir::new("sun-mcp-topic-metadata");
@@ -721,7 +726,7 @@ fn open_alpha_oa04_mcp_termination_boundaries_recover_from_durable_facts() {
         "execution_run",
         json!({
             "view":view_id,
-            "program":"python",
+            "program":PYTHON,
             "args":["-c","import time; time.sleep(30)"],
             "cwd":".",
             "network":"not_enforced"

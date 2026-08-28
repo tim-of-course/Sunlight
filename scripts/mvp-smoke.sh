@@ -74,7 +74,7 @@ run_ok() {
 json_string_field() {
     local json="$1"
     local field="$2"
-    printf '%s' "$json" | sed -n "s/.*\"$field\":\(null\|\"\\([^\"]*\\)\"\).*/\\2/p" | head -n 1
+    printf '%s' "$json" | sed -n "s/.*\"$field\":\"\\([^\"]*\\)\".*/\\1/p" | head -n 1
 }
 
 git_capture() {
@@ -82,7 +82,7 @@ git_capture() {
 }
 
 sun() {
-    "$sun_bin" "$@"
+    (cd "$tmp_dir" && "$sun_bin" "$@")
 }
 
 command -v git >/dev/null 2>&1 || fail "git is required"

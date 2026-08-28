@@ -45,18 +45,24 @@ Warnings may be returned, but warnings cannot downgrade hard failures for secret
 
 ## Parent Selection
 
-Default parent selection is `base_checkpoint_git_parent`.
+Default parent selection is `base_checkpoint_git_parent`, extended by a
+durable prior-export lineage on the requested ref.
 
 The writer must:
 
-- Resolve the checkpoint's imported base checkpoint chain to exactly one Git commit when available.
-- Use that commit as the single parent for the MVP export.
+- If the target ref tip has a durable Sunlight export map for a different
+  checkpoint on that exact ref, use the mapped commit as the parent.
+- Otherwise resolve the checkpoint's imported base checkpoint chain to exactly
+  one Git commit and use it as the parent.
 - Fail with `export_parent_not_found` if no compatible imported base commit is recorded.
 - Fail with `export_parent_ambiguous` if multiple candidate parent commits match and policy does not select one.
 - Reject parent commits outside the target repository object database.
-- Treat the target branch's current tip as a safety check, not as semantic parent authority.
+- Treat an unmapped target branch tip as a safety conflict, not as semantic
+  parent authority.
 
-If the requested target ref already exists, the writer may update it only when the existing tip is the selected parent, an earlier export map for the same checkpoint, or another state explicitly allowed by a future fast-forward/overwrite policy. Otherwise fail before updating the ref.
+If the requested target ref already exists, the writer may update it only when
+the existing tip is the selected parent or an earlier export map for the same
+checkpoint. Otherwise fail before updating the ref.
 
 ## Commit Shape
 
@@ -118,6 +124,7 @@ Required tests before replacing the fixture CLI path:
 | `git_export_commit_tree_matches_checkpoint` | `git ls-tree` for the commit matches checkpoint paths, bytes, and executable bits plus allowed manifests. |
 | `git_export_ignores_working_tree` | Extra untracked, modified, and staged files do not appear in the exported commit. |
 | `git_export_selects_base_parent` | Commit parent equals the imported base checkpoint Git commit. |
+| `git_export_appends_prior_mapped_ref` | A different checkpoint exported to the same mapped ref uses the prior exported commit as parent and persists a new export map. |
 | `git_export_missing_parent_fails` | Missing base Git parent returns `export_parent_not_found` and does not update the ref. |
 | `git_export_ref_conflict_fails` | Conflicting existing target ref returns `export_target_ref_conflict` and leaves the ref unchanged. |
 | `git_export_policy_failure_no_ref_update` | Policy hard failure writes no commit on the target ref and no export map. |

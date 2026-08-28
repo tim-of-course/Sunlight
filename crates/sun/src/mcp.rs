@@ -1134,7 +1134,7 @@ fn build_invocation(
             "--session".into(),
             identifier(args, "session")?,
             "--classification".into(),
-            classification(args)?,
+            promotion_classification(args)?,
         ],
         "checkpoint_create" => {
             let mut argv = vec![
@@ -1263,6 +1263,13 @@ fn classification(args: &Map<String, Value>) -> Result<String, ToolFailure> {
             "binary",
             "vendored",
         ],
+    )
+}
+fn promotion_classification(args: &Map<String, Value>) -> Result<String, ToolFailure> {
+    enumeration(
+        args,
+        "classification",
+        &["source_like_delta", "generated_artifact"],
     )
 }
 fn expected_hash(args: &Map<String, Value>) -> Result<String, ToolFailure> {
@@ -1733,8 +1740,8 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "session_start",
-            "Start a topic-bound authoring session over an exact resolved view. The session writes only to the supplied topic; its initial read frontier is copied from the supplied view.",
-            json!({"topic":id_schema("Exact topic_id returned by topic_create or inspect, or its unique topic slug."),"view":id_schema("Exact resolved_view_id returned by repository_status or view_resolve."),"actor":id_schema("Stable caller-chosen actor identifier used for provenance.")}),
+            "Start a topic-bound authoring session over an exact base, current, or checkpointed resolved view. The session writes only to the supplied topic; its initial read frontier is copied from the supplied view.",
+            json!({"topic":id_schema("Exact topic_id returned by topic_create or inspect, or its unique topic slug."),"view":id_schema("Exact resolved_view_id returned by repository_status, view_resolve, or checkpoint_create."),"actor":id_schema("Stable caller-chosen actor identifier used for provenance.")}),
             &["topic", "view", "actor"],
             true,
         ),
@@ -1848,8 +1855,8 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "execution_promote_output",
-            "Promote one classified regular-file execution output into a session-owned operation. Ignored, log, cache, and outputs larger than 2 MiB remain local-only and fail closed with recovery facts. Sunlight does not classify content as secret.",
-            json!({"execution":id_schema("Exact execution_id that produced the candidate."),"path":path_schema(),"session":id_schema("Exact authoring session_id that will own the promoted operation."),"classification":class_schema()}),
+            "Promote one classified regular-file execution output into a session-owned operation. Pass the candidate classification returned by execution_run verbatim: source_like_delta or generated_artifact. These are execution provenance classes, not artifact classes. Ignored, log, cache, and outputs larger than 2 MiB remain local-only and fail closed with recovery facts. Sunlight does not classify content as secret.",
+            json!({"execution":id_schema("Exact execution_id that produced the candidate."),"path":path_schema(),"session":id_schema("Exact authoring session_id that will own the promoted operation."),"classification":promotion_class_schema()}),
             &["execution", "path", "session", "classification"],
             true,
         ),
@@ -2168,6 +2175,9 @@ fn path_schema() -> Value {
 fn class_schema() -> Value {
     json!({"type":"string","enum":["source","generated","cache","local-only","execution-output","lockfile","migration","binary","vendored"]})
 }
+fn promotion_class_schema() -> Value {
+    json!({"type":"string","enum":["source_like_delta","generated_artifact"],"description":"Exact classification returned for this promotion candidate by execution_run."})
+}
 
 #[cfg(test)]
 mod tests {
@@ -2381,6 +2391,67 @@ mod tests {
         assert!(wait["outputSchema"]["properties"]["data"]["properties"]
             .get("wait")
             .is_some());
+
+        let promote = find("execution_promote_output");
+        assert_eq!(
+            promote["inputSchema"]["properties"]["classification"]["enum"],
+            json!(["source_like_delta", "generated_artifact"])
+        );
+        assert!(promote["description"]
+            .as_str()
+            .unwrap()
+            .contains("returned by execution_run verbatim"));
+    }
+
+    #[test]
+    fn promotion_invocation_accepts_execution_candidate_classes_only() {
+        let root = TestRoot::new();
+        let temp = PrivateTemp::new(&root.0).unwrap();
+        let invocation = build_invocation(
+            "execution_promote_output",
+            &json!({
+                "execution":"exec_native_0001",
+                "path":"src/generated.rs",
+                "session":"session_agent_a",
+                "classification":"source_like_delta"
+            }),
+            &root.0,
+            &temp,
+        )
+        .unwrap();
+        assert_eq!(
+            invocation.argv,
+            vec![
+                "execution",
+                "promote-output",
+                "exec_native_0001",
+                "--path",
+                "src/generated.rs",
+                "--session",
+                "session_agent_a",
+                "--classification",
+                "source_like_delta"
+            ]
+        );
+
+        let error = match build_invocation(
+            "execution_promote_output",
+            &json!({
+                "execution":"exec_native_0001",
+                "path":"src/generated.rs",
+                "session":"session_agent_a",
+                "classification":"source"
+            }),
+            &root.0,
+            &temp,
+        ) {
+            Ok(_) => panic!("artifact classification must not be accepted for promotion"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "invalid_request");
+        assert!(error
+            .message
+            .contains("source_like_delta, generated_artifact"));
     }
 
     #[test]

@@ -1282,7 +1282,9 @@ mod tests {
                     .as_nanos()
             ));
             fs::create_dir_all(&path).unwrap();
-            Self { path }
+            Self {
+                path: fs::canonicalize(path).unwrap(),
+            }
         }
 
         fn path(&self) -> &Path {

@@ -92,7 +92,7 @@ json_string_field() {
 }
 
 sun() {
-    "$sun_bin" "$@"
+    (cd "$tmp_dir" && "$sun_bin" "$@")
 }
 
 step "Building sun CLI"
@@ -112,7 +112,7 @@ out="$(run_ok init-idempotent sun init --json --repo "$init_repo")"
 assert_contains "$out" '"command":"repository.init"' "init idempotent command"
 assert_contains "$out" '"ok":true' "init idempotent ok"
 
-out="$(cd "$init_repo" && run_ok policy-check-commit sun policy check-commit --json)"
+out="$(cd "$init_repo" && run_ok policy-check-commit "$sun_bin" policy check-commit --json)"
 assert_contains "$out" '"command":"policy.check-commit"' "policy check commit command"
 assert_contains "$out" '"ok":true' "policy check commit ok"
 assert_contains "$out" '"managed_ignore_blocks_checked":1' "policy check commit managed ignore blocks"

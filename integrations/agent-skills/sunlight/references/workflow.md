@@ -64,11 +64,13 @@ bypass a failed CAS by writing outside Sunlight.
 4. Inspect combined artifacts through view-scoped reads.
 5. Run focused tests and the repository's required validation using
    `execution_run` on the exact combined view.
-6. Inspect output classification. Generated or source-like outputs enter source
-   truth only through explicit `execution_promote_output`; ignored build/cache
-   output should not be promoted. Promotion accepts one classified regular file
-   up to 2 MiB; keep denied output local-only and reduce or split legitimate
-   larger generated source before retrying.
+6. Inspect output classification. Pass a promotion candidate's returned
+   classification (`source_like_delta` or `generated_artifact`) verbatim to
+   `execution_promote_output`; these execution provenance classes are not the
+   artifact classes `source` and `generated`. Ignored build/cache output should
+   not be promoted. Promotion accepts one classified regular file up to 2 MiB;
+   keep denied output local-only and reduce or split legitimate larger
+   generated source before retrying.
 7. Create a checkpoint using passing evidence that matches the exact view and
    tree. Materialize an inspection projection only when a filesystem consumer
    needs one.
@@ -84,6 +86,9 @@ bypass a failed CAS by writing outside Sunlight.
   explicit adaptation; do not choose moving heads implicitly.
 - execution failure: use bounded output text and phase timings as diagnostics;
   make the correction in a topic session and resolve a new exact view.
+- Git export failure: preserve the validated checkpoint and report the native
+  handoff as blocked. A completed native handoff has a returned export-map ID;
+  Git plumbing outside Sunlight does not substitute for that provenance.
 - missing MCP server: stop the strict Sunlight workflow and give the user the
   setup or doctor command. Do not fall back to direct source access without
   explicit user approval.

@@ -6,13 +6,13 @@ it builds the local `sun` CLI with Cargo, uses fixture data, writes only
 temporary command output, and does not require network access or real filesystem
 reflink support.
 
-Run on Linux or WSL:
+Run on macOS, Linux, or WSL:
 
 ```sh
 scripts/projection-strategy-smoke.sh
 ```
 
-Optionally probe a non-temp WSL/Linux filesystem in the same run by setting a
+Optionally probe a non-temp macOS/Linux/WSL filesystem in the same run by setting a
 parent directory. The harness creates and removes a private probe directory
 under that parent, and emitted rows still omit absolute paths:
 
@@ -35,12 +35,12 @@ The smoke covers:
 
 - exact resolved-view materialization from `resolved_content_tree`
 - full-copy correctness fallback and cache-key selection
-- portable fixture copy metrics for the local WSL/Linux lane: selected strategy,
+- portable fixture copy metrics for the local macOS/Linux/WSL lane: selected strategy,
   elapsed materialization time, file/directory/byte counts, executable-file
   count, manifest summary counts, and deferred real-filesystem strategies
-- observed WSL/Linux temporary filesystem capability rows for reflink,
+- observed host temporary filesystem capability rows for reflink,
   read-only hardlink mutation isolation, and overlay/copy-up availability
-- optional observed WSL/Linux non-temp filesystem capability rows under a
+- optional observed host non-temp filesystem capability rows under a
   caller-supplied home/repo parent, without committing absolute probe paths
 - explicit reflink strategy selection through fixture capabilities
 - local-only projection metadata and local root references with
@@ -53,6 +53,10 @@ The smoke covers:
 
 The reflink case is a planner/CLI contract check. It intentionally relies on
 the fixture capability model instead of probing the host filesystem.
+
+The host capability probe uses `cp -c` and APFS metadata on macOS, and
+`cp --reflink=always` plus GNU `stat` on Linux/WSL. macOS reports overlay
+copy-up as platform-unsupported rather than attempting a Linux overlay mount.
 
 ## Current WSL/Linux Metric And Capability Slice
 

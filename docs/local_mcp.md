@@ -106,6 +106,15 @@ The server exposes these typed tools:
 - `policy_check_export`, `policy_check_commit`, `policy_explain`
 - `git_export`, `inspect`
 
+`session_start` accepts an exact persisted checkpoint view as well as the base
+or current view, so a follow-up topic can retain an earlier validated frontier.
+For `execution_promote_output`, pass the candidate classification returned by
+`execution_run` verbatim (`source_like_delta` or `generated_artifact`); those
+execution provenance classes are distinct from artifact classifications.
+When a target ref points to a prior Sunlight export on that same ref, a later
+checkpoint export appends to the mapped commit and writes a new export map.
+Unrecognized ref tips still fail closed.
+
 Every successful or native command-error result includes both MCP text content
 and `structuredContent` containing the existing `sun --json` envelope. Native
 errors such as `precondition_failed`, `repository_writer_busy`, and

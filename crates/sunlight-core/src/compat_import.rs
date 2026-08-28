@@ -553,13 +553,25 @@ fn scan_projection_files(
                 relative,
                 ScannedProjectionFile {
                     bytes,
-                    executable: false,
+                    executable: projection_file_is_executable(&metadata),
                     blocked_reason: None,
                 },
             );
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn projection_file_is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn projection_file_is_executable(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn classify_projection_path(

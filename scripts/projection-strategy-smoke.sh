@@ -159,7 +159,13 @@ probe_reflink_capability() {
     printf 'sunlight-projection-reflink-source\n' >"$src"
     before_hash="$(hash_file "$src")"
 
-    if cp --reflink=always "$src" "$dst" 2>"$stderr_file"; then
+    if {
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            cp -c "$src" "$dst"
+        else
+            cp --reflink=always "$src" "$dst"
+        fi
+    } 2>"$stderr_file"; then
         printf 'sunlight-projection-reflink-dest-mutation\n' >"$dst"
         after_hash="$(hash_file "$src")"
         if [[ "$before_hash" == "$after_hash" ]]; then
@@ -249,6 +255,12 @@ probe_overlay_copyup_capability() {
     local private_writes="unknown"
     local reason
 
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        printf 'projection_fs_capability host_scope=%s probe_root=%s strategy=overlay_copyup fs_type=%s overlay_attempt=failed copyup_writes_private=unknown accepted=deferred reason=platform_unsupported\n' \
+            "$host_scope" "$probe_label" "$fs_type"
+        return
+    fi
+
     mkdir -p "$lower" "$upper" "$work" "$merged"
     printf 'sunlight-projection-overlay-lower\n' >"$lower/file.txt"
     lower_before="$(hash_file "$lower/file.txt")"
@@ -294,7 +306,14 @@ probe_filesystem_capabilities() {
     local fs_type
 
     mkdir -p "$probe_root"
-    fs_type="$(stat -f -c %T "$probe_root" 2>/dev/null || printf 'unknown')"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        local device
+        device="$(df -P "$probe_root" | awk 'NR == 2 { print $1 }')"
+        fs_type="$(diskutil info "$device" 2>/dev/null | sed -n 's/^[[:space:]]*Type (Bundle):[[:space:]]*//p' | head -n 1)"
+        fs_type="${fs_type:-unknown}"
+    else
+        fs_type="$(stat -f -c %T "$probe_root" 2>/dev/null || printf 'unknown')"
+    fi
     printf 'projection_fs_capability host_scope=%s fs_type=%s probe_root=%s absolute_paths=omitted\n' "$host_scope" "$fs_type" "$probe_label"
     printf 'projection_fs_capability host_scope=%s probe_root=%s strategy=copy fs_type=%s accepted=accepted reason=correctness_fallback\n' "$host_scope" "$probe_label" "$fs_type"
     probe_reflink_capability "$probe_root" "$fs_type" "$host_scope" "$probe_label"
@@ -303,17 +322,23 @@ probe_filesystem_capabilities() {
 }
 
 probe_real_filesystem_capabilities() {
-    probe_filesystem_capabilities "$tmp_dir/real-fs-probe" current_wsl_linux_tempdir tempdir
+    local temp_scope="current_wsl_linux_tempdir"
+    local non_temp_scope="current_wsl_linux_non_temp_root"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        temp_scope="current_macos_tempdir"
+        non_temp_scope="current_macos_non_temp_root"
+    fi
+    probe_filesystem_capabilities "$tmp_dir/real-fs-probe" "$temp_scope" tempdir
 
     if [[ -n "${SUNLIGHT_PROJECTION_SMOKE_NON_TEMP_ROOT:-}" ]]; then
         mkdir -p "$SUNLIGHT_PROJECTION_SMOKE_NON_TEMP_ROOT"
         non_temp_probe_dir="$(mktemp -d "$SUNLIGHT_PROJECTION_SMOKE_NON_TEMP_ROOT/sun-projection-non-temp-fs-probe.XXXXXX")"
-        probe_filesystem_capabilities "$non_temp_probe_dir" current_wsl_linux_non_temp_root non_temp
+        probe_filesystem_capabilities "$non_temp_probe_dir" "$non_temp_scope" non_temp
     fi
 }
 
 sun() {
-    "$sun_bin" "$@"
+    (cd "$tmp_dir" && "$sun_bin" "$@")
 }
 
 export ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$tmp_dir/zig-local-cache}"
@@ -370,7 +395,7 @@ assert_contains "$out" '"cleanup":{"projection_root":{' "copy metrics cleanup"
 printf 'projection_metric fixture=basic-app view=%s purpose=execution selected_strategy=copy elapsed_ms=%s files_written=%s directories_created=%s bytes_written=%s executable_files=%s manifest_entries=%s manifest_files=%s manifest_directories=%s manifest_bytes=%s deferred_strategies=reflink_real_fs,hardlink_readonly_real_fs,overlay_copyup_real_fs scope=fixture_copy_materialization_only\n' \
     "$metrics_view_id" "$elapsed_ms" "$files_written" "$directories_created" "$bytes_written" "$executable_files" "$manifest_entries" "$manifest_files" "$manifest_directories" "$manifest_bytes"
 
-step "Probing observed WSL/Linux filesystem capabilities"
+step "Probing observed host filesystem capabilities"
 probe_real_filesystem_capabilities
 
 step "Verifying explicit reflink strategy selection JSON"

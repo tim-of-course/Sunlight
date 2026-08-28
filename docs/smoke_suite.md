@@ -9,7 +9,7 @@ this repository. The repo does not currently carry provider-specific workflow
 files, so CI systems should wire their own runner to these commands instead of
 assuming a GitHub Actions, Azure Pipelines, or other hosted-CI convention.
 
-Run on Linux or WSL:
+Run on macOS, Linux, or WSL:
 
 ```sh
 scripts/smoke-suite.sh
@@ -29,8 +29,12 @@ require the WSL lane.
 
 Platform lanes:
 
+- macOS: run `scripts/smoke-suite.sh` from the repository root with a local
+  Rust toolchain, `cargo`, `rustfmt`, `git`, and `python3` available on `PATH`.
+  The lane is a development compatibility check and does not claim the
+  Windows isolation guarantees.
 - Linux/WSL: run `scripts/smoke-suite.sh` from the repository root with a local
-  Rust toolchain, `cargo`, and `git` available on `PATH`.
+  Rust toolchain, `cargo`, `rustfmt`, `git`, and `python3` available on `PATH`.
 - Windows native: run `scripts/smoke-suite.ps1` in PowerShell with Rust and
   `git` available on the Windows `PATH`. If WSL is installed, the wrapper
   delegates to the Linux/WSL lane unless `SUNLIGHT_SMOKE_USE_WSL=0` is set or

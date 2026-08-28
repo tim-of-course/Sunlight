@@ -3,7 +3,9 @@ use std::fs;
 #[cfg(windows)]
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+#[cfg(windows)]
+use std::process::Stdio;
+use std::process::{Command, Output};
 #[cfg(windows)]
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,6 +13,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use sunlight_core::records::parse_json_record;
 use sunlight_core::repo_state::{RealQuarantineEntry, RealRepoState};
+
+#[cfg(windows)]
+const PYTHON: &str = "python";
+#[cfg(not(windows))]
+const PYTHON: &str = "python3";
 
 fn sun() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sun"))
@@ -1174,7 +1181,7 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
     let run = sun()
         .args(["run", "--view", "view_base_0001", "--json", "--"])
         .args([
-            "python",
+            PYTHON,
             "-c",
             "from pathlib import Path; Path('generated').mkdir(exist_ok=True); Path('generated/out.txt').write_bytes(b'promoted needle\\n'); Path('generated/hidden.txt').write_bytes(b'hidden output\\n')",
         ])
@@ -1240,6 +1247,26 @@ fn no_fixture_execution_output_promotion_repo_backed_slice() {
         .expect("sun execution promote-output should run");
     assert_failure(&bad_promote);
     assert!(stdout(&bad_promote).contains("\"code\":\"promotion_precondition_failed\""));
+
+    let wrong_classification = sun()
+        .arg("execution")
+        .arg("promote-output")
+        .arg(&execution_id)
+        .arg("--path")
+        .arg("generated/out.txt")
+        .arg("--session")
+        .arg("session_agent_a")
+        .arg("--classification")
+        .arg("source")
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("mismatched promotion classification should run");
+    assert_failure(&wrong_classification);
+    let wrong_classification = stdout(&wrong_classification);
+    assert!(wrong_classification.contains("\"code\":\"promotion_policy_failed\""));
+    assert!(wrong_classification.contains("\"provided_classification\":\"source\""));
+    assert!(wrong_classification.contains("\"expected_classification\":\"source_like_delta\""));
 
     let hidden_promote = sun()
         .arg("execution")
@@ -1364,7 +1391,7 @@ fn oversized_execution_output_promotion_fails_closed_without_native_mutation() {
     let run = sun()
         .args(["run", "--view", "view_base_0001", "--json", "--"])
         .args([
-            "python",
+            PYTHON,
             "-c",
             "from pathlib import Path; Path('src').mkdir(exist_ok=True); Path('src/generated_large.rs').write_bytes(b'x' * 2097153)",
         ])
@@ -1427,7 +1454,7 @@ fn ignored_execution_outputs_are_batched_bounded_and_not_promotable() {
     let run = sun()
         .args(["run", "--view", "view_base_0001", "--json", "--"])
         .args([
-            "python",
+            PYTHON,
             "-c",
             "from pathlib import Path; [Path('custom-output').mkdir(exist_ok=True), Path('dist').mkdir(exist_ok=True)]; [Path(f'custom-output/out-{i}.txt').write_text(str(i)) for i in range(20)]; [Path(f'dist/bundle-{i}.js').write_text(str(i)) for i in range(20)]; print('build-complete')",
         ])
@@ -1469,7 +1496,7 @@ fn tracked_gitignore_match_modified_by_execution_remains_promotable() {
     let run = sun()
         .args(["run", "--view", "view_base_0001", "--json", "--"])
         .args([
-            "python",
+            PYTHON,
             "-c",
             "from pathlib import Path; Path('tracked.env').write_text('after\\n')",
         ])
@@ -1493,7 +1520,7 @@ fn execution_git_ignore_probe_failure_is_not_treated_as_source() {
     let run = sun()
         .args(["run", "--view", "view_base_0001", "--json", "--"])
         .args([
-            "python",
+            PYTHON,
             "-c",
             "from pathlib import Path; Path('candidate.txt').write_text('candidate\\n')",
         ])
@@ -1928,7 +1955,7 @@ fn no_fixture_windows_user_toolchain_incompatibility_is_fail_closed_before_comma
             "disabled",
             "--json",
             "--",
-            "python",
+            PYTHON,
             "-c",
         ])
         .arg("from pathlib import Path; Path('COMMAND_RAN').write_text('ran')")
@@ -2074,7 +2101,7 @@ fn no_fixture_windows_cleanup_failure_persists_execution_and_recovers_from_journ
             "not_enforced",
             "--json",
             "--",
-            "python",
+            PYTHON,
             "-c",
             "pass",
         ])
@@ -2285,7 +2312,7 @@ fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_
             "disabled",
             "--json",
             "--",
-            "python",
+            PYTHON,
             "-c",
             "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')",
         ])
@@ -2321,7 +2348,7 @@ fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_
             "not_enforced",
             "--json",
             "--",
-            "python",
+            PYTHON,
             "-c",
             "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')",
         ])
@@ -2357,7 +2384,7 @@ fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_
             "not_enforced",
             "--json",
             "--",
-            "python",
+            PYTHON,
             "-c",
             "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ran')",
         ])
@@ -2459,7 +2486,7 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
         timeout_command.args(["cmd.exe", "/d", "/c", "timeout-root.cmd"]);
     } else {
         timeout_command.args([
-            "python",
+            PYTHON,
             "-c",
             r#"import subprocess,sys,time; from pathlib import Path; p=subprocess.Popen([sys.executable,'-c',"import time; from pathlib import Path; time.sleep(3); Path('LATE_MARKER').write_text('late')"]); time.sleep(5)"#,
         ]);
@@ -2541,7 +2568,7 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
         large_command.args(["cmd.exe", "/d", "/c", "large-output.cmd"]);
     } else {
         large_command.args([
-            "python",
+            PYTHON,
             "-c",
             "import sys; sys.stdout.buffer.write(b'A'*5000); sys.stderr.buffer.write(b'B'*7000)",
         ]);
@@ -2589,7 +2616,7 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
         normal_command.args(["cmd.exe", "/d", "/c", "environment-check.cmd"]);
     } else {
         normal_command.args([
-            "python",
+            PYTHON,
             "-c",
             "import os,sys; sys.exit(1 if os.environ.get('SUNLIGHT_TEST_SECRET') else 0)",
         ]);
@@ -2628,7 +2655,7 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
     assert_eq!(tool_hints.len(), 1);
     assert_eq!(
         tool_hints[0]["name"],
-        if cfg!(windows) { "cmd" } else { "python" }
+        if cfg!(windows) { "cmd" } else { PYTHON }
     );
     assert!(tool_hints[0]["version_or_digest"]
         .as_str()
@@ -2745,7 +2772,7 @@ fn windows_job_object_enforces_cpu_memory_and_active_process_limits() {
             "view_base_0001",
             "--json",
             "--",
-            "python",
+            PYTHON,
             "-c",
             "pass",
         ])
@@ -2774,7 +2801,7 @@ fn windows_job_object_enforces_cpu_memory_and_active_process_limits() {
             "view_base_0001",
             "--json",
             "--",
-            "python",
+            PYTHON,
             "-c",
             "raise SystemExit(7)",
         ])
@@ -2840,7 +2867,7 @@ fn windows_job_object_enforces_cpu_memory_and_active_process_limits() {
                 "view_base_0001",
                 "--json",
                 "--",
-                "python",
+                PYTHON,
                 "-c",
                 script,
             ])
@@ -2901,7 +2928,7 @@ fn no_fixture_invalid_execution_policy_precedes_projection_process_and_state_mut
         .arg("view_base_0001")
         .arg("--json")
         .arg("--")
-        .arg("python")
+        .arg(PYTHON)
         .arg("-c")
         .arg("from pathlib import Path; Path('PROCESS_MUST_NOT_RUN').write_text('bad')")
         .current_dir(repo.path())
@@ -2972,7 +2999,7 @@ fn no_fixture_custom_managed_root_drives_compat_and_execution_projections() {
             "view_base_0001",
             "--json",
             "--",
-            "python",
+            PYTHON,
             "-c",
             "pass",
         ])
@@ -3578,7 +3605,7 @@ fn no_fixture_projection_policy_rejection_precedes_files_state_and_process() {
         .arg("view_base_0001")
         .arg("--json")
         .arg("--")
-        .arg("python")
+        .arg(PYTHON)
         .arg("-c")
         .arg("from pathlib import Path; import sys; Path(sys.argv[1]).write_text('ran')")
         .arg(&process_marker)
@@ -10888,6 +10915,199 @@ fn no_fixture_policy_check_and_git_export_share_persisted_validation() {
 }
 
 #[test]
+fn no_fixture_git_export_appends_new_checkpoint_to_prior_exported_ref() {
+    let repo = TestRepo::new("real-incremental-export");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "incremental-export");
+    let branch = "refs/heads/sunlight/incremental-export";
+
+    let first_checkpoint = create_real_base_checkpoint(&repo);
+    let first_export = run_real_json(
+        &repo,
+        &[
+            "git",
+            "export",
+            "--checkpoint",
+            &first_checkpoint,
+            "--branch",
+            branch,
+            "--execute-local",
+        ],
+    );
+    assert_success(&first_export);
+    let first_commit = git(repo.path(), &["rev-parse", branch]).trim().to_string();
+
+    let content = repo.write_file("follow-up-input.txt", "follow-up\n");
+    let write = sun()
+        .args([
+            "write",
+            "src/follow-up.txt",
+            "--session",
+            "session_agent_a",
+            "--expect-hash",
+            "new",
+            "--content-file",
+        ])
+        .arg(content)
+        .args(["--classification", "source", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .expect("follow-up write should run");
+    assert_success(&write);
+    let follow_up_view = json_string_field(&stdout(&write), "resolved_view_id");
+    let checkpoint = run_real_json(&repo, &["checkpoint", "create", "--view", &follow_up_view]);
+    assert_success(&checkpoint);
+    let second_checkpoint = json_string_field(&stdout(&checkpoint), "checkpoint_id");
+
+    let second_export = run_real_json(
+        &repo,
+        &[
+            "git",
+            "export",
+            "--checkpoint",
+            &second_checkpoint,
+            "--branch",
+            branch,
+            "--execute-local",
+        ],
+    );
+    assert_success(&second_export);
+    let second_commit = git(repo.path(), &["rev-parse", branch]).trim().to_string();
+
+    assert_ne!(second_commit, first_commit);
+    assert_eq!(
+        git(repo.path(), &["rev-parse", &format!("{second_commit}^")]).trim(),
+        first_commit
+    );
+    assert_eq!(
+        git(
+            repo.path(),
+            &["show", &format!("{second_commit}:src/follow-up.txt")]
+        ),
+        "follow-up\n"
+    );
+    assert!(repo
+        .path()
+        .join(".sunlight/export-map")
+        .join(format!("export_map_{first_checkpoint}.json"))
+        .is_file());
+    assert!(repo
+        .path()
+        .join(".sunlight/export-map")
+        .join(format!("export_map_{second_checkpoint}.json"))
+        .is_file());
+}
+
+#[test]
+fn no_fixture_session_can_start_from_exact_checkpointed_view() {
+    let repo = TestRepo::new("real-session-checkpoint-view");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "checkpoint-source");
+
+    let first_content = repo.write_file("first-input.txt", "first\n");
+    let first_write = sun()
+        .args([
+            "write",
+            "src/first.txt",
+            "--session",
+            "session_agent_a",
+            "--expect-hash",
+            "new",
+            "--content-file",
+        ])
+        .arg(first_content)
+        .args(["--classification", "source", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .expect("first write should run");
+    assert_success(&first_write);
+    let checkpoint_view = json_string_field(&stdout(&first_write), "resolved_view_id");
+    assert_success(&run_real_json(
+        &repo,
+        &["checkpoint", "create", "--view", &checkpoint_view],
+    ));
+
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "topic",
+            "create",
+            "other-head",
+            "--display-name",
+            "Other head",
+        ],
+    ));
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "topic_other_head",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "agent-b",
+        ],
+    ));
+    let second_content = repo.write_file("second-input.txt", "second\n");
+    let second_write = sun()
+        .args([
+            "write",
+            "src/second.txt",
+            "--session",
+            "session_agent_b",
+            "--expect-hash",
+            "new",
+            "--content-file",
+        ])
+        .arg(second_content)
+        .args(["--classification", "source", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .expect("second write should run");
+    assert_success(&second_write);
+
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "topic",
+            "create",
+            "checkpoint-follow-up",
+            "--display-name",
+            "Checkpoint follow-up",
+        ],
+    ));
+    let follow_up_session = run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "topic_checkpoint_follow_up",
+            "--view",
+            &checkpoint_view,
+            "--actor",
+            "agent-c",
+        ],
+    );
+    assert_success(&follow_up_session);
+
+    let first_read = run_real_json(
+        &repo,
+        &["read", "src/first.txt", "--session", "session_agent_c"],
+    );
+    assert_success(&first_read);
+    assert!(stdout(&first_read).contains("first"));
+    let second_read = run_real_json(
+        &repo,
+        &["read", "src/second.txt", "--session", "session_agent_c"],
+    );
+    assert_failure(&second_read);
+    assert!(stdout(&second_read).contains("\"code\":\"path_not_found\""));
+}
+
+#[test]
 fn no_fixture_generated_policy_failure_does_not_mutate_git_or_export_maps() {
     let repo = TestRepo::new("real-policy-generated-block");
     init_local_git_repo(&repo);
@@ -14179,7 +14399,9 @@ impl TestRepo {
                 .as_nanos()
         ));
         fs::create_dir_all(&path).unwrap();
-        Self { path }
+        Self {
+            path: fs::canonicalize(path).unwrap(),
+        }
     }
 
     fn path(&self) -> &Path {

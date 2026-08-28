@@ -1313,13 +1313,12 @@ fn execution_promote_output(ctx: &CommandContext) -> Result<(), CliError> {
         ));
     }
     if options.classification.as_deref() != Some(candidate.classification.as_str()) {
-        return Err(promotion_error(
-            "promotion_policy_failed",
-            "execution output promotion classification does not match the candidate",
+        return Err(promotion_classification_error(
             &options.execution_id,
             options.path.as_deref(),
             options.session_id.as_deref(),
             options.classification.as_deref(),
+            candidate.classification.as_str(),
         ));
     }
 
@@ -2894,6 +2893,12 @@ fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Res
     let topic = real_topic(&state, &options.topic)?.clone();
     let selected = if options.view_id == state.base_resolved_view_id {
         real_base_resolved_repo_view(&state)
+    } else if let Some(checkpoint) = state
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.resolved_view_id == options.view_id)
+    {
+        real_checkpoint_snapshot_resolved_view(&state, checkpoint)
     } else {
         let head = state.resolve_head_view();
         if options.view_id != head.result.resolved_view_id
@@ -3905,6 +3910,7 @@ struct BoundedProcessOutput {
 #[derive(Debug)]
 enum ProcessRunError {
     Command(io::Error),
+    #[cfg(windows)]
     ContainmentSetup(io::Error),
     Publication(RepoStateError),
     #[cfg(windows)]
@@ -3938,6 +3944,7 @@ impl ExecutionChild {
         #[cfg(not(windows))]
         {
             let _ = policy;
+            let mut command = command;
             command
                 .spawn()
                 .map(|child| Self { child })
@@ -4055,9 +4062,8 @@ fn resolve_execution_program(program: &str, cwd: &Path) -> Option<PathBuf> {
     }
     #[cfg(not(windows))]
     {
-        env::var_os("PATH")
-            .into_iter()
-            .flat_map(env::split_paths)
+        let path = env::var_os("PATH")?;
+        env::split_paths(&path)
             .map(|root| root.join(program))
             .find(|candidate| candidate.is_file())
             .and_then(|path| fs::canonicalize(path).ok())
@@ -4682,6 +4688,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
             )
             .with_detail("command", options.command_argv.join(" "))
         }
+        #[cfg(windows)]
         ProcessRunError::ContainmentSetup(error) => {
             remove_unpublished_execution_root(&projection_root);
             CliError::new(
@@ -5065,13 +5072,12 @@ fn real_execution_promote_output(
         ));
     }
     if classification != output.classification {
-        return Err(promotion_error(
-            "promotion_policy_failed",
-            "execution output promotion classification does not match the candidate",
+        return Err(promotion_classification_error(
             &options.execution_id,
             Some(&path),
             Some(&session_id),
             Some(&classification),
+            &output.classification,
         ));
     }
     if classification == "ignored" || classification == "log" || classification == "cache" {
@@ -7311,12 +7317,19 @@ fn real_git_export_writer_input(
         .map(|commit_id| commit_id.trim().to_string())
         .filter(|commit_id| !commit_id.is_empty());
     let refs = target_ref_commit_id
+        .clone()
         .map(|commit_id| GitRefState {
             git_ref: target_ref.clone(),
             commit_id,
         })
         .into_iter()
         .collect();
+    let mut reachable_commit_ids = vec![base_commit_id.clone()];
+    if let Some(commit_id) = target_ref_commit_id {
+        if !reachable_commit_ids.contains(&commit_id) {
+            reachable_commit_ids.push(commit_id);
+        }
+    }
     let mut request = GitExportRequest::from_checkpoint(&checkpoint);
     request.git_ref = target_ref.clone();
     request.validation_report_id = validation_report.id.clone();
@@ -7358,7 +7371,7 @@ fn real_git_export_writer_input(
             repository_id: checkpoint.repository_id.clone(),
             git_root: repo_root_string.clone(),
             sunlight_repo_root: repo_root_string,
-            reachable_commit_ids: vec![base_commit_id],
+            reachable_commit_ids,
             refs,
         },
     })
@@ -13883,6 +13896,39 @@ fn promotion_error(
     ))
 }
 
+fn promotion_classification_error(
+    execution_id: &str,
+    path: Option<&str>,
+    session_id: Option<&str>,
+    provided_classification: Option<&str>,
+    expected_classification: &str,
+) -> CliError {
+    CliError::new(
+        "promotion_policy_failed",
+        "execution output promotion classification does not match the candidate",
+    )
+    .with_raw_details_json(format!(
+        concat!(
+            "{{",
+            "\"execution_id\":\"{}\",",
+            "\"path\":{},",
+            "\"session_id\":{},",
+            "\"classification\":{},",
+            "\"provided_classification\":{},",
+            "\"expected_classification\":\"{}\",",
+            "\"operation_transaction_id\":null,",
+            "\"topic_revision_id\":null",
+            "}}"
+        ),
+        json_escape(execution_id),
+        optional_string_json(path),
+        optional_string_json(session_id),
+        optional_string_json(provided_classification),
+        optional_string_json(provided_classification),
+        json_escape(expected_classification),
+    ))
+}
+
 fn oversized_promotion_error(
     execution_id: &str,
     path: &str,
@@ -18917,7 +18963,7 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
         "topic create" => outputln!(ctx, "sun topic create\n\nUsage:\n  sun topic create <slug> --display-name <name> [--owner <actor>] [--visibility local|private] [--acceptance-criterion <text>...] [--json]\n\nCreates a durable topic in the initialized repository. Defaults: owner=local, visibility=local."),
         "topic complete" => outputln!(ctx, "sun topic complete\n\nUsage:\n  sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]\n\nRecords an idempotent durable completion fact for the exact current topic revision; it does not assert review or quality."),
         "session" => outputln!(ctx, "sun session\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]\n  sun session refresh <session> --policy manual|follow|none [--json]"),
-        "session start" => outputln!(ctx, "sun session start\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]"),
+        "session start" => outputln!(ctx, "sun session start\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]\n\nThe exact view may be the repository base, current head, or a persisted checkpoint view."),
         "session refresh" => outputln!(ctx, "sun session refresh\n\nUsage:\n  sun session refresh <session> --policy manual|follow|none [--json]\n\nmanual and follow immediately advance already-selected non-write topics to current heads; none pins them. The write topic always remains at the session revision. An unchanged policy/frontier is an idempotent no-op."),
         "compat" | "compat project" | "compat diff" | "compat import" => outputln!(ctx, "sun compat\n\nUsage:\n  sun compat project --session <session> [--json]\n  sun compat diff --projection <projection> [--json]\n  sun compat import --projection <projection> --candidate <candidate> [--json]\n\nCompatibility projections are adapters. Only explicit import creates native operations."),
         "policy" | "policy check-export" | "policy check-commit" | "policy explain" => outputln!(ctx, "sun policy\n\nUsage:\n  sun policy check-export --checkpoint <checkpoint> [--branch <ref>] [--json]\n  sun policy check-commit [--paths <path>...] [--json]\n  sun policy explain <validation-report> [--json]"),
@@ -18927,7 +18973,7 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
         "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => outputln!(ctx, "sun artifact operations\n\nUsage:\n  sun read <path> (--session <session> | --view <resolved-view>) [--json]\n  sun list [path-prefix] (--session <session> | --view <resolved-view>) [--json]\n  sun search <query> (--session <session> | --view <resolved-view>) [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification <class> [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification <class> [--json]\n\nResolved-view reads are read-only and do not create a session. Mutations always require a topic-bound authoring session."),
         "view" | "view resolve" => outputln!(ctx, "sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nResolves persisted topic selections; conflicts and staleness remain inspectable records."),
         "project" | "project materialize" | "projection" | "projection create" => outputln!(ctx, "sun project materialize\n\nUsage:\n  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export [--strategy copy|reflink|hardlink_readonly|overlay_copyup] [--no-copy-fallback] [--projection-root <path>] [--json]\n\nManaged projections adapt persisted views for filesystem tools and are not source truth. Automatic selection uses verified-cache read-only hardlinks for Windows inspection, prefers safe block cloning for writable purposes, and falls back to private copies; --no-copy-fallback makes the requested strategy required."),
-        "execution" | "execution promote-output" => outputln!(ctx, "sun execution promote-output\n\nUsage:\n  sun execution promote-output <execution-id> --path <path> --session <session> --classification <class> [--json]"),
+        "execution" | "execution promote-output" => outputln!(ctx, "sun execution promote-output\n\nUsage:\n  sun execution promote-output <execution-id> --path <path> --session <session> --classification source_like_delta|generated_artifact [--json]\n\nPass the exact promotion-candidate classification returned by sun run."),
         "mcp" | "mcp serve" => outputln!(ctx, "sun mcp serve\n\nUsage:\n  sun mcp serve --repo <initialized-repo>\n\nRuns MCP JSON-RPC 2.0 over newline-delimited stdio. The server is bound to one canonical initialized repository; stdout contains protocol messages only."),
         _ => print_help(ctx),
     }

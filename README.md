@@ -10,6 +10,10 @@ single-repository workflow on Windows/NTFS. macOS and Linux builds are not
 supported alpha targets; their compilation or best-effort behavior is not a
 claim of enforced isolation or product support.
 
+macOS is available as a development and test host. Passing its test lane does
+not change the Windows-only product scope: process-tree, resource, network, and
+filesystem isolation remain unenforced where the CLI reports them as such.
+
 ## Build
 
 ```powershell
@@ -18,6 +22,23 @@ cargo build --release --workspace
 
 The executable is `target\release\sun.exe` on Windows and
 `target/release/sun` elsewhere.
+
+## Test on macOS
+
+The macOS lane requires a stable Rust toolchain with `cargo` and `rustfmt`,
+Git, Bash, and Python 3 available as `python3`. No additional native libraries
+are required.
+
+From the repository root, run the aggregate suite:
+
+```sh
+scripts/smoke-suite.sh
+```
+
+It runs formatting, compilation, all workspace tests, the no-fixture
+self-hosting journey, and the validation, projection-strategy, and MVP smoke
+scripts. The Bash scripts are compatible with the Bash 3 version included with
+macOS.
 
 ## Set up a repository for coding agents
 
@@ -98,11 +119,16 @@ that repository's confined MCP binding, and start a new Codex task.
 
 ## Verify the implementation
 
+On macOS, Linux, or WSL:
+
+```sh
+scripts/smoke-suite.sh
+```
+
+On Windows PowerShell:
+
 ```powershell
-cargo fmt --all -- --check
-cargo test --workspace
-scripts\validation-smoke.ps1
-scripts\mvp-smoke.ps1
+scripts\smoke-suite.ps1
 ```
 
 See [the local MCP reference](docs/local_mcp.md) and the

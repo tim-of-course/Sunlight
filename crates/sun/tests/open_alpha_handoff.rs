@@ -6,6 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use sunlight_core::repo_state::RealRepoState;
 
+#[cfg(windows)]
+const PYTHON: &str = "python";
+#[cfg(not(windows))]
+const PYTHON: &str = "python3";
+
 #[test]
 fn open_alpha_oa05_exact_checkpoint_exports_to_safe_buildable_git_handoff() {
     let temp = TempDir::new("sun-oa05-git-handoff");
@@ -47,7 +52,7 @@ fn open_alpha_oa05_exact_checkpoint_exports_to_safe_buildable_git_handoff() {
             "--view",
             "view_base_0001",
             "--",
-            "python",
+            PYTHON,
             "-m",
             "unittest",
             "-v",
@@ -120,7 +125,7 @@ fn open_alpha_oa05_exact_checkpoint_exports_to_safe_buildable_git_handoff() {
     let focused = sun_ok(
         &repo,
         &[
-            "run", "--view", &view_id, "--", "python", "-m", "unittest", "-v",
+            "run", "--view", &view_id, "--", PYTHON, "-m", "unittest", "-v",
         ],
     );
     assert_eq!(
@@ -134,7 +139,7 @@ fn open_alpha_oa05_exact_checkpoint_exports_to_safe_buildable_git_handoff() {
             "--view",
             &view_id,
             "--",
-            "python",
+            PYTHON,
             "-m",
             "compileall",
             "-q",
@@ -296,12 +301,12 @@ fn open_alpha_oa05_exact_checkpoint_exports_to_safe_buildable_git_handoff() {
         ],
     );
     command_ok(
-        Command::new("python")
+        Command::new(PYTHON)
             .args(["-m", "unittest", "-v"])
             .current_dir(&consumer),
     );
     command_ok(
-        Command::new("python")
+        Command::new(PYTHON)
             .args(["-m", "compileall", "-q", "."])
             .current_dir(&consumer),
     );

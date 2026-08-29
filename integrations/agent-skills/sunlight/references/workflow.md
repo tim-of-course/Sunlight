@@ -60,6 +60,9 @@ the captured revision.
 2. Create a narrowly named topic with `topic_create`.
 3. Start a session from the intended exact view with `session_start`. Use a
    stable actor identifier and do not reuse another agent's session.
+   Other visible topics are informational: continue authoring in this exact
+   session. Overlapping paths become conflicts only if their revisions are
+   selected together for integration.
 4. Discover source with `artifact_list` and `artifact_search`; inspect it with
    `artifact_read` using the session scope.
 5. Mutate with `artifact_patch`, `artifact_write`, `artifact_move`,
@@ -79,8 +82,9 @@ bypass a failed CAS by writing outside Sunlight.
 
 ## Coordinate and integrate
 
-1. Wait for an owned dependency with `topic_wait`; do not poll status in a
-   loop. Consume the returned structured handoff.
+1. When the task has an explicit dependency, wait for its topic with
+   `topic_wait`; do not infer dependencies from topic visibility or poll status
+   in a loop. Consume the returned structured handoff.
 2. Call `view_resolve` with the base checkpoint and exactly one selected
    revision for every topic being integrated. Omitting `include` resolves moving
    current heads and is discovery-only.
@@ -114,8 +118,11 @@ bypass a failed CAS by writing outside Sunlight.
 ## Failure handling
 
 - `precondition_failed`: re-read the artifact and reconsider the patch.
-- `repository_writer_busy` or `concurrent_state_update`: safe native calls are
-  retried by the server; if still returned, reload state and retry deliberately.
+- `repository_writer_busy` or `concurrent_state_update`: the server queues,
+  reloads, and retries safe native calls automatically. If one is returned,
+  retry the same safe call once after a brief delay. If it recurs, report the
+  exact facts as a repository-service blocker rather than coordinating writers
+  or repairing native state manually.
 - conflicted or stale view: inspect the referenced records and create an
   explicit adaptation; do not choose moving heads implicitly.
 - execution failure: use bounded output text and phase timings as diagnostics;

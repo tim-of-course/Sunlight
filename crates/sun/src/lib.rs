@@ -3084,7 +3084,19 @@ fn real_resolve_view_by_id(
     }
 
     if view_id == state.resolved_view_id {
-        return Ok(head);
+        let resolved = state.resolve_view(
+            state
+                .current_topic_frontier
+                .iter()
+                .map(|(topic_id, revision_id)| TopicRevisionSelection {
+                    topic_id: topic_id.clone(),
+                    revision_id: revision_id.clone(),
+                })
+                .collect(),
+        );
+        if resolved.result.resolved_view_id == view_id {
+            return Ok(resolved);
+        }
     }
 
     if let Some(frontier) = load_persisted_view_frontier(repo_root, state, view_id)? {
@@ -3104,6 +3116,31 @@ fn real_resolve_view_by_id(
             )
             .with_detail("recorded_view_id", view_id)
             .with_detail("resolved_view_id", resolved.result.resolved_view_id));
+        }
+        return Ok(resolved);
+    }
+
+    if let Some(checkpoint) = state
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.resolved_view_id == view_id)
+    {
+        let resolved = real_checkpoint_snapshot_resolved_view(state, checkpoint);
+        if !resolved.result.conflict_free()
+            || resolved.result.resolved_view_id != checkpoint.resolved_view_id
+            || resolved
+                .result
+                .tree_identity
+                .as_ref()
+                .map(|tree| tree.tree_hash.as_str())
+                != Some(checkpoint.tree_hash.as_str())
+        {
+            return Err(CliError::new(
+                "checkpoint_view_mismatch",
+                "the checkpoint frontier does not reproduce its exact persisted view",
+            )
+            .with_detail("checkpoint_id", checkpoint.checkpoint_id.clone())
+            .with_detail("resolved_view_id", checkpoint.resolved_view_id.clone()));
         }
         return Ok(resolved);
     }
@@ -3207,6 +3244,18 @@ fn real_checkpoint_snapshot_resolved_view(
     state: &RealRepoState,
     snapshot: &RealCheckpointSnapshot,
 ) -> RealResolvedRepoView {
+    if snapshot.entries.is_empty() {
+        return state.resolve_view(
+            snapshot
+                .topic_frontier
+                .iter()
+                .map(|(topic_id, revision_id)| TopicRevisionSelection {
+                    topic_id: topic_id.clone(),
+                    revision_id: revision_id.clone(),
+                })
+                .collect(),
+        );
+    }
     let tree_entries = snapshot
         .entries
         .iter()
@@ -3510,23 +3559,7 @@ fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Res
     let repo_root = ctx.repo_root.clone();
     let mut state = RealRepoState::load_metadata(&repo_root)?;
     let topic = real_topic(&state, &options.topic)?.clone();
-    let selected = if options.view_id == state.base_resolved_view_id {
-        real_base_resolved_repo_view(&state)
-    } else if let Some(checkpoint) = state
-        .checkpoints
-        .iter()
-        .find(|checkpoint| checkpoint.resolved_view_id == options.view_id)
-    {
-        real_checkpoint_snapshot_resolved_view(&state, checkpoint)
-    } else {
-        let head = state.resolve_head_view();
-        if options.view_id != head.result.resolved_view_id
-            && options.view_id != state.resolved_view_id
-        {
-            return Err(object_not_found("view", &options.view_id));
-        }
-        head
-    };
+    let selected = real_resolve_view_by_id(&repo_root, &state, &options.view_id)?;
     if !selected.result.conflict_free() {
         return Err(CliError::new(
             "conflicted_view",
@@ -3537,7 +3570,7 @@ fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Res
     let topic_frontier = selected.result.topic_frontier.clone();
     let actor_slug = options.actor_id.replace('-', "_");
     let base_session_id = format!("session_{actor_slug}");
-    let session_id = match state.session_by_id(&base_session_id) {
+    let preferred_session_id = match state.session_by_id(&base_session_id) {
         None => base_session_id,
         Some(existing) => {
             if existing.actor_id == options.actor_id && existing.write_topic_id == topic.topic_id {
@@ -3547,7 +3580,41 @@ fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Res
             }
         }
     };
+    let mut session_id = preferred_session_id.clone();
+    for discriminator in 2u64.. {
+        let Some(existing) = state.session_by_id(&session_id) else {
+            break;
+        };
+        if existing.actor_id == options.actor_id && existing.write_topic_id == topic.topic_id {
+            break;
+        }
+        session_id = format!("{preferred_session_id}_{discriminator:04}");
+    }
     if let Some(existing) = state.session_by_id(&session_id) {
+        if existing.actor_id != options.actor_id || existing.write_topic_id != topic.topic_id {
+            return Err(CliError::new(
+                "session_identity_mismatch",
+                "the resolved session identity belongs to another actor or topic",
+            )
+            .with_detail("session_id", existing.session_id.clone()));
+        }
+        if existing.resolved_view_id != selected.result.resolved_view_id
+            || existing.topic_frontier != topic_frontier
+        {
+            return Err(CliError::new(
+                "session_view_mismatch",
+                "the existing actor/topic session is pinned to a different exact view",
+            )
+            .with_detail("session_id", existing.session_id.clone())
+            .with_detail(
+                "existing_resolved_view_id",
+                existing.resolved_view_id.clone(),
+            )
+            .with_detail(
+                "requested_resolved_view_id",
+                selected.result.resolved_view_id.clone(),
+            ));
+        }
         if ctx.json {
             outputln!(
                 ctx,
@@ -6671,7 +6738,14 @@ fn real_accept_mutation(
         .tree_identity
         .as_ref()
         .map(|tree| tree.tree_hash.clone())
-        .unwrap_or_else(|| real_tree_hash(&session_resolved.entries));
+        .ok_or_else(|| {
+            CliError::new(
+                "conflicted_view",
+                "mutation would produce a conflicted session view",
+            )
+            .with_detail("resolved_view_id", resolved_view_id.clone())
+            .with_detail("session_id", session_id.to_string())
+        })?;
     state.resolved_view_id = resolved_view_id.clone();
     state.current_topic_frontier = session_resolved.result.topic_frontier.clone();
     state.tree_hash = tree_hash;
@@ -9829,10 +9903,11 @@ fn real_operational_warnings_json(
     if summary.quarantined_count > 0 {
         warnings.push(format!("{{\"code\":\"legacy_ingest_quarantine\",\"message\":\"legacy automatic secret detection excluded files from this native state\",\"details\":{{\"count\":{},\"next_action\":\"Run repository_init with the current build to migrate a clean state, or follow its preservation instructions when authored history exists.\"}}}}", summary.quarantined_count));
     }
-    if summary.conflict_count > 0 {
+    if matches!(command, "status.repository" | "inspect.repository") && summary.conflict_count > 0 {
         warnings.push(format!("{{\"code\":\"resolver_conflicts\",\"message\":\"inspect and resolve conflicting topic operations\",\"details\":{{\"count\":{}}}}}", summary.conflict_count));
     }
-    if summary.staleness_count > 0 {
+    if matches!(command, "status.repository" | "inspect.repository") && summary.staleness_count > 0
+    {
         warnings.push(format!("{{\"code\":\"resolver_staleness\",\"message\":\"refresh or reselect stale topic dependencies\",\"details\":{{\"count\":{}}}}}", summary.staleness_count));
     }
     if summary.execution_failed > 0 || summary.execution_timeouts > 0 {
@@ -10007,13 +10082,14 @@ fn print_real_status_text(
             "warning[legacy_ingest_quarantine]: run sun init with the current build to migrate a clean state, or follow its preservation instructions when authored history exists"
         );
     }
-    if summary.conflict_count > 0 {
+    if matches!(command, "status.repository" | "inspect.repository") && summary.conflict_count > 0 {
         outputln!(
             ctx,
             "warning[resolver_conflicts]: inspect and resolve conflicting topic operations"
         );
     }
-    if summary.staleness_count > 0 {
+    if matches!(command, "status.repository" | "inspect.repository") && summary.staleness_count > 0
+    {
         outputln!(
             ctx,
             "warning[resolver_staleness]: refresh or reselect stale topic dependencies"
@@ -19855,6 +19931,12 @@ fn next_action_for_error_code(code: &str) -> &'static str {
         }
         "session_not_found" => {
             "Inspect repository status for current sessions; start a new session on the intended topic and exact view when the supplied session does not exist."
+        }
+        "session_view_mismatch" => {
+            "Use the returned existing session at its pinned exact view, or choose a distinct actor identifier when a separate session is required."
+        }
+        "session_identity_mismatch" => {
+            "Choose a distinct actor identifier and retry session_start; do not reuse a session owned by another actor or topic."
         }
         "topic_completed" | "topic_already_completed" => {
             "Treat the completed revision as immutable; create a dependent topic and session for any follow-up change."

@@ -1035,6 +1035,7 @@ impl RealRepoState {
             quarantine,
         };
         state.sync_compat_fields();
+        state.validate_embedded_checkpoint_entries(&path)?;
         if !compact_entries
             && state.current_topic_frontier.is_empty()
             && state.resolved_view_id != state.base_resolved_view_id
@@ -1093,7 +1094,7 @@ impl RealRepoState {
             )
         })?;
         if load_blob_bytes {
-            state.hydrate_compact_snapshot_entries(&path)?;
+            state.validate_compact_snapshot_entries(&path, true)?;
         }
         state
             .entries
@@ -1101,13 +1102,55 @@ impl RealRepoState {
         Ok(state)
     }
 
-    fn hydrate_compact_snapshot_entries(
-        &mut self,
+    fn validate_embedded_checkpoint_entries(
+        &self,
         state_path: &Path,
     ) -> Result<(), RepoStateError> {
-        let mut resolved_entries = BTreeMap::<(String, String), Vec<RealArtifactEntry>>::new();
+        for checkpoint in self
+            .checkpoints
+            .iter()
+            .filter(|checkpoint| !checkpoint.entries.is_empty())
+        {
+            if real_tree_hash(&checkpoint.entries) != checkpoint.tree_hash {
+                return Err(invalid_state(
+                    state_path,
+                    format!(
+                        "checkpoint `{}` entries do not reproduce tree `{}`",
+                        checkpoint.checkpoint_id, checkpoint.tree_hash
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_compact_publication_snapshots(
+        &self,
+        state_path: &Path,
+    ) -> Result<(), RepoStateError> {
+        let mut compact = self.clone();
+        for projection in &mut compact.projections {
+            projection.entries.clear();
+        }
+        for checkpoint in &mut compact.checkpoints {
+            checkpoint.entries.clear();
+        }
+        compact.validate_compact_snapshot_entries(state_path, false)
+    }
+
+    fn validate_compact_snapshot_entries(
+        &mut self,
+        state_path: &Path,
+        hydrate: bool,
+    ) -> Result<(), RepoStateError> {
+        let mut resolved_entries =
+            BTreeMap::<(String, String, BTreeMap<String, String>), Vec<RealArtifactEntry>>::new();
         resolved_entries.insert(
-            (self.resolved_view_id.clone(), self.tree_hash.clone()),
+            (
+                self.resolved_view_id.clone(),
+                self.tree_hash.clone(),
+                self.current_topic_frontier.clone(),
+            ),
             self.entries.clone(),
         );
 
@@ -1133,7 +1176,9 @@ impl RealRepoState {
                 &frontier,
                 &mut resolved_entries,
             )?;
-            self.projections[index].entries = entries;
+            if hydrate {
+                self.projections[index].entries = entries;
+            }
         }
 
         let checkpoint_requests = self
@@ -1158,7 +1203,9 @@ impl RealRepoState {
                 &frontier,
                 &mut resolved_entries,
             )?;
-            self.checkpoints[index].entries = entries;
+            if hydrate {
+                self.checkpoints[index].entries = entries;
+            }
         }
         Ok(())
     }
@@ -1169,9 +1216,9 @@ impl RealRepoState {
         view_id: &str,
         tree_hash: &str,
         frontier: &BTreeMap<String, String>,
-        cache: &mut BTreeMap<(String, String), Vec<RealArtifactEntry>>,
+        cache: &mut BTreeMap<(String, String, BTreeMap<String, String>), Vec<RealArtifactEntry>>,
     ) -> Result<Vec<RealArtifactEntry>, RepoStateError> {
-        let key = (view_id.to_string(), tree_hash.to_string());
+        let key = (view_id.to_string(), tree_hash.to_string(), frontier.clone());
         if let Some(entries) = cache.get(&key) {
             return Ok(entries.clone());
         }
@@ -1246,8 +1293,10 @@ impl RealRepoState {
         repo_root: &Path,
         records: &[DerivedRecordPublication],
     ) -> Result<(), RepoStateError> {
-        self.persist_blobs(repo_root)?;
         let path = real_state_path(repo_root);
+        self.validate_embedded_checkpoint_entries(&path)?;
+        self.validate_compact_publication_snapshots(&path)?;
+        self.persist_blobs(repo_root)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| io_error(parent, "failed to create state directory", error))?;
@@ -1884,7 +1933,7 @@ fn expanded_same_artifact_conflicts(
     by_artifact
         .into_iter()
         .filter_map(|(artifact_id, operations)| {
-            if operations.len() <= 1 || real_operations_form_dependency_chain(&operations) {
+            if operations.len() <= 1 || real_operations_form_dependency_chain(state, &operations) {
                 return None;
             }
             let candidate_hashes = operations
@@ -1951,6 +2000,7 @@ fn expanded_same_artifact_conflicts(
 }
 
 fn real_operations_form_dependency_chain(
+    state: &RealRepoState,
     operations: &[(&RealOperationRecord, RealOperationEffect)],
 ) -> bool {
     let mut remaining = operations.to_vec();
@@ -1962,16 +2012,20 @@ fn real_operations_form_dependency_chain(
             .enumerate()
             .filter(|(_, (operation, effect))| match &previous {
                 Some((previous_operation, previous_effect)) => {
-                    operation
-                        .dependency_revision_ids
-                        .contains(&previous_operation.topic_revision_id)
-                        && effect.base_content_hash.as_deref()
-                            == Some(previous_effect.result_content_hash.as_str())
+                    real_revision_reachable_from_dependencies(
+                        state,
+                        &previous_operation.topic_revision_id,
+                        &operation.dependency_revision_ids,
+                    ) && effect.base_content_hash.as_deref()
+                        == Some(previous_effect.result_content_hash.as_str())
                 }
-                None => !operation.dependency_revision_ids.iter().any(|dependency| {
-                    remaining
-                        .iter()
-                        .any(|(candidate, _)| candidate.topic_revision_id == *dependency)
+                None => !remaining.iter().any(|(candidate, _)| {
+                    candidate.topic_revision_id != operation.topic_revision_id
+                        && real_revision_reachable_from_dependencies(
+                            state,
+                            &candidate.topic_revision_id,
+                            &operation.dependency_revision_ids,
+                        )
                 }),
             })
             .map(|(index, _)| index)
@@ -1983,6 +2037,48 @@ fn real_operations_form_dependency_chain(
     }
 
     true
+}
+
+fn real_revision_reachable_from_dependencies(
+    state: &RealRepoState,
+    target_revision_id: &str,
+    dependency_revision_ids: &[String],
+) -> bool {
+    let Some((target_index, target_operation)) = state
+        .operations
+        .iter()
+        .enumerate()
+        .find(|(_, operation)| operation.topic_revision_id == target_revision_id)
+    else {
+        return false;
+    };
+    let mut pending = dependency_revision_ids.to_vec();
+    let mut visited = BTreeSet::new();
+
+    while let Some(revision_id) = pending.pop() {
+        if !visited.insert(revision_id.clone()) {
+            continue;
+        }
+        if revision_id == target_revision_id {
+            return true;
+        }
+        let Some((dependency_index, dependency_operation)) = state
+            .operations
+            .iter()
+            .enumerate()
+            .find(|(_, operation)| operation.topic_revision_id == revision_id)
+        else {
+            continue;
+        };
+        if dependency_operation.topic_id == target_operation.topic_id
+            && target_index <= dependency_index
+        {
+            return true;
+        }
+        pending.extend(dependency_operation.dependency_revision_ids.iter().cloned());
+    }
+
+    false
 }
 
 fn materialize_real_resolved_entries(
@@ -2623,7 +2719,7 @@ fn publish_state_and_records(
     atomic_replace_file(&preparing, &manifest_path, None)?;
 
     trigger_failpoint("batch_before_canonical_commit", canonical)?;
-    publish_native_state(repo_root, canonical, sequence, state_bytes)?;
+    publish_prevalidated_native_state(repo_root, canonical, sequence, state_bytes)?;
     trigger_failpoint("batch_after_canonical_commit", canonical)?;
     publish_committed_record_batch(repo_root, &transaction_root, &manifest, true)?;
     Ok(())
@@ -2650,21 +2746,23 @@ fn recover_publication_outbox(repo_root: &Path) -> Result<(), RepoStateError> {
     transaction_roots.sort();
     for transaction_root in transaction_roots {
         let manifest_path = transaction_root.join("manifest.json");
+        let preparing_manifest_path = transaction_root.join("manifest.preparing.json");
+        if !manifest_path.exists() && !preparing_manifest_path.exists() {
+            remove_publication_transaction(&root, &transaction_root)?;
+            continue;
+        }
         let manifest = load_and_validate_publication_manifest(repo_root, &transaction_root)?;
         let canonical_path = real_state_path(repo_root);
         let canonical_bytes = fs::read(&canonical_path).ok();
-        let canonical_state = RealRepoState::load_from_path(repo_root, &canonical_path).ok();
+        let canonical_sequence = read_publication_sequence(&canonical_path).ok();
         let committed = canonical_bytes.as_ref().is_some_and(|bytes| {
             sha256_digest(bytes) == manifest.target_digest
-                && canonical_state
-                    .as_ref()
-                    .is_some_and(|state| state.publication_sequence == manifest.target_sequence)
+                && canonical_sequence == Some(manifest.target_sequence)
         });
         if committed {
             publish_committed_record_batch(repo_root, &transaction_root, &manifest, false)?;
-        } else if canonical_state
-            .as_ref()
-            .is_none_or(|state| state.publication_sequence < manifest.target_sequence)
+        } else if canonical_bytes.is_none()
+            || canonical_sequence.is_some_and(|sequence| sequence < manifest.target_sequence)
         {
             remove_publication_transaction(&root, &transaction_root)?;
         } else {
@@ -2818,10 +2916,8 @@ fn load_and_validate_publication_manifest(
     let preparing_manifest = transaction_root.join("manifest.preparing.json");
     let manifest_path = if published_manifest.exists() {
         published_manifest
-    } else if preparing_manifest.exists() {
-        preparing_manifest
     } else {
-        published_manifest
+        preparing_manifest
     };
     let bytes = fs::read(&manifest_path).map_err(|error| {
         publication_recovery_error(
@@ -3085,11 +3181,31 @@ fn state_recovery_paths(repo_root: &Path) -> StateRecoveryPaths {
     }
 }
 
+#[cfg(test)]
 fn publish_native_state(
     repo_root: &Path,
     canonical: &Path,
     sequence: u64,
     bytes: &[u8],
+) -> Result<(), RepoStateError> {
+    publish_native_state_inner(repo_root, canonical, sequence, bytes, false)
+}
+
+fn publish_prevalidated_native_state(
+    repo_root: &Path,
+    canonical: &Path,
+    sequence: u64,
+    bytes: &[u8],
+) -> Result<(), RepoStateError> {
+    publish_native_state_inner(repo_root, canonical, sequence, bytes, true)
+}
+
+fn publish_native_state_inner(
+    repo_root: &Path,
+    canonical: &Path,
+    sequence: u64,
+    bytes: &[u8],
+    compact_snapshots_prevalidated: bool,
 ) -> Result<(), RepoStateError> {
     let recovery = state_recovery_paths(repo_root);
     fs::create_dir_all(&recovery.root).map_err(|error| {
@@ -3104,6 +3220,11 @@ fn publish_native_state(
     remove_file_if_exists(&recovery.journal)?;
 
     write_flushed_file(&recovery.staged, bytes)?;
+    let mut staged_state =
+        RealRepoState::load_from_path_with_blob_mode(repo_root, &recovery.staged, false)?;
+    if !compact_snapshots_prevalidated {
+        staged_state.validate_compact_snapshot_entries(&recovery.staged, false)?;
+    }
     let digest = format!("sha256:{:x}", Sha256::digest(bytes));
     let journal_value = JsonValue::Object(BTreeMap::from([
         (
@@ -3250,14 +3371,7 @@ fn recover_state_publication(repo_root: &Path) -> Result<(), RepoStateError> {
         (None, None) => None,
     };
     if let Some((fallback_path, fallback_sequence)) = fallback {
-        let evidence = recovery.root.join(format!("evidence-{sequence}"));
-        fs::create_dir_all(&evidence).map_err(|error| {
-            io_error(
-                &evidence,
-                "failed to preserve interrupted publication evidence",
-                error,
-            )
-        })?;
+        let evidence = create_recovery_evidence_directory(&recovery.root, sequence)?;
         if fallback_path == recovery.backup {
             atomic_replace_file(
                 &recovery.backup,
@@ -3297,6 +3411,32 @@ fn recover_state_publication(repo_root: &Path) -> Result<(), RepoStateError> {
             "no fully valid candidate matches intended publication sequence {sequence} and digest {digest}; evidence was retained"
         ),
     ))
+}
+
+fn create_recovery_evidence_directory(
+    recovery_root: &Path,
+    sequence: u64,
+) -> Result<PathBuf, RepoStateError> {
+    for attempt in 1u64.. {
+        let name = if attempt == 1 {
+            format!("evidence-{sequence}")
+        } else {
+            format!("evidence-{sequence}-{attempt:04}")
+        };
+        let evidence = recovery_root.join(name);
+        match fs::create_dir(&evidence) {
+            Ok(()) => return Ok(evidence),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(io_error(
+                    &evidence,
+                    "failed to preserve interrupted publication evidence",
+                    error,
+                ))
+            }
+        }
+    }
+    unreachable!("recovery evidence attempt counter is unbounded")
 }
 
 fn preserve_recovery_evidence(source: &Path, destination: &Path) -> Result<(), RepoStateError> {
@@ -7574,9 +7714,9 @@ mod tests {
         });
         state.save(&repo).unwrap();
 
-        let JsonValue::Object(object) =
-            parse_json_record(&fs::read(real_state_path(&repo)).unwrap()).unwrap()
-        else {
+        let canonical = real_state_path(&repo);
+        let persisted_bytes = fs::read(&canonical).unwrap();
+        let JsonValue::Object(object) = parse_json_record(&persisted_bytes).unwrap() else {
             panic!("persisted state must be an object");
         };
         assert!(
@@ -7594,6 +7734,98 @@ mod tests {
         assert!(
             matches!(object.get("checkpoints"), Some(JsonValue::Array(values)) if matches!(&values[0], JsonValue::Object(checkpoint) if matches!(checkpoint.get("entries"), Some(JsonValue::Array(entries)) if entries.is_empty())))
         );
+
+        let next_sequence = required_u64(&object, "publication_sequence", &canonical).unwrap() + 1;
+        for field in ["projections", "checkpoints"] {
+            let mut invalid = object.clone();
+            let Some(JsonValue::Array(snapshots)) = invalid.get_mut(field) else {
+                panic!("{field} must be an array");
+            };
+            let JsonValue::Object(snapshot) = &mut snapshots[0] else {
+                panic!("{field} snapshot must be an object");
+            };
+            snapshot.insert(
+                "tree_hash".to_string(),
+                JsonValue::String(format!("tree_{}", "0".repeat(64))),
+            );
+            let invalid_bytes = canonical_json_bytes(&JsonValue::Object(invalid)).unwrap();
+            let error =
+                publish_native_state(&repo, &canonical, next_sequence, &invalid_bytes).unwrap_err();
+            assert!(matches!(error, RepoStateError::InvalidState { .. }));
+            assert_eq!(fs::read(&canonical).unwrap(), persisted_bytes);
+        }
+
+        let mut invalid = object.clone();
+        let Some(JsonValue::Array(checkpoints)) = invalid.get_mut("checkpoints") else {
+            panic!("checkpoints must be an array");
+        };
+        let JsonValue::Object(checkpoint) = &mut checkpoints[0] else {
+            panic!("checkpoint must be an object");
+        };
+        checkpoint.insert(
+            "tree_hash".to_string(),
+            JsonValue::String(format!("tree_{}", "0".repeat(64))),
+        );
+        checkpoint.insert(
+            "entries".to_string(),
+            JsonValue::Array(vec![JsonValue::Object(BTreeMap::from([
+                (
+                    "path".to_string(),
+                    JsonValue::String(entries[0].path.clone()),
+                ),
+                (
+                    "artifact_id".to_string(),
+                    JsonValue::String(entries[0].artifact_id.clone()),
+                ),
+                (
+                    "content_hash".to_string(),
+                    JsonValue::String(entries[0].content_hash.clone()),
+                ),
+                (
+                    "executable".to_string(),
+                    JsonValue::Bool(entries[0].executable),
+                ),
+                (
+                    "classification".to_string(),
+                    JsonValue::String(entries[0].classification.clone()),
+                ),
+                (
+                    "tombstone".to_string(),
+                    JsonValue::Bool(entries[0].tombstone),
+                ),
+            ]))]),
+        );
+        let invalid_bytes = canonical_json_bytes(&JsonValue::Object(invalid)).unwrap();
+        let error =
+            publish_native_state(&repo, &canonical, next_sequence, &invalid_bytes).unwrap_err();
+        assert!(matches!(error, RepoStateError::InvalidState { .. }));
+        assert_eq!(fs::read(&canonical).unwrap(), persisted_bytes);
+
+        let mut invalid = object.clone();
+        let Some(JsonValue::Array(checkpoints)) = invalid.get_mut("checkpoints") else {
+            panic!("checkpoints must be an array");
+        };
+        let JsonValue::Object(checkpoint) = &mut checkpoints[0] else {
+            panic!("checkpoint must be an object");
+        };
+        checkpoint.insert(
+            "topic_frontier".to_string(),
+            JsonValue::Array(vec![JsonValue::Object(BTreeMap::from([
+                (
+                    "topic_id".to_string(),
+                    JsonValue::String("topic_missing".to_string()),
+                ),
+                (
+                    "topic_revision_id".to_string(),
+                    JsonValue::String("rev_missing_0001".to_string()),
+                ),
+            ]))]),
+        );
+        let invalid_bytes = canonical_json_bytes(&JsonValue::Object(invalid)).unwrap();
+        let error =
+            publish_native_state(&repo, &canonical, next_sequence, &invalid_bytes).unwrap_err();
+        assert!(matches!(error, RepoStateError::InvalidState { .. }));
+        assert_eq!(fs::read(&canonical).unwrap(), persisted_bytes);
 
         let metadata = RealRepoState::load_metadata(&repo).unwrap();
         assert_eq!(metadata.entries[0].path, entries[0].path);
@@ -7621,6 +7853,20 @@ mod tests {
         let old_bytes = fs::read(&canonical).unwrap();
         assert_eq!(state.publication_sequence, 1);
 
+        let JsonValue::Object(mut invalid_state) = parse_json_record(&old_bytes).unwrap() else {
+            panic!("persisted state must be an object");
+        };
+        invalid_state.insert(
+            "tree_hash".to_string(),
+            JsonValue::String(format!("tree_{}", "0".repeat(64))),
+        );
+        let invalid_bytes = canonical_json_bytes(&JsonValue::Object(invalid_state)).unwrap();
+        let error = publish_native_state(&repo, &canonical, 2, &invalid_bytes).unwrap_err();
+        assert!(matches!(error, RepoStateError::InvalidState { .. }));
+        assert_eq!(fs::read(&canonical).unwrap(), old_bytes);
+        let recovery = state_recovery_paths(&repo);
+        assert!(!recovery.journal.exists());
+
         state.generation_number = 1;
         select_publication_failpoint("state_after_prepare", &canonical);
         let error = state.save(&repo).unwrap_err();
@@ -7632,7 +7878,6 @@ mod tests {
         assert_eq!(recovered.generation_number, 1);
         assert_eq!(recovered.publication_sequence, 2);
         parse_json_record(&fs::read(&canonical).unwrap()).unwrap();
-        let recovery = state_recovery_paths(&repo);
         assert!(!recovery.journal.exists());
         assert!(!recovery.staged.exists());
         assert!(!recovery.backup.exists());
@@ -7736,6 +7981,13 @@ mod tests {
         let canonical = real_state_path(&repo);
         let old_canonical = fs::read(&canonical).unwrap();
 
+        let abandoned = publication_outbox_root(&repo).join("publication-abandoned");
+        fs::create_dir_all(abandoned.join("staged")).unwrap();
+        fs::write(abandoned.join("staged/0000.json"), b"{\"step\":0}").unwrap();
+        RealRepoState::load(&repo).unwrap();
+        assert!(!publication_outbox_root(&repo).exists());
+        assert_eq!(fs::read(&canonical).unwrap(), old_canonical);
+
         state.generation_number = 1;
         let before_record = state
             .record_publication("operations", "op_before", "{\"step\":1}")
@@ -7781,12 +8033,29 @@ mod tests {
             .contains("batch_after_canonical_commit"));
         std::env::remove_var(STATE_PUBLICATION_FAILPOINT_ENV);
         assert!(!repo.join(".sunlight/operations/op_after.json").exists());
-        let recovered = RealRepoState::load(&repo).unwrap();
-        assert_eq!(recovered.generation_number, 2);
+        let committed_transaction = fs::read_dir(publication_outbox_root(&repo))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::rename(
+            committed_transaction.join("manifest.json"),
+            committed_transaction.join("manifest.preparing.json"),
+        )
+        .unwrap();
+        let missing_blob = real_blob_path(&repo, &after.base_entries[0].content_hash);
+        let missing_blob_bytes = fs::read(&missing_blob).unwrap();
+        fs::remove_file(&missing_blob).unwrap();
+        RealRepoState::load(&repo).unwrap_err();
         assert_eq!(
             fs::read(repo.join(".sunlight/operations/op_after.json")).unwrap(),
             b"{\"step\":2}"
         );
+        assert!(!publication_outbox_root(&repo).exists());
+        fs::write(&missing_blob, missing_blob_bytes).unwrap();
+        let recovered = RealRepoState::load(&repo).unwrap();
+        assert_eq!(recovered.generation_number, 2);
         RealRepoState::load(&repo).unwrap();
         assert!(!publication_outbox_root(&repo).exists());
 
@@ -8782,6 +9051,66 @@ mod tests {
             b"# Base\n\nClean docs\n"
         );
 
+        let followup = artifact_entry("src/followup.rs", b"pub fn followup() {}\n");
+        state.base_entries.push(followup.clone());
+        state.entries.push(followup.clone());
+        let code_followup = operation(
+            "op_code_0002",
+            "topic_code",
+            "rev_code_0002",
+            &followup,
+            b"pub fn followup() { println!(\"done\"); }\n",
+        );
+        state.operations.push(code_followup);
+        let code_topic = state
+            .topics
+            .iter_mut()
+            .find(|topic| topic.topic_id == "topic_code")
+            .unwrap();
+        code_topic.head_revision_id = Some("rev_code_0002".to_string());
+        code_topic.revision_number = 2;
+
+        state.topics.push(RealTopicRecord {
+            topic_id: "topic_code_adapter".to_string(),
+            slug: "code-adapter".to_string(),
+            display_name: "Code adapter".to_string(),
+            owner_actor_id: "agent-adapter".to_string(),
+            visibility: "local".to_string(),
+            acceptance_criteria: Vec::new(),
+            base_checkpoint_id: "checkpoint_base_0001".to_string(),
+            head_revision_id: Some("rev_code_adapter_0001".to_string()),
+            completed_revision_id: None,
+            revision_number: 1,
+        });
+        let code_result = artifact_entry("src/lib.rs", b"pub fn value() -> u32 { 2 }\n");
+        let mut adapter = operation(
+            "op_code_adapter_0001",
+            "topic_code_adapter",
+            "rev_code_adapter_0001",
+            &code_result,
+            b"pub fn value() -> u32 { 4 }\n",
+        );
+        adapter.dependency_revision_ids = vec!["rev_code_0002".to_string()];
+        state.operations.push(adapter);
+
+        let transitively_dependent = state.resolve_head_view();
+        assert!(
+            transitively_dependent.result.conflict_free(),
+            "{:?}",
+            transitively_dependent.result.records
+        );
+        assert_eq!(
+            transitively_dependent
+                .entries
+                .iter()
+                .find(|entry| entry.path == "src/lib.rs")
+                .unwrap()
+                .bytes,
+            b"pub fn value() -> u32 { 4 }\n"
+        );
+        state.topics.pop();
+        state.operations.pop();
+
         state.topics.push(RealTopicRecord {
             topic_id: "topic_alt_code".to_string(),
             slug: "alt-code".to_string(),
@@ -8812,24 +9141,6 @@ mod tests {
             vec!["op_alt_code_0001", "op_code_0001"]
         );
         assert_eq!(conflict.path_refs[0].path, "src/lib.rs");
-
-        let followup = artifact_entry("src/followup.rs", b"pub fn followup() {}\n");
-        state.base_entries.push(followup.clone());
-        state.entries.push(followup.clone());
-        state.operations.push(operation(
-            "op_code_0002",
-            "topic_code",
-            "rev_code_0002",
-            &followup,
-            b"pub fn followup() { println!(\"done\"); }\n",
-        ));
-        let code_topic = state
-            .topics
-            .iter_mut()
-            .find(|topic| topic.topic_id == "topic_code")
-            .unwrap();
-        code_topic.head_revision_id = Some("rev_code_0002".to_string());
-        code_topic.revision_number = 2;
 
         let expanded_conflict = state.resolve_head_view();
         assert!(!expanded_conflict.result.conflict_free());

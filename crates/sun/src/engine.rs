@@ -204,7 +204,7 @@ fn command_allows_automatic_concurrency_retry(arguments: &[String]) -> bool {
                 | ("execution", "promote-output")
                 | ("checkpoint", "create")
                 | ("policy", "check-export" | "check-commit" | "explain")
-                | ("compat", "diff")
+                | ("compat", "diff" | "import")
                 | ("projection", "quarantine-cleanup")
         ),
         _ => false,
@@ -226,6 +226,7 @@ mod tests {
             args(&["topic", "create", "change"]),
             args(&["view", "resolve"]),
             args(&["status"]),
+            args(&["compat", "import"]),
         ] {
             assert!(command_allows_automatic_concurrency_retry(&command));
         }
@@ -233,7 +234,7 @@ mod tests {
             args(&["run", "--", "cargo", "test"]),
             args(&["git", "export"]),
             args(&["project", "materialize"]),
-            args(&["compat", "import"]),
+            args(&["compat", "capture"]),
         ] {
             assert!(!command_allows_automatic_concurrency_retry(&command));
         }

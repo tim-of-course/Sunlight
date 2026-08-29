@@ -1039,6 +1039,91 @@ fn no_fixture_interrupted_state_publication_recovers_and_continues() {
 }
 
 #[test]
+fn no_fixture_repeated_recovery_at_one_sequence_preserves_distinct_evidence() {
+    let repo = TestRepo::new("repeated-state-recovery-evidence");
+    init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+
+    let canonical = repo.path().join(".sunlight/records/native-state.json");
+    let canonical_before = fs::read(&canonical).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&canonical_before).unwrap();
+    let intended_sequence = state["publication_sequence"].as_u64().unwrap() + 1;
+    let recovery_root = repo.path().join(".sunlight/local/recovery/native-state");
+    fs::create_dir_all(&recovery_root).unwrap();
+
+    let rejected_payloads = [
+        b"{\"rejected_attempt\":\"first\"}".as_slice(),
+        b"{\"rejected_attempt\":\"second\"}".as_slice(),
+    ];
+    for payload in rejected_payloads {
+        let digest = format!("sha256:{:x}", Sha256::digest(payload));
+        fs::write(recovery_root.join("staged.json"), payload).unwrap();
+        fs::write(
+            recovery_root.join("journal.json"),
+            format!(
+                "{{\"intended_sha256\":\"{digest}\",\"publication_sequence\":{intended_sequence},\"record_type\":\"native_state_publication\",\"schema_version\":1}}"
+            ),
+        )
+        .unwrap();
+
+        let recovered = run_real_json(&repo, &["status"]);
+        assert_success(&recovered);
+        assert_eq!(fs::read(&canonical).unwrap(), canonical_before);
+    }
+
+    let evidence_dirs = fs::read_dir(&recovery_root)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| {
+            entry.file_type().unwrap().is_dir()
+                && entry.file_name().to_string_lossy().starts_with("evidence-")
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        evidence_dirs.len(),
+        2,
+        "each rejected publication must retain its own evidence directory"
+    );
+    let evidence_payloads = evidence_dirs
+        .iter()
+        .map(|directory| fs::read(directory.join("rejected-staged.json")).unwrap())
+        .collect::<Vec<_>>();
+    for payload in rejected_payloads {
+        assert!(
+            evidence_payloads.iter().any(|evidence| evidence == payload),
+            "recovery evidence was overwritten for {}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+
+    assert_success(&run_real_json(&repo, &["status"]));
+    assert_success(&run_real_json(&repo, &["status"]));
+    assert_eq!(fs::read(&canonical).unwrap(), canonical_before);
+    let evidence_count = fs::read_dir(&recovery_root)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| {
+            entry.file_type().unwrap().is_dir()
+                && entry.file_name().to_string_lossy().starts_with("evidence-")
+        })
+        .count();
+    assert_eq!(evidence_count, 2, "idle recovery must be idempotent");
+
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "topic",
+            "create",
+            "after-recovery",
+            "--display-name",
+            "After recovery",
+        ],
+    ));
+    assert!(serde_json::from_slice::<serde_json::Value>(&fs::read(&canonical).unwrap()).is_ok());
+}
+
+#[test]
 fn no_fixture_native_mutation_outbox_recovers_every_declared_record_and_continues() {
     let repo = TestRepo::new("native-mutation-outbox-recovery");
     init_local_git_repo(&repo);
@@ -11503,6 +11588,29 @@ fn no_fixture_session_can_start_from_exact_checkpointed_view() {
         &repo,
         &["checkpoint", "create", "--view", &checkpoint_view],
     ));
+    let advanced_content = repo.write_file("after-checkpoint-input.txt", "after checkpoint\n");
+    let advanced_write = sun()
+        .args([
+            "write",
+            "src/after-checkpoint.txt",
+            "--session",
+            "session_agent_a",
+            "--expect-hash",
+            "new",
+            "--content-file",
+        ])
+        .arg(advanced_content)
+        .args(["--classification", "source", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .expect("source session advance should run");
+    assert_success(&advanced_write);
+    fs::remove_file(
+        repo.path()
+            .join(".sunlight/views")
+            .join(format!("{checkpoint_view}.json")),
+    )
+    .unwrap();
 
     assert_success(&run_real_json(
         &repo,
@@ -13931,6 +14039,46 @@ fn no_fixture_same_actor_sessions_keep_distinct_generation_lineages() {
         assert!(record.contains(&format!("\"session_id\":\"{session_id}\"")));
         assert!(record.contains("\"generation_number\":1"));
     }
+
+    let normalized_actor_first = run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "first",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "shared_agent",
+        ],
+    );
+    assert_success(&normalized_actor_first);
+    assert_eq!(
+        json_string_field(&stdout(&normalized_actor_first), "session_id"),
+        "session_shared_agent_first"
+    );
+
+    let normalized_actor_second = run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "second",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "shared_agent",
+        ],
+    );
+    assert_success(&normalized_actor_second);
+    let normalized_actor_second_stdout = stdout(&normalized_actor_second);
+    assert_eq!(
+        json_string_field(&normalized_actor_second_stdout, "session_id"),
+        "session_shared_agent_second_0002"
+    );
+    assert!(normalized_actor_second_stdout.contains("\"actor_id\":\"shared_agent\""));
 }
 
 #[test]

@@ -708,6 +708,311 @@ fn two_live_mcp_agents_author_independent_topics_into_one_exact_view() {
 }
 
 #[test]
+fn two_live_mcp_agents_can_author_overlapping_existing_paths_while_global_view_is_conflicted() {
+    let temp = TempDir::new("sun-mcp-conflicted-global-authoring");
+    let repo = temp.path().join("repository");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    git(&repo, &["config", "user.name", "Sun MCP Test"]);
+    git(&repo, &["config", "user.email", "sun-mcp@example.invalid"]);
+    fs::write(repo.join("history.txt"), "historical base\n").unwrap();
+    fs::write(repo.join("shared.txt"), "shared base\n").unwrap();
+    git(&repo, &["add", "history.txt", "shared.txt"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+
+    let mut setup = initialized_mcp(&repo);
+    setup.call(2, "repository_init", json!({}));
+    for (id, slug, actor) in [
+        (3, "historical-left", "historical-left-agent"),
+        (4, "historical-right", "historical-right-agent"),
+    ] {
+        setup.call(id, "topic_create", json!({"slug":slug,"display_name":slug}));
+        setup.call(
+            id + 10,
+            "session_start",
+            json!({"topic":slug,"view":"view_base_0001","actor":actor}),
+        );
+    }
+    let historical_left = setup.call(
+        20,
+        "artifact_read",
+        json!({"path":"history.txt","session":"session_historical_left_agent"}),
+    );
+    let historical_hash = historical_left["data"]["artifacts"][0]["content_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    setup.call(
+        21,
+        "artifact_write",
+        json!({
+            "path":"history.txt",
+            "session":"session_historical_left_agent",
+            "expect_hash":historical_hash,
+            "content":"historical left\n",
+            "classification":"source"
+        }),
+    );
+    setup.call(
+        22,
+        "artifact_write",
+        json!({
+            "path":"history.txt",
+            "session":"session_historical_right_agent",
+            "expect_hash":historical_hash,
+            "content":"historical right\n",
+            "classification":"source"
+        }),
+    );
+    let historical_conflict =
+        setup.call(23, "view_resolve", json!({"base":"checkpoint_base_0001"}));
+    assert_eq!(historical_conflict["data"]["tree_identity"], Value::Null);
+    assert_eq!(
+        historical_conflict["data"]["conflict_ids"],
+        json!(["conflict_history_txt_0001"])
+    );
+    setup.call(
+        24,
+        "topic_create",
+        json!({"slug":"predecessor","display_name":"Predecessor"}),
+    );
+    setup.call(
+        25,
+        "session_start",
+        json!({
+            "topic":"predecessor",
+            "view":"view_base_0001",
+            "actor":"predecessor-agent"
+        }),
+    );
+    let predecessor_shared = setup.call(
+        26,
+        "artifact_read",
+        json!({"path":"shared.txt","session":"session_predecessor_agent"}),
+    );
+    let predecessor_base_hash = predecessor_shared["data"]["artifacts"][0]["content_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let predecessor_patch = setup.call(
+        27,
+        "artifact_patch",
+        json!({
+            "path":"shared.txt",
+            "session":"session_predecessor_agent",
+            "expect_hash":predecessor_base_hash,
+            "patch":"@@ -1 +1 @@\n-shared base\n+predecessor\n"
+        }),
+    );
+    let predecessor_revision = predecessor_patch["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let persisted_earlier_view = setup.call(
+        28,
+        "view_resolve",
+        json!({
+            "base":"checkpoint_base_0001",
+            "include":[{"topic":"topic_predecessor","revision":predecessor_revision}]
+        }),
+    )["data"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let predecessor_head = setup.call(
+        29,
+        "artifact_write",
+        json!({
+            "path":"predecessor.txt",
+            "session":"session_predecessor_agent",
+            "expect_hash":"new",
+            "content":"advanced unrelated revision\n",
+            "classification":"source"
+        }),
+    );
+    let predecessor_view = predecessor_head["data"]["view"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    setup.call(
+        30,
+        "topic_create",
+        json!({"slug":"earlier-exact","display_name":"Earlier exact"}),
+    );
+    let earlier_session = setup.call(
+        31,
+        "session_start",
+        json!({
+            "topic":"earlier-exact",
+            "view":persisted_earlier_view.clone(),
+            "actor":"earlier-exact-agent"
+        }),
+    );
+    assert_eq!(
+        earlier_session["data"]["command"], "session.start",
+        "session_start must accept an earlier durable view_resolve ID"
+    );
+    assert_eq!(
+        earlier_session["data"]["view"]["resolved_view_id"],
+        persisted_earlier_view
+    );
+    let mismatched_restart = setup.call_error(
+        32,
+        "session_start",
+        json!({
+            "topic":"earlier-exact",
+            "view":predecessor_view.clone(),
+            "actor":"earlier-exact-agent"
+        }),
+    );
+    assert_eq!(mismatched_restart["error"]["code"], "session_view_mismatch");
+    setup.shutdown();
+
+    let mut agent_a = initialized_mcp(&repo);
+    let mut agent_b = initialized_mcp(&repo);
+    agent_a.call(
+        30,
+        "topic_create",
+        json!({"slug":"current-left","display_name":"Current left"}),
+    );
+    agent_b.call(
+        30,
+        "topic_create",
+        json!({"slug":"current-right","display_name":"Current right"}),
+    );
+    agent_a.call(
+        31,
+        "session_start",
+        json!({
+            "topic":"current-left",
+            "view":predecessor_view,
+            "actor":"current-left-agent"
+        }),
+    );
+    agent_b.call(
+        31,
+        "session_start",
+        json!({
+            "topic":"current-right",
+            "view":"view_base_0001",
+            "actor":"current-right-agent"
+        }),
+    );
+    let shared_a = agent_a.call(
+        32,
+        "artifact_read",
+        json!({"path":"shared.txt","session":"session_current_left_agent"}),
+    );
+    let shared_a_hash = shared_a["data"]["artifacts"][0]["content_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let shared_b = agent_b.call(
+        32,
+        "artifact_read",
+        json!({"path":"shared.txt","session":"session_current_right_agent"}),
+    );
+    let shared_b_hash = shared_b["data"]["artifacts"][0]["content_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    agent_a.start_call(
+        33,
+        "artifact_patch",
+        json!({
+            "path":"shared.txt",
+            "session":"session_current_left_agent",
+            "expect_hash":shared_a_hash,
+            "patch":"@@ -1 +1 @@\n-predecessor\n+current left\n"
+        }),
+    );
+    agent_b.start_call(
+        33,
+        "artifact_patch",
+        json!({
+            "path":"shared.txt",
+            "session":"session_current_right_agent",
+            "expect_hash":shared_b_hash,
+            "patch":"@@ -1 +1 @@\n-shared base\n+current right\n"
+        }),
+    );
+    let write_a = agent_a.finish_call(33);
+    let write_b = agent_b.finish_call(33);
+    let revision_a = write_a["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let revision_b = write_b["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let view_a = write_a["data"]["view"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let view_b = write_b["data"]["view"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        agent_a.call(
+            34,
+            "artifact_read",
+            json!({"path":"shared.txt","view":view_a})
+        )["data"]["content"]["bytes"],
+        "current left\n"
+    );
+    assert_eq!(
+        agent_b.call(
+            34,
+            "artifact_read",
+            json!({"path":"shared.txt","view":view_b})
+        )["data"]["content"]["bytes"],
+        "current right\n"
+    );
+    assert!(!repo
+        .join(".sunlight/conflicts/conflict_shared_txt_0001.json")
+        .exists());
+    let native_state = fs::read(repo.join(".sunlight/records/native-state.json")).unwrap();
+    serde_json::from_slice::<Value>(&native_state).expect("concurrent writes kept valid state");
+    let session_status = agent_a.call(
+        35,
+        "repository_status",
+        json!({"scope":"session","id":"session_current_left_agent"}),
+    );
+    assert!(session_status["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|warning| warning["code"] != "resolver_conflicts"));
+
+    let combined = agent_a.call(
+        36,
+        "view_resolve",
+        json!({
+            "base":"checkpoint_base_0001",
+            "include":[
+                {"topic":"topic_current_left","revision":revision_a},
+                {"topic":"topic_current_right","revision":revision_b}
+            ]
+        }),
+    );
+    assert_eq!(combined["data"]["tree_identity"], Value::Null);
+    assert_eq!(
+        combined["data"]["conflict_ids"],
+        json!(["conflict_shared_txt_0001"])
+    );
+    assert!(repo
+        .join(".sunlight/conflicts/conflict_shared_txt_0001.json")
+        .is_file());
+
+    agent_a.shutdown();
+    agent_b.shutdown();
+}
+
+#[test]
 fn open_alpha_oa04_mcp_termination_boundaries_recover_from_durable_facts() {
     let temp = TempDir::new("sun-mcp-oa04-recovery");
     let repo = temp.path().join("repository");

@@ -11255,6 +11255,10 @@ fn checkpoint_create_json_fixture_ready_view_returns_checkpoint_envelope() {
     ));
     assert!(stdout.contains("\"export_refs\":[]"));
     assert!(stdout.contains("\"export_ready\":true"));
+    assert!(stdout.contains(
+        "\"handoff\":{\"exact_ids\":{\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""
+    ));
+    assert!(stdout.contains("\"execution_ids\":[\"exec_auth_profile_tests_0001\"]"));
     assert!(stdout.contains("\"conflict_free\":true"));
 }
 
@@ -14583,6 +14587,9 @@ fn completed_topic_status_exposes_structured_handoff_facts() {
     let completed_stdout = stdout(&completed);
     assert!(completed_stdout.contains("\"handoff\":{"));
     assert!(completed_stdout.contains("\"available\":true"));
+    assert!(completed_stdout.contains(&format!(
+        "\"exact_ids\":{{\"topic_id\":\"topic_handoff_facts\",\"completed_revision_id\":\"{revision_id}\",\"session_id\":\"session_agent_a\"}}"
+    )));
     assert!(completed_stdout.contains("Changed src.txt from before to after."));
     assert!(completed_stdout.contains("\"changed_paths\":[\"src.txt\"]"));
     assert!(completed_stdout.contains(&format!("\"before_hash\":\"{before_hash}\"")));

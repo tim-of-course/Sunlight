@@ -1273,7 +1273,12 @@ fn view_resolve(ctx: &CommandContext) -> Result<(), CliError> {
         outputln!(
             ctx,
             "{}",
-            view_resolve_success_envelope(&result, &requested_frontier)
+            view_resolve_success_envelope(
+                &result,
+                &requested_frontier,
+                "checkpoint_base_0001",
+                &BTreeMap::new(),
+            )
         );
     } else if result.conflict_free() {
         let tree_hash = result
@@ -3125,27 +3130,43 @@ fn real_resolve_view_by_id(
         .iter()
         .find(|checkpoint| checkpoint.resolved_view_id == view_id)
     {
-        let resolved = real_checkpoint_snapshot_resolved_view(state, checkpoint);
-        if !resolved.result.conflict_free()
-            || resolved.result.resolved_view_id != checkpoint.resolved_view_id
-            || resolved
-                .result
-                .tree_identity
-                .as_ref()
-                .map(|tree| tree.tree_hash.as_str())
-                != Some(checkpoint.tree_hash.as_str())
-        {
-            return Err(CliError::new(
-                "checkpoint_view_mismatch",
-                "the checkpoint frontier does not reproduce its exact persisted view",
-            )
-            .with_detail("checkpoint_id", checkpoint.checkpoint_id.clone())
-            .with_detail("resolved_view_id", checkpoint.resolved_view_id.clone()));
-        }
-        return Ok(resolved);
+        return real_resolve_checkpoint_by_id(state, &checkpoint.checkpoint_id);
     }
 
     Err(object_not_found("resolved_view", view_id))
+}
+
+fn real_resolve_checkpoint_by_id(
+    state: &RealRepoState,
+    checkpoint_id: &str,
+) -> Result<RealResolvedRepoView, CliError> {
+    if checkpoint_id == state.base_checkpoint_id {
+        return Ok(real_base_resolved_repo_view(state));
+    }
+
+    let checkpoint = state
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.checkpoint_id == checkpoint_id)
+        .ok_or_else(|| object_not_found("checkpoint", checkpoint_id))?;
+    let resolved = real_checkpoint_snapshot_resolved_view(state, checkpoint);
+    if !resolved.result.conflict_free()
+        || resolved.result.resolved_view_id != checkpoint.resolved_view_id
+        || resolved
+            .result
+            .tree_identity
+            .as_ref()
+            .map(|tree| tree.tree_hash.as_str())
+            != Some(checkpoint.tree_hash.as_str())
+    {
+        return Err(CliError::new(
+            "checkpoint_view_mismatch",
+            "the checkpoint frontier does not reproduce its exact persisted view",
+        )
+        .with_detail("checkpoint_id", checkpoint.checkpoint_id.clone())
+        .with_detail("resolved_view_id", checkpoint.resolved_view_id.clone()));
+    }
+    Ok(resolved)
 }
 
 fn load_persisted_view_frontier(
@@ -4341,37 +4362,45 @@ fn real_artifact_metadata_set(
 
 fn real_view_resolve(ctx: &CommandContext, options: ViewResolveOptions) -> Result<(), CliError> {
     let state = RealRepoState::load_metadata(&ctx.repo_root)?;
-    if let Some(base) = &options.base_checkpoint_id {
-        if base != &state.base_checkpoint_id {
-            return Err(object_not_found("checkpoint", base));
-        }
-    }
-    let frontier = if options.include.is_empty() {
-        Vec::new()
-    } else {
-        options
-            .include
-            .iter()
-            .map(|selection| {
-                let topic = real_topic(&state, &selection.topic_id)?;
-                if !state.operations.iter().any(|operation| {
-                    operation.topic_id == topic.topic_id
-                        && operation.topic_revision_id == selection.revision_id
-                }) {
-                    return Err(object_not_found("topic_revision", &selection.revision_id));
-                }
-                Ok(TopicRevisionSelection {
-                    topic_id: topic.topic_id.clone(),
-                    revision_id: selection.revision_id.clone(),
-                })
+    let starting_checkpoint_id = options
+        .base_checkpoint_id
+        .as_deref()
+        .unwrap_or(&state.base_checkpoint_id);
+    let starting = real_resolve_checkpoint_by_id(&state, starting_checkpoint_id)?;
+    let starting_frontier = starting.result.topic_frontier.clone();
+    let included = options
+        .include
+        .iter()
+        .map(|selection| {
+            let topic = real_topic(&state, &selection.topic_id)?;
+            if !state.operations.iter().any(|operation| {
+                operation.topic_id == topic.topic_id
+                    && operation.topic_revision_id == selection.revision_id
+            }) {
+                return Err(object_not_found("topic_revision", &selection.revision_id));
+            }
+            Ok(TopicRevisionSelection {
+                topic_id: topic.topic_id.clone(),
+                revision_id: selection.revision_id.clone(),
             })
-            .collect::<Result<Vec<_>, CliError>>()?
-    };
-    let requested_frontier = exact_requested_frontier(&frontier)?;
-    let resolved = if frontier.is_empty() {
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    let included_frontier = exact_requested_frontier(&included)?;
+    let discovery_only = included.is_empty() && starting_checkpoint_id == state.base_checkpoint_id;
+    let mut requested_frontier = starting_frontier.clone();
+    requested_frontier.extend(included_frontier);
+    let resolved = if discovery_only {
         state.resolve_head_view()
     } else {
-        state.resolve_view(frontier)
+        state.resolve_view(
+            requested_frontier
+                .iter()
+                .map(|(topic_id, revision_id)| TopicRevisionSelection {
+                    topic_id: topic_id.clone(),
+                    revision_id: revision_id.clone(),
+                })
+                .collect(),
+        )
     };
     let view = resolved.result;
     ensure_resolver_preserved_frontier(&requested_frontier, &view.topic_frontier)?;
@@ -4393,7 +4422,12 @@ fn real_view_resolve(ctx: &CommandContext, options: ViewResolveOptions) -> Resul
         outputln!(
             ctx,
             "{}",
-            view_resolve_success_envelope(&view, &requested_frontier)
+            view_resolve_success_envelope(
+                &view,
+                &requested_frontier,
+                starting_checkpoint_id,
+                &starting_frontier,
+            )
         );
     } else {
         let tree_hash = view
@@ -8186,9 +8220,12 @@ fn real_topic_handoff_json(
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"available\":{},\"immutable\":{},\"completed_revision_id\":{},\"summary\":{},\"session_id\":{},\"actor_id\":{},\"operation_count\":{},\"changed_paths\":{},\"operations\":[{}]}}",
+        "{{\"available\":{},\"immutable\":{},\"exact_ids\":{{\"topic_id\":\"{}\",\"completed_revision_id\":{},\"session_id\":{}}},\"completed_revision_id\":{},\"summary\":{},\"session_id\":{},\"actor_id\":{},\"operation_count\":{},\"changed_paths\":{},\"operations\":[{}]}}",
         topic.completed_revision_id.is_some(),
         topic.completed_revision_id.is_some(),
+        json_escape(&topic.topic_id),
+        optional_string_json(topic.completed_revision_id.as_deref()),
+        optional_string_json(completion_string("session_id")),
         optional_string_json(topic.completed_revision_id.as_deref()),
         optional_string_json(completion_string("summary")),
         optional_string_json(completion_string("session_id")),
@@ -9870,6 +9907,35 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
     )
 }
 
+fn real_recommended_start_json(state: &RealRepoState) -> String {
+    for checkpoint in state.checkpoints.iter().rev() {
+        if real_resolve_checkpoint_by_id(state, &checkpoint.checkpoint_id).is_ok() {
+            return format!(
+                "{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"topic_frontier\":{},\"source\":\"latest_checkpoint\"}}",
+                json_escape(&checkpoint.checkpoint_id),
+                json_escape(&checkpoint.resolved_view_id),
+                json_escape(&checkpoint.tree_hash),
+                real_topic_frontier_pairs_json(&checkpoint.topic_frontier),
+            );
+        }
+    }
+
+    let base = real_base_resolved_repo_view(state);
+    let tree_hash = base
+        .result
+        .tree_identity
+        .as_ref()
+        .map(|tree| tree.tree_hash.as_str())
+        .unwrap_or(&state.tree_hash);
+    format!(
+        "{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"topic_frontier\":{},\"source\":\"repository_base\"}}",
+        json_escape(&state.base_checkpoint_id),
+        json_escape(&state.base_resolved_view_id),
+        json_escape(tree_hash),
+        string_string_map_json(&BTreeMap::new()),
+    )
+}
+
 fn real_operational_warnings_json(
     state: &RealRepoState,
     summary: &RealOperationalSummary,
@@ -10207,7 +10273,7 @@ fn real_status_envelope(
         })
         .unwrap_or_default();
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"automatic_secret_detection\":false,\"legacy_quarantine_excluded_count\":{},\"ignore_policy\":{{\"gitignore\":\"git_semantics\",\"sunignore\":\".sunignore\",\"sunignore_owner\":\"human_worktree\",\"sunignore_change_command\":\"sun init\",\"intrinsic\":[\".git/\",\".sunlight/\"]}},\"worktree\":{}}},\"topic\":{},\"handoff\":{},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"recommended_start\":{},\"automatic_secret_detection\":false,\"legacy_quarantine_excluded_count\":{},\"ignore_policy\":{{\"gitignore\":\"git_semantics\",\"sunignore\":\".sunignore\",\"sunignore_owner\":\"human_worktree\",\"sunignore_change_command\":\"sun init\",\"intrinsic\":[\".git/\",\".sunlight/\"]}},\"worktree\":{}}},\"topic\":{},\"handoff\":{},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
         command,
         json_escape(&state.repository_id),
         json_escape(&state.repository_id),
@@ -10218,6 +10284,7 @@ fn real_status_envelope(
         state.entries.iter().filter(|entry| !entry.tombstone).count(),
         json_escape(&state.tree_hash),
         json_escape(&state.base_checkpoint_id),
+        real_recommended_start_json(state),
         state.quarantine.len(),
         real_worktree_status_json(state, summary),
         topic_json,
@@ -15478,7 +15545,8 @@ fn checkpoint_create_success_envelope(checkpoint: &CheckpointRecord) -> String {
             "\"topic_frontier\":{},",
             "\"evidence_refs\":[{}],",
             "\"export_refs\":{},",
-            "\"export_ready\":true",
+            "\"export_ready\":true,",
+            "\"handoff\":{}",
             "}},",
             "\"warnings\":[]",
             "}}"
@@ -15501,6 +15569,25 @@ fn checkpoint_create_success_envelope(checkpoint: &CheckpointRecord) -> String {
             .collect::<Vec<_>>()
             .join(","),
         export_refs_json(checkpoint),
+        checkpoint_handoff_json(checkpoint),
+    )
+}
+
+fn checkpoint_handoff_json(checkpoint: &CheckpointRecord) -> String {
+    let execution_ids = checkpoint
+        .evidence_refs
+        .iter()
+        .map(|evidence| match evidence {
+            EvidenceRef::Execution(execution) => execution.execution_id.as_str(),
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "{{\"exact_ids\":{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"execution_ids\":{}}},\"topic_frontier\":{},\"export_ready\":true}}",
+        json_escape(&checkpoint.id),
+        json_escape(&checkpoint.resolved_view_id),
+        json_escape(&checkpoint.tree_identity.tree_hash),
+        string_array_json(execution_ids.iter().copied()),
+        checkpoint_topic_frontier_json(checkpoint),
     )
 }
 
@@ -18581,6 +18668,8 @@ fn ensure_resolver_preserved_frontier(
 fn view_resolve_success_envelope(
     result: &ResolvedViewResult,
     requested_frontier: &BTreeMap<String, String>,
+    starting_checkpoint_id: &str,
+    starting_frontier: &BTreeMap<String, String>,
 ) -> String {
     let conflict_ids = result
         .conflicts()
@@ -18597,10 +18686,12 @@ fn view_resolve_success_envelope(
             "\"data\":{{",
             "\"command\":\"view.resolve\",",
             "\"repository_id\":\"{}\",",
-            "\"ids\":{{\"resolved_view_id\":\"{}\",\"base_checkpoint_id\":\"{}\"}},",
+            "\"ids\":{{\"resolved_view_id\":\"{}\",\"base_checkpoint_id\":\"{}\",\"starting_checkpoint_id\":\"{}\"}},",
             "\"view\":{},",
             "\"resolved_view_id\":\"{}\",",
             "\"base_checkpoint_ids\":{},",
+            "\"starting_checkpoint_id\":\"{}\",",
+            "\"starting_frontier\":{},",
             "\"topic_frontier\":{},",
             "\"requested_frontier\":{},",
             "\"normalized_frontier\":{},",
@@ -18620,9 +18711,12 @@ fn view_resolve_success_envelope(
         json_escape(&result.repository_id),
         json_escape(&result.resolved_view_id),
         json_escape(&result.base_checkpoint_ids[0]),
+        json_escape(starting_checkpoint_id),
         view_resolve_view_json(result),
         json_escape(&result.resolved_view_id),
         string_array_json(result.base_checkpoint_ids.iter().map(String::as_str)),
+        json_escape(starting_checkpoint_id),
+        string_string_map_json(starting_frontier),
         topic_frontier_json(result),
         string_string_map_json(requested_frontier),
         string_string_map_json(&result.topic_frontier),
@@ -20169,7 +20263,7 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
         "checkpoint" | "checkpoint create" => outputln!(ctx, "sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--execution <passing-execution-id>] [--json]\n\nWhen supplied, execution evidence must pass and exactly match the resolved view and tree."),
         "run" => outputln!(ctx, "sun run\n\nUsage:\n  sun run --view <resolved-view-id> [--network disabled|not_enforced] -- <command> [args...]\n\nRuntime bounds come from [execution_policy] in .sunlight/config.toml. Windows runs always use restricted low-integrity filesystem isolation and a dedicated Job Object. Network disabled adds a capability-less per-execution AppContainer; not_enforced retains compatibility with ordinary user toolchains."),
         "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => outputln!(ctx, "sun artifact operations\n\nUsage:\n  sun read <path> (--session <session> | --view <resolved-view>) [--json]\n  sun list [path-prefix] (--session <session> | --view <resolved-view>) [--json]\n  sun search <query> (--session <session> | --view <resolved-view>) [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification source|generated [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification source|generated [--json]\n\nsource checkpoints and exports normally. generated checkpoints normally but exports only with reachable execution-output promotion provenance; relabeling does not create provenance."),
-        "view" | "view resolve" => outputln!(ctx, "sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nSupply exact include selections for durable integration. Omitting include is discovery-only and resolves moving current heads. Conflicts and staleness remain inspectable records."),
+        "view" | "view resolve" => outputln!(ctx, "sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nStart from any exact checkpoint. Its topic frontier is included automatically, and explicit selections replace revisions for the same topic. Omitting include on a later checkpoint reproduces it exactly. Omitting include on the repository base is discovery-only and resolves moving current heads. Conflicts and staleness remain inspectable records."),
         "project" | "project materialize" | "projection" | "projection create" => outputln!(ctx, "sun project materialize\n\nUsage:\n  sun project materialize --view <resolved-view-id> --purpose execution|compatibility|inspection|export [--strategy copy|reflink|hardlink_readonly|overlay_copyup] [--no-copy-fallback] [--projection-root <path>] [--json]\n\nManaged projections adapt persisted views for filesystem tools and are not source truth. Automatic selection uses verified-cache read-only hardlinks for Windows inspection, prefers safe block cloning for writable purposes, and falls back to private copies; --no-copy-fallback makes the requested strategy required."),
         "execution" | "execution promote-output" => outputln!(ctx, "sun execution promote-output\n\nUsage:\n  sun execution promote-output <execution-id> --path <path> --session <session> --classification source_like_delta|generated_artifact [--json]\n\nPass the exact promotion-candidate classification returned by sun run."),
         "mcp" | "mcp serve" => outputln!(ctx, "sun mcp serve\n\nUsage:\n  sun mcp serve --repo <repository-directory>\n\nRuns MCP JSON-RPC 2.0 over newline-delimited stdio. The server is bound to one canonical directory, which may be uninitialized so repository_init can perform first ingest; stdout contains protocol messages only."),

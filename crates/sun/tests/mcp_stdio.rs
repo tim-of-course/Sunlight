@@ -652,6 +652,35 @@ fn two_live_mcp_agents_author_independent_topics_into_one_exact_view() {
     assert_eq!(a_reads_b["data"]["access_mode"], "read_only_view");
     assert_eq!(b_reads_a["data"]["access_mode"], "read_only_view");
 
+    let session_a_read = agent_a.call(
+        70,
+        "artifact_read",
+        json!({"path":"agents/a.txt","session":session_a_id}),
+    );
+    let session_a_hash = session_a_read["data"]["artifacts"][0]["content_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let post_resolution_patch = agent_a.call(
+        71,
+        "artifact_patch",
+        json!({
+            "path":"agents/a.txt",
+            "session":session_a_id,
+            "expect_hash":session_a_hash,
+            "patch":"@@ -1 +1 @@\n-authored by agent A\n+authored by agent A after resolution\n"
+        }),
+    );
+    let revision_a = post_resolution_patch["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(post_resolution_patch["ok"], true);
+    assert_eq!(
+        post_resolution_patch["data"]["artifacts"][0]["path"],
+        "agents/a.txt"
+    );
+
     agent_b.start_call(
         8,
         "topic_wait",
@@ -675,7 +704,7 @@ fn two_live_mcp_agents_author_independent_topics_into_one_exact_view() {
         waited_a["data"]["handoff"]["summary"],
         "Agent A authored the agents/a files."
     );
-    assert_eq!(waited_a["data"]["handoff"]["operation_count"], 7);
+    assert_eq!(waited_a["data"]["handoff"]["operation_count"], 8);
     assert!(waited_a["data"]["handoff"]["changed_paths"]
         .as_array()
         .unwrap()
@@ -705,6 +734,180 @@ fn two_live_mcp_agents_author_independent_topics_into_one_exact_view() {
 
     agent_a.shutdown();
     agent_b.shutdown();
+}
+
+#[test]
+fn checkpoint_recommendation_seeds_exact_follow_up_resolution_and_handoff() {
+    let temp = TempDir::new("sun-mcp-checkpoint-start");
+    let repo = temp.path().join("repository");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    git(&repo, &["config", "user.name", "Sun MCP Test"]);
+    git(&repo, &["config", "user.email", "sun-mcp@example.invalid"]);
+    fs::write(repo.join("README.md"), "# checkpoint start\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+
+    let mut mcp = initialized_mcp(&repo);
+    mcp.call(2, "repository_init", json!({}));
+    let initial_status = mcp.call(3, "repository_status", json!({}));
+    let initial_view = initial_status["data"]["repository"]["recommended_start"]
+        ["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        initial_status["data"]["repository"]["recommended_start"]["source"],
+        "repository_base"
+    );
+
+    mcp.call(
+        4,
+        "topic_create",
+        json!({"slug":"checkpoint-foundation","display_name":"Checkpoint foundation"}),
+    );
+    let foundation_session = mcp.call(
+        5,
+        "session_start",
+        json!({
+            "topic":"checkpoint-foundation",
+            "view":initial_view,
+            "actor":"foundation-agent"
+        }),
+    )["data"]["ids"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let foundation_write = mcp.call(
+        6,
+        "artifact_write",
+        json!({
+            "path":"foundation.txt",
+            "session":foundation_session,
+            "expect_hash":"new",
+            "content":"foundation\n",
+            "classification":"source"
+        }),
+    );
+    let foundation_revision = foundation_write["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let foundation_view = foundation_write["data"]["view"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let checkpoint = mcp.call(7, "checkpoint_create", json!({"view":foundation_view}));
+    let checkpoint_id = checkpoint["data"]["ids"]["checkpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        checkpoint["data"]["handoff"]["exact_ids"]["checkpoint_id"],
+        checkpoint_id
+    );
+    assert_eq!(
+        checkpoint["data"]["handoff"]["exact_ids"]["resolved_view_id"],
+        foundation_view
+    );
+    assert!(checkpoint["data"]["handoff"]["exact_ids"]["tree_hash"]
+        .as_str()
+        .unwrap()
+        .starts_with("tree_"));
+
+    let status = mcp.call(8, "repository_status", json!({}));
+    let recommended = &status["data"]["repository"]["recommended_start"];
+    assert_eq!(recommended["checkpoint_id"], checkpoint_id);
+    assert_eq!(recommended["resolved_view_id"], foundation_view);
+    assert_eq!(recommended["source"], "latest_checkpoint");
+    assert_eq!(
+        recommended["topic_frontier"]["topic_checkpoint_foundation"],
+        foundation_revision
+    );
+
+    mcp.call(
+        9,
+        "topic_create",
+        json!({"slug":"checkpoint-follow-up","display_name":"Checkpoint follow-up"}),
+    );
+    let follow_up_session = mcp.call(
+        10,
+        "session_start",
+        json!({
+            "topic":"checkpoint-follow-up",
+            "view":recommended["resolved_view_id"],
+            "actor":"follow-up-agent"
+        }),
+    )["data"]["ids"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let follow_up = mcp.call(
+        11,
+        "artifact_write",
+        json!({
+            "path":"follow-up.txt",
+            "session":follow_up_session,
+            "expect_hash":"new",
+            "content":"follow up\n",
+            "classification":"source"
+        }),
+    );
+    let follow_up_revision = follow_up["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let combined = mcp.call(
+        12,
+        "view_resolve",
+        json!({
+            "base":checkpoint_id,
+            "include":[{
+                "topic":"topic_checkpoint_follow_up",
+                "revision":follow_up_revision
+            }]
+        }),
+    );
+    assert_eq!(combined["data"]["starting_checkpoint_id"], checkpoint_id);
+    assert_eq!(
+        combined["data"]["starting_frontier"]["topic_checkpoint_foundation"],
+        foundation_revision
+    );
+    assert_eq!(
+        combined["data"]["normalized_frontier"]["topic_checkpoint_foundation"],
+        foundation_revision
+    );
+    assert_eq!(
+        combined["data"]["normalized_frontier"]["topic_checkpoint_follow_up"],
+        follow_up_revision
+    );
+    let combined_view = combined["data"]["ids"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        mcp.call(
+            13,
+            "artifact_read",
+            json!({"path":"foundation.txt","view":combined_view})
+        )["data"]["content"]["bytes"],
+        "foundation\n"
+    );
+    assert_eq!(
+        mcp.call(
+            14,
+            "artifact_read",
+            json!({"path":"follow-up.txt","view":combined_view})
+        )["data"]["content"]["bytes"],
+        "follow up\n"
+    );
+
+    let reproduced = mcp.call(15, "view_resolve", json!({"base":checkpoint_id}));
+    assert_eq!(reproduced["data"]["resolved_view_id"], foundation_view);
+    assert!(reproduced["data"]["normalized_frontier"]
+        .get("topic_checkpoint_follow_up")
+        .is_none());
+    mcp.shutdown();
 }
 
 #[test]

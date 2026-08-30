@@ -373,7 +373,7 @@ fn handle_message(
                             "version": env!("CARGO_PKG_VERSION"),
                             "description": "Repository-confined Sunlight v0.3 authoring and operation tools"
                         },
-                        "instructions": "All tools are bound to the canonical repository supplied when this server started. Start with repository_status. Its repository.worktree field reports whether ordinary editor or agent changes exist outside Sunlight; call worktree_diff to inspect them and worktree_capture only when those edits should enter native history. Capture returns a completed topic revision with exact provenance, which can be combined through view_resolve like any other topic. For native authoring, use topic_create, session_start, scoped artifact reads and mutations, and topic_complete. Integrate with topic_wait and view_resolve using exact selected revisions; omitting include is discovery-only and resolves moving current heads. Validate the exact combined view with execution_run. Promote each intentional output with execution_promote_output using its returned candidate classification and a live topic-owned session over the validated view; resolve the resulting exact revision and create a checkpoint from matching passing evidence. For a requested Git handoff, call policy_check_export with the exact checkpoint and target ref, then git_export; completion is a returned export_map_id for that checkpoint and ref. artifact_read/list/search accept exactly one scope: session for the authoring frontier or view for session-free read-only access to an exact resolved view. topic_complete and completed topic status return a structured handoff with summary, operations, changed paths, and hashes; use topic_wait instead of polling when another agent owns the topic. Transient repository writer and state-sequence races are retried automatically for safe native and read commands; commands that can replay external side effects are never automatically retried. Use exact IDs and sha256 hashes returned by tools. artifact_write uses expect_hash \"new\" only when the path must be absent. Sessions have fixed topic scope: session_refresh advances only non-write topics already in that session frontier and does not discover newly created topics. execution_run returns bounded stdout/stderr text in that response, phase timings, and only source-like or explicitly generated promotion candidates. No fixture tools or arbitrary host paths are available."
+                        "instructions": "All tools are bound to the canonical repository supplied when this server started. Start with repository_status and use repository.recommended_start as the default exact checkpoint, view, and tree for new work, even when the moving repository head is conflicted. Its repository.worktree field reports whether ordinary editor or agent changes exist outside Sunlight; call worktree_diff to inspect them and worktree_capture only when those edits should enter native history. Capture returns a completed topic revision with exact provenance, which can be combined through view_resolve like any other topic. For native authoring, use topic_create, session_start, scoped artifact reads and mutations, and topic_complete. Sessions remain pinned and writable while unrelated topics resolve or conflict. Integrate with topic_wait and view_resolve using exact selected revisions. Any checkpoint may be the starting checkpoint; its frontier is included automatically and explicit selections replace revisions for the same topics. Omitting include on the repository base is discovery-only and resolves moving current heads. Validate the exact combined view with execution_run. Promote each intentional output with execution_promote_output using its returned candidate classification and a live topic-owned session over the validated view; resolve the resulting exact revision and create a checkpoint from matching passing evidence. checkpoint_create returns a structured handoff with the exact IDs to report. For a requested Git handoff, call policy_check_export with the exact checkpoint and target ref, then git_export; completion is a returned export_map_id for that checkpoint and ref. artifact_read/list/search accept exactly one scope: session for the authoring frontier or view for session-free read-only access to an exact resolved view. topic_complete and completed topic status return a structured handoff with summary, operations, changed paths, and hashes; use topic_wait instead of polling when another agent owns the topic. Transient repository writer and state-sequence races are retried automatically for safe native and read commands; commands that can replay external side effects are never automatically retried. Use exact IDs and sha256 hashes returned by tools. artifact_write uses expect_hash \"new\" only when the path must be absent. Sessions have fixed topic scope: session_refresh advances only non-write topics already in that session frontier and does not discover newly created topics. execution_run returns bounded stdout/stderr text in that response, phase timings, and only source-like or explicitly generated promotion candidates. No fixture tools or arbitrary host paths are available."
                     }),
                 ),
             )
@@ -1878,7 +1878,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "repository_status",
-            "Read persisted repository or object status. Omit id for repository scope; every other scope requires the exact matching object id. Completed topic status includes its structured handoff.",
+            "Read persisted repository or object status. Repository status returns repository.recommended_start, the default exact checkpoint, view, and tree for new work. Omit id for repository scope; every other scope requires the exact matching object id. Completed topic status includes its structured handoff.",
             json!({"scope":status_scope_schema(),"id":id_schema("Required exact object id whenever scope is not repository; omit for repository scope.")}),
             &[],
             false,
@@ -1979,8 +1979,8 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "view_resolve",
-            "Resolve one exact revision per topic over the base checkpoint. Supply include for durable integration. Omitting include is discovery-only and resolves moving current heads. Every supplied selection is echoed as requested_frontier and normalized_frontier; dependencies, conflicts, and staleness are returned as facts rather than merged implicitly.",
-            json!({"base":id_schema("Exact base checkpoint_id."),"include":{"type":"array","maxItems":128,"description":"Exact topic revision selections for durable integration. Omit only to discover the current heads. A topic may appear at most once.","items":{"type":"object","additionalProperties":false,"properties":{"topic":id_schema("Exact topic_id, not a slug."),"revision":id_schema("Exact topic_revision_id belonging to topic.")},"required":["topic","revision"]}}}),
+            "Resolve an exact view starting from any checkpoint. The checkpoint frontier is included automatically; supplied topic revisions replace the checkpoint revision for the same topic. Omitting include on the repository base is discovery-only and resolves moving current heads. The complete starting, requested, and normalized frontiers are returned with conflicts and staleness.",
+            json!({"base":id_schema("Exact checkpoint_id. Use repository_status.repository.recommended_start.checkpoint_id unless the task requires another baseline."),"include":{"type":"array","maxItems":128,"description":"Exact topic revision additions or replacements for durable integration. Omit on a later checkpoint to reproduce that checkpoint exactly. Omit on the repository base only to discover current heads. A topic may appear at most once.","items":{"type":"object","additionalProperties":false,"properties":{"topic":id_schema("Exact topic_id, not a slug."),"revision":id_schema("Exact topic_revision_id belonging to topic.")},"required":["topic","revision"]}}}),
             &["base"],
             true,
         ),
@@ -2197,7 +2197,11 @@ fn output_ids(name: &str) -> &'static [&'static str] {
             "session_generation_id",
             "resolved_view_id",
         ],
-        "view_resolve" => &["resolved_view_id"],
+        "view_resolve" => &[
+            "resolved_view_id",
+            "base_checkpoint_id",
+            "starting_checkpoint_id",
+        ],
         "project_materialize" | "compat_project" => &["projection_id", "resolved_view_id"],
         "compat_diff" => &["projection_id", "resolved_view_id", "session_generation_id"],
         "worktree_diff" => &["worktree_anchor_id", "worktree_diff_id", "resolved_view_id"],
@@ -2333,10 +2337,16 @@ fn output_payloads(name: &str) -> &'static [(&'static str, &'static str)] {
             ("promotion", "Execution provenance for the promoted output."),
             ("operation", "Topic-owned operation created by promotion."),
         ],
-        "checkpoint_create" => &[(
-            "checkpoint",
-            "Frozen exact view, tree, and selected evidence.",
-        )],
+        "checkpoint_create" => &[
+            (
+                "checkpoint",
+                "Frozen exact view, tree, and selected evidence.",
+            ),
+            (
+                "handoff",
+                "Ready-to-report exact checkpoint, view, tree, execution, and frontier IDs.",
+            ),
+        ],
         "policy_check_export" | "policy_explain" => &[(
             "validation_report",
             "Persisted export-policy checks, warnings, and blocking failures.",

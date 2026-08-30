@@ -111,10 +111,16 @@ The server exposes these typed tools:
 - `policy_check_export`, `policy_check_commit`, `policy_explain`
 - `git_export`, `inspect`
 
-`session_start` accepts an exact persisted checkpoint view as well as the base
-or current view, so a follow-up topic can retain an earlier validated frontier.
-For durable integration, pass exact topic revisions to `view_resolve.include`;
-omitting `include` is discovery-only and resolves moving current heads.
+Repository status returns `repository.recommended_start`, the newest usable
+checkpoint, view, and tree for new work. `session_start` accepts that exact view
+and remains pinned to it while unrelated topics resolve or conflict.
+For durable integration, pass the recommended checkpoint to `view_resolve.base`
+and exact new or replacement topic revisions to `view_resolve.include`.
+Sunlight includes the checkpoint's existing frontier automatically. Omitting
+`include` on a later checkpoint reproduces that checkpoint; omitting it on the
+repository base is discovery-only and resolves moving current heads.
+`checkpoint_create` returns `handoff.exact_ids` with the exact checkpoint, view,
+tree, and execution IDs to report or pass to the next agent.
 `compat_diff` re-echoes the projection's `session_generation_id`, and MCP
 requires that value for the immediately following `compat_import`.
 Repository status also compares ordinary repository-root files with Sunlight's

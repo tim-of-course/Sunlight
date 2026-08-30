@@ -14,7 +14,8 @@ preconditions, and handoffs rather than following a rigid script.
 1. Find the MCP server that exposes `repository_status` and the Sunlight
    artifact tools. Server names may be repository-specific.
 2. Call `repository_status`. Initialize through `repository_init` only when the
-   bound root is uninitialized.
+   bound root is uninitialized. Use `repository.recommended_start` as the
+   default exact checkpoint, view, and tree for new work.
 3. Read `repository.worktree`. If it reports external changes, use
    `worktree_diff` to understand them. Call `worktree_capture` only when those
    edits should enter Sunlight; it returns a completed topic revision for the
@@ -29,13 +30,16 @@ Read [references/workflow.md](references/workflow.md) before beginning native
 authoring or integration.
 
 - Create one bounded topic and one actor-owned session from an exact view.
+- Keep that session pinned while unrelated topics resolve or conflict. The
+  session remains writable until its own topic is completed.
 - Inspect and mutate tracked artifacts through Sunlight. Use returned hashes as
   compare-and-swap preconditions.
 - Keep authoring scoped to that exact session while other topics are open;
   their changes matter only when selected for integration.
 - Complete work at the exact head revision with a factual immutable handoff.
 - Use `topic_wait` only for an explicit task dependency. Use `view_resolve` with
-  exact selected revisions for integration.
+  the recommended checkpoint and exact selected revisions for integration; the
+  checkpoint frontier is carried forward automatically.
 - Run validation on the exact combined view. Promote only intentional outputs,
   then create a checkpoint from matching passing evidence.
 - Export to Git only when the user requests that compatibility handoff.
@@ -46,6 +50,6 @@ another agent's session.
 
 ## Report
 
-Report the relevant topic, session, operation, revision, view, tree, execution,
-checkpoint, projection, and export IDs. State what was validated and whether
+Report exact IDs from the returned topic and checkpoint `handoff.exact_ids`
+objects without retyping them from memory. State what was validated and whether
 any tracked-source access occurred outside Sunlight.

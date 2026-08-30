@@ -56,13 +56,17 @@ the captured revision.
 ## Author one change
 
 1. Call `repository_status`. If the root is uninitialized, call
-   `repository_init`, then read status again.
+   `repository_init`, then read status again. Use
+   `repository.recommended_start.resolved_view_id` for the new session unless
+   the task explicitly requires an older exact state. This recommendation stays
+   usable when unrelated moving heads conflict.
 2. Create a narrowly named topic with `topic_create`.
 3. Start a session from the intended exact view with `session_start`. Use a
    stable actor identifier and do not reuse another agent's session.
    Other visible topics are informational: continue authoring in this exact
    session. Overlapping paths become conflicts only if their revisions are
-   selected together for integration.
+   selected together for integration. Unrelated `view_resolve` calls do not
+   refresh, conflict, or close this session.
 4. Discover source with `artifact_list` and `artifact_search`; inspect it with
    `artifact_read` using the session scope.
 5. Mutate with `artifact_patch`, `artifact_write`, `artifact_move`,
@@ -85,9 +89,11 @@ bypass a failed CAS by writing outside Sunlight.
 1. When the task has an explicit dependency, wait for its topic with
    `topic_wait`; do not infer dependencies from topic visibility or poll status
    in a loop. Consume the returned structured handoff.
-2. Call `view_resolve` with the base checkpoint and exactly one selected
-   revision for every topic being integrated. Omitting `include` resolves moving
-   current heads and is discovery-only.
+2. Call `view_resolve` with the intended starting checkpoint and the exact new
+   or replacement revisions being integrated. Sunlight carries that
+   checkpoint's frontier forward automatically. Omitting `include` on a later
+   checkpoint reproduces it exactly. Omitting `include` on the repository base
+   resolves moving current heads and is discovery-only.
 3. Stop on conflicts or staleness and report the structured records. Adapt
    through new topic-owned operations rather than editing a projection.
 4. Inspect combined artifacts through view-scoped reads.
@@ -105,8 +111,9 @@ bypass a failed CAS by writing outside Sunlight.
    promotion. Resolve its returned revision into a new exact view and rerun the
    matching validation.
 7. Create a checkpoint using passing evidence that matches the exact view and
-   tree. Materialize an inspection projection only when a filesystem consumer
-   needs one.
+   tree. Preserve its returned `handoff.exact_ids` as the integration result.
+   Materialize an inspection projection only when a filesystem consumer needs
+   one.
 8. For a requested Git handoff, call `policy_check_export` with the exact
    checkpoint and target Git ref, then call `git_export`. `policy_check_commit`
    checks only `.sunlight/**` metadata candidates (or the managed `.gitignore`
@@ -124,7 +131,9 @@ bypass a failed CAS by writing outside Sunlight.
   exact facts as a repository-service blocker rather than coordinating writers
   or repairing native state manually.
 - conflicted or stale view: inspect the referenced records and create an
-  explicit adaptation; do not choose moving heads implicitly.
+  explicit adaptation. Continue unrelated work from
+  `repository.recommended_start` instead of selecting the conflicted moving
+  head.
 - execution failure: use bounded output text and phase timings as diagnostics;
   make the correction in a topic session and resolve a new exact view.
 - stale compatibility projection: create a fresh projection from the session's
@@ -146,5 +155,5 @@ bypass a failed CAS by writing outside Sunlight.
 - Use session scope for authoring and view scope for immutable inspection.
 - Do not create branches, worktrees, commits, or exports unless the requested
   workflow requires them.
-- Report exact topic, session, revision, operation, view, tree, execution, and
-  checkpoint IDs in the final handoff when they exist.
+- Report the returned topic and checkpoint `handoff.exact_ids` verbatim, plus
+  any relevant operation, projection, and export IDs.

@@ -316,6 +316,9 @@ pub struct RealProjectionSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RealProjectionMaterializationMetrics {
     pub elapsed_ms: u64,
+    pub cache_build_ms: u64,
+    pub cache_validation_ms: u64,
+    pub projection_materialization_ms: u64,
     pub logical_bytes: u64,
     pub physically_materialized_bytes: Option<u64>,
     pub physical_allocation_bytes: Option<u64>,
@@ -403,10 +406,21 @@ pub struct RealExecutionSnapshot {
     pub network_policy: String,
     pub filesystem_write_policy_requested: String,
     pub filesystem_write_policy: String,
+    pub runtime_dependency_paths: Vec<String>,
+    pub preexisting_runtime_dependency_paths: Vec<String>,
+    pub runtime_dependency_bindings: Vec<RealExecutionRuntimeDependencyBinding>,
+    pub runtime_dependency_strategy: String,
     pub outputs: Vec<RealExecutionOutputSnapshot>,
     pub started_at: String,
     pub finished_at: String,
     pub privacy_class: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealExecutionRuntimeDependencyBinding {
+    pub path: String,
+    pub origin: String,
+    pub binding_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2242,6 +2256,449 @@ pub fn scan_real_projection_files_with_quarantine(
     Ok(())
 }
 
+pub fn scan_real_execution_projection_files_with_quarantine(
+    projection_root: &Path,
+    current: &Path,
+    runtime_dependency_paths: &BTreeSet<String>,
+    entries: &mut Vec<RealArtifactEntry>,
+    quarantine: &mut Vec<RealQuarantineEntry>,
+) -> Result<(), RepoStateError> {
+    let children = fs::read_dir(current)
+        .map_err(|error| io_error(current, "failed to scan execution projection", error))?;
+    for child in children {
+        let child = child.map_err(|error| RepoStateError::Io {
+            path: current.to_path_buf(),
+            message: format!("failed to scan execution projection: {error}"),
+        })?;
+        let path = child.path();
+        let relative = path
+            .strip_prefix(projection_root)
+            .map_err(|_| {
+                invalid_state(
+                    projection_root,
+                    "execution projection path escaped its root",
+                )
+            })?
+            .to_string_lossy()
+            .replace('\\', "/");
+        PathPolicy::posix_case_sensitive()
+            .validate(&relative)
+            .map_err(|error| {
+                invalid_state(
+                    &path,
+                    format!("execution projection path failed configured path policy: {error}"),
+                )
+            })?;
+        if runtime_dependency_paths.contains(&relative) {
+            validate_private_runtime_dependency_tree(projection_root, &path)?;
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            io_error(&path, "failed to inspect execution projection path", error)
+        })?;
+        if projection_metadata_is_reparse(&metadata) {
+            return Err(invalid_state(
+                &path,
+                "execution projection reparse points and symlinks are allowed only inside registered private runtime dependency paths",
+            ));
+        }
+        if metadata.is_dir() {
+            scan_real_execution_projection_files_with_quarantine(
+                projection_root,
+                &path,
+                runtime_dependency_paths,
+                entries,
+                quarantine,
+            )?;
+        } else if metadata.is_file() {
+            ingest_real_repo_path(projection_root, &relative, entries, quarantine)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn materialize_private_runtime_dependency_tree(
+    source: &Path,
+    destination: &Path,
+    projection_root: &Path,
+) -> Result<(), RepoStateError> {
+    let source = fs::canonicalize(source)
+        .map_err(|error| io_error(source, "failed to resolve runtime dependency source", error))?;
+    let metadata = fs::symlink_metadata(&source).map_err(|error| {
+        io_error(
+            &source,
+            "failed to inspect runtime dependency source",
+            error,
+        )
+    })?;
+    if projection_metadata_is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(invalid_state(
+            &source,
+            "runtime dependency source must resolve to a real directory",
+        ));
+    }
+    if destination.exists() {
+        return Err(invalid_state(
+            destination,
+            "private runtime dependency destination already exists",
+        ));
+    }
+    copy_private_runtime_dependency_directory(&source, destination, projection_root)
+}
+
+pub fn real_runtime_dependency_binding_fingerprint(root: &Path) -> Result<String, RepoStateError> {
+    let metadata = fs::symlink_metadata(root).map_err(|error| {
+        io_error(
+            root,
+            "failed to inspect runtime dependency binding root",
+            error,
+        )
+    })?;
+    if projection_metadata_is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(invalid_state(
+            root,
+            "runtime dependency binding root must be a real directory",
+        ));
+    }
+    let mut entries = BTreeMap::from([(
+        ".".to_string(),
+        JsonValue::Object(BTreeMap::from([(
+            "kind".to_string(),
+            JsonValue::String("directory".to_string()),
+        )])),
+    )]);
+    collect_runtime_dependency_binding_entries(root, root, &mut entries)?;
+    Ok(real_content_hash(&canonical_json_bytes(
+        &JsonValue::Object(entries),
+    )?))
+}
+
+fn collect_runtime_dependency_binding_entries(
+    root: &Path,
+    current: &Path,
+    entries: &mut BTreeMap<String, JsonValue>,
+) -> Result<(), RepoStateError> {
+    for item in fs::read_dir(current).map_err(|error| {
+        io_error(
+            current,
+            "failed to read runtime dependency binding directory",
+            error,
+        )
+    })? {
+        let item = item.map_err(|error| {
+            io_error(
+                current,
+                "failed to read runtime dependency binding entry",
+                error,
+            )
+        })?;
+        let path = item.path();
+        let relative = path.strip_prefix(root).map_err(|_| {
+            invalid_state(&path, "runtime dependency binding entry escaped its root")
+        })?;
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            io_error(
+                &path,
+                "failed to inspect runtime dependency binding entry",
+                error,
+            )
+        })?;
+        let binding = if projection_metadata_is_reparse(&metadata) {
+            let target = fs::read_link(&path).map_err(|error| {
+                io_error(
+                    &path,
+                    "failed to read runtime dependency binding symlink",
+                    error,
+                )
+            })?;
+            JsonValue::Object(BTreeMap::from([
+                ("kind".to_string(), JsonValue::String("symlink".to_string())),
+                (
+                    "target".to_string(),
+                    JsonValue::String(target.to_string_lossy().into_owned()),
+                ),
+            ]))
+        } else if metadata.is_dir() {
+            JsonValue::Object(BTreeMap::from([(
+                "kind".to_string(),
+                JsonValue::String("directory".to_string()),
+            )]))
+        } else if metadata.is_file() {
+            let bytes = fs::read(&path).map_err(|error| {
+                io_error(
+                    &path,
+                    "failed to read runtime dependency binding file",
+                    error,
+                )
+            })?;
+            JsonValue::Object(BTreeMap::from([
+                ("kind".to_string(), JsonValue::String("file".to_string())),
+                (
+                    "content_hash".to_string(),
+                    JsonValue::String(real_content_hash(&bytes)),
+                ),
+                (
+                    "byte_length".to_string(),
+                    JsonValue::Number(bytes.len().to_string()),
+                ),
+                (
+                    "executable".to_string(),
+                    JsonValue::Bool(runtime_dependency_file_is_executable(&metadata)),
+                ),
+            ]))
+        } else {
+            return Err(invalid_state(
+                &path,
+                "runtime dependency binding contains an unsupported filesystem entry",
+            ));
+        };
+        entries.insert(relative, binding);
+        if metadata.is_dir() && !projection_metadata_is_reparse(&metadata) {
+            collect_runtime_dependency_binding_entries(root, &path, entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_private_runtime_dependency_directory(
+    source: &Path,
+    destination: &Path,
+    projection_root: &Path,
+) -> Result<(), RepoStateError> {
+    fs::create_dir(destination).map_err(|error| {
+        io_error(
+            destination,
+            "failed to create private runtime dependency directory",
+            error,
+        )
+    })?;
+    for item in fs::read_dir(source)
+        .map_err(|error| io_error(source, "failed to read runtime dependency directory", error))?
+    {
+        let item = item
+            .map_err(|error| io_error(source, "failed to read runtime dependency entry", error))?;
+        let source_path = item.path();
+        let destination_path = destination.join(item.file_name());
+        let metadata = fs::symlink_metadata(&source_path).map_err(|error| {
+            io_error(
+                &source_path,
+                "failed to inspect runtime dependency entry",
+                error,
+            )
+        })?;
+        if projection_metadata_is_reparse(&metadata) {
+            let target = fs::read_link(&source_path).map_err(|error| {
+                io_error(
+                    &source_path,
+                    "failed to read runtime dependency symlink",
+                    error,
+                )
+            })?;
+            ensure_private_runtime_link_target(projection_root, &destination_path, &target)?;
+            create_runtime_dependency_symlink(&target, &destination_path, &source_path)?;
+        } else if metadata.is_dir() {
+            copy_private_runtime_dependency_directory(
+                &source_path,
+                &destination_path,
+                projection_root,
+            )?;
+        } else if metadata.is_file() {
+            let executable = runtime_dependency_file_is_executable(&metadata);
+            match clone_file_cow(&source_path, &destination_path, metadata.len()) {
+                Ok(_) => {}
+                Err(_) => {
+                    fs::copy(&source_path, &destination_path).map_err(|error| {
+                        io_error(
+                            &destination_path,
+                            "failed to copy private runtime dependency file",
+                            error,
+                        )
+                    })?;
+                }
+            }
+            set_private_projection_permissions(&destination_path, executable)?;
+        } else {
+            return Err(invalid_state(
+                &source_path,
+                "runtime dependency tree contains an unsupported filesystem entry",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_runtime_dependency_tree(
+    projection_root: &Path,
+    runtime_root: &Path,
+) -> Result<(), RepoStateError> {
+    let metadata = fs::symlink_metadata(runtime_root).map_err(|error| {
+        io_error(
+            runtime_root,
+            "failed to inspect private runtime dependency root",
+            error,
+        )
+    })?;
+    if projection_metadata_is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(invalid_state(
+            runtime_root,
+            "private runtime dependency root must be a real directory",
+        ));
+    }
+    validate_private_runtime_dependency_directory(projection_root, runtime_root)
+}
+
+fn validate_private_runtime_dependency_directory(
+    projection_root: &Path,
+    current: &Path,
+) -> Result<(), RepoStateError> {
+    for item in fs::read_dir(current).map_err(|error| {
+        io_error(
+            current,
+            "failed to scan private runtime dependency directory",
+            error,
+        )
+    })? {
+        let item = item.map_err(|error| {
+            io_error(
+                current,
+                "failed to scan private runtime dependency entry",
+                error,
+            )
+        })?;
+        let path = item.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            io_error(
+                &path,
+                "failed to inspect private runtime dependency entry",
+                error,
+            )
+        })?;
+        if projection_metadata_is_reparse(&metadata) {
+            let target = fs::read_link(&path).map_err(|error| {
+                io_error(
+                    &path,
+                    "failed to read private runtime dependency symlink",
+                    error,
+                )
+            })?;
+            ensure_private_runtime_link_target(projection_root, &path, &target)?;
+        } else if metadata.is_dir() {
+            validate_private_runtime_dependency_directory(projection_root, &path)?;
+        } else if !metadata.is_file() {
+            return Err(invalid_state(
+                &path,
+                "private runtime dependency tree contains an unsupported filesystem entry",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_private_runtime_link_target(
+    projection_root: &Path,
+    link_path: &Path,
+    target: &Path,
+) -> Result<(), RepoStateError> {
+    if target.is_absolute() {
+        return Err(invalid_state(
+            link_path,
+            "private runtime dependency symlink target must be relative",
+        ));
+    }
+    let parent = link_path.parent().ok_or_else(|| {
+        invalid_state(
+            link_path,
+            "private runtime dependency symlink has no parent",
+        )
+    })?;
+    let parent_relative = parent.strip_prefix(projection_root).map_err(|_| {
+        invalid_state(
+            link_path,
+            "private runtime dependency symlink escaped its projection",
+        )
+    })?;
+    let mut depth = parent_relative.components().count();
+    for component in target.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::ParentDir if depth > 0 => depth -= 1,
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(invalid_state(
+                    link_path,
+                    "private runtime dependency symlink target escapes the projection",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_runtime_dependency_symlink(
+    target: &Path,
+    destination: &Path,
+    _source: &Path,
+) -> Result<(), RepoStateError> {
+    std::os::unix::fs::symlink(target, destination).map_err(|error| {
+        io_error(
+            destination,
+            "failed to create private runtime dependency symlink",
+            error,
+        )
+    })
+}
+
+#[cfg(windows)]
+fn create_runtime_dependency_symlink(
+    target: &Path,
+    destination: &Path,
+    source: &Path,
+) -> Result<(), RepoStateError> {
+    let resolved = source
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(target);
+    let result = if resolved.is_dir() {
+        std::os::windows::fs::symlink_dir(target, destination)
+    } else {
+        std::os::windows::fs::symlink_file(target, destination)
+    };
+    result.map_err(|error| {
+        io_error(
+            destination,
+            "failed to create private runtime dependency symlink",
+            error,
+        )
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_runtime_dependency_symlink(
+    _target: &Path,
+    destination: &Path,
+    _source: &Path,
+) -> Result<(), RepoStateError> {
+    Err(invalid_state(
+        destination,
+        "private runtime dependency symlinks are unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn runtime_dependency_file_is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn runtime_dependency_file_is_executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
 fn scan_real_repo_files_fallback(
     repo_root: &Path,
     current: &Path,
@@ -2366,11 +2823,28 @@ pub fn path_is_sunignored(
 }
 
 pub fn path_is_gitignored(repo_root: &Path, relative: &str) -> Result<bool, RepoStateError> {
+    path_is_gitignored_with_kind(repo_root, relative, false)
+}
+
+pub fn directory_is_gitignored(repo_root: &Path, relative: &str) -> Result<bool, RepoStateError> {
+    path_is_gitignored_with_kind(repo_root, relative, true)
+}
+
+fn path_is_gitignored_with_kind(
+    repo_root: &Path,
+    relative: &str,
+    is_dir: bool,
+) -> Result<bool, RepoStateError> {
     if repo_root.join(".git").exists() {
+        let query = if is_dir && !relative.ends_with('/') {
+            format!("{relative}/")
+        } else {
+            relative.to_string()
+        };
         let output = Command::new("git")
             .arg("-C")
             .arg(repo_root)
-            .args(["check-ignore", "--quiet", "--", relative])
+            .args(["check-ignore", "--quiet", "--", &query])
             .output()
             .map_err(|error| {
                 invalid_state(
@@ -2390,7 +2864,7 @@ pub fn path_is_gitignored(repo_root: &Path, relative: &str) -> Result<bool, Repo
             )),
         };
     }
-    path_is_ignored_by_file(repo_root, relative, false, ".gitignore")
+    path_is_ignored_by_file(repo_root, relative, is_dir, ".gitignore")
 }
 
 fn path_is_ignored_by_file(
@@ -4032,6 +4506,7 @@ pub fn materialize_real_projection(
     } else {
         vec![preferred]
     };
+    let projection_materialization_started = Instant::now();
     let mut unsupported_reason = None;
     for strategy in strategies {
         let staging = projection_staging_path(root);
@@ -4077,14 +4552,19 @@ pub fn materialize_real_projection(
                     cache_key,
                     strategy,
                     metrics: RealProjectionMaterializationMetrics {
-                        elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        elapsed_ms: elapsed_millis_u64(started),
+                        cache_build_ms: cache.cache_build_ms,
+                        cache_validation_ms: cache.cache_validation_ms,
+                        projection_materialization_ms: elapsed_millis_u64(
+                            projection_materialization_started,
+                        ),
                         logical_bytes,
                         physically_materialized_bytes,
                         physical_allocation_bytes: None,
                         file_count,
                         cache_hit: cache.cache_hit,
                         reuse: cache.reuse,
-                        integrity_revalidated: true,
+                        integrity_revalidated: cache.integrity_revalidated,
                         storage_amplification_millionths: if logical_bytes == 0 {
                             None
                         } else {
@@ -4117,6 +4597,9 @@ struct RealProjectionCacheEntry {
     cache_hit: bool,
     reuse: String,
     physically_materialized_bytes: u64,
+    cache_build_ms: u64,
+    cache_validation_ms: u64,
+    integrity_revalidated: bool,
 }
 
 fn ensure_real_projection_cache_entry(
@@ -4132,16 +4615,26 @@ fn ensure_real_projection_cache_entry(
     let entry_root = cache_root.join(&key_digest);
     let expected_manifest = real_projection_cache_manifest_bytes(state, request, cache_key)?;
     let mut rebuilt_after_quarantine = false;
+    let mut cache_build_ms = 0_u64;
+    let mut cache_validation_ms = 0_u64;
 
     for _ in 0..3 {
         if projection_cache_path_exists(&entry_root)? {
-            match validate_real_projection_cache_entry(&entry_root, state, &expected_manifest) {
+            let validation_started = Instant::now();
+            let validation =
+                validate_real_projection_cache_entry(&entry_root, state, &expected_manifest);
+            cache_validation_ms =
+                cache_validation_ms.saturating_add(elapsed_millis_u64(validation_started));
+            match validation {
                 Ok(()) => {
                     return Ok(RealProjectionCacheEntry {
                         content_root: entry_root.join(PROJECTION_CACHE_CONTENT_ROOT),
                         cache_hit: true,
                         reuse: "reused".to_string(),
                         physically_materialized_bytes: 0,
+                        cache_build_ms,
+                        cache_validation_ms,
+                        integrity_revalidated: true,
                     });
                 }
                 Err(reason) => {
@@ -4156,6 +4649,7 @@ fn ensure_real_projection_cache_entry(
             }
         }
 
+        let cache_build_started = Instant::now();
         let staging = cache_root.join(format!(
             ".staging-{key_digest}-{}-{}-{}",
             std::process::id(),
@@ -4179,16 +4673,7 @@ fn ensure_real_projection_cache_entry(
             cleanup_projection_staging(&staging);
             return Err(error);
         }
-        if let Err(reason) =
-            validate_real_projection_cache_entry(&staging, state, &expected_manifest)
-        {
-            cleanup_projection_staging(&staging);
-            return Err(RepoStateError::ProjectionCacheIntegrity {
-                cache_key: cache_key.to_string(),
-                path: staging,
-                reason,
-            });
-        }
+        cache_build_ms = cache_build_ms.saturating_add(elapsed_millis_u64(cache_build_started));
 
         match fs::rename(&staging, &entry_root) {
             Ok(()) => {
@@ -4201,17 +4686,28 @@ fn ensure_real_projection_cache_entry(
                         "created".to_string()
                     },
                     physically_materialized_bytes: state_logical_bytes(state),
+                    cache_build_ms,
+                    cache_validation_ms,
+                    integrity_revalidated: false,
                 });
             }
             Err(error) if projection_cache_path_exists(&entry_root)? => {
                 cleanup_projection_staging(&staging);
-                match validate_real_projection_cache_entry(&entry_root, state, &expected_manifest) {
+                let validation_started = Instant::now();
+                let validation =
+                    validate_real_projection_cache_entry(&entry_root, state, &expected_manifest);
+                cache_validation_ms =
+                    cache_validation_ms.saturating_add(elapsed_millis_u64(validation_started));
+                match validation {
                     Ok(()) => {
                         return Ok(RealProjectionCacheEntry {
                             content_root: entry_root.join(PROJECTION_CACHE_CONTENT_ROOT),
                             cache_hit: true,
                             reuse: "reused_concurrent_publication".to_string(),
                             physically_materialized_bytes: 0,
+                            cache_build_ms,
+                            cache_validation_ms,
+                            integrity_revalidated: true,
                         });
                     }
                     Err(reason) => {
@@ -4251,6 +4747,11 @@ fn state_logical_bytes(state: &RealRepoState) -> u64 {
         .map(|entry| entry.bytes.len() as u64)
         .sum()
 }
+
+fn elapsed_millis_u64(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
 fn projection_cache_staging_identity(name: &str) -> Option<(u32, u128)> {
     let mut parts = name.strip_prefix(".staging-")?.split('-');
     let key_digest = parts.next()?;
@@ -5152,6 +5653,8 @@ fn materialize_real_projection_strategy(
         if strategy != RealProjectionStrategy::HardlinkReadonly {
             set_private_projection_permissions(&path, entry.executable)
                 .map_err(StrategyAttemptError::State)?;
+        }
+        if strategy == RealProjectionStrategy::Copy {
             let materialized = fs::read(&path).map_err(|error| {
                 StrategyAttemptError::State(io_error(
                     &path,
@@ -5253,6 +5756,30 @@ fn publish_projection_staging(root: &Path, staging: &Path) -> Result<(), RepoSta
     }
     fs::rename(staging, root)
         .map_err(|error| io_error(root, "failed to publish projection atomically", error))
+}
+
+#[cfg(target_os = "macos")]
+fn clone_file_cow(source: &Path, destination: &Path, length: u64) -> Result<u64, String> {
+    use std::ffi::{c_char, CString};
+    use std::os::unix::ffi::OsStrExt;
+
+    extern "C" {
+        fn clonefile(source: *const c_char, destination: *const c_char, flags: u32) -> i32;
+    }
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| "source path contains an interior NUL byte".to_string())?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| "destination path contains an interior NUL byte".to_string())?;
+    let result = unsafe { clonefile(source.as_ptr(), destination.as_ptr(), 0) };
+    if result == 0 {
+        Ok(length)
+    } else {
+        Err(format!(
+            "macOS clonefile is unavailable: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
 }
 
 #[cfg(windows)]
@@ -5395,7 +5922,7 @@ fn clone_file_cow(source: &Path, destination: &Path, length: u64) -> Result<u64,
     Ok(clone_length)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn clone_file_cow(_source: &Path, _destination: &Path, _length: u64) -> Result<u64, String> {
     Err("this build has no platform COW clone implementation".to_string())
 }
@@ -5843,6 +6370,14 @@ fn parse_projection_materialization_metrics(
     };
     Ok(Some(RealProjectionMaterializationMetrics {
         elapsed_ms: required_u64(metrics, "elapsed_ms", state_path)?,
+        cache_build_ms: optional_u64(metrics, "cache_build_ms", state_path)?.unwrap_or(0),
+        cache_validation_ms: optional_u64(metrics, "cache_validation_ms", state_path)?.unwrap_or(0),
+        projection_materialization_ms: optional_u64(
+            metrics,
+            "projection_materialization_ms",
+            state_path,
+        )?
+        .unwrap_or(0),
         logical_bytes: required_u64(metrics, "logical_bytes", state_path)?,
         physically_materialized_bytes: optional_u64(
             metrics,
@@ -6102,10 +6637,65 @@ fn parse_execution_snapshot(
         .unwrap_or_else(|| "legacy_unrecorded".to_string()),
         filesystem_write_policy: optional_string(object, "filesystem_write_policy", state_path)?
             .unwrap_or_else(|| "legacy_unrecorded".to_string()),
+        runtime_dependency_paths: optional_array(object, "runtime_dependency_paths", state_path)?
+            .iter()
+            .map(|value| match value {
+                JsonValue::String(path) => Ok(path.clone()),
+                _ => Err(invalid_state(
+                    state_path,
+                    "execution runtime_dependency_paths must contain strings",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        preexisting_runtime_dependency_paths: optional_array(
+            object,
+            "preexisting_runtime_dependency_paths",
+            state_path,
+        )?
+        .iter()
+        .map(|value| match value {
+            JsonValue::String(path) => Ok(path.clone()),
+            _ => Err(invalid_state(
+                state_path,
+                "execution preexisting_runtime_dependency_paths must contain strings",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?,
+        runtime_dependency_bindings: optional_array(
+            object,
+            "runtime_dependency_bindings",
+            state_path,
+        )?
+        .iter()
+        .map(|value| parse_execution_runtime_dependency_binding(value, state_path))
+        .collect::<Result<Vec<_>, _>>()?,
+        runtime_dependency_strategy: optional_string(
+            object,
+            "runtime_dependency_strategy",
+            state_path,
+        )?
+        .unwrap_or_else(|| "legacy_unrecorded".to_string()),
         outputs,
         started_at: required_string(object, "started_at", state_path)?,
         finished_at: required_string(object, "finished_at", state_path)?,
         privacy_class: required_string(object, "privacy_class", state_path)?,
+    })
+}
+
+fn parse_execution_runtime_dependency_binding(
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealExecutionRuntimeDependencyBinding, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(
+            state_path,
+            "execution runtime dependency binding must be a JSON object",
+        ));
+    };
+    Ok(RealExecutionRuntimeDependencyBinding {
+        path: required_string(object, "path", state_path)?,
+        origin: required_string(object, "origin", state_path)?,
+        binding_fingerprint: required_string(object, "binding_fingerprint", state_path)?,
     })
 }
 
@@ -6430,6 +7020,18 @@ fn projection_materialization_metrics_json(
         JsonValue::Number(metrics.elapsed_ms.to_string()),
     );
     object.insert(
+        "cache_build_ms".to_string(),
+        JsonValue::Number(metrics.cache_build_ms.to_string()),
+    );
+    object.insert(
+        "cache_validation_ms".to_string(),
+        JsonValue::Number(metrics.cache_validation_ms.to_string()),
+    );
+    object.insert(
+        "projection_materialization_ms".to_string(),
+        JsonValue::Number(metrics.projection_materialization_ms.to_string()),
+    );
+    object.insert(
         "logical_bytes".to_string(),
         JsonValue::Number(metrics.logical_bytes.to_string()),
     );
@@ -6700,6 +7302,52 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
     object.insert(
         "filesystem_write_policy".to_string(),
         JsonValue::String(execution.filesystem_write_policy.clone()),
+    );
+    object.insert(
+        "runtime_dependency_paths".to_string(),
+        JsonValue::Array(
+            execution
+                .runtime_dependency_paths
+                .iter()
+                .map(|path| JsonValue::String(path.clone()))
+                .collect(),
+        ),
+    );
+    object.insert(
+        "preexisting_runtime_dependency_paths".to_string(),
+        JsonValue::Array(
+            execution
+                .preexisting_runtime_dependency_paths
+                .iter()
+                .map(|path| JsonValue::String(path.clone()))
+                .collect(),
+        ),
+    );
+    object.insert(
+        "runtime_dependency_bindings".to_string(),
+        JsonValue::Array(
+            execution
+                .runtime_dependency_bindings
+                .iter()
+                .map(|binding| {
+                    JsonValue::Object(BTreeMap::from([
+                        ("path".to_string(), JsonValue::String(binding.path.clone())),
+                        (
+                            "origin".to_string(),
+                            JsonValue::String(binding.origin.clone()),
+                        ),
+                        (
+                            "binding_fingerprint".to_string(),
+                            JsonValue::String(binding.binding_fingerprint.clone()),
+                        ),
+                    ]))
+                })
+                .collect(),
+        ),
+    );
+    object.insert(
+        "runtime_dependency_strategy".to_string(),
+        JsonValue::String(execution.runtime_dependency_strategy.clone()),
     );
     object.insert(
         "outputs".to_string(),
@@ -7689,6 +8337,9 @@ mod tests {
             strategy: "copy".to_string(),
             materialization: Some(RealProjectionMaterializationMetrics {
                 elapsed_ms: 1,
+                cache_build_ms: 1,
+                cache_validation_ms: 0,
+                projection_materialization_ms: 0,
                 logical_bytes: entries[0].bytes.len() as u64,
                 physically_materialized_bytes: Some(entries[0].bytes.len() as u64),
                 physical_allocation_bytes: None,
@@ -9276,6 +9927,60 @@ mod tests {
             .any(|entry| entry.path == "README.md" && entry.tombstone));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn private_runtime_dependency_trees_are_opaque_and_cannot_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_repo("private-runtime-tree");
+        let source = root.join("host-node-modules");
+        fs::create_dir_all(source.join("pkg")).unwrap();
+        fs::create_dir_all(source.join(".bin")).unwrap();
+        fs::write(source.join("pkg/index.js"), b"host bytes\n").unwrap();
+        symlink("../pkg/index.js", source.join(".bin/tool")).unwrap();
+
+        let projection = root.join("projection");
+        fs::create_dir_all(projection.join("src")).unwrap();
+        fs::write(projection.join("src/main.js"), b"source bytes\n").unwrap();
+        let destination = projection.join("node_modules");
+        materialize_private_runtime_dependency_tree(&source, &destination, &projection).unwrap();
+        fs::write(destination.join("pkg/index.js"), b"private mutation\n").unwrap();
+        assert_eq!(
+            fs::read(source.join("pkg/index.js")).unwrap(),
+            b"host bytes\n"
+        );
+        assert_eq!(
+            fs::read(destination.join(".bin/tool")).unwrap(),
+            b"private mutation\n"
+        );
+
+        let mut entries = Vec::new();
+        let mut quarantine = Vec::new();
+        scan_real_execution_projection_files_with_quarantine(
+            &projection,
+            &projection,
+            &BTreeSet::from(["node_modules".to_string()]),
+            &mut entries,
+            &mut quarantine,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "src/main.js");
+
+        symlink("../../../outside", destination.join(".bin/escape")).unwrap();
+        let error = scan_real_execution_projection_files_with_quarantine(
+            &projection,
+            &projection,
+            &BTreeSet::from(["node_modules".to_string()]),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("escapes the projection"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn stale_projection_cache_staging_cleanup_is_safe_and_bounded() {
         let repo = temp_repo("projection-cache-staging-gc");
@@ -9356,6 +10061,8 @@ mod tests {
         let first = materialize_real_projection(&repo, &state, &first_root, &request).unwrap();
         assert_eq!(first.strategy, RealProjectionStrategy::HardlinkReadonly);
         assert!(!first.metrics.cache_hit);
+        assert!(!first.metrics.integrity_revalidated);
+        assert_eq!(first.metrics.cache_validation_ms, 0);
         assert_eq!(first.metrics.logical_bytes, 13);
         assert_eq!(first.metrics.physically_materialized_bytes, Some(13));
         assert_eq!(
@@ -9375,6 +10082,8 @@ mod tests {
         let second_root = repo.join("projection-second");
         let second = materialize_real_projection(&repo, &state, &second_root, &request).unwrap();
         assert!(second.metrics.cache_hit);
+        assert!(second.metrics.integrity_revalidated);
+        assert_eq!(second.metrics.cache_build_ms, 0);
         assert_eq!(second.metrics.physically_materialized_bytes, Some(0));
         assert_eq!(
             fs::read(second_root.join("source.txt")).unwrap(),
@@ -9423,6 +10132,12 @@ mod tests {
         assert_eq!(results[0].cache_key, results[1].cache_key);
         assert!(results.iter().any(|result| !result.metrics.cache_hit));
         assert!(results.iter().any(|result| result.metrics.cache_hit));
+        let created = results
+            .iter()
+            .find(|result| !result.metrics.cache_hit)
+            .unwrap();
+        assert!(!created.metrics.integrity_revalidated);
+        assert_eq!(created.metrics.cache_validation_ms, 0);
         assert_eq!(published_projection_cache_entries(&repo), 1);
         assert_eq!(
             fs::read(repo.join("projection-a/source.txt")).unwrap(),
@@ -9452,6 +10167,8 @@ mod tests {
         )
         .unwrap();
         assert!(after_interruption.metrics.cache_hit);
+        assert!(after_interruption.metrics.integrity_revalidated);
+        assert_eq!(after_interruption.metrics.cache_build_ms, 0);
         assert_eq!(
             fs::read(repo.join("projection-after-interruption/source.txt")).unwrap(),
             b"source truth\n"

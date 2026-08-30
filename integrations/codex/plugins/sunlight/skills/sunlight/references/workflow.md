@@ -73,7 +73,9 @@ the captured revision.
    `artifact_delete`, or `artifact_metadata_set`. Pass the exact current
    `content_hash` as the compare-and-swap precondition. Use `new` only when a
    written path must be absent. Classify authored source as `source`; reserve
-   `generated` for output promoted from a recorded execution.
+   `generated` for output promoted from a recorded execution. When one logical
+   edit spans multiple existing text files, pass `artifact_patch.edits` so all
+   per-file hashes and patches succeed as one operation and topic revision.
 6. Re-read important changes from the session view. If a focused validation is
    useful before integration, resolve the topic revision into an exact view and
    run it there.
@@ -155,5 +157,5 @@ bypass a failed CAS by writing outside Sunlight.
 - Use session scope for authoring and view scope for immutable inspection.
 - Do not create branches, worktrees, commits, or exports unless the requested
   workflow requires them.
-- Report the returned topic and checkpoint `handoff.exact_ids` verbatim, plus
+- Report the returned topic and checkpoint `handoff.copy_report` strings, plus
   any relevant operation, projection, and export IDs.

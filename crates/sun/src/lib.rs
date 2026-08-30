@@ -97,18 +97,20 @@ use sunlight_core::projection::{
 };
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repo_state::{
+    directory_is_gitignored, materialize_private_runtime_dependency_tree,
     materialize_real_projection, native_session_generation_id, path_is_gitignored,
     path_is_sunignored, process_may_be_live, read_real_blob, real_artifact_id_for_path,
-    real_content_hash, real_execution_environment_summary_digest, real_tree_hash,
-    scan_real_projection_files_with_quarantine, validate_topic_metadata,
+    real_content_hash, real_execution_environment_summary_digest,
+    real_runtime_dependency_binding_fingerprint, real_tree_hash,
+    scan_real_execution_projection_files_with_quarantine, validate_topic_metadata,
     verify_real_readonly_projection, DerivedRecordPublication, RealArtifactEntry,
     RealCheckpointSnapshot, RealExecutionEnvironmentSummary, RealExecutionOutputSnapshot,
-    RealExecutionPromotionSnapshot, RealExecutionSnapshot, RealExecutionToolHint,
-    RealExportMapSnapshot, RealOperationEffect, RealOperationRecord, RealProjectionMaterialization,
-    RealProjectionMaterializationMetrics, RealProjectionMaterializationRequest,
-    RealProjectionSnapshot, RealProjectionStrategy, RealRepoState, RealResolvedRepoView,
-    RealSessionGenerationRecord, RealSessionRecord, RealTopicRecord, RealWorktreeAnchor,
-    RepoStateError, TopicMetadataValidationError,
+    RealExecutionPromotionSnapshot, RealExecutionRuntimeDependencyBinding, RealExecutionSnapshot,
+    RealExecutionToolHint, RealExportMapSnapshot, RealOperationEffect, RealOperationRecord,
+    RealProjectionMaterialization, RealProjectionMaterializationMetrics,
+    RealProjectionMaterializationRequest, RealProjectionSnapshot, RealProjectionStrategy,
+    RealRepoState, RealResolvedRepoView, RealSessionGenerationRecord, RealSessionRecord,
+    RealTopicRecord, RealWorktreeAnchor, RepoStateError, TopicMetadataValidationError,
 };
 use sunlight_core::repository::{
     init_repository, resolve_projection_policy, ExecutionPolicy, RepositoryConfig,
@@ -1045,6 +1047,24 @@ fn artifact_search(ctx: &CommandContext) -> Result<(), CliError> {
 }
 
 fn artifact_patch(ctx: &CommandContext) -> Result<(), CliError> {
+    if ctx.args.iter().any(|arg| arg == "--batch-file") {
+        let options = parse_patch_batch_options(ctx)?;
+        if options.fixture.is_some() {
+            return Err(invalid_request(
+                "batch patching is available only for repository-backed sessions",
+            ));
+        }
+        let batch =
+            fs::read_to_string(ctx.command_file_path(&options.batch_file)).map_err(|error| {
+                invalid_request(format!(
+                    "failed to read patch batch file `{}`",
+                    options.batch_file
+                ))
+                .with_detail("source", error.to_string())
+            })?;
+        let edits = parse_patch_batch(&batch)?;
+        return real_artifact_patch_batch(ctx, &options.session_id, edits);
+    }
     let options = parse_mutation_options(ctx, "patch", 1)?;
     let expect_hash = options
         .expect_hash
@@ -3511,6 +3531,19 @@ fn real_topic_complete(
     };
 
     if changed {
+        let completion_view = state.resolve_session_view(&session);
+        let completion_tree_hash = completion_view
+            .result
+            .tree_identity
+            .as_ref()
+            .map(|tree| tree.tree_hash.as_str())
+            .ok_or_else(|| {
+                CliError::new(
+                    "conflicted_view",
+                    "cannot complete a topic from a conflicted session view",
+                )
+                .with_detail("session_id", session.session_id.clone())
+            })?;
         state.topics[topic_index].completed_revision_id = Some(options.revision_id.clone());
         state.sync_compat_fields();
         let topic = state.topics[topic_index].clone();
@@ -3538,13 +3571,17 @@ fn real_topic_complete(
                 "topics",
                 &completion_id,
                 &format!(
-                    "{{\"record_type\":\"topic_completion\",\"id\":\"{}\",\"repository_id\":\"{}\",\"topic_id\":\"{}\",\"completed_revision_id\":\"{}\",\"session_id\":\"{}\",\"actor_id\":\"{}\",\"summary\":\"{}\",\"immutable\":true}}\n",
+                    "{{\"record_type\":\"topic_completion\",\"id\":\"{}\",\"repository_id\":\"{}\",\"topic_id\":\"{}\",\"topic_revision_id\":\"{}\",\"completed_revision_id\":\"{}\",\"session_id\":\"{}\",\"actor_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"topic_frontier\":{},\"summary\":\"{}\",\"immutable\":true}}\n",
                     json_escape(&completion_id),
                     json_escape(&state.repository_id),
                     json_escape(&topic.topic_id),
                     json_escape(&options.revision_id),
+                    json_escape(&options.revision_id),
                     json_escape(&session.session_id),
                     json_escape(&session.actor_id),
+                    json_escape(&completion_view.result.resolved_view_id),
+                    json_escape(completion_tree_hash),
+                    string_map_object_json(&completion_view.result.topic_frontier),
                     json_escape(summary),
                 ),
             )?,
@@ -3556,9 +3593,10 @@ fn real_topic_complete(
     if ctx.json {
         outputln!(
             ctx,
-            "{{\"ok\":true,\"data\":{{\"command\":\"topic.complete\",\"repository_id\":\"{}\",\"ids\":{{\"topic_id\":\"{}\",\"completed_revision_id\":\"{}\",\"session_id\":\"{}\"}},\"changed\":{},\"immutable\":true,\"topic\":{},\"handoff\":{}}},\"warnings\":[]}}",
+            "{{\"ok\":true,\"data\":{{\"command\":\"topic.complete\",\"repository_id\":\"{}\",\"ids\":{{\"topic_id\":\"{}\",\"topic_revision_id\":\"{}\",\"completed_revision_id\":\"{}\",\"session_id\":\"{}\"}},\"changed\":{},\"immutable\":true,\"topic\":{},\"handoff\":{}}},\"warnings\":[]}}",
             json_escape(&state.repository_id),
             json_escape(&topic.topic_id),
+            json_escape(&options.revision_id),
             json_escape(&options.revision_id),
             json_escape(&session.session_id),
             changed,
@@ -4197,6 +4235,145 @@ fn real_artifact_patch(
     finish_real_mutation(ctx, state, response)
 }
 
+fn real_artifact_patch_batch(
+    ctx: &CommandContext,
+    session_id: &str,
+    edits: Vec<PatchBatchEdit>,
+) -> Result<(), CliError> {
+    let mut state = RealRepoState::load(&ctx.repo_root)?;
+    let session = real_session(&state, session_id)?.clone();
+    let resolved = state.resolve_session_view(&session);
+    let mut seen_paths = BTreeSet::new();
+    let mut prepared = Vec::with_capacity(edits.len());
+    for edit in edits {
+        if !seen_paths.insert(edit.path.clone()) {
+            return Err(CliError::new(
+                "duplicate_patch_path",
+                "a batch patch may edit each path only once",
+            )
+            .with_detail("path", edit.path));
+        }
+        ensure_path_visible_to_sunlight(&ctx.repo_root, &edit.path)?;
+        let before = real_entry(&state, &resolved.entries, &edit.path)?.clone();
+        if before.content_hash != edit.expect_hash {
+            return Err(real_precondition_error(&state, &before, &edit.expect_hash));
+        }
+        let before_text = std::str::from_utf8(&before.bytes)
+            .map_err(|_| CliError::new("invalid_content_encoding", "path is not UTF-8 text"))?;
+        let (after_text, _) = apply_real_patch(before_text, &edit.patch)?;
+        let mut after = before.clone();
+        after.bytes = after_text.into_bytes();
+        after.content_hash = real_content_hash(&after.bytes);
+        prepared.push((before, after));
+    }
+
+    let (first_before, first_after) = prepared
+        .first()
+        .cloned()
+        .expect("patch batches are validated as non-empty");
+    let first_path = first_after.path.clone();
+    let mut response = real_accept_mutation(
+        &mut state,
+        session_id,
+        "patch",
+        &first_path,
+        Some(first_before),
+        first_after,
+    )?;
+    let effects = prepared
+        .iter()
+        .map(|(before, after)| RealOperationEffect {
+            artifact_id: after.artifact_id.clone(),
+            path: after.path.clone(),
+            base_content_hash: Some(before.content_hash.clone()),
+            result_content_hash: after.content_hash.clone(),
+            classification: after.classification.clone(),
+            executable: after.executable,
+            tombstone: after.tombstone,
+            bytes: after.bytes.clone(),
+        })
+        .collect::<Vec<_>>();
+    state
+        .operations
+        .last_mut()
+        .expect("accepted mutation records an operation")
+        .effects = effects;
+
+    let session = real_session(&state, session_id)?.clone();
+    let session_resolved = state.resolve_session_view(&session);
+    let tree_hash = session_resolved
+        .result
+        .tree_identity
+        .as_ref()
+        .map(|tree| tree.tree_hash.clone())
+        .ok_or_else(|| {
+            CliError::new(
+                "conflicted_view",
+                "batch patch would produce a conflicted session view",
+            )
+            .with_detail(
+                "resolved_view_id",
+                session_resolved.result.resolved_view_id.clone(),
+            )
+        })?;
+    let resolved_view_id = session_resolved.result.resolved_view_id.clone();
+    state.resolved_view_id = resolved_view_id.clone();
+    state.current_topic_frontier = session_resolved.result.topic_frontier.clone();
+    state.tree_hash = tree_hash.clone();
+    state.entries = session_resolved.entries.clone();
+    if let Some(session) = state.session_by_id_mut(session_id) {
+        session.resolved_view_id = resolved_view_id.clone();
+    }
+    if let Some(generation) = state
+        .session_generations
+        .iter_mut()
+        .find(|generation| generation.session_generation_id == response.session_generation.id)
+    {
+        generation.resolved_view_id = resolved_view_id.clone();
+    }
+    state.sync_compat_fields();
+
+    let artifacts = prepared
+        .iter()
+        .map(|(before, after)| MutationArtifactView {
+            artifact_id: after.artifact_id.clone(),
+            path: after.path.clone(),
+            kind: ArtifactKind::File,
+            before_hash: Some(before.content_hash.clone()),
+            after_hash: after.content_hash.clone(),
+            classification: after.classification.clone(),
+            executable: after.executable,
+        })
+        .collect::<Vec<_>>();
+    response.operation.write_set = artifacts
+        .iter()
+        .map(|artifact| sunlight_core::artifacts::WriteSetEntry {
+            artifact_id: artifact.artifact_id.clone(),
+            path: artifact.path.clone(),
+            mutation: MutationKind::Patch,
+        })
+        .collect();
+    response.operation.before_refs.artifacts = prepared
+        .iter()
+        .map(|(before, _)| real_mutation_ref(Some(before), &before.path, false))
+        .collect();
+    response.operation.after_refs.artifacts = prepared
+        .iter()
+        .map(|(_, after)| real_mutation_ref(Some(after), &after.path, false))
+        .collect();
+    let tree_identity = TreeIdentityView {
+        kind: "SingleRepoTree".to_string(),
+        repository_id: state.repository_id.clone(),
+        tree_hash,
+    };
+    response.operation.after_refs.tree_identity = tree_identity.clone();
+    response.view.resolved_view_id = resolved_view_id.clone();
+    response.view.tree_identity = tree_identity;
+    response.session_generation.resolved_view_id = resolved_view_id;
+
+    finish_real_mutation_with_artifacts(ctx, state, response, artifacts)
+}
+
 fn real_artifact_write(
     ctx: &CommandContext,
     options: MutationCommandOptions,
@@ -4488,14 +4665,18 @@ fn real_project_materialize(
                 .iter()
                 .filter(|entry| !entry.tombstone)
                 .count() as u64;
+            let verification_ms = verification_started
+                .elapsed()
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
             let materialization = RealProjectionMaterialization {
                 cache_key: projection.cache_key.clone(),
                 strategy: RealProjectionStrategy::HardlinkReadonly,
                 metrics: RealProjectionMaterializationMetrics {
-                    elapsed_ms: verification_started
-                        .elapsed()
-                        .as_millis()
-                        .min(u64::MAX as u128) as u64,
+                    elapsed_ms: verification_ms,
+                    cache_build_ms: 0,
+                    cache_validation_ms: verification_ms,
+                    projection_materialization_ms: 0,
                     logical_bytes,
                     physically_materialized_bytes: Some(0),
                     physical_allocation_bytes: Some(0),
@@ -5201,6 +5382,8 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         .with_detail("resolved_view_id", resolved.result.resolved_view_id));
     }
     let view_state = real_view_state(&state, &resolved);
+    let runtime_dependency_paths =
+        execution_runtime_dependency_paths(&repo_root, &relative_cwd, &view_state.entries)?;
     let provisional_projection_id = format!(
         "projection_execution_native_{:04}",
         state.projections.len() + 1
@@ -5224,6 +5407,24 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     let projection_root = projection_policy.execution_root(&projection_id);
     relocate_managed_projection_root(&provisional_root, &projection_root)?;
     let materialization_ms = materialization_started.elapsed().as_millis();
+    let cache_build_ms = u128::from(materialization.metrics.cache_build_ms);
+    let cache_validation_ms = u128::from(materialization.metrics.cache_validation_ms);
+    let projection_materialization_ms =
+        u128::from(materialization.metrics.projection_materialization_ms);
+    let dependency_prepare_started = Instant::now();
+    let runtime_dependency_bindings = materialize_execution_runtime_dependencies(
+        &repo_root,
+        &projection_root,
+        &runtime_dependency_paths,
+    )
+    .inspect_err(|_| {
+        remove_unpublished_execution_root(&projection_root);
+    })?;
+    let preexisting_runtime_dependency_paths = runtime_dependency_bindings
+        .iter()
+        .map(|binding| binding.path.clone())
+        .collect::<Vec<_>>();
+    let dependency_prepare_ms = dependency_prepare_started.elapsed().as_millis();
     #[cfg(windows)]
     let mut isolation = windows_isolation::PreparedIsolation::prepare(
         &repo_root,
@@ -5320,7 +5521,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     );
     let started_at = real_now_id();
     let empty_output_digest = real_content_hash(&[]);
-    let running_execution = RealExecutionSnapshot {
+    let mut running_execution = RealExecutionSnapshot {
         execution_id: execution_id.clone(),
         projection_id: projection_id.clone(),
         resolved_view_id: view_state.resolved_view_id.clone(),
@@ -5372,6 +5573,10 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         network_policy: network_policy_effective.clone(),
         filesystem_write_policy_requested: execution_policy.filesystem_write_policy.clone(),
         filesystem_write_policy: filesystem_write_policy_effective.clone(),
+        runtime_dependency_paths: runtime_dependency_paths.clone(),
+        preexisting_runtime_dependency_paths: preexisting_runtime_dependency_paths.clone(),
+        runtime_dependency_bindings,
+        runtime_dependency_strategy: "private_cow_or_copy_opaque_v1".to_string(),
         outputs: Vec::new(),
         started_at: started_at.clone(),
         finished_at: String::new(),
@@ -5450,12 +5655,42 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     let output_scan_started = Instant::now();
     let mut projected_entries = Vec::new();
     let mut quarantine = Vec::new();
-    scan_real_projection_files_with_quarantine(
+    let runtime_dependency_path_set = runtime_dependency_paths.iter().cloned().collect();
+    scan_real_execution_projection_files_with_quarantine(
         &projection_root,
         &projection_root,
+        &runtime_dependency_path_set,
         &mut projected_entries,
         &mut quarantine,
     )?;
+    for relative in &runtime_dependency_paths {
+        if running_execution
+            .runtime_dependency_bindings
+            .iter()
+            .any(|binding| binding.path == *relative)
+        {
+            continue;
+        }
+        let root = projection_root.join(relative);
+        if !path_exists_without_following(&root)? {
+            continue;
+        }
+        let binding_fingerprint =
+            real_runtime_dependency_binding_fingerprint(&root).map_err(|error| {
+                CliError::new(
+                    "execution_runtime_dependency_fingerprint_failed",
+                    error.to_string(),
+                )
+                .with_detail("path", relative.clone())
+            })?;
+        running_execution
+            .runtime_dependency_bindings
+            .push(RealExecutionRuntimeDependencyBinding {
+                path: relative.clone(),
+                origin: "execution_created".to_string(),
+                binding_fingerprint,
+            });
+    }
     projected_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let outputs = if command_output.cancelled {
         Vec::new()
@@ -5583,6 +5818,10 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
                 &stdout_text,
                 &stderr_text,
                 materialization_ms,
+                cache_build_ms,
+                cache_validation_ms,
+                projection_materialization_ms,
+                dependency_prepare_ms,
                 command_ms,
                 output_scan_ms,
                 publication_ms,
@@ -5689,6 +5928,131 @@ fn real_execution_relative_cwd(cwd: &str) -> Result<PathBuf, CliError> {
         }
     }
     Ok(relative)
+}
+
+fn execution_runtime_dependency_paths(
+    repo_root: &Path,
+    relative_cwd: &Path,
+    view_entries: &[RealArtifactEntry],
+) -> Result<Vec<String>, CliError> {
+    let mut candidates = BTreeSet::new();
+    let mut current = PathBuf::new();
+    candidates.insert("node_modules".to_string());
+    for component in relative_cwd.components() {
+        if let std::path::Component::Normal(part) = component {
+            current.push(part);
+            candidates.insert(
+                current
+                    .join("node_modules")
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
+        }
+    }
+    for entry in view_entries.iter().filter(|entry| !entry.tombstone) {
+        let path = Path::new(&entry.path);
+        if path.file_name().and_then(|name| name.to_str()) != Some("package.json") {
+            continue;
+        }
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        candidates.insert(
+            parent
+                .join("node_modules")
+                .to_string_lossy()
+                .replace('\\', "/"),
+        );
+    }
+
+    let mut eligible = Vec::new();
+    for candidate in candidates {
+        let prefix = format!("{candidate}/");
+        if view_entries.iter().any(|entry| {
+            !entry.tombstone && (entry.path == candidate || entry.path.starts_with(&prefix))
+        }) {
+            continue;
+        }
+        if path_is_sunignored(repo_root, &candidate, true)? {
+            continue;
+        }
+        let source = repo_root.join(&candidate);
+        let gitignored = directory_is_gitignored(repo_root, &candidate).map_err(|error| {
+            CliError::new(
+                "execution_ignore_policy_failed",
+                format!("failed to evaluate Git ignore policy: {error}"),
+            )
+            .with_detail("path", candidate.clone())
+        })?;
+        if !gitignored {
+            if !path_exists_without_following(&source)? {
+                continue;
+            }
+            return Err(CliError::new(
+                "execution_runtime_dependency_not_gitignored",
+                "a preexisting runtime dependency path must be Git-ignored before managed execution",
+            )
+            .with_detail("path", candidate));
+        }
+        eligible.push(candidate);
+    }
+    Ok(eligible)
+}
+
+fn materialize_execution_runtime_dependencies(
+    repo_root: &Path,
+    projection_root: &Path,
+    runtime_dependency_paths: &[String],
+) -> Result<Vec<RealExecutionRuntimeDependencyBinding>, CliError> {
+    let mut bindings = Vec::new();
+    for relative in runtime_dependency_paths {
+        let source = repo_root.join(relative);
+        if !path_exists_without_following(&source)? {
+            continue;
+        }
+        let destination = projection_root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                CliError::new(
+                    "execution_runtime_dependency_materialization_failed",
+                    format!("failed to create private dependency parent: {error}"),
+                )
+                .with_detail("path", relative.clone())
+            })?;
+        }
+        materialize_private_runtime_dependency_tree(&source, &destination, projection_root)
+            .map_err(|error| {
+                CliError::new(
+                    "execution_runtime_dependency_materialization_failed",
+                    error.to_string(),
+                )
+                .with_detail("path", relative.clone())
+            })?;
+        let binding_fingerprint = real_runtime_dependency_binding_fingerprint(&destination)
+            .map_err(|error| {
+                CliError::new(
+                    "execution_runtime_dependency_fingerprint_failed",
+                    error.to_string(),
+                )
+                .with_detail("path", relative.clone())
+            })?;
+        bindings.push(RealExecutionRuntimeDependencyBinding {
+            path: relative.clone(),
+            origin: "worktree_gitignored".to_string(),
+            binding_fingerprint,
+        });
+    }
+    Ok(bindings)
+}
+
+fn path_exists_without_following(path: &Path) -> Result<bool, CliError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CliError::new(
+            "execution_runtime_dependency_inspection_failed",
+            format!("failed to inspect runtime dependency path: {error}"),
+        )
+        .with_detail("path", path.display().to_string())),
+    }
 }
 
 fn real_execution_cwd_path(
@@ -6923,6 +7287,16 @@ fn finish_real_mutation(
     state: RealRepoState,
     response: MutationResponse,
 ) -> Result<(), CliError> {
+    let artifacts = vec![response.artifact.clone()];
+    finish_real_mutation_with_artifacts(ctx, state, response, artifacts)
+}
+
+fn finish_real_mutation_with_artifacts(
+    ctx: &CommandContext,
+    state: RealRepoState,
+    response: MutationResponse,
+    artifacts: Vec<MutationArtifactView>,
+) -> Result<(), CliError> {
     let repo_root = ctx.repo_root.clone();
     let records = vec![
         state.record_publication(
@@ -6955,14 +7329,15 @@ fn finish_real_mutation(
     ];
     state.save_with_records(&repo_root, &records)?;
     if ctx.json {
-        outputln!(ctx, "{}", mutation_success_envelope(&response));
-    } else {
         outputln!(
             ctx,
-            "{} {}",
-            response.artifact.path,
-            response.artifact.after_hash
+            "{}",
+            mutation_success_envelope_with_artifacts(&response, &artifacts)
         );
+    } else {
+        for artifact in artifacts {
+            outputln!(ctx, "{} {}", artifact.path, artifact.after_hash);
+        }
     }
     Ok(())
 }
@@ -8182,6 +8557,30 @@ fn real_topic_handoff_json(
             .and_then(|value| value.get(field))
             .and_then(serde_json::Value::as_str)
     };
+    let fallback_session =
+        completion_string("session_id").and_then(|session_id| state.session_by_id(session_id));
+    let fallback_view = fallback_session.map(|session| state.resolve_session_view(session));
+    let resolved_view_id = completion_string("resolved_view_id").or_else(|| {
+        fallback_view
+            .as_ref()
+            .map(|view| view.result.resolved_view_id.as_str())
+    });
+    let tree_hash = completion_string("tree_hash").or_else(|| {
+        fallback_view
+            .as_ref()
+            .and_then(|view| view.result.tree_identity.as_ref())
+            .map(|tree| tree.tree_hash.as_str())
+    });
+    let topic_frontier = completion
+        .as_ref()
+        .and_then(|value| value.get("topic_frontier"))
+        .map(serde_json::Value::to_string)
+        .or_else(|| {
+            fallback_view
+                .as_ref()
+                .map(|view| string_map_object_json(&view.result.topic_frontier))
+        })
+        .unwrap_or_else(|| "{}".to_string());
     let topic_operations = state
         .operations
         .iter()
@@ -8219,13 +8618,24 @@ fn real_topic_handoff_json(
         })
         .collect::<Vec<_>>()
         .join(",");
+    let exact_ids = CanonicalHandoffExactIds {
+        topic_id: Some(&topic.topic_id),
+        topic_revision_id: topic.completed_revision_id.as_deref(),
+        session_id: completion_string("session_id"),
+        resolved_view_id,
+        tree_hash,
+        checkpoint_id: None,
+        execution_ids: &[],
+        topic_frontier_json: &topic_frontier,
+    }
+    .to_json();
+    let copy_report = format!("Sunlight handoff exact IDs: {exact_ids}");
     format!(
-        "{{\"available\":{},\"immutable\":{},\"exact_ids\":{{\"topic_id\":\"{}\",\"completed_revision_id\":{},\"session_id\":{}}},\"completed_revision_id\":{},\"summary\":{},\"session_id\":{},\"actor_id\":{},\"operation_count\":{},\"changed_paths\":{},\"operations\":[{}]}}",
+        "{{\"available\":{},\"immutable\":{},\"exact_ids\":{},\"copy_report\":\"{}\",\"completed_revision_id\":{},\"summary\":{},\"session_id\":{},\"actor_id\":{},\"operation_count\":{},\"changed_paths\":{},\"operations\":[{}]}}",
         topic.completed_revision_id.is_some(),
         topic.completed_revision_id.is_some(),
-        json_escape(&topic.topic_id),
-        optional_string_json(topic.completed_revision_id.as_deref()),
-        optional_string_json(completion_string("session_id")),
+        exact_ids,
+        json_escape(&copy_report),
         optional_string_json(topic.completed_revision_id.as_deref()),
         optional_string_json(completion_string("summary")),
         optional_string_json(completion_string("session_id")),
@@ -8234,6 +8644,38 @@ fn real_topic_handoff_json(
         string_array_json(changed_paths.iter().map(String::as_str)),
         operations_json,
     )
+}
+
+struct CanonicalHandoffExactIds<'a> {
+    topic_id: Option<&'a str>,
+    topic_revision_id: Option<&'a str>,
+    session_id: Option<&'a str>,
+    resolved_view_id: Option<&'a str>,
+    tree_hash: Option<&'a str>,
+    checkpoint_id: Option<&'a str>,
+    execution_ids: &'a [&'a str],
+    topic_frontier_json: &'a str,
+}
+
+impl CanonicalHandoffExactIds<'_> {
+    fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{\"topic_id\":{},\"topic_revision_id\":{},\"completed_revision_id\":{},\"session_id\":{},",
+                "\"resolved_view_id\":{},\"tree_hash\":{},\"checkpoint_id\":{},",
+                "\"execution_ids\":{},\"topic_frontier\":{}}}"
+            ),
+            optional_string_json(self.topic_id),
+            optional_string_json(self.topic_revision_id),
+            optional_string_json(self.topic_revision_id),
+            optional_string_json(self.session_id),
+            optional_string_json(self.resolved_view_id),
+            optional_string_json(self.tree_hash),
+            optional_string_json(self.checkpoint_id),
+            string_array_json(self.execution_ids.iter().copied()),
+            self.topic_frontier_json,
+        )
+    }
 }
 
 fn real_session_start_success_envelope(
@@ -8295,8 +8737,11 @@ fn real_materialization_metrics_json(
         .map(|value| format!("{:.6}", value as f64 / 1_000_000.0))
         .unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"elapsed_ms\":{},\"logical_bytes\":{},\"physically_materialized_bytes\":{},\"physical_allocation_bytes\":{},\"file_count\":{},\"cache_hit\":{},\"reuse\":\"{}\",\"integrity_revalidated\":{},\"storage_amplification\":{}}}",
+        "{{\"elapsed_ms\":{},\"cache_build_ms\":{},\"cache_validation_ms\":{},\"projection_materialization_ms\":{},\"logical_bytes\":{},\"physically_materialized_bytes\":{},\"physical_allocation_bytes\":{},\"file_count\":{},\"cache_hit\":{},\"reuse\":\"{}\",\"integrity_revalidated\":{},\"storage_amplification\":{}}}",
         metrics.elapsed_ms,
+        metrics.cache_build_ms,
+        metrics.cache_validation_ms,
+        metrics.projection_materialization_ms,
         metrics.logical_bytes,
         metrics.physically_materialized_bytes.map(|value| value.to_string()).unwrap_or_else(|| "null".to_string()),
         metrics.physical_allocation_bytes.map(|value| value.to_string()).unwrap_or_else(|| "null".to_string()),
@@ -9073,7 +9518,8 @@ fn real_execution_runtime_policy_json(execution: &RealExecutionSnapshot) -> Stri
             "\"environment\":{{\"inheritance\":\"{}\",\"allowlist\":{},\"values_recorded\":false}},",
             "\"network\":{{\"requested\":\"{}\",\"effective\":\"{}\"}},",
             "\"filesystem_writes_requested\":\"{}\",",
-            "\"filesystem_writes\":\"{}\"}}"
+            "\"filesystem_writes\":\"{}\",",
+            "\"runtime_dependencies\":{{\"strategy\":\"{}\",\"opaque_paths\":{},\"preexisting_private_paths\":{},\"bindings\":{}}}}}"
         ),
         execution
             .timeout_ms
@@ -9104,6 +9550,33 @@ fn real_execution_runtime_policy_json(execution: &RealExecutionSnapshot) -> Stri
         json_escape(&execution.network_policy),
         json_escape(&execution.filesystem_write_policy_requested),
         json_escape(&execution.filesystem_write_policy),
+        json_escape(&execution.runtime_dependency_strategy),
+        string_array_json(execution.runtime_dependency_paths.iter().map(String::as_str)),
+        string_array_json(
+            execution
+                .preexisting_runtime_dependency_paths
+                .iter()
+                .map(String::as_str)
+        ),
+        execution_runtime_dependency_bindings_json(&execution.runtime_dependency_bindings),
+    )
+}
+
+fn execution_runtime_dependency_bindings_json(
+    bindings: &[RealExecutionRuntimeDependencyBinding],
+) -> String {
+    format!(
+        "[{}]",
+        bindings
+            .iter()
+            .map(|binding| format!(
+                "{{\"path\":\"{}\",\"origin\":\"{}\",\"binding_fingerprint\":\"{}\"}}",
+                json_escape(&binding.path),
+                json_escape(&binding.origin),
+                json_escape(&binding.binding_fingerprint),
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
     )
 }
 
@@ -9274,6 +9747,10 @@ fn real_execution_run_success_envelope(
     stdout_text: &str,
     stderr_text: &str,
     materialization_ms: u128,
+    cache_build_ms: u128,
+    cache_validation_ms: u128,
+    projection_materialization_ms: u128,
+    dependency_prepare_ms: u128,
     command_ms: u128,
     output_scan_ms: u128,
     publication_ms: u128,
@@ -9301,7 +9778,7 @@ fn real_execution_run_success_envelope(
             "\"runtime_policy\":{},",
             "\"output_capture\":{},",
             "\"output_text\":{{\"stdout\":\"{}\",\"stderr\":\"{}\",\"durability\":\"response_only\"}},",
-            "\"phase_timings_ms\":{{\"materialization\":{},\"command\":{},",
+            "\"phase_timings_ms\":{{\"materialization\":{},\"cache_build\":{},\"cache_validation\":{},\"projection_materialization\":{},\"dependency_prepare\":{},\"command\":{},",
             "\"output_scan_and_classification\":{},\"publication\":{},\"total\":{}}},",
             "\"output_summary_counts\":{},",
             "\"promotion_candidates\":[{}]",
@@ -9324,6 +9801,10 @@ fn real_execution_run_success_envelope(
         json_escape(stdout_text),
         json_escape(stderr_text),
         materialization_ms,
+        cache_build_ms,
+        cache_validation_ms,
+        projection_materialization_ms,
+        dependency_prepare_ms,
         command_ms,
         output_scan_ms,
         publication_ms,
@@ -13856,6 +14337,20 @@ struct MutationCommandOptions {
 }
 
 #[derive(Debug)]
+struct PatchBatchOptions {
+    session_id: String,
+    fixture: Option<String>,
+    batch_file: String,
+}
+
+#[derive(Debug)]
+struct PatchBatchEdit {
+    path: String,
+    expect_hash: String,
+    patch: String,
+}
+
+#[derive(Debug)]
 struct ExecutionPromoteOutputOptions {
     execution_id: String,
     fixture: Option<String>,
@@ -14201,6 +14696,103 @@ fn artifact_usage(command: &str) -> String {
         _ => "usage: sun <artifact-command> --session <session> --fixture basic-app",
     }
     .to_string()
+}
+
+fn parse_patch_batch_options(ctx: &CommandContext) -> Result<PatchBatchOptions, CliError> {
+    let mut session_id = None;
+    let mut fixture = None;
+    let mut batch_file = None;
+    let mut args = ctx.args.iter().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--session" => {
+                session_id = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request(
+                                "usage: sun patch --batch-file <file> requires --session <session>",
+                            )
+                        })?
+                        .clone(),
+                );
+            }
+            "--fixture" => {
+                fixture = Some(
+                    args.next()
+                        .ok_or_else(|| invalid_request("usage: sun patch --fixture basic-app"))?
+                        .clone(),
+                );
+            }
+            "--batch-file" => {
+                batch_file = Some(
+                    args.next()
+                        .ok_or_else(|| invalid_request("usage: sun patch --batch-file <file>"))?
+                        .clone(),
+                );
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun patch"
+                )));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected batch patch argument `{value}`"
+                )));
+            }
+        }
+    }
+    Ok(PatchBatchOptions {
+        session_id: session_id.ok_or_else(|| {
+            invalid_request("usage: sun patch --batch-file <file> requires --session <session>")
+        })?,
+        fixture,
+        batch_file: batch_file
+            .ok_or_else(|| invalid_request("usage: sun patch --batch-file <file>"))?,
+    })
+}
+
+fn parse_patch_batch(value: &str) -> Result<Vec<PatchBatchEdit>, CliError> {
+    let value: serde_json::Value = serde_json::from_str(value).map_err(|error| {
+        invalid_request("patch batch file must contain a JSON array")
+            .with_detail("source", error.to_string())
+    })?;
+    let edits = value
+        .as_array()
+        .filter(|edits| !edits.is_empty())
+        .ok_or_else(|| invalid_request("patch batch must contain at least one edit"))?;
+    edits
+        .iter()
+        .enumerate()
+        .map(|(index, edit)| {
+            let object = edit.as_object().ok_or_else(|| {
+                invalid_request("each patch batch edit must be a JSON object")
+                    .with_detail("edit_index", index.to_string())
+            })?;
+            for key in object.keys() {
+                if !matches!(key.as_str(), "path" | "expect_hash" | "patch") {
+                    return Err(
+                        invalid_request(format!("unknown patch batch edit field `{key}`"))
+                            .with_detail("edit_index", index.to_string()),
+                    );
+                }
+            }
+            let required = |key: &str| {
+                object
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        invalid_request(format!("patch batch edit requires string field `{key}`"))
+                            .with_detail("edit_index", index.to_string())
+                    })
+            };
+            Ok(PatchBatchEdit {
+                path: required("path")?.to_string(),
+                expect_hash: required("expect_hash")?.to_string(),
+                patch: required("patch")?.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn parse_mutation_options(
@@ -15523,6 +16115,12 @@ fn phase1_capabilities_json() -> String {
 }
 
 fn checkpoint_create_success_envelope(checkpoint: &CheckpointRecord) -> String {
+    let execution_id = checkpoint
+        .evidence_refs
+        .first()
+        .map(|evidence| match evidence {
+            EvidenceRef::Execution(execution) => execution.execution_id.as_str(),
+        });
     format!(
         concat!(
             "{{\"ok\":true,",
@@ -15531,7 +16129,9 @@ fn checkpoint_create_success_envelope(checkpoint: &CheckpointRecord) -> String {
             "\"repository_id\":\"{}\",",
             "\"ids\":{{",
             "\"checkpoint_id\":\"{}\",",
-            "\"resolved_view_id\":\"{}\"",
+            "\"resolved_view_id\":\"{}\",",
+            "\"tree_hash\":\"{}\",",
+            "\"execution_id\":{}",
             "}},",
             "\"view\":{{",
             "\"resolved_view_id\":\"{}\",",
@@ -15554,6 +16154,8 @@ fn checkpoint_create_success_envelope(checkpoint: &CheckpointRecord) -> String {
         json_escape(&checkpoint.repository_id),
         json_escape(&checkpoint.id),
         json_escape(&checkpoint.resolved_view_id),
+        json_escape(&checkpoint.tree_identity.tree_hash),
+        optional_string_json(execution_id),
         json_escape(&checkpoint.resolved_view_id),
         checkpoint_topic_frontier_json(checkpoint),
         single_repo_tree_json(&checkpoint.tree_identity),
@@ -15581,13 +16183,24 @@ fn checkpoint_handoff_json(checkpoint: &CheckpointRecord) -> String {
             EvidenceRef::Execution(execution) => execution.execution_id.as_str(),
         })
         .collect::<Vec<_>>();
+    let topic_frontier = checkpoint_topic_frontier_json(checkpoint);
+    let exact_ids = CanonicalHandoffExactIds {
+        topic_id: None,
+        topic_revision_id: None,
+        session_id: None,
+        resolved_view_id: Some(&checkpoint.resolved_view_id),
+        tree_hash: Some(&checkpoint.tree_identity.tree_hash),
+        checkpoint_id: Some(&checkpoint.id),
+        execution_ids: &execution_ids,
+        topic_frontier_json: &topic_frontier,
+    }
+    .to_json();
+    let copy_report = format!("Sunlight handoff exact IDs: {exact_ids}");
     format!(
-        "{{\"exact_ids\":{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"execution_ids\":{}}},\"topic_frontier\":{},\"export_ready\":true}}",
-        json_escape(&checkpoint.id),
-        json_escape(&checkpoint.resolved_view_id),
-        json_escape(&checkpoint.tree_identity.tree_hash),
-        string_array_json(execution_ids.iter().copied()),
-        checkpoint_topic_frontier_json(checkpoint),
+        "{{\"exact_ids\":{},\"copy_report\":\"{}\",\"topic_frontier\":{},\"export_ready\":true}}",
+        exact_ids,
+        json_escape(&copy_report),
+        topic_frontier,
     )
 }
 
@@ -18552,6 +19165,13 @@ fn view_search_success_envelope(
 }
 
 fn mutation_success_envelope(response: &MutationResponse) -> String {
+    mutation_success_envelope_with_artifacts(response, std::slice::from_ref(&response.artifact))
+}
+
+fn mutation_success_envelope_with_artifacts(
+    response: &MutationResponse,
+    artifacts: &[MutationArtifactView],
+) -> String {
     format!(
         concat!(
             "{{\"ok\":true,",
@@ -18578,7 +19198,11 @@ fn mutation_success_envelope(response: &MutationResponse) -> String {
         json_escape(&response.operation.id),
         json_escape(&response.topic_revision.id),
         view_json(&response.view),
-        mutation_artifact_json(&response.artifact),
+        artifacts
+            .iter()
+            .map(mutation_artifact_json)
+            .collect::<Vec<_>>()
+            .join(","),
         operation_json(response),
         topic_revision_json(response),
         session_generation_json(response),

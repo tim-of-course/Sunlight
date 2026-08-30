@@ -1992,6 +1992,368 @@ fn ignored_execution_outputs_are_batched_bounded_and_not_promotable() {
     assert!(stdout(&repository_status).contains("\"pending_promotions\":0"));
 }
 
+#[cfg(unix)]
+#[test]
+fn execution_keeps_preexisting_and_created_node_modules_private_and_opaque() {
+    use std::os::unix::fs::symlink;
+
+    let repo = TestRepo::new("private-runtime-dependencies");
+    init_local_git_repo(&repo);
+    repo.write_file(".gitignore", "node_modules/\n");
+    write_nested_file(repo.path(), "packages/app/main.py", "print('app')\n");
+    write_nested_file(repo.path(), "packages/app/package.json", "{}\n");
+    write_nested_file(
+        repo.path(),
+        "node_modules/pkg/index.js",
+        "original dependency\n",
+    );
+    fs::create_dir_all(repo.path().join("node_modules/.bin")).unwrap();
+    symlink(
+        "../pkg/index.js",
+        repo.path().join("node_modules/.bin/tool"),
+    )
+    .unwrap();
+    git(
+        repo.path(),
+        &[
+            "add",
+            ".gitignore",
+            "packages/app/main.py",
+            "packages/app/package.json",
+        ],
+    );
+    git(repo.path(), &["commit", "-m", "add app"]);
+    assert_success(&run_real_json(&repo, &["init"]));
+
+    let run = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            PYTHON,
+            "-c",
+            concat!(
+                "from pathlib import Path; ",
+                "root=Path('node_modules'); ",
+                "assert (root/'.bin/tool').read_text() == 'original dependency\\n'; ",
+                "(root/'pkg/index.js').write_text('private mutation\\n'); ",
+                "local=Path('packages/app/node_modules'); (local/'pkg').mkdir(parents=True); ",
+                "(local/'pkg/bin.py').write_text('print(1)\\n'); ",
+                "(local/'.bin').mkdir(); (local/'.bin/local').symlink_to('../pkg/bin.py')"
+            ),
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("dependency-bound execution should run");
+    assert_success(&run);
+    let body: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
+    assert_eq!(body["data"]["result"]["status"], "pass");
+    assert_eq!(body["data"]["promotion_candidates"], serde_json::json!([]));
+    assert!(body["data"]["phase_timings_ms"]["dependency_prepare"].is_number());
+    assert_eq!(
+        body["data"]["runtime_policy"]["runtime_dependencies"]["preexisting_private_paths"],
+        serde_json::json!(["node_modules"])
+    );
+    let bindings = body["data"]["runtime_policy"]["runtime_dependencies"]["bindings"]
+        .as_array()
+        .unwrap();
+    let root_binding = bindings
+        .iter()
+        .find(|binding| binding["path"] == "node_modules")
+        .unwrap();
+    assert_eq!(root_binding["origin"], "worktree_gitignored");
+    let first_root_fingerprint = root_binding["binding_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(first_root_fingerprint.starts_with("sha256:"));
+    let created_binding = bindings
+        .iter()
+        .find(|binding| binding["path"] == "packages/app/node_modules")
+        .unwrap();
+    assert_eq!(created_binding["origin"], "execution_created");
+    assert!(created_binding["binding_fingerprint"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert!(
+        body["data"]["runtime_policy"]["runtime_dependencies"]["opaque_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "packages/app/node_modules")
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join("node_modules/pkg/index.js")).unwrap(),
+        "original dependency\n"
+    );
+    assert!(!repo.path().join("packages/app/node_modules").exists());
+
+    let state = RealRepoState::load(repo.path()).unwrap();
+    let execution = state.executions.last().unwrap();
+    assert!(execution.outputs.is_empty());
+    assert_eq!(
+        execution.preexisting_runtime_dependency_paths,
+        vec!["node_modules"]
+    );
+    assert_eq!(execution.runtime_dependency_bindings.len(), 2);
+
+    fs::write(
+        repo.path().join("node_modules/pkg/index.js"),
+        "replacement dependency\n",
+    )
+    .unwrap();
+    let rerun = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            PYTHON,
+            "-c",
+            "from pathlib import Path; assert Path('node_modules/pkg/index.js').read_text() == 'replacement dependency\\n'",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("dependency-bound execution should rerun");
+    assert_success(&rerun);
+    let rerun_body: serde_json::Value = serde_json::from_str(&stdout(&rerun)).unwrap();
+    let second_root_fingerprint = rerun_body["data"]["runtime_policy"]["runtime_dependencies"]
+        ["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|binding| binding["path"] == "node_modules")
+        .unwrap()["binding_fingerprint"]
+        .as_str()
+        .unwrap();
+    assert_ne!(first_root_fingerprint, second_root_fingerprint);
+}
+
+#[test]
+fn sunignored_node_modules_is_not_registered_or_exposed_to_execution() {
+    let repo = TestRepo::new("sunignored-runtime-dependencies");
+    init_local_git_repo(&repo);
+    repo.write_file(".gitignore", "node_modules/\n");
+    repo.write_file(".sunignore", "node_modules/\n");
+    write_nested_file(
+        repo.path(),
+        "node_modules/pkg/secret.js",
+        "private dependency\n",
+    );
+    git(repo.path(), &["add", ".gitignore", ".sunignore"]);
+    git(
+        repo.path(),
+        &["commit", "-m", "exclude dependencies from sunlight"],
+    );
+    assert_success(&run_real_json(&repo, &["init"]));
+
+    let run = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            PYTHON,
+            "-c",
+            "from pathlib import Path; assert not Path('node_modules').exists()",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("sunignored dependency execution should run");
+    assert_success(&run);
+    let body: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
+    assert_eq!(body["data"]["result"]["status"], "pass");
+    assert_eq!(
+        body["data"]["runtime_policy"]["runtime_dependencies"]["opaque_paths"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        body["data"]["runtime_policy"]["runtime_dependencies"]["bindings"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn absent_nonignored_node_modules_remains_a_promotable_execution_output() {
+    let repo = TestRepo::new("nonignored-created-runtime-dependencies");
+    init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+
+    let run = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            PYTHON,
+            "-c",
+            "from pathlib import Path; path=Path('node_modules/pkg/generated.py'); path.parent.mkdir(parents=True); path.write_text('print(1)\\n')",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("nonignored dependency output execution should run");
+    assert_success(&run);
+    let body: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
+    assert_eq!(body["data"]["result"]["status"], "pass");
+    assert_eq!(body["data"]["output_summary_counts"]["file_delta"], 1);
+    assert_eq!(
+        body["data"]["runtime_policy"]["runtime_dependencies"]["opaque_paths"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        body["data"]["promotion_candidates"][0]["output_path"],
+        "node_modules/pkg/generated.py"
+    );
+}
+
+#[test]
+fn batch_patch_is_one_atomic_multi_effect_revision() {
+    let repo = TestRepo::new("atomic-batch-patch");
+    init_local_git_repo(&repo);
+    repo.write_file("a.txt", "alpha\n");
+    repo.write_file("b.txt", "beta\n");
+    git(repo.path(), &["add", "a.txt", "b.txt"]);
+    git(repo.path(), &["commit", "-m", "add patch inputs"]);
+    start_native_session(&repo, "batch-patch");
+
+    let a_hash = json_string_field(
+        &stdout(&run_real_json(
+            &repo,
+            &["read", "a.txt", "--session", "session_agent_a"],
+        )),
+        "content_hash",
+    );
+    let b_hash = json_string_field(
+        &stdout(&run_real_json(
+            &repo,
+            &["read", "b.txt", "--session", "session_agent_a"],
+        )),
+        "content_hash",
+    );
+    let batch_path = repo.path().join("patch-batch.json");
+    fs::write(
+        &batch_path,
+        serde_json::to_vec(&serde_json::json!([
+            {"path":"a.txt","expect_hash":a_hash,"patch":"@@\n-alpha\n+alpha changed\n"},
+            {"path":"b.txt","expect_hash":b_hash,"patch":"@@\n-beta\n+beta changed\n"}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let patched = sun()
+        .args(["patch", "--session", "session_agent_a", "--batch-file"])
+        .arg(&batch_path)
+        .args(["--json"])
+        .current_dir(repo.path())
+        .output()
+        .expect("batch patch should run");
+    assert_success(&patched);
+    let body: serde_json::Value = serde_json::from_str(&stdout(&patched)).unwrap();
+    assert_eq!(body["data"]["artifacts"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        body["data"]["operation"]["write_set"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        body["data"]["ids"]["topic_revision_id"],
+        "rev_batch_patch_0001"
+    );
+    assert_eq!(
+        body["data"]["session_generation"]["session_generation_id"],
+        "gen_agent_a_0002"
+    );
+
+    let state = RealRepoState::load(repo.path()).unwrap();
+    assert_eq!(state.operations.len(), 1);
+    assert_eq!(state.operations[0].artifact_effects().len(), 2);
+    assert_eq!(
+        state
+            .topic_by_id_or_slug("batch-patch")
+            .unwrap()
+            .revision_number,
+        1
+    );
+    assert_eq!(state.entry("a.txt").unwrap().bytes, b"alpha changed\n");
+    assert_eq!(state.entry("b.txt").unwrap().bytes, b"beta changed\n");
+
+    let state_before_failure =
+        fs::read(repo.path().join(".sunlight/records/native-state.json")).unwrap();
+    fs::write(
+        &batch_path,
+        serde_json::to_vec(&serde_json::json!([
+            {"path":"a.txt","expect_hash":body["data"]["artifacts"][0]["after_hash"],"patch":"@@\n-alpha changed\n+again\n"},
+            {"path":"b.txt","expect_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","patch":"@@\n-beta changed\n+again\n"}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let failed = sun()
+        .args(["patch", "--session", "session_agent_a", "--batch-file"])
+        .arg(&batch_path)
+        .args(["--json"])
+        .current_dir(repo.path())
+        .output()
+        .expect("stale batch patch should fail");
+    assert_failure(&failed);
+    assert!(stdout(&failed).contains("\"code\":\"precondition_failed\""));
+    assert_eq!(
+        fs::read(repo.path().join(".sunlight/records/native-state.json")).unwrap(),
+        state_before_failure
+    );
+
+    let completed = run_real_json(
+        &repo,
+        &[
+            "topic",
+            "complete",
+            "--topic",
+            "topic_batch_patch",
+            "--revision",
+            "rev_batch_patch_0001",
+            "--session",
+            "session_agent_a",
+        ],
+    );
+    assert_success(&completed);
+    let completed: serde_json::Value = serde_json::from_str(&stdout(&completed)).unwrap();
+    let topic_ids = &completed["data"]["handoff"]["exact_ids"];
+    assert_eq!(topic_ids["topic_id"], "topic_batch_patch");
+    assert_eq!(topic_ids["topic_revision_id"], "rev_batch_patch_0001");
+    assert!(topic_ids["resolved_view_id"].is_string());
+    assert!(topic_ids["tree_hash"].is_string());
+    assert_eq!(topic_ids["checkpoint_id"], serde_json::Value::Null);
+    assert!(completed["data"]["handoff"]["copy_report"]
+        .as_str()
+        .unwrap()
+        .contains("topic_revision_id"));
+
+    let resolved_view_id = body["data"]["view"]["resolved_view_id"].as_str().unwrap();
+    let checkpoint = run_real_json(&repo, &["checkpoint", "create", "--view", resolved_view_id]);
+    assert_success(&checkpoint);
+    let checkpoint: serde_json::Value = serde_json::from_str(&stdout(&checkpoint)).unwrap();
+    let checkpoint_ids = &checkpoint["data"]["handoff"]["exact_ids"];
+    assert!(checkpoint_ids["checkpoint_id"].is_string());
+    assert_eq!(checkpoint_ids["topic_id"], serde_json::Value::Null);
+    assert_eq!(checkpoint_ids["topic_revision_id"], serde_json::Value::Null);
+    assert_eq!(
+        checkpoint_ids["topic_frontier"]["topic_batch_patch"],
+        "rev_batch_patch_0001"
+    );
+    assert_eq!(
+        checkpoint["data"]["ids"]["execution_id"],
+        serde_json::Value::Null
+    );
+}
+
 #[test]
 fn tracked_gitignore_match_modified_by_execution_remains_promotable() {
     let repo = TestRepo::new("tracked-ignored-execution-output");
@@ -3629,7 +3991,10 @@ fn no_fixture_forced_copy_reports_truthful_metrics_and_isolates_store_mutation()
     assert!(body.contains("\"file_count\":1"));
     assert!(body.contains("\"cache_hit\":false"));
     assert!(body.contains("\"reuse\":\"created\""));
-    assert!(body.contains("\"integrity_revalidated\":true"));
+    assert!(body.contains("\"integrity_revalidated\":false"));
+    assert!(body.contains("\"cache_build_ms\":"));
+    assert!(body.contains("\"cache_validation_ms\":0"));
+    assert!(body.contains("\"projection_materialization_ms\":"));
     assert!(body.contains("\"storage_amplification\":2.000000"));
     assert!(body.contains("\"cache_key\":\"projection-cache:"));
 
@@ -3696,6 +4061,10 @@ fn no_fixture_repeated_exact_view_reuses_one_durable_projection_cache_entry() {
     let second_body = stdout(&second);
     assert!(second_body.contains("\"cache_hit\":true"));
     assert!(second_body.contains("\"reuse\":\"reused\""));
+    assert!(second_body.contains("\"integrity_revalidated\":true"));
+    assert!(second_body.contains("\"cache_build_ms\":0"));
+    assert!(second_body.contains("\"cache_validation_ms\":"));
+    assert!(second_body.contains("\"projection_materialization_ms\":"));
     assert!(second_body.contains("\"physically_materialized_bytes\":5"));
     assert!(second_body.contains("\"storage_amplification\":1.000000"));
     assert_eq!(
@@ -11255,9 +11624,15 @@ fn checkpoint_create_json_fixture_ready_view_returns_checkpoint_envelope() {
     ));
     assert!(stdout.contains("\"export_refs\":[]"));
     assert!(stdout.contains("\"export_ready\":true"));
-    assert!(stdout.contains(
-        "\"handoff\":{\"exact_ids\":{\"checkpoint_id\":\"checkpoint_auth_profile_ready_0001\""
-    ));
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        value["data"]["handoff"]["exact_ids"]["checkpoint_id"],
+        "checkpoint_auth_profile_ready_0001"
+    );
+    assert!(value["data"]["handoff"]["copy_report"]
+        .as_str()
+        .unwrap()
+        .contains("checkpoint_auth_profile_ready_0001"));
     assert!(stdout.contains("\"execution_ids\":[\"exec_auth_profile_tests_0001\"]"));
     assert!(stdout.contains("\"conflict_free\":true"));
 }
@@ -14587,9 +14962,15 @@ fn completed_topic_status_exposes_structured_handoff_facts() {
     let completed_stdout = stdout(&completed);
     assert!(completed_stdout.contains("\"handoff\":{"));
     assert!(completed_stdout.contains("\"available\":true"));
-    assert!(completed_stdout.contains(&format!(
-        "\"exact_ids\":{{\"topic_id\":\"topic_handoff_facts\",\"completed_revision_id\":\"{revision_id}\",\"session_id\":\"session_agent_a\"}}"
-    )));
+    let completed_value: serde_json::Value = serde_json::from_str(&completed_stdout).unwrap();
+    let exact_ids = &completed_value["data"]["handoff"]["exact_ids"];
+    assert_eq!(exact_ids["topic_id"], "topic_handoff_facts");
+    assert_eq!(exact_ids["topic_revision_id"], revision_id);
+    assert_eq!(exact_ids["session_id"], "session_agent_a");
+    assert_eq!(
+        completed_value["data"]["ids"]["completed_revision_id"],
+        revision_id
+    );
     assert!(completed_stdout.contains("Changed src.txt from before to after."));
     assert!(completed_stdout.contains("\"changed_paths\":[\"src.txt\"]"));
     assert!(completed_stdout.contains(&format!("\"before_hash\":\"{before_hash}\"")));

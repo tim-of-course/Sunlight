@@ -50,6 +50,6 @@ another agent's session.
 
 ## Report
 
-Report exact IDs from the returned topic and checkpoint `handoff.exact_ids`
-objects without retyping them from memory. State what was validated and whether
-any tracked-source access occurred outside Sunlight.
+Report the returned topic and checkpoint `handoff.copy_report` strings. They
+are generated from the canonical `handoff.exact_ids` objects. State what was
+validated and whether any tracked-source access occurred outside Sunlight.

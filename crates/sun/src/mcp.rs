@@ -1076,19 +1076,68 @@ fn build_invocation(
             v
         }
         "artifact_patch" => {
-            let file = temp.stage("patch", required_string(args, "patch")?)?;
-            let path = file.path.display().to_string();
-            staged.push(file);
-            vec![
-                "patch".into(),
-                artifact_path(args, "path", false)?,
-                "--session".into(),
-                identifier(args, "session")?,
-                "--expect-hash".into(),
-                expected_hash(args)?,
-                "--patch-file".into(),
-                path,
-            ]
+            if let Some(edits) = args.get("edits") {
+                if args.contains_key("path")
+                    || args.contains_key("expect_hash")
+                    || args.contains_key("patch")
+                {
+                    return Err(ToolFailure::new(
+                        "invalid_request",
+                        "artifact_patch accepts either edits or one path/expect_hash/patch tuple",
+                    ));
+                }
+                let edits = edits
+                    .as_array()
+                    .filter(|edits| !edits.is_empty())
+                    .ok_or_else(|| {
+                        ToolFailure::new("invalid_request", "`edits` must be a nonempty array")
+                    })?;
+                for edit in edits {
+                    let edit = edit.as_object().ok_or_else(|| {
+                        ToolFailure::new("invalid_request", "each patch edit must be an object")
+                    })?;
+                    reject_unknown(edit, &["path", "expect_hash", "patch"])?;
+                    artifact_path(edit, "path", false)?;
+                    expected_hash(edit)?;
+                    let patch = required_string(edit, "patch")?;
+                    if patch.len() > MAX_CONTENT_BYTES {
+                        return Err(ToolFailure::new(
+                            "invalid_request",
+                            "a patch edit exceeds the request content limit",
+                        ));
+                    }
+                }
+                let encoded = serde_json::to_string(edits).map_err(|error| {
+                    ToolFailure::new(
+                        "invalid_request",
+                        format!("cannot encode patch batch: {error}"),
+                    )
+                })?;
+                let file = temp.stage("patch-batch", &encoded)?;
+                let path = file.path.display().to_string();
+                staged.push(file);
+                vec![
+                    "patch".into(),
+                    "--session".into(),
+                    identifier(args, "session")?,
+                    "--batch-file".into(),
+                    path,
+                ]
+            } else {
+                let file = temp.stage("patch", required_string(args, "patch")?)?;
+                let path = file.path.display().to_string();
+                staged.push(file);
+                vec![
+                    "patch".into(),
+                    artifact_path(args, "path", false)?,
+                    "--session".into(),
+                    identifier(args, "session")?,
+                    "--expect-hash".into(),
+                    expected_hash(args)?,
+                    "--patch-file".into(),
+                    path,
+                ]
+            }
         }
         "artifact_write" => {
             let file = temp.stage("content", required_string(args, "content")?)?;
@@ -1738,8 +1787,8 @@ const TOOL_CONTRACTS: &[ToolContract] = &[
     },
     ToolContract {
         name: "artifact_patch",
-        allowed: &["path", "session", "expect_hash", "patch"],
-        required: &["path", "session", "expect_hash", "patch"],
+        allowed: &["path", "session", "expect_hash", "patch", "edits"],
+        required: &["session"],
     },
     ToolContract {
         name: "artifact_write",
@@ -1938,9 +1987,9 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "artifact_patch",
-            "Patch one UTF-8 artifact using compare-and-swap. Standard unified diffs and *** Begin Patch / *** Update File envelopes are accepted. Numeric hunk positions and counts are treated as hints: exact unique context locates the edit. Ambiguous or stale context is rejected, while expect_hash remains the concurrency guard.",
-            json!({"path":path_schema(),"session":id_schema("Exact authoring session_id."),"expect_hash":existing_hash_schema(),"patch":patch_schema()}),
-            &["path", "session", "expect_hash", "patch"],
+            "Patch one or more UTF-8 artifacts using compare-and-swap. Pass path, expect_hash, and patch for one edit, or pass edits for one atomic multi-file operation and one topic revision. Standard unified diffs and *** Begin Patch / *** Update File envelopes are accepted. Numeric hunk positions and counts are treated as hints; ambiguous or stale context is rejected.",
+            json!({"path":path_schema(),"session":id_schema("Exact authoring session_id."),"expect_hash":existing_hash_schema(),"patch":patch_schema(),"edits":{"type":"array","description":"Nonempty atomic batch of per-file compare-and-swap patches. Do not combine with top-level path, expect_hash, or patch.","minItems":1,"items":{"type":"object","properties":{"path":path_schema(),"expect_hash":existing_hash_schema(),"patch":patch_schema()},"required":["path","expect_hash","patch"],"additionalProperties":false}}}),
+            &["session"],
             true,
         ),
         tool(
@@ -2154,7 +2203,14 @@ fn output_schema(name: &str) -> Value {
     }
 
     for (field, description) in output_payloads(name) {
-        data.insert(field.to_string(), json!({"description":description}));
+        data.insert(
+            field.to_string(),
+            if *field == "handoff" {
+                handoff_output_schema(description)
+            } else {
+                json!({"description":description})
+            },
+        );
     }
 
     json!({
@@ -2168,6 +2224,35 @@ fn output_schema(name: &str) -> Value {
             "warnings":{"type":["array","object"],"description":"Advisory facts that do not replace hard error states."}
         },
         "additionalProperties":false
+    })
+}
+
+fn handoff_output_schema(description: &str) -> Value {
+    json!({
+        "type":"object",
+        "description":description,
+        "properties":{
+            "exact_ids":{
+                "type":"object",
+                "description":"Canonical exact identities for topic and checkpoint handoffs. Inapplicable singular identities are null.",
+                "required":["topic_id","topic_revision_id","completed_revision_id","session_id","resolved_view_id","tree_hash","checkpoint_id","execution_ids","topic_frontier"],
+                "properties":{
+                    "topic_id":{"type":["string","null"]},
+                    "topic_revision_id":{"type":["string","null"]},
+                    "completed_revision_id":{"type":["string","null"],"description":"Compatibility alias for topic_revision_id."},
+                    "session_id":{"type":["string","null"]},
+                    "resolved_view_id":{"type":["string","null"]},
+                    "tree_hash":{"type":["string","null"]},
+                    "checkpoint_id":{"type":["string","null"]},
+                    "execution_ids":{"type":"array","items":{"type":"string"}},
+                    "topic_frontier":{"type":"object","additionalProperties":{"type":"string"}}
+                },
+                "additionalProperties":false
+            },
+            "copy_report":{"type":"string","description":"Copy-ready report generated directly from exact_ids."}
+        },
+        "required":["exact_ids","copy_report"],
+        "additionalProperties":true
     })
 }
 
@@ -2532,6 +2617,48 @@ mod tests {
     }
 
     #[test]
+    fn patch_batch_stages_one_private_manifest_and_rejects_mixed_forms() {
+        let (root, temp) = private_temp();
+        let hash = format!("sha256:{}", "0".repeat(64));
+        let invocation = build_invocation(
+            "artifact_patch",
+            &json!({
+                "session":"session_a",
+                "edits":[
+                    {"path":"a.txt","expect_hash":hash,"patch":"@@\n-a\n+b\n"},
+                    {"path":"b.txt","expect_hash":format!("sha256:{}", "1".repeat(64)),"patch":"@@\n-c\n+d\n"}
+                ]
+            }),
+            &root.0,
+            &temp,
+        )
+        .unwrap();
+        assert_eq!(invocation.staged.len(), 1);
+        assert_eq!(invocation.argv[0], "patch");
+        assert!(invocation.argv.iter().any(|arg| arg == "--batch-file"));
+
+        let mixed = build_invocation(
+            "artifact_patch",
+            &json!({
+                "session":"session_a",
+                "path":"a.txt",
+                "expect_hash":format!("sha256:{}", "0".repeat(64)),
+                "patch":"@@\n-a\n+b\n",
+                "edits":[{"path":"b.txt","expect_hash":format!("sha256:{}", "1".repeat(64)),"patch":"@@\n-c\n+d\n"}]
+            }),
+            &root.0,
+            &temp,
+        );
+        assert!(matches!(
+            mixed,
+            Err(ToolFailure {
+                code: "invalid_request",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn repository_mutation_queue_covers_short_state_writers_only() {
         for name in [
             "repository_init",
@@ -2679,6 +2806,17 @@ mod tests {
         assert!(wait["outputSchema"]["properties"]["data"]["properties"]
             .get("wait")
             .is_some());
+        let handoff = &wait["outputSchema"]["properties"]["data"]["properties"]["handoff"];
+        assert_eq!(
+            handoff["properties"]["exact_ids"]["properties"]["topic_revision_id"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            handoff["properties"]["exact_ids"]["properties"]["completed_revision_id"]
+                ["description"],
+            "Compatibility alias for topic_revision_id."
+        );
+        assert_eq!(handoff["properties"]["copy_report"]["type"], "string");
 
         let promote = find("execution_promote_output");
         assert_eq!(

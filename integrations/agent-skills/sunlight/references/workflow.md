@@ -113,9 +113,12 @@ bypass a failed CAS by writing outside Sunlight.
    promotion. Resolve its returned revision into a new exact view and rerun the
    matching validation.
 7. Create a checkpoint using passing evidence that matches the exact view and
-   tree. Preserve its returned `handoff.exact_ids` as the integration result.
-   Materialize an inspection projection only when a filesystem consumer needs
-   one.
+   tree. Prefer one combined checkpoint that includes every completed topic
+   head. Creating an intentional partial or alternative checkpoint requires
+   `acknowledge_omitted_completed_heads`; report the recorded omitted heads and
+   do not present that checkpoint as complete frontier coverage. Preserve the
+   returned `handoff.exact_ids` as the integration result. Materialize an
+   inspection projection only when a filesystem consumer needs one.
 8. For a requested Git handoff, call `policy_check_export` with the exact
    checkpoint and target Git ref, then call `git_export`. `policy_check_commit`
    checks only `.sunlight/**` metadata candidates (or the managed `.gitignore`
@@ -123,6 +126,17 @@ bypass a failed CAS by writing outside Sunlight.
    does not create a persisted report for `policy_explain`. Git is a
    compatibility/export surface, not native authorship. The handoff is complete
    when export returns an `export_map_id` for the checkpoint and target ref.
+
+## Finish safely
+
+1. Call `repository_status` immediately before reporting completion and read
+   `completion_guard`.
+2. If task-owned tracked edits remain in the worktree, call `worktree_diff` and
+   capture those edits into native history before claiming implementation.
+   Leave unrelated external edits untouched and report them separately.
+3. Confirm that the task-owned result has a native topic or checkpoint handoff.
+   Copy each returned `handoff.copy_report` verbatim; never rebuild exact IDs
+   from memory or separate fields.
 
 ## Failure handling
 

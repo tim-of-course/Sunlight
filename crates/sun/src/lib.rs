@@ -34,9 +34,9 @@ use sunlight_core::artifacts::{
 };
 use sunlight_core::checkpoint::{
     fixture_checkpoint_from_resolved_view, validated_execution_evidence, CheckpointRecord,
-    CheckpointValidationError, EvidenceRef, GitExportMapRecord, FIXTURE_CHECKPOINT_ID,
-    FIXTURE_CREATED_AT, FIXTURE_EXPORTED_GIT_REF, FIXTURE_EXPORT_MAP_ID, FIXTURE_GIT_COMMIT_ID,
-    FIXTURE_VALIDATION_REPORT_ID,
+    CheckpointValidationError, EvidenceRef, GitExportMapRecord, TopicFrontierEntry,
+    FIXTURE_CHECKPOINT_ID, FIXTURE_CREATED_AT, FIXTURE_EXPORTED_GIT_REF, FIXTURE_EXPORT_MAP_ID,
+    FIXTURE_GIT_COMMIT_ID, FIXTURE_VALIDATION_REPORT_ID,
 };
 use sunlight_core::compat_import::{
     diff_real_compat_projection, diff_real_worktree, fixture_basic_app_candidate_deltas,
@@ -101,7 +101,8 @@ use sunlight_core::repo_state::{
     materialize_real_projection, native_session_generation_id, path_is_gitignored,
     path_is_sunignored, process_may_be_live, read_real_blob, real_artifact_id_for_path,
     real_content_hash, real_execution_environment_summary_digest,
-    real_runtime_dependency_binding_fingerprint, real_tree_hash,
+    real_runtime_dependency_binding_fingerprint,
+    real_runtime_dependency_source_snapshot_fingerprint, real_tree_hash,
     scan_real_execution_projection_files_with_quarantine, validate_topic_metadata,
     verify_real_readonly_projection, DerivedRecordPublication, RealArtifactEntry,
     RealCheckpointSnapshot, RealExecutionEnvironmentSummary, RealExecutionOutputSnapshot,
@@ -4809,15 +4810,149 @@ struct BoundedProcessOutput {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
 enum ProcessRunError {
     Command(io::Error),
-    #[cfg(windows)]
-    ContainmentSetup(io::Error),
+    ContainmentBootstrapSetup(io::Error),
+    ContainmentSpawnSetup(io::Error),
     Publication(RepoStateError),
-    #[cfg(windows)]
-    FilesystemIsolationSetup(io::Error),
-    #[cfg(windows)]
-    NetworkIsolationSetup(io::Error),
+    FilesystemIsolationSetup {
+        error: io::Error,
+        output: BoundedProcessOutput,
+    },
+    NetworkIsolationSetup {
+        error: io::Error,
+        output: BoundedProcessOutput,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessRunFailurePhase {
+    BeforePublication,
+    PublishedBeforeCommand,
+    PublishedAfterCommand,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PublishedExecutionFailure {
+    command_started: bool,
+    status: &'static str,
+    termination_reason: &'static str,
+}
+
+impl ProcessRunError {
+    fn phase(&self) -> ProcessRunFailurePhase {
+        match self.published_execution_failure() {
+            None => ProcessRunFailurePhase::BeforePublication,
+            Some(failure) if failure.command_started => {
+                ProcessRunFailurePhase::PublishedAfterCommand
+            }
+            Some(_) => ProcessRunFailurePhase::PublishedBeforeCommand,
+        }
+    }
+
+    fn output(&self) -> Option<&BoundedProcessOutput> {
+        match self {
+            Self::FilesystemIsolationSetup { output, .. }
+            | Self::NetworkIsolationSetup { output, .. } => Some(output),
+            _ => None,
+        }
+    }
+
+    fn published_execution_failure(&self) -> Option<PublishedExecutionFailure> {
+        match self {
+            Self::Command(_) => Some(PublishedExecutionFailure {
+                command_started: false,
+                status: "failed",
+                termination_reason: "command_spawn_failed",
+            }),
+            Self::ContainmentSpawnSetup(_) => Some(PublishedExecutionFailure {
+                command_started: false,
+                status: "failed",
+                termination_reason: "execution_containment_setup_failed",
+            }),
+            Self::FilesystemIsolationSetup { .. } => Some(PublishedExecutionFailure {
+                command_started: true,
+                status: "policy_blocked",
+                termination_reason: "execution_filesystem_isolation_setup_failed",
+            }),
+            Self::NetworkIsolationSetup { .. } => Some(PublishedExecutionFailure {
+                command_started: true,
+                status: "policy_blocked",
+                termination_reason: "execution_network_isolation_setup_failed",
+            }),
+            Self::ContainmentBootstrapSetup(_) | Self::Publication(_) => None,
+        }
+    }
+}
+
+fn terminal_execution_after_process_error(
+    running_execution: &RealExecutionSnapshot,
+    error: &ProcessRunError,
+) -> Option<RealExecutionSnapshot> {
+    let failure = error.published_execution_failure()?;
+    let mut execution = running_execution.clone();
+    execution.command_started = failure.command_started;
+    execution.status = failure.status.to_string();
+    execution.runner_process_id = None;
+    execution.termination_reason = Some(failure.termination_reason.to_string());
+    execution.finished_at = real_now_id();
+    if let Some(output) = error.output() {
+        execution.exit_code = output.status.as_ref().and_then(ExitStatus::code);
+        execution.timed_out = output.timed_out;
+        execution.termination_failed = output.termination_failed;
+        execution.wait_failed = output.wait_failed;
+        execution.stdout_observed_digest = output.stdout.observed_digest.clone();
+        execution.stdout_byte_length = output.stdout.observed_byte_length;
+        execution.stdout_captured_byte_length = output.stdout.captured_byte_length;
+        execution.stdout_truncated = output.stdout.truncated;
+        execution.stdout_capture_failed = output.stdout.capture_failed;
+        execution.stderr_observed_digest = output.stderr.observed_digest.clone();
+        execution.stderr_byte_length = output.stderr.observed_byte_length;
+        execution.stderr_captured_byte_length = output.stderr.captured_byte_length;
+        execution.stderr_truncated = output.stderr.truncated;
+        execution.stderr_capture_failed = output.stderr.capture_failed;
+    }
+    Some(execution)
+}
+
+fn process_run_cli_error(
+    error: ProcessRunError,
+    command_argv: &[String],
+    execution_id: &str,
+) -> CliError {
+    let phase = error.phase();
+    let command_started = phase == ProcessRunFailurePhase::PublishedAfterCommand;
+    let cli_error = match error {
+        ProcessRunError::Publication(error) => return CliError::from(error),
+        ProcessRunError::Command(error) => CliError::new(
+            "execution_command_failed",
+            format!("failed to run command: {error}"),
+        )
+        .with_detail("command", command_argv.join(" ")),
+        ProcessRunError::ContainmentBootstrapSetup(error)
+        | ProcessRunError::ContainmentSpawnSetup(error) => CliError::new(
+            "execution_containment_setup_failed",
+            format!("failed to establish execution containment: {error}"),
+        )
+        .with_detail("platform", std::env::consts::OS),
+        ProcessRunError::FilesystemIsolationSetup { error, .. } => CliError::new(
+            "execution_filesystem_isolation_setup_failed",
+            format!("failed to establish Windows filesystem isolation: {error}"),
+        )
+        .with_detail("platform", "windows"),
+        ProcessRunError::NetworkIsolationSetup { error, .. } => CliError::new(
+            "execution_network_isolation_setup_failed",
+            format!("failed to establish Windows network isolation: {error}"),
+        )
+        .with_detail("platform", "windows"),
+    }
+    .with_detail("command_started", command_started.to_string());
+    if phase == ProcessRunFailurePhase::BeforePublication {
+        cli_error
+    } else {
+        cli_error.with_detail("execution_id", execution_id.to_string())
+    }
 }
 
 struct ExecutionChild {
@@ -4835,7 +4970,7 @@ impl ExecutionChild {
                 .map(|contained| Self { contained })
                 .map_err(|error| match error {
                     windows_job::ContainmentSpawnError::Setup(error) => {
-                        ProcessRunError::ContainmentSetup(error)
+                        ProcessRunError::ContainmentSpawnSetup(error)
                     }
                     windows_job::ContainmentSpawnError::Command(error) => {
                         ProcessRunError::Command(error)
@@ -5113,13 +5248,13 @@ fn run_bounded_process(
     policy: &ExecutionPolicy,
     cancellation: &AtomicBool,
     #[cfg(windows)] isolation: &windows_isolation::PreparedIsolation,
-    on_started: impl FnOnce() -> Result<(), RepoStateError>,
+    on_starting: impl FnOnce() -> Result<(), RepoStateError>,
 ) -> Result<BoundedProcessOutput, ProcessRunError> {
     let allowlist = execution_environment_allowlist();
     #[cfg(windows)]
     let mut command = isolation
         .bootstrap_command(argv)
-        .map_err(ProcessRunError::ContainmentSetup)?;
+        .map_err(ProcessRunError::ContainmentBootstrapSetup)?;
     #[cfg(not(windows))]
     let mut command = Command::new(&argv[0]);
     command
@@ -5141,14 +5276,10 @@ fn run_bounded_process(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut execution_child = ExecutionChild::spawn(command, policy)?;
-    if let Err(error) = on_started() {
-        let (_, root_termination_started) = execution_child.terminate_tree();
-        if root_termination_started {
-            let _ = execution_child.child_mut().wait();
-        }
+    if let Err(error) = on_starting() {
         return Err(ProcessRunError::Publication(error));
     }
+    let mut execution_child = ExecutionChild::spawn(command, policy)?;
     let stdout_limit = policy.stdout_limit_bytes;
     let stderr_limit = policy.stderr_limit_bytes;
     let stdout_reader = execution_child.child_mut().stdout.take().map(|stdout| {
@@ -5323,24 +5454,16 @@ fn run_bounded_process(
         failed_summary()
     };
     #[cfg(windows)]
-    let bootstrap_verification = isolation
-        .verify_bootstrap(status.as_ref().and_then(ExitStatus::code))
-        .map_err(|error| match isolation.setup_dimension() {
-            windows_isolation::IsolationSetupDimension::Filesystem => {
-                ProcessRunError::FilesystemIsolationSetup(error)
-            }
-            windows_isolation::IsolationSetupDimension::Network => {
-                ProcessRunError::NetworkIsolationSetup(error)
-            }
-        })?;
+    let bootstrap_verification =
+        isolation.verify_bootstrap(status.as_ref().and_then(ExitStatus::code));
     #[cfg(windows)]
     if matches!(
-        bootstrap_verification,
-        windows_isolation::BootstrapVerification::FailedAfterCommandMayHaveStarted
+        &bootstrap_verification,
+        Ok(windows_isolation::BootstrapVerification::FailedAfterCommandMayHaveStarted)
     ) {
         wait_failed = true;
     }
-    Ok(BoundedProcessOutput {
+    let output = BoundedProcessOutput {
         status,
         cancelled,
         timed_out,
@@ -5349,7 +5472,19 @@ fn run_bounded_process(
         resource_termination,
         stdout,
         stderr,
-    })
+    };
+    #[cfg(windows)]
+    if let Err(error) = bootstrap_verification {
+        return Err(match isolation.setup_dimension() {
+            windows_isolation::IsolationSetupDimension::Filesystem => {
+                ProcessRunError::FilesystemIsolationSetup { error, output }
+            }
+            windows_isolation::IsolationSetupDimension::Network => {
+                ProcessRunError::NetworkIsolationSetup { error, output }
+            }
+        });
+    }
+    Ok(output)
 }
 
 fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Result<(), CliError> {
@@ -5371,7 +5506,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     if let Some(network_policy) = options.network_policy {
         execution_policy.network_policy = network_policy.as_str().to_string();
     }
-    let mut state = RealRepoState::load(&repo_root)?;
+    let mut state = load_real_state_for_execution_merge(&repo_root)?;
     let relative_cwd = real_execution_relative_cwd(&options.cwd)?;
     let resolved = real_resolve_view_by_id(&repo_root, &state, &options.view_id)?;
     if !resolved.result.conflict_free() {
@@ -5384,11 +5519,11 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     let view_state = real_view_state(&state, &resolved);
     let runtime_dependency_paths =
         execution_runtime_dependency_paths(&repo_root, &relative_cwd, &view_state.entries)?;
-    let provisional_projection_id = format!(
-        "projection_execution_native_{:04}",
-        state.projections.len() + 1
-    );
-    let execution_id = format!("exec_native_{:04}", state.executions.len() + 1);
+    let start_reservation = reserve_real_execution_start(&repo_root)?;
+    let execution_sequence = start_reservation.sequence;
+    let provisional_projection_id =
+        format!("projection_execution_native_{:04}", execution_sequence);
+    let execution_id = format!("exec_native_{execution_sequence:04}");
     let provisional_root = projection_policy.execution_root(&provisional_projection_id);
     let materialization_started = Instant::now();
     let materialization = materialize_repo_projection(
@@ -5402,7 +5537,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     let projection_id = selected_real_projection_id(
         ProjectionPurpose::Execution,
         materialization.strategy,
-        state.projections.len() + 1,
+        execution_sequence,
     );
     let projection_root = projection_policy.execution_root(&projection_id);
     relocate_managed_projection_root(&provisional_root, &projection_root)?;
@@ -5416,6 +5551,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         &repo_root,
         &projection_root,
         &runtime_dependency_paths,
+        &state.executions,
     )
     .inspect_err(|_| {
         remove_unpublished_execution_root(&projection_root);
@@ -5473,7 +5609,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         ProjectionPurpose::Execution,
         materialization.strategy,
     );
-    state.projections.push(RealProjectionSnapshot {
+    let execution_projection = RealProjectionSnapshot {
         projection_id: projection_id.clone(),
         repository_id: state.repository_id.clone(),
         purpose: "execution".to_string(),
@@ -5494,7 +5630,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         privacy_class: "local_only".to_string(),
         last_import_operation_id: None,
         entries: view_state.entries.clone(),
-    });
+    };
 
     let environment_allowlist = execution_environment_allowlist()
         .into_iter()
@@ -5582,72 +5718,34 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         finished_at: String::new(),
         privacy_class: "policy_gated".to_string(),
     };
-    state.executions.push(running_execution.clone());
-    let running_records = vec![
-        real_projection_publication(&state, state.projections.last().unwrap())?,
-        state.record_publication(
-            "executions",
-            &running_execution.execution_id,
-            &format!(
-                "{}\n",
-                real_execution_snapshot_record_json(&state, &running_execution)
-            ),
-        )?,
-    ];
     let command_started = Instant::now();
-    let command_output = run_bounded_process(
+    let command_result = run_bounded_process(
         &options.command_argv,
         &execution_cwd,
         &execution_policy,
         &ctx.cancellation,
         #[cfg(windows)]
         &isolation,
-        || state.save_with_records(&repo_root, &running_records),
-    )
-    .map_err(|error| match error {
-        ProcessRunError::Command(error) => {
-            remove_unpublished_execution_root(&projection_root);
-            CliError::new(
-                "execution_command_failed",
-                format!("failed to run command: {error}"),
-            )
-            .with_detail("command", options.command_argv.join(" "))
+        || publish_real_execution_start(&repo_root, &execution_projection, &running_execution),
+    );
+    drop(start_reservation);
+    let command_output = match command_result {
+        Ok(output) => output,
+        Err(error) => {
+            if let Some(failed_execution) =
+                terminal_execution_after_process_error(&running_execution, &error)
+            {
+                finalize_real_execution(&repo_root, &failed_execution, true)?;
+            } else {
+                remove_unpublished_execution_root(&projection_root);
+            }
+            return Err(process_run_cli_error(
+                error,
+                &options.command_argv,
+                &execution_id,
+            ));
         }
-        #[cfg(windows)]
-        ProcessRunError::ContainmentSetup(error) => {
-            remove_unpublished_execution_root(&projection_root);
-            CliError::new(
-                "execution_containment_setup_failed",
-                format!("failed to establish execution containment: {error}"),
-            )
-            .with_detail("platform", std::env::consts::OS)
-            .with_detail("command_started", "false")
-        }
-        ProcessRunError::Publication(error) => {
-            remove_unpublished_execution_root(&projection_root);
-            CliError::from(error)
-        }
-        #[cfg(windows)]
-        ProcessRunError::FilesystemIsolationSetup(error) => {
-            remove_unpublished_execution_root(&projection_root);
-            CliError::new(
-                "execution_filesystem_isolation_setup_failed",
-                format!("failed to establish Windows filesystem isolation: {error}"),
-            )
-            .with_detail("platform", "windows")
-            .with_detail("command_started", "false")
-        }
-        #[cfg(windows)]
-        ProcessRunError::NetworkIsolationSetup(error) => {
-            remove_unpublished_execution_root(&projection_root);
-            CliError::new(
-                "execution_network_isolation_setup_failed",
-                format!("failed to establish Windows network isolation: {error}"),
-            )
-            .with_detail("platform", "windows")
-            .with_detail("command_started", "false")
-        }
-    })?;
+    };
     let command_ms = command_started.elapsed().as_millis();
     let stdout_text = String::from_utf8_lossy(&command_output.stdout.captured_bytes).into_owned();
     let stderr_text = String::from_utf8_lossy(&command_output.stderr.captured_bytes).into_owned();
@@ -5689,6 +5787,8 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
                 path: relative.clone(),
                 origin: "execution_created".to_string(),
                 binding_fingerprint,
+                source_snapshot_fingerprint: None,
+                binding_reuse: "computed".to_string(),
             });
     }
     projected_entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -5703,16 +5803,10 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         )?
     };
     let output_scan_ms = output_scan_started.elapsed().as_millis();
-    state = RealRepoState::load(&repo_root)?;
     #[cfg(windows)]
     let cleanup_error = isolation.finish().err().map(|error| error.to_string());
     #[cfg(not(windows))]
     let cleanup_error: Option<String> = None;
-    if cleanup_error.is_some() {
-        if let Some(projection) = state.projections.last_mut() {
-            projection.retention_state = "quarantined".to_string();
-        }
-    }
     let status = if command_output.cancelled {
         "canceled"
     } else if command_output.resource_termination.is_some() || cleanup_error.is_some() {
@@ -5772,24 +5866,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     execution.outputs = outputs;
     execution.finished_at = finished_at;
     let publication_started = Instant::now();
-    let persisted_execution = state
-        .executions
-        .iter_mut()
-        .find(|persisted| persisted.execution_id == execution.execution_id)
-        .ok_or_else(|| object_not_found("execution", &execution.execution_id))?;
-    *persisted_execution = execution.clone();
-    let records = vec![
-        real_projection_publication(&state, state.projections.last().unwrap())?,
-        state.record_publication(
-            "executions",
-            &execution.execution_id,
-            &format!(
-                "{}\n",
-                real_execution_snapshot_record_json(&state, &execution)
-            ),
-        )?,
-    ];
-    state.save_with_records(&repo_root, &records)?;
+    state = finalize_real_execution(&repo_root, &execution, cleanup_error.is_some())?;
     let publication_ms = publication_started.elapsed().as_millis();
     let total_ms = overall_started.elapsed().as_millis();
     if let Some(cleanup_error) = cleanup_error {
@@ -5837,6 +5914,261 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
 fn remove_unpublished_execution_root(projection_root: &Path) {
     if let Some(allocation_root) = projection_root.parent() {
         let _ = fs::remove_dir_all(allocation_root);
+    }
+}
+
+struct RealExecutionStartReservation {
+    sequence: usize,
+    path: PathBuf,
+}
+
+impl Drop for RealExecutionStartReservation {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+fn reserve_real_execution_start(
+    repo_root: &Path,
+) -> Result<RealExecutionStartReservation, CliError> {
+    let reservation_root = repo_root.join(".sunlight/local/execution-start-reservations");
+    fs::create_dir_all(&reservation_root).map_err(|error| {
+        CliError::new(
+            "execution_start_reservation_failed",
+            format!("failed to create execution start reservation storage: {error}"),
+        )
+        .with_detail("path", reservation_root.display().to_string())
+        .with_detail("command_started", "false")
+    })?;
+    let mut sequence = load_real_state_for_execution_merge(repo_root)?
+        .executions
+        .len()
+        + 1;
+    loop {
+        let path = reservation_root.join(format!("{sequence:04}"));
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                let state = match load_real_state_for_execution_merge(repo_root) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        let _ = fs::remove_dir(&path);
+                        return Err(CliError::from(error));
+                    }
+                };
+                let execution_id = format!("exec_native_{sequence:04}");
+                let projection_suffix = format!("native_{sequence:04}");
+                if state
+                    .executions
+                    .iter()
+                    .any(|execution| execution.execution_id == execution_id)
+                    || state.projections.iter().any(|projection| {
+                        projection.purpose == "execution"
+                            && projection.projection_id.ends_with(&projection_suffix)
+                    })
+                {
+                    let _ = fs::remove_dir(&path);
+                    sequence += 1;
+                    continue;
+                }
+                return Ok(RealExecutionStartReservation { sequence, path });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                sequence += 1;
+            }
+            Err(error) => {
+                return Err(CliError::new(
+                    "execution_start_reservation_failed",
+                    format!("failed to reserve unique execution identity: {error}"),
+                )
+                .with_detail("path", path.display().to_string())
+                .with_detail("command_started", "false"));
+            }
+        }
+    }
+}
+
+fn publish_real_execution_start(
+    repo_root: &Path,
+    projection: &RealProjectionSnapshot,
+    execution: &RealExecutionSnapshot,
+) -> Result<(), RepoStateError> {
+    let mut retry_count = 0_usize;
+    loop {
+        let mut state = load_real_state_for_execution_merge(repo_root)?;
+        if let Some(persisted) = state
+            .executions
+            .iter()
+            .find(|persisted| persisted.execution_id == execution.execution_id)
+        {
+            if persisted == execution
+                && state
+                    .projections
+                    .iter()
+                    .any(|persisted| persisted == projection)
+            {
+                return Ok(());
+            }
+            return Err(RepoStateError::InvalidState {
+                path: repo_root.to_path_buf(),
+                message: format!(
+                    "execution start identity `{}` is already bound to different facts",
+                    execution.execution_id
+                ),
+            });
+        }
+        if state
+            .projections
+            .iter()
+            .any(|persisted| persisted.projection_id == projection.projection_id)
+        {
+            return Err(RepoStateError::InvalidState {
+                path: repo_root.to_path_buf(),
+                message: format!(
+                    "execution projection identity `{}` is already bound to different facts",
+                    projection.projection_id
+                ),
+            });
+        }
+        state.projections.push(projection.clone());
+        state.executions.push(execution.clone());
+        let records = vec![
+            real_projection_publication(&state, projection).map_err(|error| {
+                RepoStateError::InvalidState {
+                    path: repo_root.to_path_buf(),
+                    message: error.message,
+                }
+            })?,
+            state.record_publication(
+                "executions",
+                &execution.execution_id,
+                &format!(
+                    "{}\n",
+                    real_execution_snapshot_record_json(&state, execution)
+                ),
+            )?,
+        ];
+        match state.save_with_records(repo_root, &records) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error,
+                    RepoStateError::ConcurrentStateUpdate { .. }
+                        | RepoStateError::WriterBusy { .. }
+                ) && retry_count < EXECUTION_FINALIZATION_RETRY_LIMIT =>
+            {
+                thread::sleep(Duration::from_millis(1_u64 << retry_count.min(6)));
+                retry_count += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+const EXECUTION_FINALIZATION_RETRY_LIMIT: usize = 64;
+
+fn load_real_state_for_execution_merge(repo_root: &Path) -> Result<RealRepoState, RepoStateError> {
+    let mut retry_count = 0_usize;
+    loop {
+        match RealRepoState::load(repo_root) {
+            Ok(state) => return Ok(state),
+            Err(RepoStateError::WriterBusy { .. })
+                if retry_count < EXECUTION_FINALIZATION_RETRY_LIMIT =>
+            {
+                thread::sleep(Duration::from_millis(1_u64 << retry_count.min(6)));
+                retry_count += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn finalize_real_execution(
+    repo_root: &Path,
+    execution: &RealExecutionSnapshot,
+    quarantine_projection: bool,
+) -> Result<RealRepoState, CliError> {
+    let mut retry_count = 0_usize;
+    loop {
+        let mut state = load_real_state_for_execution_merge(repo_root)?;
+        let persisted_execution = state
+            .executions
+            .iter_mut()
+            .find(|persisted| persisted.execution_id == execution.execution_id)
+            .ok_or_else(|| object_not_found("execution", &execution.execution_id))?;
+        if persisted_execution.projection_id != execution.projection_id
+            || persisted_execution.resolved_view_id != execution.resolved_view_id
+            || persisted_execution.tree_hash != execution.tree_hash
+        {
+            return Err(CliError::new(
+                "execution_finalization_identity_mismatch",
+                "the durable running execution no longer matches the completed command",
+            )
+            .with_detail("execution_id", execution.execution_id.clone())
+            .with_detail("projection_id", execution.projection_id.clone()));
+        }
+        if persisted_execution == execution {
+            return Ok(state);
+        }
+        if persisted_execution.status != "running" {
+            return Err(CliError::new(
+                "execution_finalization_conflict",
+                "the durable execution was finalized with different result facts",
+            )
+            .with_detail("execution_id", execution.execution_id.clone())
+            .with_detail("durable_status", persisted_execution.status.clone())
+            .with_detail("completed_status", execution.status.clone()));
+        }
+        *persisted_execution = execution.clone();
+
+        let projection = state
+            .projections
+            .iter_mut()
+            .find(|projection| projection.projection_id == execution.projection_id)
+            .ok_or_else(|| object_not_found("projection", &execution.projection_id))?;
+        if projection.resolved_view_id != execution.resolved_view_id
+            || projection.tree_hash != execution.tree_hash
+        {
+            return Err(CliError::new(
+                "execution_finalization_identity_mismatch",
+                "the durable execution projection no longer matches the completed command",
+            )
+            .with_detail("execution_id", execution.execution_id.clone())
+            .with_detail("projection_id", execution.projection_id.clone()));
+        }
+        if quarantine_projection {
+            projection.retention_state = "quarantined".to_string();
+        }
+
+        let mut records = vec![state.record_publication(
+            "executions",
+            &execution.execution_id,
+            &format!(
+                "{}\n",
+                real_execution_snapshot_record_json(&state, execution)
+            ),
+        )?];
+        if quarantine_projection {
+            let projection = state
+                .projections
+                .iter()
+                .find(|projection| projection.projection_id == execution.projection_id)
+                .expect("execution projection remains present");
+            records.push(real_projection_publication(&state, projection)?);
+        }
+        match state.save_with_records(repo_root, &records) {
+            Ok(()) => return Ok(load_real_state_for_execution_merge(repo_root)?),
+            Err(error)
+                if matches!(
+                    error,
+                    RepoStateError::ConcurrentStateUpdate { .. }
+                        | RepoStateError::WriterBusy { .. }
+                ) && retry_count < EXECUTION_FINALIZATION_RETRY_LIMIT =>
+            {
+                thread::sleep(Duration::from_millis(1_u64 << retry_count.min(6)));
+                retry_count += 1;
+            }
+            Err(error) => return Err(CliError::from(error)),
+        }
     }
 }
 
@@ -6001,6 +6333,7 @@ fn materialize_execution_runtime_dependencies(
     repo_root: &Path,
     projection_root: &Path,
     runtime_dependency_paths: &[String],
+    prior_executions: &[RealExecutionSnapshot],
 ) -> Result<Vec<RealExecutionRuntimeDependencyBinding>, CliError> {
     let mut bindings = Vec::new();
     for relative in runtime_dependency_paths {
@@ -6008,6 +6341,26 @@ fn materialize_execution_runtime_dependencies(
         if !path_exists_without_following(&source)? {
             continue;
         }
+        let source_snapshot_before = real_runtime_dependency_source_snapshot_fingerprint(&source)
+            .map_err(|error| {
+            CliError::new(
+                "execution_runtime_dependency_fingerprint_failed",
+                error.to_string(),
+            )
+            .with_detail("path", relative.clone())
+        })?;
+        let reusable_binding = source_snapshot_before.as_ref().and_then(|snapshot| {
+            prior_executions.iter().rev().find_map(|execution| {
+                execution
+                    .runtime_dependency_bindings
+                    .iter()
+                    .find(|binding| {
+                        binding.path == *relative
+                            && binding.origin == "worktree_gitignored"
+                            && binding.source_snapshot_fingerprint.as_ref() == Some(snapshot)
+                    })
+            })
+        });
         let destination = projection_root.join(relative);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| {
@@ -6026,7 +6379,7 @@ fn materialize_execution_runtime_dependencies(
                 )
                 .with_detail("path", relative.clone())
             })?;
-        let binding_fingerprint = real_runtime_dependency_binding_fingerprint(&destination)
+        let source_snapshot_after = real_runtime_dependency_source_snapshot_fingerprint(&source)
             .map_err(|error| {
                 CliError::new(
                     "execution_runtime_dependency_fingerprint_failed",
@@ -6034,10 +6387,47 @@ fn materialize_execution_runtime_dependencies(
                 )
                 .with_detail("path", relative.clone())
             })?;
+        let source_stable =
+            source_snapshot_before.is_some() && source_snapshot_before == source_snapshot_after;
+        let (binding_fingerprint, binding_reuse) = if source_stable {
+            match reusable_binding {
+                Some(binding) => (
+                    binding.binding_fingerprint.clone(),
+                    "reused_unchanged_source".to_string(),
+                ),
+                None => (
+                    real_runtime_dependency_binding_fingerprint(&destination).map_err(|error| {
+                        CliError::new(
+                            "execution_runtime_dependency_fingerprint_failed",
+                            error.to_string(),
+                        )
+                        .with_detail("path", relative.clone())
+                    })?,
+                    "computed".to_string(),
+                ),
+            }
+        } else {
+            (
+                real_runtime_dependency_binding_fingerprint(&destination).map_err(|error| {
+                    CliError::new(
+                        "execution_runtime_dependency_fingerprint_failed",
+                        error.to_string(),
+                    )
+                    .with_detail("path", relative.clone())
+                })?,
+                "computed_unstable_source".to_string(),
+            )
+        };
         bindings.push(RealExecutionRuntimeDependencyBinding {
             path: relative.clone(),
             origin: "worktree_gitignored".to_string(),
             binding_fingerprint,
+            source_snapshot_fingerprint: if source_stable {
+                source_snapshot_after
+            } else {
+                None
+            },
+            binding_reuse,
         });
     }
     Ok(bindings)
@@ -6334,6 +6724,23 @@ fn real_checkpoint_create(
     }
     let view_state = real_view_state(&state, &resolved);
     reject_real_export_blocked_entries(&view_state)?;
+    let omitted_completed_topic_heads =
+        completed_topic_frontier_omissions(&state, &resolved.result.topic_frontier);
+    if !omitted_completed_topic_heads.is_empty() && !options.acknowledge_omitted_completed_heads {
+        let omitted = omitted_completed_topic_heads
+            .iter()
+            .map(|entry| (entry.topic_id.clone(), entry.topic_revision_id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        return Err(CliError::new(
+            "checkpoint_omits_completed_topic_heads",
+            "the exact view omits completed topic heads; acknowledge an intentional partial checkpoint or resolve the completed heads together",
+        )
+        .with_raw_details_json(format!(
+            "{{\"resolved_view_id\":\"{}\",\"omitted_completed_topic_heads\":{},\"acknowledgement_flag\":\"--acknowledge-omitted-completed-heads\"}}",
+            json_escape(&resolved.result.resolved_view_id),
+            string_map_object_json(&omitted),
+        )));
+    }
     let evidence_refs = match options.execution_id.as_deref() {
         Some(execution_id) => {
             let execution = state
@@ -6354,7 +6761,24 @@ fn real_checkpoint_create(
         }
         None => Vec::new(),
     };
-    let checkpoint = real_checkpoint(&view_state, evidence_refs);
+    let mut checkpoint = real_checkpoint(&view_state, evidence_refs);
+    checkpoint.omitted_completed_topic_heads = omitted_completed_topic_heads;
+    checkpoint.completed_frontier_acknowledged = options.acknowledge_omitted_completed_heads
+        && !checkpoint.omitted_completed_topic_heads.is_empty();
+    if checkpoint.completed_frontier_acknowledged {
+        let omission_identity = checkpoint
+            .omitted_completed_topic_heads
+            .iter()
+            .map(|entry| format!("{}\0{}", entry.topic_id, entry.topic_revision_id))
+            .collect::<Vec<_>>()
+            .join("\0");
+        let omission_component = real_content_hash(omission_identity.as_bytes())
+            .trim_start_matches("sha256:")
+            .chars()
+            .take(12)
+            .collect::<String>();
+        checkpoint.id = format!("{}_partial_{omission_component}", checkpoint.id);
+    }
     if !state
         .checkpoints
         .iter()
@@ -6369,6 +6793,12 @@ fn real_checkpoint_create(
                 .iter()
                 .map(|entry| (entry.topic_id.clone(), entry.topic_revision_id.clone()))
                 .collect(),
+            omitted_completed_topic_heads: checkpoint
+                .omitted_completed_topic_heads
+                .iter()
+                .map(|entry| (entry.topic_id.clone(), entry.topic_revision_id.clone()))
+                .collect(),
+            completed_frontier_acknowledged: checkpoint.completed_frontier_acknowledged,
             evidence_refs: checkpoint.evidence_refs.clone(),
             created_at: checkpoint.created_at.clone(),
             entries: view_state.entries.clone(),
@@ -6386,6 +6816,25 @@ fn real_checkpoint_create(
         outputln!(ctx, "{} {}", checkpoint.id, checkpoint.resolved_view_id);
     }
     Ok(())
+}
+
+fn completed_topic_frontier_omissions(
+    state: &RealRepoState,
+    frontier: &BTreeMap<String, String>,
+) -> Vec<TopicFrontierEntry> {
+    state
+        .topics
+        .iter()
+        .filter_map(|topic| {
+            let completed_revision_id = topic.completed_revision_id.as_ref()?;
+            (frontier.get(&topic.topic_id) != Some(completed_revision_id)).then(|| {
+                TopicFrontierEntry {
+                    topic_id: topic.topic_id.clone(),
+                    topic_revision_id: completed_revision_id.clone(),
+                }
+            })
+        })
+        .collect()
 }
 
 fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<(), CliError> {
@@ -8101,9 +8550,104 @@ fn apply_real_patch(before: &str, patch: &str) -> Result<(String, usize), CliErr
 
 #[cfg(test)]
 mod unified_patch_tests {
+    use std::io;
+
     use super::{
-        apply_real_patch, common_created_output_classification, execution_output_requires_promotion,
+        apply_real_patch, common_created_output_classification,
+        execution_output_requires_promotion, BoundedProcessOutput, BoundedStreamSummary,
+        ProcessRunError, ProcessRunFailurePhase, PublishedExecutionFailure,
     };
+
+    fn empty_process_output() -> BoundedProcessOutput {
+        let stream = || BoundedStreamSummary {
+            observed_digest: "empty".to_string(),
+            observed_byte_length: 0,
+            captured_byte_length: 0,
+            captured_bytes: Vec::new(),
+            truncated: false,
+            capture_failed: false,
+        };
+        BoundedProcessOutput {
+            status: None,
+            cancelled: false,
+            timed_out: false,
+            termination_failed: false,
+            wait_failed: false,
+            resource_termination: None,
+            stdout: stream(),
+            stderr: stream(),
+        }
+    }
+
+    #[test]
+    fn process_failures_preserve_execution_publication_boundaries() {
+        let error = || io::Error::new(io::ErrorKind::Other, "injected failure");
+        let bootstrap = ProcessRunError::ContainmentBootstrapSetup(error());
+        assert_eq!(bootstrap.phase(), ProcessRunFailurePhase::BeforePublication);
+        assert_eq!(bootstrap.published_execution_failure(), None);
+
+        let command = ProcessRunError::Command(error());
+        assert_eq!(
+            command.phase(),
+            ProcessRunFailurePhase::PublishedBeforeCommand
+        );
+        assert_eq!(
+            command.published_execution_failure(),
+            Some(PublishedExecutionFailure {
+                command_started: false,
+                status: "failed",
+                termination_reason: "command_spawn_failed",
+            })
+        );
+
+        let containment = ProcessRunError::ContainmentSpawnSetup(error());
+        assert_eq!(
+            containment.phase(),
+            ProcessRunFailurePhase::PublishedBeforeCommand
+        );
+        assert_eq!(
+            containment.published_execution_failure(),
+            Some(PublishedExecutionFailure {
+                command_started: false,
+                status: "failed",
+                termination_reason: "execution_containment_setup_failed",
+            })
+        );
+
+        let filesystem = ProcessRunError::FilesystemIsolationSetup {
+            error: error(),
+            output: empty_process_output(),
+        };
+        assert_eq!(
+            filesystem.phase(),
+            ProcessRunFailurePhase::PublishedAfterCommand
+        );
+        assert_eq!(
+            filesystem.published_execution_failure(),
+            Some(PublishedExecutionFailure {
+                command_started: true,
+                status: "policy_blocked",
+                termination_reason: "execution_filesystem_isolation_setup_failed",
+            })
+        );
+
+        let network = ProcessRunError::NetworkIsolationSetup {
+            error: error(),
+            output: empty_process_output(),
+        };
+        assert_eq!(
+            network.phase(),
+            ProcessRunFailurePhase::PublishedAfterCommand
+        );
+        assert_eq!(
+            network.published_execution_failure(),
+            Some(PublishedExecutionFailure {
+                command_started: true,
+                status: "policy_blocked",
+                termination_reason: "execution_network_isolation_setup_failed",
+            })
+        );
+    }
 
     #[test]
     fn applies_multiple_standard_hunks() {
@@ -8255,6 +8799,8 @@ fn real_checkpoint(state: &RealRepoState, evidence_refs: Vec<EvidenceRef>) -> Ch
                 })
             })
             .collect(),
+        omitted_completed_topic_heads: Vec::new(),
+        completed_frontier_acknowledged: false,
         evidence_refs,
         conflict_free: true,
         created_by: sunlight_core::checkpoint::CreatedBy {
@@ -9570,10 +10116,12 @@ fn execution_runtime_dependency_bindings_json(
         bindings
             .iter()
             .map(|binding| format!(
-                "{{\"path\":\"{}\",\"origin\":\"{}\",\"binding_fingerprint\":\"{}\"}}",
+                "{{\"path\":\"{}\",\"origin\":\"{}\",\"binding_fingerprint\":\"{}\",\"source_snapshot_fingerprint\":{},\"binding_reuse\":\"{}\"}}",
                 json_escape(&binding.path),
                 json_escape(&binding.origin),
                 json_escape(&binding.binding_fingerprint),
+                optional_string_json(binding.source_snapshot_fingerprint.as_deref()),
+                json_escape(&binding.binding_reuse),
             ))
             .collect::<Vec<_>>()
             .join(",")
@@ -9881,6 +10429,7 @@ fn real_checkpoint_snapshot_json(
             "\"resolved_view_id\":\"{}\",",
             "\"tree_identity\":{},",
             "\"topic_frontier\":{},",
+            "\"completed_frontier_coverage\":{},",
             "\"evidence_refs\":[{}],",
             "\"entry_count\":{},",
             "\"created_at\":\"{}\",",
@@ -9897,6 +10446,7 @@ fn real_checkpoint_snapshot_json(
             tree_hash: checkpoint.tree_hash.clone(),
         }),
         real_topic_frontier_pairs_json(&checkpoint.topic_frontier),
+        real_checkpoint_completed_frontier_coverage_json(checkpoint),
         checkpoint
             .evidence_refs
             .iter()
@@ -9923,6 +10473,20 @@ fn real_checkpoint_status_envelope(
         json_escape(&checkpoint.resolved_view_id),
         json_escape(&checkpoint.checkpoint_id),
         real_checkpoint_snapshot_json(state, checkpoint),
+    )
+}
+
+fn real_checkpoint_completed_frontier_coverage_json(checkpoint: &RealCheckpointSnapshot) -> String {
+    let omitted = checkpoint
+        .omitted_completed_topic_heads
+        .iter()
+        .cloned()
+        .collect::<BTreeMap<_, _>>();
+    format!(
+        "{{\"complete\":{},\"acknowledged\":{},\"omitted_completed_topic_heads\":{}}}",
+        checkpoint.omitted_completed_topic_heads.is_empty(),
+        checkpoint.completed_frontier_acknowledged,
+        string_map_object_json(&omitted),
     )
 }
 
@@ -10388,17 +10952,58 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
     )
 }
 
-fn real_recommended_start_json(state: &RealRepoState) -> String {
+fn recommended_start_checkpoint(
+    state: &RealRepoState,
+) -> Option<(&RealCheckpointSnapshot, Vec<TopicFrontierEntry>)> {
+    let mut newest_valid = None;
     for checkpoint in state.checkpoints.iter().rev() {
-        if real_resolve_checkpoint_by_id(state, &checkpoint.checkpoint_id).is_ok() {
-            return format!(
-                "{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"topic_frontier\":{},\"source\":\"latest_checkpoint\"}}",
-                json_escape(&checkpoint.checkpoint_id),
-                json_escape(&checkpoint.resolved_view_id),
-                json_escape(&checkpoint.tree_hash),
-                real_topic_frontier_pairs_json(&checkpoint.topic_frontier),
-            );
+        if real_resolve_checkpoint_by_id(state, &checkpoint.checkpoint_id).is_err() {
+            continue;
         }
+        let frontier = checkpoint
+            .topic_frontier
+            .iter()
+            .cloned()
+            .collect::<BTreeMap<_, _>>();
+        let omissions = completed_topic_frontier_omissions(state, &frontier);
+        if omissions.is_empty() {
+            return Some((checkpoint, omissions));
+        }
+        if newest_valid.is_none() {
+            newest_valid = Some((checkpoint, omissions));
+        }
+    }
+    newest_valid
+}
+
+fn real_recommended_start_json(state: &RealRepoState) -> String {
+    if let Some((checkpoint, omissions)) = recommended_start_checkpoint(state) {
+        let omitted = omissions
+            .iter()
+            .map(|entry| (entry.topic_id.clone(), entry.topic_revision_id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let recorded = checkpoint
+            .omitted_completed_topic_heads
+            .iter()
+            .cloned()
+            .collect::<BTreeMap<_, _>>();
+        let acknowledged = checkpoint.completed_frontier_acknowledged && recorded == omitted;
+        let source = if omissions.is_empty() {
+            "latest_complete_checkpoint"
+        } else {
+            "latest_partial_checkpoint"
+        };
+        return format!(
+            "{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"topic_frontier\":{},\"completed_frontier_coverage\":{{\"complete\":{},\"acknowledged\":{},\"omitted_completed_topic_heads\":{}}},\"source\":\"{}\"}}",
+            json_escape(&checkpoint.checkpoint_id),
+            json_escape(&checkpoint.resolved_view_id),
+            json_escape(&checkpoint.tree_hash),
+            real_topic_frontier_pairs_json(&checkpoint.topic_frontier),
+            omissions.is_empty(),
+            acknowledged,
+            string_map_object_json(&omitted),
+            source,
+        );
     }
 
     let base = real_base_resolved_repo_view(state);
@@ -10408,12 +11013,18 @@ fn real_recommended_start_json(state: &RealRepoState) -> String {
         .as_ref()
         .map(|tree| tree.tree_hash.as_str())
         .unwrap_or(&state.tree_hash);
+    let omissions = completed_topic_frontier_omissions(state, &BTreeMap::new())
+        .into_iter()
+        .map(|entry| (entry.topic_id, entry.topic_revision_id))
+        .collect::<BTreeMap<_, _>>();
     format!(
-        "{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"topic_frontier\":{},\"source\":\"repository_base\"}}",
+        "{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"topic_frontier\":{},\"completed_frontier_coverage\":{{\"complete\":{},\"acknowledged\":false,\"omitted_completed_topic_heads\":{}}},\"source\":\"repository_base\"}}",
         json_escape(&state.base_checkpoint_id),
         json_escape(&state.base_resolved_view_id),
         json_escape(tree_hash),
         string_string_map_json(&BTreeMap::new()),
+        omissions.is_empty(),
+        string_map_object_json(&omissions),
     )
 }
 
@@ -10443,6 +11054,21 @@ fn real_operational_warnings_json(
             "{{\"code\":\"worktree_scan_unavailable\",\"message\":\"Sunlight could not compare the worktree with its anchor\",\"details\":{{\"reason\":{}}}}}",
             optional_string_json(summary.worktree_scan_error.as_deref()),
         ));
+    }
+    if matches!(command, "status.repository" | "inspect.repository") {
+        let omissions = recommended_start_checkpoint(state)
+            .map(|(_, omissions)| omissions)
+            .unwrap_or_else(|| completed_topic_frontier_omissions(state, &BTreeMap::new()));
+        if !omissions.is_empty() {
+            let omitted = omissions
+                .into_iter()
+                .map(|entry| (entry.topic_id, entry.topic_revision_id))
+                .collect::<BTreeMap<_, _>>();
+            warnings.push(format!(
+                "{{\"code\":\"recommended_start_omits_completed_topic_heads\",\"message\":\"no complete checkpoint covers every completed topic head\",\"details\":{{\"omitted_completed_topic_heads\":{},\"next_action\":\"Resolve the intended completed revisions together and checkpoint that exact view, or use the explicit partial-checkpoint acknowledgement when omission is intentional.\"}}}}",
+                string_map_object_json(&omitted),
+            ));
+        }
     }
     if summary.recovery_rollback_evidence {
         warnings.push("{\"code\":\"state_recovery_rolled_back\",\"message\":\"an interrupted malformed publication was rolled back to the newest fully valid state\",\"details\":{\"evidence_root\":\"local://.sunlight/local/recovery/native-state\"}}".to_string());
@@ -10754,7 +11380,7 @@ fn real_status_envelope(
         })
         .unwrap_or_default();
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"recommended_start\":{},\"automatic_secret_detection\":false,\"legacy_quarantine_excluded_count\":{},\"ignore_policy\":{{\"gitignore\":\"git_semantics\",\"sunignore\":\".sunignore\",\"sunignore_owner\":\"human_worktree\",\"sunignore_change_command\":\"sun init\",\"intrinsic\":[\".git/\",\".sunlight/\"]}},\"worktree\":{}}},\"topic\":{},\"handoff\":{},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"recommended_start\":{},\"automatic_secret_detection\":false,\"legacy_quarantine_excluded_count\":{},\"ignore_policy\":{{\"gitignore\":\"git_semantics\",\"sunignore\":\".sunignore\",\"sunignore_owner\":\"human_worktree\",\"sunignore_change_command\":\"sun init\",\"intrinsic\":[\".git/\",\".sunlight/\"]}},\"worktree\":{}}},\"completion_guard\":{},\"topic\":{},\"handoff\":{},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
         command,
         json_escape(&state.repository_id),
         json_escape(&state.repository_id),
@@ -10768,6 +11394,7 @@ fn real_status_envelope(
         real_recommended_start_json(state),
         state.quarantine.len(),
         real_worktree_status_json(state, summary),
+        real_completion_guard_json(state, summary),
         topic_json,
         handoff_json,
         optional_string_json(session_id),
@@ -10776,6 +11403,51 @@ fn real_status_envelope(
         session_context,
         summary_extension,
         warnings,
+    )
+}
+
+fn real_completion_guard_json(state: &RealRepoState, summary: &RealOperationalSummary) -> String {
+    let completed_topic_ids = state
+        .topics
+        .iter()
+        .filter(|topic| topic.completed_revision_id.is_some())
+        .map(|topic| topic.topic_id.as_str())
+        .collect::<Vec<_>>();
+    let checkpoint_ids = state
+        .checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.checkpoint_id.as_str())
+        .collect::<Vec<_>>();
+    let native_handoff_available = !completed_topic_ids.is_empty() || !checkpoint_ids.is_empty();
+    let status = match summary.worktree_state.as_str() {
+        "unavailable" => "worktree_scan_unavailable",
+        "dirty" if native_handoff_available => "native_handoff_with_external_changes",
+        "dirty" => "uncaptured_changes_without_native_handoff",
+        _ if native_handoff_available => "native_handoff_available",
+        _ => "no_native_handoff",
+    };
+    let next_action = match status {
+        "worktree_scan_unavailable" => {
+            "Inspect worktree_diff before making a completion claim."
+        }
+        "native_handoff_with_external_changes" => {
+            "Inspect worktree_diff and verify task-owned edits are represented by the returned completed topic or checkpoint IDs. Capture any missing task-owned edits, preserve unrelated external edits, and report the canonical native handoff."
+        }
+        "uncaptured_changes_without_native_handoff" => {
+            "Inspect worktree_diff. Capture task-owned edits into native history before claiming implementation, and preserve unrelated edits."
+        }
+        "native_handoff_available" => "Report the canonical native handoff.",
+        _ => "Create or identify the native topic handoff before claiming implementation.",
+    };
+    format!(
+        "{{\"status\":\"{}\",\"native_handoff_available\":{},\"completed_topic_ids\":{},\"checkpoint_ids\":{},\"repository_worktree_clean\":{},\"external_change_count\":{},\"next_action\":\"{}\"}}",
+        status,
+        native_handoff_available,
+        string_array_json(completed_topic_ids.iter().copied()),
+        string_array_json(checkpoint_ids.iter().copied()),
+        summary.worktree_state == "clean",
+        summary.worktree_candidate_count,
+        json_escape(next_action),
     )
 }
 
@@ -11163,6 +11835,7 @@ struct CheckpointCreateOptions {
     fixture: Option<String>,
     view_id: String,
     execution_id: Option<String>,
+    acknowledge_omitted_completed_heads: bool,
 }
 
 #[derive(Debug)]
@@ -11688,6 +12361,7 @@ fn parse_checkpoint_create_options(
     let mut fixture = None;
     let mut view_id = None;
     let mut execution_id = None;
+    let mut acknowledge_omitted_completed_heads = false;
     let mut args = ctx.args.iter().skip(2);
 
     while let Some(arg) = args.next() {
@@ -11714,6 +12388,9 @@ fn parse_checkpoint_create_options(
                 })?;
                 execution_id = Some(value.clone());
             }
+            "--acknowledge-omitted-completed-heads" => {
+                acknowledge_omitted_completed_heads = true;
+            }
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
                     "unknown flag `{flag}` for sun checkpoint create"
@@ -11730,7 +12407,7 @@ fn parse_checkpoint_create_options(
 
     let view_id = view_id.ok_or_else(|| {
         invalid_request(
-            "usage: sun checkpoint create --view <resolved-view-id> [--execution <execution-id>] [--fixture basic-app]",
+            "usage: sun checkpoint create --view <resolved-view-id> [--execution <execution-id>] [--acknowledge-omitted-completed-heads] [--fixture basic-app]",
         )
     })?;
 
@@ -11738,6 +12415,7 @@ fn parse_checkpoint_create_options(
         fixture,
         view_id,
         execution_id,
+        acknowledge_omitted_completed_heads,
     })
 }
 
@@ -16143,6 +16821,7 @@ fn checkpoint_create_success_envelope(checkpoint: &CheckpointRecord) -> String {
             "\"resolved_view_id\":\"{}\",",
             "\"tree_identity\":{},",
             "\"topic_frontier\":{},",
+            "\"completed_frontier_coverage\":{},",
             "\"evidence_refs\":[{}],",
             "\"export_refs\":{},",
             "\"export_ready\":true,",
@@ -16164,6 +16843,7 @@ fn checkpoint_create_success_envelope(checkpoint: &CheckpointRecord) -> String {
         json_escape(&checkpoint.resolved_view_id),
         single_repo_tree_json(&checkpoint.tree_identity),
         checkpoint_topic_frontier_json(checkpoint),
+        checkpoint_completed_frontier_coverage_json(checkpoint),
         checkpoint
             .evidence_refs
             .iter()
@@ -19688,6 +20368,7 @@ fn checkpoint_json(checkpoint: &CheckpointRecord) -> String {
             "\"resolved_view_id\":\"{}\",",
             "\"tree_identity\":{},",
             "\"topic_frontier\":{},",
+            "\"completed_frontier_coverage\":{},",
             "\"evidence_refs\":[{}],",
             "\"conflict_free\":{},",
             "\"created_by\":{{\"actor_id\":\"{}\",\"command\":\"{}\"}},",
@@ -19702,6 +20383,7 @@ fn checkpoint_json(checkpoint: &CheckpointRecord) -> String {
         json_escape(&checkpoint.resolved_view_id),
         single_repo_tree_json(&checkpoint.tree_identity),
         checkpoint_topic_frontier_json(checkpoint),
+        checkpoint_completed_frontier_coverage_json(checkpoint),
         checkpoint
             .evidence_refs
             .iter()
@@ -19732,6 +20414,27 @@ fn checkpoint_topic_frontier_json(checkpoint: &CheckpointRecord) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{{{fields}}}")
+}
+
+fn checkpoint_completed_frontier_coverage_json(checkpoint: &CheckpointRecord) -> String {
+    let omitted = checkpoint
+        .omitted_completed_topic_heads
+        .iter()
+        .map(|entry| {
+            format!(
+                "\"{}\":\"{}\"",
+                json_escape(&entry.topic_id),
+                json_escape(&entry.topic_revision_id),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"complete\":{},\"acknowledged\":{},\"omitted_completed_topic_heads\":{{{}}}}}",
+        checkpoint.omitted_completed_topic_heads.is_empty(),
+        checkpoint.completed_frontier_acknowledged,
+        omitted,
+    )
 }
 
 fn evidence_ref_json(evidence: &EvidenceRef) -> String {
@@ -20694,6 +21397,9 @@ fn next_action_for_error_code(code: &str) -> &'static str {
         "checkpoint_stale_view" | "resolver_frontier_input_lost" | "persisted_view_mismatch" => {
             "Inspect the returned staleness or frontier facts, reselect exact completed revisions, and create a fresh resolved view before retrying."
         }
+        "checkpoint_omits_completed_topic_heads" => {
+            "Resolve the intended completed revisions together and checkpoint that exact view, or explicitly acknowledge a partial or alternative checkpoint so every omitted head is recorded."
+        }
         "repository_writer_busy" | "concurrent_state_update" => {
             "Call repository_status to observe durable state, then retry the same idempotent operation after the bounded writer contention clears."
         }
@@ -20814,7 +21520,7 @@ Usage:
   sun compat capture --worktree --topic <slug> --actor <actor> [--candidate <candidate>...|--path <path>...] [--json]
   sun run --view <view> [runtime policy options] -- <command> [args...]
   sun execution promote-output <execution> --path <path> --session <session> --classification source_like_delta|generated_artifact [--json]
-  sun checkpoint create --view <view> [--execution <execution>] [--json]
+  sun checkpoint create --view <view> [--execution <execution>] [--acknowledge-omitted-completed-heads] [--json]
   sun policy check-export --checkpoint <checkpoint> --branch <ref> [--json]
   sun policy check-commit [--paths <.sunlight/path>...] [--json]
   sun policy explain <validation-report> [--json]
@@ -20884,7 +21590,7 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
         "compat" | "compat project" | "compat diff" | "compat import" | "compat capture" => outputln!(ctx, "sun compat\n\nUsage:\n  sun compat project --session <session> [--json]\n  sun compat diff --projection <projection> [--json]\n  sun compat import --projection <projection> --candidate <candidate> --session-generation <generation> [--json]\n  sun compat diff --worktree [--json]\n  sun compat capture --worktree --topic <slug> --actor <actor> [--anchor-generation <number>] [--candidate <candidate>...|--path <path>...] [--json]\n\nProjection imports enter an existing session. Direct worktree capture creates one completed topic and advances the durable worktree anchor without rewriting repository files."),
         "policy" | "policy check-export" | "policy check-commit" | "policy explain" => outputln!(ctx, "sun policy\n\nUsage:\n  sun policy check-export --checkpoint <checkpoint> --branch <ref> [--json]\n  sun policy check-commit [--paths <.sunlight/path>...] [--json]\n  sun policy explain <validation-report> [--json]\n\ncheck-commit validates only Sunlight metadata or, with no paths, the managed .gitignore block. It returns an inline report. Source-artifact safety uses a checkpoint plus check-export; that persisted export report can be passed to policy explain."),
         "git" | "git export" => outputln!(ctx, "sun git export\n\nUsage:\n  sun git export --checkpoint <checkpoint> --branch <ref> [--write-plan|--execute-local] [--repo <path>] [--json]"),
-        "checkpoint" | "checkpoint create" => outputln!(ctx, "sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--execution <passing-execution-id>] [--json]\n\nWhen supplied, execution evidence must pass and exactly match the resolved view and tree."),
+        "checkpoint" | "checkpoint create" => outputln!(ctx, "sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--execution <passing-execution-id>] [--acknowledge-omitted-completed-heads] [--json]\n\nWhen supplied, execution evidence must pass and exactly match the resolved view and tree. Completed topic heads cannot be omitted by default; the acknowledgement flag records an intentional partial or alternative checkpoint."),
         "run" => outputln!(ctx, "sun run\n\nUsage:\n  sun run --view <resolved-view-id> [--network disabled|not_enforced] -- <command> [args...]\n\nRuntime bounds come from [execution_policy] in .sunlight/config.toml. Windows runs always use restricted low-integrity filesystem isolation and a dedicated Job Object. Network disabled adds a capability-less per-execution AppContainer; not_enforced retains compatibility with ordinary user toolchains."),
         "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => outputln!(ctx, "sun artifact operations\n\nUsage:\n  sun read <path> (--session <session> | --view <resolved-view>) [--json]\n  sun list [path-prefix] (--session <session> | --view <resolved-view>) [--json]\n  sun search <query> (--session <session> | --view <resolved-view>) [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification source|generated [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification source|generated [--json]\n\nsource checkpoints and exports normally. generated checkpoints normally but exports only with reachable execution-output promotion provenance; relabeling does not create provenance."),
         "view" | "view resolve" => outputln!(ctx, "sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nStart from any exact checkpoint. Its topic frontier is included automatically, and explicit selections replace revisions for the same topic. Omitting include on a later checkpoint reproduces it exactly. Omitting include on the repository base is discovery-only and resolves moving current heads. Conflicts and staleness remain inspectable records."),

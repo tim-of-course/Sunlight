@@ -421,6 +421,8 @@ pub struct RealExecutionRuntimeDependencyBinding {
     pub path: String,
     pub origin: String,
     pub binding_fingerprint: String,
+    pub source_snapshot_fingerprint: Option<String>,
+    pub binding_reuse: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,6 +473,8 @@ pub struct RealCheckpointSnapshot {
     pub resolved_view_id: String,
     pub tree_hash: String,
     pub topic_frontier: Vec<(String, String)>,
+    pub omitted_completed_topic_heads: Vec<(String, String)>,
+    pub completed_frontier_acknowledged: bool,
     pub evidence_refs: Vec<EvidenceRef>,
     pub created_at: String,
     pub entries: Vec<RealArtifactEntry>,
@@ -2371,6 +2375,152 @@ pub fn real_runtime_dependency_binding_fingerprint(root: &Path) -> Result<String
     Ok(real_content_hash(&canonical_json_bytes(
         &JsonValue::Object(entries),
     )?))
+}
+
+#[cfg(unix)]
+pub fn real_runtime_dependency_source_snapshot_fingerprint(
+    root: &Path,
+) -> Result<Option<String>, RepoStateError> {
+    let metadata = fs::symlink_metadata(root).map_err(|error| {
+        io_error(
+            root,
+            "failed to inspect runtime dependency source snapshot root",
+            error,
+        )
+    })?;
+    if projection_metadata_is_reparse(&metadata) || !metadata.is_dir() {
+        return Err(invalid_state(
+            root,
+            "runtime dependency source snapshot root must be a real directory",
+        ));
+    }
+    let mut entries = BTreeMap::from([(
+        ".".to_string(),
+        runtime_dependency_source_metadata_value("directory", &metadata, None),
+    )]);
+    collect_runtime_dependency_source_snapshot_entries(root, root, &mut entries)?;
+    Ok(Some(real_content_hash(&canonical_json_bytes(
+        &JsonValue::Object(entries),
+    )?)))
+}
+
+#[cfg(not(unix))]
+pub fn real_runtime_dependency_source_snapshot_fingerprint(
+    _root: &Path,
+) -> Result<Option<String>, RepoStateError> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn collect_runtime_dependency_source_snapshot_entries(
+    root: &Path,
+    current: &Path,
+    entries: &mut BTreeMap<String, JsonValue>,
+) -> Result<(), RepoStateError> {
+    for item in fs::read_dir(current).map_err(|error| {
+        io_error(
+            current,
+            "failed to read runtime dependency source snapshot directory",
+            error,
+        )
+    })? {
+        let item = item.map_err(|error| {
+            io_error(
+                current,
+                "failed to read runtime dependency source snapshot entry",
+                error,
+            )
+        })?;
+        let path = item.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| invalid_state(&path, "runtime dependency source snapshot escaped root"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            io_error(
+                &path,
+                "failed to inspect runtime dependency source snapshot entry",
+                error,
+            )
+        })?;
+        let (kind, target) = if projection_metadata_is_reparse(&metadata) {
+            let target = fs::read_link(&path).map_err(|error| {
+                io_error(
+                    &path,
+                    "failed to read runtime dependency source snapshot symlink",
+                    error,
+                )
+            })?;
+            ("symlink", Some(target.to_string_lossy().into_owned()))
+        } else if metadata.is_dir() {
+            ("directory", None)
+        } else if metadata.is_file() {
+            ("file", None)
+        } else {
+            return Err(invalid_state(
+                &path,
+                "runtime dependency source snapshot contains an unsupported filesystem entry",
+            ));
+        };
+        entries.insert(
+            relative,
+            runtime_dependency_source_metadata_value(kind, &metadata, target.as_deref()),
+        );
+        if metadata.is_dir() && !projection_metadata_is_reparse(&metadata) {
+            collect_runtime_dependency_source_snapshot_entries(root, &path, entries)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn runtime_dependency_source_metadata_value(
+    kind: &str,
+    metadata: &fs::Metadata,
+    target: Option<&str>,
+) -> JsonValue {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut value = BTreeMap::from([
+        ("kind".to_string(), JsonValue::String(kind.to_string())),
+        (
+            "device".to_string(),
+            JsonValue::Number(metadata.dev().to_string()),
+        ),
+        (
+            "inode".to_string(),
+            JsonValue::Number(metadata.ino().to_string()),
+        ),
+        (
+            "mode".to_string(),
+            JsonValue::Number(metadata.mode().to_string()),
+        ),
+        (
+            "size".to_string(),
+            JsonValue::Number(metadata.size().to_string()),
+        ),
+        (
+            "mtime".to_string(),
+            JsonValue::Number(metadata.mtime().to_string()),
+        ),
+        (
+            "mtime_nsec".to_string(),
+            JsonValue::Number(metadata.mtime_nsec().to_string()),
+        ),
+        (
+            "ctime".to_string(),
+            JsonValue::Number(metadata.ctime().to_string()),
+        ),
+        (
+            "ctime_nsec".to_string(),
+            JsonValue::Number(metadata.ctime_nsec().to_string()),
+        ),
+    ]);
+    if let Some(target) = target {
+        value.insert("target".to_string(), JsonValue::String(target.to_string()));
+    }
+    JsonValue::Object(value)
 }
 
 fn collect_runtime_dependency_binding_entries(
@@ -6696,6 +6846,13 @@ fn parse_execution_runtime_dependency_binding(
         path: required_string(object, "path", state_path)?,
         origin: required_string(object, "origin", state_path)?,
         binding_fingerprint: required_string(object, "binding_fingerprint", state_path)?,
+        source_snapshot_fingerprint: optional_string(
+            object,
+            "source_snapshot_fingerprint",
+            state_path,
+        )?,
+        binding_reuse: optional_string(object, "binding_reuse", state_path)?
+            .unwrap_or_else(|| "legacy_unrecorded".to_string()),
     })
 }
 
@@ -6774,6 +6931,22 @@ fn parse_checkpoint_snapshot(
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let omitted_completed_topic_heads =
+        optional_array(object, "omitted_completed_topic_heads", state_path)?
+            .iter()
+            .map(|value| {
+                let JsonValue::Object(object) = value else {
+                    return Err(invalid_state(
+                        state_path,
+                        "checkpoint omitted_completed_topic_heads entries must be objects",
+                    ));
+                };
+                Ok((
+                    required_string(object, "topic_id", state_path)?,
+                    required_string(object, "topic_revision_id", state_path)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
     let evidence_refs = optional_array(object, "evidence_refs", state_path)?
         .iter()
         .map(|value| parse_checkpoint_evidence(value, state_path))
@@ -6783,6 +6956,13 @@ fn parse_checkpoint_snapshot(
         resolved_view_id: required_string(object, "resolved_view_id", state_path)?,
         tree_hash: required_string(object, "tree_hash", state_path)?,
         topic_frontier,
+        omitted_completed_topic_heads,
+        completed_frontier_acknowledged: optional_bool(
+            object,
+            "completed_frontier_acknowledged",
+            state_path,
+        )?
+        .unwrap_or(false),
         evidence_refs,
         created_at: required_string(object, "created_at", state_path)?,
         entries,
@@ -7340,6 +7520,14 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
                             "binding_fingerprint".to_string(),
                             JsonValue::String(binding.binding_fingerprint.clone()),
                         ),
+                        (
+                            "source_snapshot_fingerprint".to_string(),
+                            optional_json(&binding.source_snapshot_fingerprint),
+                        ),
+                        (
+                            "binding_reuse".to_string(),
+                            JsonValue::String(binding.binding_reuse.clone()),
+                        ),
                     ]))
                 })
                 .collect(),
@@ -7476,6 +7664,28 @@ fn checkpoint_snapshot_json(checkpoint: &RealCheckpointSnapshot) -> JsonValue {
                 })
                 .collect(),
         ),
+    );
+    object.insert(
+        "omitted_completed_topic_heads".to_string(),
+        JsonValue::Array(
+            checkpoint
+                .omitted_completed_topic_heads
+                .iter()
+                .map(|(topic_id, topic_revision_id)| {
+                    let mut object = BTreeMap::new();
+                    object.insert("topic_id".to_string(), JsonValue::String(topic_id.clone()));
+                    object.insert(
+                        "topic_revision_id".to_string(),
+                        JsonValue::String(topic_revision_id.clone()),
+                    );
+                    JsonValue::Object(object)
+                })
+                .collect(),
+        ),
+    );
+    object.insert(
+        "completed_frontier_acknowledged".to_string(),
+        JsonValue::Bool(checkpoint.completed_frontier_acknowledged),
     );
     object.insert(
         "evidence_refs".to_string(),
@@ -8359,6 +8569,8 @@ mod tests {
             resolved_view_id: state.resolved_view_id.clone(),
             tree_hash: state.tree_hash.clone(),
             topic_frontier: Vec::new(),
+            omitted_completed_topic_heads: Vec::new(),
+            completed_frontier_acknowledged: false,
             evidence_refs: Vec::new(),
             created_at: "time_compact".to_string(),
             entries: entries.clone(),

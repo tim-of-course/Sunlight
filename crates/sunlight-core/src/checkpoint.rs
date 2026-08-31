@@ -16,6 +16,8 @@ pub struct CheckpointRecord {
     pub resolved_view_id: String,
     pub tree_identity: SingleRepoTree,
     pub topic_frontier: Vec<TopicFrontierEntry>,
+    pub omitted_completed_topic_heads: Vec<TopicFrontierEntry>,
+    pub completed_frontier_acknowledged: bool,
     pub evidence_refs: Vec<EvidenceRef>,
     pub conflict_free: bool,
     pub created_by: CreatedBy,
@@ -174,6 +176,8 @@ pub fn fixture_checkpoint_from_resolved_view(
                 topic_revision_id: topic_revision_id.clone(),
             })
             .collect(),
+        omitted_completed_topic_heads: Vec::new(),
+        completed_frontier_acknowledged: false,
         evidence_refs,
         conflict_free: true,
         created_by: CreatedBy {

@@ -50,6 +50,13 @@ another agent's session.
 
 ## Report
 
-Report the returned topic and checkpoint `handoff.copy_report` strings. They
-are generated from the canonical `handoff.exact_ids` objects. State what was
-validated and whether any tracked-source access occurred outside Sunlight.
+Immediately before the final response, call `repository_status` and read
+`completion_guard`. If task-owned edits remain outside native history, inspect
+them with `worktree_diff` and capture only those edits. Preserve unrelated
+external edits and report them as a separate worktree condition; they do not
+invalidate an existing native handoff.
+
+Report the returned topic and checkpoint `handoff.copy_report` strings
+verbatim. Do not reconstruct their IDs. State what was validated and whether
+any tracked-source access occurred outside Sunlight. Do not claim implemented
+work without a native topic or checkpoint handoff for the task-owned changes.

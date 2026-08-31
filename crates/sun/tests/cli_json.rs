@@ -3,9 +3,7 @@ use std::fs;
 #[cfg(windows)]
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::process::Stdio;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 #[cfg(windows)]
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -882,6 +880,118 @@ fn no_fixture_repository_status_warns_about_external_git_working_tree_changes() 
     let cleanup_path = repo.path().to_path_buf();
     drop(repo);
     assert!(!cleanup_path.exists());
+}
+
+#[test]
+fn completion_guard_distinguishes_uncaptured_task_work_from_unrelated_external_edits() {
+    let repo = TestRepo::new("completion-guard");
+    init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+    repo.write_file("external.txt", "unrelated editor change\n");
+
+    let uncaptured = run_real_json(&repo, &["status"]);
+    assert_success(&uncaptured);
+    let uncaptured: serde_json::Value = serde_json::from_str(&stdout(&uncaptured)).unwrap();
+    assert_eq!(
+        uncaptured["data"]["completion_guard"]["status"],
+        "uncaptured_changes_without_native_handoff"
+    );
+    assert_eq!(
+        uncaptured["data"]["completion_guard"]["native_handoff_available"],
+        false
+    );
+
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "topic",
+            "create",
+            "guard-native",
+            "--display-name",
+            "Guard native",
+        ],
+    ));
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "guard-native",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "guard-agent",
+        ],
+    ));
+    let content = repo
+        .path()
+        .join(".sunlight/local/completion-guard-content.txt");
+    fs::write(&content, "native task result\n").unwrap();
+    let write = run_real_json_os(
+        &repo,
+        &[
+            "write".as_ref(),
+            "native.txt".as_ref(),
+            "--session".as_ref(),
+            "session_guard_agent".as_ref(),
+            "--expect-hash".as_ref(),
+            "new".as_ref(),
+            "--content-file".as_ref(),
+            content.as_os_str(),
+            "--classification".as_ref(),
+            "source".as_ref(),
+        ],
+    );
+    assert_success(&write);
+    let write: serde_json::Value = serde_json::from_str(&stdout(&write)).unwrap();
+    let revision = write["data"]["ids"]["topic_revision_id"].as_str().unwrap();
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "topic",
+            "complete",
+            "--topic",
+            "topic_guard_native",
+            "--revision",
+            revision,
+            "--session",
+            "session_guard_agent",
+        ],
+    ));
+
+    let mixed = run_real_json(&repo, &["status"]);
+    assert_success(&mixed);
+    let mixed: serde_json::Value = serde_json::from_str(&stdout(&mixed)).unwrap();
+    assert_eq!(
+        mixed["data"]["completion_guard"]["status"],
+        "native_handoff_with_external_changes"
+    );
+    assert_eq!(
+        mixed["data"]["completion_guard"]["native_handoff_available"],
+        true
+    );
+    assert!(mixed["data"]["completion_guard"]["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("preserve unrelated external edits"));
+    assert_eq!(
+        fs::read_to_string(repo.path().join("external.txt")).unwrap(),
+        "unrelated editor change\n"
+    );
+
+    fs::remove_file(repo.path().join("external.txt")).unwrap();
+    let clean = run_real_json(&repo, &["status"]);
+    assert_success(&clean);
+    let clean: serde_json::Value = serde_json::from_str(&stdout(&clean)).unwrap();
+    assert_eq!(
+        clean["data"]["completion_guard"]["status"],
+        "native_handoff_available"
+    );
+    assert_eq!(
+        clean["data"]["completion_guard"]["repository_worktree_clean"],
+        true
+    );
 }
 
 #[test]
@@ -2064,6 +2174,11 @@ fn execution_keeps_preexisting_and_created_node_modules_private_and_opaque() {
         .find(|binding| binding["path"] == "node_modules")
         .unwrap();
     assert_eq!(root_binding["origin"], "worktree_gitignored");
+    assert_eq!(root_binding["binding_reuse"], "computed");
+    assert!(root_binding["source_snapshot_fingerprint"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
     let first_root_fingerprint = root_binding["binding_fingerprint"]
         .as_str()
         .unwrap()
@@ -2100,6 +2215,38 @@ fn execution_keeps_preexisting_and_created_node_modules_private_and_opaque() {
     );
     assert_eq!(execution.runtime_dependency_bindings.len(), 2);
 
+    let unchanged = sun()
+        .args([
+            "run",
+            "--view",
+            "view_base_0001",
+            "--json",
+            "--",
+            PYTHON,
+            "-c",
+            "from pathlib import Path; assert Path('node_modules/pkg/index.js').read_text() == 'original dependency\\n'",
+        ])
+        .current_dir(repo.path())
+        .output()
+        .expect("unchanged dependency-bound execution should rerun");
+    assert_success(&unchanged);
+    let unchanged_body: serde_json::Value = serde_json::from_str(&stdout(&unchanged)).unwrap();
+    let unchanged_binding = unchanged_body["data"]["runtime_policy"]["runtime_dependencies"]
+        ["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|binding| binding["path"] == "node_modules")
+        .unwrap();
+    assert_eq!(
+        unchanged_binding["binding_fingerprint"],
+        first_root_fingerprint
+    );
+    assert_eq!(
+        unchanged_binding["binding_reuse"],
+        "reused_unchanged_source"
+    );
+
     fs::write(
         repo.path().join("node_modules/pkg/index.js"),
         "replacement dependency\n",
@@ -2131,6 +2278,135 @@ fn execution_keeps_preexisting_and_created_node_modules_private_and_opaque() {
         .as_str()
         .unwrap();
     assert_ne!(first_root_fingerprint, second_root_fingerprint);
+    assert_eq!(
+        rerun_body["data"]["runtime_policy"]["runtime_dependencies"]["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|binding| binding["path"] == "node_modules")
+            .unwrap()["binding_reuse"],
+        "computed"
+    );
+}
+
+#[test]
+fn simultaneous_execution_start_reserves_unique_ids_and_runs_each_command_once() {
+    let repo = TestRepo::new("concurrent-execution-finalization");
+    init_local_git_repo(&repo);
+    for index in 0..256 {
+        write_nested_file(
+            repo.path(),
+            &format!("src/concurrent-{index:04}.txt"),
+            &"concurrent startup payload\n".repeat(64),
+        );
+    }
+    git(repo.path(), &["add", "src"]);
+    git(repo.path(), &["commit", "-m", "add concurrent inputs"]);
+    assert_success(&run_real_json(&repo, &["init"]));
+
+    let gate = repo.path().join(".sunlight/local/concurrent-start-gate");
+    let command_count = repo
+        .path()
+        .join(".sunlight/local/concurrent-command-count.txt");
+    let wrapper = "from pathlib import Path; import subprocess,sys,time\ngate=Path(sys.argv[1])\nwhile not gate.exists(): time.sleep(0.01)\nraise SystemExit(subprocess.run(sys.argv[2:]).returncode)";
+    let command = "from pathlib import Path; import sys\nwith Path(sys.argv[1]).open('a') as output: output.write(sys.argv[2] + '\\n')";
+    let launch = |label: &str| {
+        let mut process = Command::new(PYTHON);
+        process
+            .args(["-c", wrapper])
+            .arg(&gate)
+            .arg(env!("CARGO_BIN_EXE_sun"))
+            .args([
+                "run",
+                "--view",
+                "view_base_0001",
+                "--json",
+                "--",
+                PYTHON,
+                "-c",
+                command,
+            ])
+            .arg(&command_count)
+            .arg(label)
+            .current_dir(repo.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("simultaneous execution should start")
+    };
+    let first = launch("first");
+    let second = launch("second");
+    std::thread::sleep(Duration::from_millis(100));
+    fs::write(&gate, "start\n").unwrap();
+    let first = first
+        .wait_with_output()
+        .expect("first execution should finish");
+    let second = second
+        .wait_with_output()
+        .expect("second execution should finish");
+    assert_success(&first);
+    assert_success(&second);
+
+    let first_body: serde_json::Value = serde_json::from_str(&stdout(&first)).unwrap();
+    let second_body: serde_json::Value = serde_json::from_str(&stdout(&second)).unwrap();
+    let first_id = first_body["data"]["execution_id"].as_str().unwrap();
+    let second_id = second_body["data"]["execution_id"].as_str().unwrap();
+    assert_ne!(first_id, second_id);
+    assert_eq!(first_body["data"]["result"]["status"], "pass");
+    assert_eq!(second_body["data"]["result"]["status"], "pass");
+    let mut command_runs = fs::read_to_string(&command_count)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    command_runs.sort();
+    assert_eq!(command_runs, vec!["first", "second"]);
+
+    let state = RealRepoState::load(repo.path()).unwrap();
+    assert_eq!(state.executions.len(), 2);
+    for execution_id in [first_id, second_id] {
+        let execution = state
+            .executions
+            .iter()
+            .find(|execution| execution.execution_id == execution_id)
+            .unwrap();
+        assert_eq!(execution.status, "pass");
+    }
+    let execution_projections = state
+        .projections
+        .iter()
+        .filter(|projection| projection.purpose == "execution")
+        .collect::<Vec<_>>();
+    assert_eq!(execution_projections.len(), 2);
+    assert_ne!(
+        execution_projections[0].projection_id,
+        execution_projections[1].projection_id
+    );
+    let projection_roots = execution_projections
+        .iter()
+        .map(|projection| PathBuf::from(projection.materialized_root.as_ref().unwrap()))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(projection_roots.len(), 2);
+    assert!(projection_roots.iter().all(|root| root.is_dir()));
+    let materialized_roots = fs::read_dir(repo.path().join(".sunlight/projections"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect::<std::collections::BTreeSet<_>>();
+    let projection_containers = projection_roots
+        .iter()
+        .map(|root| root.parent().unwrap().to_path_buf())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(materialized_roots, projection_containers);
+    assert_eq!(
+        fs::read_dir(
+            repo.path()
+                .join(".sunlight/local/execution-start-reservations")
+        )
+        .unwrap()
+        .count(),
+        0
+    );
 }
 
 #[test]
@@ -3151,7 +3427,7 @@ fn no_fixture_windows_custom_managed_root_cleanup_recovers_only_its_execution_al
 
 #[cfg(windows)]
 #[test]
-fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_command() {
+fn no_fixture_windows_setup_failure_preserves_publication_phase_and_never_launches_command() {
     let _isolation_test_guard = windows_isolation_test_lock();
     let repo = TestRepo::new("windows-isolation-public-setup-failure");
     start_native_session(&repo, "windows-setup-failure");
@@ -3247,6 +3523,10 @@ fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_
     assert!(body.contains("\"command_started\":\"false\""), "{body}");
     assert!(!command_signal.exists(), "restricted command code executed");
 
+    let state = RealRepoState::load(repo.path()).unwrap();
+    assert!(state.executions.is_empty());
+    assert!(state.projections.is_empty());
+
     let containment_failed = sun()
         .args([
             "run",
@@ -3281,11 +3561,29 @@ fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_
         "{body}"
     );
     assert!(body.contains("\"command_started\":\"false\""), "{body}");
+    assert!(
+        body.contains("\"execution_id\":\"exec_native_0001\""),
+        "{body}"
+    );
     assert!(!command_signal.exists(), "suspended command code executed");
 
     let state = RealRepoState::load(repo.path()).unwrap();
-    assert!(state.executions.is_empty());
-    assert!(state.projections.is_empty());
+    assert_eq!(state.executions.len(), 1);
+    let execution = &state.executions[0];
+    assert_eq!(execution.execution_id, "exec_native_0001");
+    assert!(!execution.command_started);
+    assert_eq!(execution.status, "failed");
+    assert_eq!(
+        execution.termination_reason.as_deref(),
+        Some("execution_containment_setup_failed")
+    );
+    assert_eq!(state.projections.len(), 1);
+    let projection = &state.projections[0];
+    assert_eq!(projection.retention_state, "quarantined");
+    assert!(
+        Path::new(projection.materialized_root.as_ref().unwrap()).is_dir(),
+        "published projection root was deleted"
+    );
     for records in [
         repo.path().join(".sunlight/executions"),
         repo.path().join(".sunlight/projections"),
@@ -3294,8 +3592,8 @@ fn no_fixture_windows_setup_failure_via_public_run_is_atomic_and_never_launches_
             fs::read_dir(&records)
                 .map(|entries| entries.count())
                 .unwrap_or(0),
-            0,
-            "unpublished record or projection root remained at {}",
+            1,
+            "published record was not preserved at {}",
             records.display()
         );
     }

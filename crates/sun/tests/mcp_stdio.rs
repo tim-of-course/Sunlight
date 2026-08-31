@@ -5,6 +5,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use sunlight_core::repo_state::RealRepoState;
 
 #[cfg(windows)]
 const PYTHON: &str = "python";
@@ -154,6 +155,9 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
         initialized["result"]["capabilities"]["tools"]["listChanged"],
         false
     );
+    let instructions = initialized["result"]["instructions"].as_str().unwrap();
+    assert!(instructions.contains("read completion_guard"));
+    assert!(instructions.contains("Copy handoff.copy_report verbatim"));
     mcp.notify("notifications/initialized", json!({}));
 
     let listed = mcp.request(2, "tools/list", json!({}));
@@ -797,7 +801,19 @@ fn checkpoint_recommendation_seeds_exact_follow_up_resolution_and_handoff() {
         .as_str()
         .unwrap()
         .to_string();
-    let checkpoint = mcp.call(7, "checkpoint_create", json!({"view":foundation_view}));
+    let checkpoint_response = mcp.request(
+        7,
+        "tools/call",
+        json!({"name":"checkpoint_create","arguments":{"view":foundation_view}}),
+    );
+    let checkpoint_result = &checkpoint_response["result"];
+    assert_ne!(checkpoint_result["isError"], true);
+    let checkpoint = checkpoint_result["structuredContent"].clone();
+    assert_eq!(
+        checkpoint_result["content"][0]["text"],
+        checkpoint["data"]["handoff"]["copy_report"]
+    );
+    assert_eq!(checkpoint_result["content"][1]["type"], "text");
     let checkpoint_id = checkpoint["data"]["ids"]["checkpoint_id"]
         .as_str()
         .unwrap()
@@ -819,7 +835,7 @@ fn checkpoint_recommendation_seeds_exact_follow_up_resolution_and_handoff() {
     let recommended = &status["data"]["repository"]["recommended_start"];
     assert_eq!(recommended["checkpoint_id"], checkpoint_id);
     assert_eq!(recommended["resolved_view_id"], foundation_view);
-    assert_eq!(recommended["source"], "latest_checkpoint");
+    assert_eq!(recommended["source"], "latest_complete_checkpoint");
     assert_eq!(
         recommended["topic_frontier"]["topic_checkpoint_foundation"],
         foundation_revision
@@ -908,6 +924,273 @@ fn checkpoint_recommendation_seeds_exact_follow_up_resolution_and_handoff() {
         .get("topic_checkpoint_follow_up")
         .is_none());
     mcp.shutdown();
+}
+
+#[test]
+fn checkpoint_requires_complete_frontier_or_records_explicit_partial_acknowledgement() {
+    let temp = TempDir::new("sun-mcp-checkpoint-frontier");
+    let repo = temp.path().join("repository");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    git(&repo, &["config", "user.name", "Sun MCP Test"]);
+    git(&repo, &["config", "user.email", "sun-mcp@example.invalid"]);
+    fs::write(repo.join("README.md"), "# checkpoint frontier\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+
+    let mut mcp = initialized_mcp(&repo);
+    mcp.call(2, "repository_init", json!({}));
+
+    mcp.call(
+        3,
+        "topic_create",
+        json!({"slug":"frontier-a","display_name":"Frontier A"}),
+    );
+    let session_a = mcp.call(
+        4,
+        "session_start",
+        json!({"topic":"frontier-a","view":"view_base_0001","actor":"frontier-a-agent"}),
+    )["data"]["ids"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let write_a = mcp.call(
+        5,
+        "artifact_write",
+        json!({
+            "path":"a.txt",
+            "session":session_a,
+            "expect_hash":"new",
+            "content":"a\n",
+            "classification":"source"
+        }),
+    );
+    let revision_a = write_a["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let view_a = write_a["data"]["view"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    mcp.call(
+        6,
+        "topic_complete",
+        json!({
+            "topic":"topic_frontier_a",
+            "revision":revision_a,
+            "session":session_a,
+            "summary":"Frontier A complete"
+        }),
+    );
+
+    mcp.call(
+        7,
+        "topic_create",
+        json!({"slug":"frontier-b","display_name":"Frontier B"}),
+    );
+    let session_b = mcp.call(
+        8,
+        "session_start",
+        json!({"topic":"frontier-b","view":"view_base_0001","actor":"frontier-b-agent"}),
+    )["data"]["ids"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let write_b = mcp.call(
+        9,
+        "artifact_write",
+        json!({
+            "path":"b.txt",
+            "session":session_b,
+            "expect_hash":"new",
+            "content":"b\n",
+            "classification":"source"
+        }),
+    );
+    let revision_b = write_b["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    mcp.call(
+        10,
+        "topic_complete",
+        json!({
+            "topic":"topic_frontier_b",
+            "revision":revision_b,
+            "session":session_b,
+            "summary":"Frontier B complete"
+        }),
+    );
+
+    let rejected = mcp.call_error(11, "checkpoint_create", json!({"view":view_a}));
+    assert_eq!(
+        rejected["error"]["code"],
+        "checkpoint_omits_completed_topic_heads"
+    );
+    assert_eq!(
+        rejected["error"]["details"]["omitted_completed_topic_heads"]["topic_frontier_b"],
+        revision_b
+    );
+
+    let partial = mcp.call(
+        12,
+        "checkpoint_create",
+        json!({"view":view_a,"acknowledge_omitted_completed_heads":true}),
+    );
+    assert_eq!(
+        partial["data"]["completed_frontier_coverage"]["complete"],
+        false
+    );
+    assert_eq!(
+        partial["data"]["completed_frontier_coverage"]["acknowledged"],
+        true
+    );
+    assert_eq!(
+        partial["data"]["completed_frontier_coverage"]["omitted_completed_topic_heads"]
+            ["topic_frontier_b"],
+        revision_b
+    );
+    let partial_id = partial["data"]["checkpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(partial_id.contains("_partial_"));
+    let partial_status = mcp.call(13, "repository_status", json!({}));
+    assert_eq!(
+        partial_status["data"]["repository"]["recommended_start"]["source"],
+        "latest_partial_checkpoint"
+    );
+    assert_eq!(
+        partial_status["data"]["repository"]["recommended_start"]["completed_frontier_coverage"]
+            ["acknowledged"],
+        true
+    );
+
+    let combined = mcp.call(
+        14,
+        "view_resolve",
+        json!({
+            "base":"checkpoint_base_0001",
+            "include":[
+                {"topic":"topic_frontier_a","revision":revision_a},
+                {"topic":"topic_frontier_b","revision":revision_b}
+            ]
+        }),
+    );
+    let combined_view = combined["data"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let complete = mcp.call(15, "checkpoint_create", json!({"view":combined_view}));
+    assert_eq!(
+        complete["data"]["completed_frontier_coverage"]["complete"],
+        true
+    );
+    assert_ne!(complete["data"]["checkpoint_id"], partial_id);
+    let final_status = mcp.call(16, "repository_status", json!({}));
+    assert_eq!(
+        final_status["data"]["repository"]["recommended_start"]["source"],
+        "latest_complete_checkpoint"
+    );
+    assert_eq!(
+        final_status["data"]["repository"]["recommended_start"]["completed_frontier_coverage"]
+            ["complete"],
+        true
+    );
+    mcp.shutdown();
+}
+
+#[test]
+fn two_mcp_processes_start_executions_without_id_root_or_command_replay_collisions() {
+    let temp = TempDir::new("sun-mcp-simultaneous-execution-start");
+    let repo = temp.path().join("repository");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    git(&repo, &["config", "user.name", "Sun MCP Test"]);
+    git(&repo, &["config", "user.email", "sun-mcp@example.invalid"]);
+    for index in 0..128 {
+        fs::write(
+            repo.join(format!("src/input-{index:04}.txt")),
+            "simultaneous execution input\n".repeat(64),
+        )
+        .unwrap();
+    }
+    git(&repo, &["add", "src"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+
+    let mut first_mcp = initialized_mcp(&repo);
+    first_mcp.call(2, "repository_init", json!({}));
+    let mut second_mcp = initialized_mcp(&repo);
+    let gate = repo.join(".sunlight/local/mcp-execution-start-gate");
+    let command_count = repo.join(".sunlight/local/mcp-command-count.txt");
+    let command = "from pathlib import Path; import sys,time\ngate=Path(sys.argv[1])\nwhile not gate.exists(): time.sleep(0.01)\nwith Path(sys.argv[2]).open('a') as output: output.write(sys.argv[3] + '\\n')";
+    let execution_args = |label: &str| {
+        json!({
+            "view":"view_base_0001",
+            "program":PYTHON,
+            "args":[
+                "-c",
+                command,
+                gate.to_string_lossy(),
+                command_count.to_string_lossy(),
+                label
+            ],
+            "cwd":".",
+            "network":"not_enforced"
+        })
+    };
+
+    first_mcp.start_call(3, "execution_run", execution_args("first"));
+    second_mcp.start_call(3, "execution_run", execution_args("second"));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    fs::write(&gate, "start\n").unwrap();
+    let first = first_mcp.finish_call(3);
+    let second = second_mcp.finish_call(3);
+    assert_eq!(first["data"]["result"]["status"], "pass");
+    assert_eq!(second["data"]["result"]["status"], "pass");
+    assert_ne!(
+        first["data"]["execution_id"],
+        second["data"]["execution_id"]
+    );
+    assert_ne!(
+        first["data"]["projection_id"],
+        second["data"]["projection_id"]
+    );
+    let mut command_runs = fs::read_to_string(&command_count)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    command_runs.sort();
+    assert_eq!(command_runs, vec!["first", "second"]);
+
+    let state = RealRepoState::load(&repo).unwrap();
+    assert_eq!(state.executions.len(), 2);
+    assert!(state
+        .executions
+        .iter()
+        .all(|execution| execution.status == "pass"));
+    let execution_projections = state
+        .projections
+        .iter()
+        .filter(|projection| projection.purpose == "execution")
+        .collect::<Vec<_>>();
+    assert_eq!(execution_projections.len(), 2);
+    assert!(execution_projections.iter().all(|projection| {
+        projection
+            .materialized_root
+            .as_ref()
+            .is_some_and(|root| Path::new(root).is_dir())
+    }));
+    assert_eq!(
+        fs::read_dir(repo.join(".sunlight/local/execution-start-reservations"))
+            .unwrap()
+            .count(),
+        0
+    );
+    first_mcp.shutdown();
+    second_mcp.shutdown();
 }
 
 #[test]

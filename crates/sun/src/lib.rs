@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod agent_setup;
 pub mod engine;
 mod mcp;
+mod repository_queue;
 #[cfg(windows)]
 mod windows_isolation;
 #[cfg(windows)]
@@ -379,7 +380,7 @@ impl From<RepoStateError> for CliError {
                 actual_sequence,
             } => CliError::new(
                 "concurrent_state_update",
-                "repository state changed after this command loaded it; reload and retry",
+                "repository state changed while this native commit was prepared",
             )
             .with_detail("path", path.display().to_string())
             .with_detail("expected_sequence", expected_sequence.to_string())
@@ -5987,11 +5988,39 @@ fn reserve_real_execution_start(
     }
 }
 
+fn acquire_execution_metadata_publication_queue(
+    repo_root: &Path,
+) -> Result<repository_queue::RepositoryMutationQueueGuard, RepoStateError> {
+    repository_queue::acquire_repository_mutation_queue(repo_root, None).map_err(
+        |error| match error {
+            repository_queue::RepositoryMutationQueueError::Timeout { lock, timeout } => {
+                RepoStateError::WriterBusy {
+                    lock,
+                    timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                }
+            }
+            repository_queue::RepositoryMutationQueueError::Io { lock, message } => {
+                RepoStateError::Io {
+                    path: lock,
+                    message,
+                }
+            }
+            repository_queue::RepositoryMutationQueueError::Cancelled { lock } => {
+                RepoStateError::WriterBusy {
+                    lock,
+                    timeout_ms: 0,
+                }
+            }
+        },
+    )
+}
+
 fn publish_real_execution_start(
     repo_root: &Path,
     projection: &RealProjectionSnapshot,
     execution: &RealExecutionSnapshot,
 ) -> Result<(), RepoStateError> {
+    let _publication_queue = acquire_execution_metadata_publication_queue(repo_root)?;
     let mut retry_count = 0_usize;
     loop {
         let mut state = load_real_state_for_execution_merge(repo_root)?;
@@ -6087,6 +6116,7 @@ fn finalize_real_execution(
     execution: &RealExecutionSnapshot,
     quarantine_projection: bool,
 ) -> Result<RealRepoState, CliError> {
+    let _publication_queue = acquire_execution_metadata_publication_queue(repo_root)?;
     let mut retry_count = 0_usize;
     loop {
         let mut state = load_real_state_for_execution_merge(repo_root)?;
@@ -21401,7 +21431,7 @@ fn next_action_for_error_code(code: &str) -> &'static str {
             "Resolve the intended completed revisions together and checkpoint that exact view, or explicitly acknowledge a partial or alternative checkpoint so every omitted head is recorded."
         }
         "repository_writer_busy" | "concurrent_state_update" => {
-            "Call repository_status to observe durable state, then retry the same idempotent operation after the bounded writer contention clears."
+            "Inspect repository_status before deciding. For a safe session mutation, retry the same operation in the existing pinned session; unrelated advancement does not require session_refresh or a replacement topic. For execution_run, inspect the exact execution record and status, and never rerun the command solely because metadata publication contended."
         }
         "request_cancelled" => {
             "Inspect repository status before retrying; an acknowledged publication may already be durable, so do not assume cancellation rolled it back."

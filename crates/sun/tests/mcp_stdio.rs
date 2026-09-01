@@ -158,6 +158,9 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
     let instructions = initialized["result"]["instructions"].as_str().unwrap();
     assert!(instructions.contains("read completion_guard"));
     assert!(instructions.contains("Copy handoff.copy_report verbatim"));
+    assert!(instructions.contains(
+        "Unrelated topic, checkpoint, and execution advancement never requires session_refresh or a replacement topic"
+    ));
     mcp.notify("notifications/initialized", json!({}));
 
     let listed = mcp.request(2, "tools/list", json!({}));
@@ -1194,6 +1197,251 @@ fn two_mcp_processes_start_executions_without_id_root_or_command_replay_collisio
 }
 
 #[test]
+fn pinned_session_remains_writable_during_unrelated_checkpoint_and_execution_commits() {
+    let temp = TempDir::new("sun-mcp-pinned-session-concurrency");
+    let repo = temp.path().join("repository");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    git(&repo, &["config", "user.name", "Sun MCP Test"]);
+    git(&repo, &["config", "user.email", "sun-mcp@example.invalid"]);
+    fs::write(repo.join("pinned.txt"), "pinned base\n").unwrap();
+    fs::write(repo.join("unrelated.txt"), "unrelated base\n").unwrap();
+    git(&repo, &["add", "pinned.txt", "unrelated.txt"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+
+    let mut author = initialized_mcp(&repo);
+    author.call(2, "repository_init", json!({}));
+    author.call(
+        3,
+        "topic_create",
+        json!({"slug":"pinned-authoring","display_name":"Pinned authoring"}),
+    );
+    let pinned_session = author.call(
+        4,
+        "session_start",
+        json!({
+            "topic":"pinned-authoring",
+            "view":"view_base_0001",
+            "actor":"pinned-author"
+        }),
+    );
+    let pinned_session_id = pinned_session["data"]["ids"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pinned_read = author.call(
+        5,
+        "artifact_read",
+        json!({"path":"pinned.txt","session":pinned_session_id}),
+    );
+    let pinned_hash = pinned_read["data"]["artifacts"][0]["content_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut integrator = initialized_mcp(&repo);
+    integrator.call(
+        2,
+        "topic_create",
+        json!({"slug":"unrelated-work","display_name":"Unrelated work"}),
+    );
+    let unrelated_session = integrator.call(
+        3,
+        "session_start",
+        json!({
+            "topic":"unrelated-work",
+            "view":"view_base_0001",
+            "actor":"unrelated-author"
+        }),
+    );
+    let unrelated_session_id = unrelated_session["data"]["ids"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let unrelated_read = integrator.call(
+        4,
+        "artifact_read",
+        json!({"path":"unrelated.txt","session":unrelated_session_id}),
+    );
+    let unrelated_hash = unrelated_read["data"]["artifacts"][0]["content_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let unrelated_write = integrator.call(
+        5,
+        "artifact_write",
+        json!({
+            "path":"unrelated.txt",
+            "session":unrelated_session_id,
+            "expect_hash":unrelated_hash,
+            "content":"unrelated completed\n",
+            "classification":"source"
+        }),
+    );
+    let unrelated_revision = unrelated_write["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    integrator.call(
+        6,
+        "topic_complete",
+        json!({
+            "topic":"topic_unrelated_work",
+            "revision":unrelated_revision,
+            "session":unrelated_session_id,
+            "summary":"Completed unrelated work."
+        }),
+    );
+    let unrelated_view = integrator.call(
+        7,
+        "view_resolve",
+        json!({
+            "base":"checkpoint_base_0001",
+            "include":[{"topic":"topic_unrelated_work","revision":unrelated_revision}]
+        }),
+    )["data"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let checkpoint = integrator.call(8, "checkpoint_create", json!({"view":unrelated_view}));
+    assert_eq!(checkpoint["data"]["command"], "checkpoint.create");
+
+    let pinned_after_checkpoint = author.call(
+        6,
+        "artifact_read",
+        json!({"path":"pinned.txt","session":pinned_session_id}),
+    );
+    assert_eq!(
+        pinned_after_checkpoint["data"]["artifacts"][0]["content_hash"],
+        pinned_hash
+    );
+    assert_eq!(
+        pinned_after_checkpoint["data"]["content"]["bytes"],
+        "pinned base\n"
+    );
+
+    let mut first_runner = initialized_mcp(&repo);
+    let mut second_runner = initialized_mcp(&repo);
+    let started = repo.join(".sunlight/local/pinned-concurrency-started.txt");
+    let release = repo.join(".sunlight/local/pinned-concurrency-release");
+    let finished = repo.join(".sunlight/local/pinned-concurrency-finished.txt");
+    let command = "from pathlib import Path; import sys,time\nwith Path(sys.argv[1]).open('a') as output: output.write(sys.argv[3] + '\\n')\nwhile not Path(sys.argv[2]).exists(): time.sleep(0.01)\nwith Path(sys.argv[4]).open('a') as output: output.write(sys.argv[3] + '\\n')";
+    let execution_args = |label: &str| {
+        json!({
+            "view":unrelated_view,
+            "program":PYTHON,
+            "args":[
+                "-c",
+                command,
+                started.to_string_lossy(),
+                release.to_string_lossy(),
+                label,
+                finished.to_string_lossy()
+            ],
+            "cwd":".",
+            "network":"not_enforced"
+        })
+    };
+    let queue_path = repo.join(".sunlight/local/mcp-mutation-queue.lock");
+    let start_queue = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&queue_path)
+        .unwrap();
+    start_queue.lock().unwrap();
+    first_runner.start_call(2, "execution_run", execution_args("first"));
+    second_runner.start_call(2, "execution_run", execution_args("second"));
+    wait_for_directory_entry_count(
+        &repo.join(".sunlight/local/execution-start-reservations"),
+        2,
+    );
+    assert_path_remains_absent_for(&started, std::time::Duration::from_millis(250));
+    assert!(
+        RealRepoState::load(&repo).unwrap().executions.is_empty(),
+        "execution starts published while the repository mutation queue was held"
+    );
+    drop(start_queue);
+
+    wait_for_file_line_count(&started, 2);
+    assert!(
+        !finished.exists(),
+        "both command bodies must still be active"
+    );
+    let running = RealRepoState::load(&repo).unwrap();
+    assert_eq!(running.executions.len(), 2);
+    assert!(running
+        .executions
+        .iter()
+        .all(|execution| execution.status == "running"));
+
+    let finish_queue = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&queue_path)
+        .unwrap();
+    finish_queue.lock().unwrap();
+    author.start_call(
+        7,
+        "artifact_patch",
+        json!({
+            "path":"pinned.txt",
+            "session":pinned_session_id,
+            "expect_hash":pinned_hash,
+            "patch":"@@ -1 +1 @@\n-pinned base\n+pinned continued\n"
+        }),
+    );
+    fs::write(&release, "finish\n").unwrap();
+    wait_for_file_line_count(&finished, 2);
+    assert_executions_remain_running_for(&repo, 2, std::time::Duration::from_millis(250));
+    drop(finish_queue);
+
+    let patch = author.finish_call(7);
+    let first_execution = first_runner.finish_call(2);
+    let second_execution = second_runner.finish_call(2);
+    assert_eq!(patch["ok"], true);
+    assert_eq!(
+        patch["data"]["transport"]["automatic_concurrency_retries"],
+        0
+    );
+    assert_eq!(first_execution["data"]["result"]["status"], "pass");
+    assert_eq!(second_execution["data"]["result"]["status"], "pass");
+
+    let continued = author.call(
+        8,
+        "artifact_read",
+        json!({"path":"pinned.txt","session":pinned_session_id}),
+    );
+    assert_eq!(continued["data"]["content"]["bytes"], "pinned continued\n");
+    let stale_write = author.call_error(
+        9,
+        "artifact_patch",
+        json!({
+            "path":"pinned.txt",
+            "session":pinned_session_id,
+            "expect_hash":pinned_hash,
+            "patch":"@@ -1 +1 @@\n-pinned continued\n+must not apply\n"
+        }),
+    );
+    assert_eq!(stale_write["error"]["code"], "precondition_failed");
+    let status = author.call(10, "repository_status", json!({}));
+    assert_eq!(status["data"]["operational_summary"]["topics"]["count"], 2);
+    let state = RealRepoState::load(&repo).unwrap();
+    assert_eq!(state.topics.len(), 2);
+    assert_eq!(state.executions.len(), 2);
+    assert!(state
+        .executions
+        .iter()
+        .all(|execution| execution.status == "pass"));
+
+    author.shutdown();
+    integrator.shutdown();
+    first_runner.shutdown();
+    second_runner.shutdown();
+}
+
+#[test]
 fn two_live_mcp_agents_can_author_overlapping_existing_paths_while_global_view_is_conflicted() {
     let temp = TempDir::new("sun-mcp-conflicted-global-authoring");
     let repo = temp.path().join("repository");
@@ -2022,6 +2270,74 @@ fn wait_for_running_execution(repo: &Path) -> String {
         assert!(
             std::time::Instant::now() < deadline,
             "running execution record was not published before timeout"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_file_line_count(path: &Path, expected: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let line_count = fs::read_to_string(path)
+            .map(|body| body.lines().count())
+            .unwrap_or(0);
+        if line_count >= expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} did not reach {expected} lines before timeout",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_directory_entry_count(path: &Path, expected: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let entry_count = fs::read_dir(path)
+            .map(|entries| entries.filter_map(Result::ok).count())
+            .unwrap_or(0);
+        if entry_count >= expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} did not reach {expected} entries before timeout",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn assert_path_remains_absent_for(path: &Path, duration: std::time::Duration) {
+    let deadline = std::time::Instant::now() + duration;
+    while std::time::Instant::now() < deadline {
+        assert!(
+            !path.exists(),
+            "{} appeared while execution start publication was queued",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn assert_executions_remain_running_for(
+    repo: &Path,
+    expected: usize,
+    duration: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + duration;
+    while std::time::Instant::now() < deadline {
+        let state = RealRepoState::load(repo).unwrap();
+        assert_eq!(state.executions.len(), expected);
+        assert!(
+            state
+                .executions
+                .iter()
+                .all(|execution| execution.status == "running"),
+            "execution result published while the repository mutation queue was held"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
+use super::repository_queue::{self, RepositoryMutationQueueError, RepositoryMutationQueueGuard};
 use super::{execute_engine, EngineCommandInput, EngineContext, EngineOutputFormat, EngineRequest};
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -24,8 +25,6 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
-const REPOSITORY_MUTATION_QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
-const REPOSITORY_MUTATION_QUEUE_POLL: Duration = Duration::from_millis(10);
 const ARTIFACT_CLASSIFICATIONS: &[&str] = &["source", "generated"];
 const PROMOTION_CLASSIFICATIONS: &[&str] = &["source_like_delta", "generated_artifact"];
 const STATUS_SCOPE_FLAGS: &[(&str, Option<&str>)] = &[
@@ -373,7 +372,7 @@ fn handle_message(
                             "version": env!("CARGO_PKG_VERSION"),
                             "description": "Repository-confined Sunlight v0.3 authoring and operation tools"
                         },
-                        "instructions": "All tools are bound to the canonical repository supplied when this server started. Start with repository_status and use repository.recommended_start as the default exact checkpoint, view, and tree for new work, even when the moving repository head is conflicted. Its repository.worktree field reports whether ordinary editor or agent changes exist outside Sunlight; call worktree_diff to inspect them and worktree_capture only when those edits should enter native history. Capture returns a completed topic revision with exact provenance, which can be combined through view_resolve like any other topic. Before claiming task completion, call repository_status and read completion_guard. Task-owned implementation needs a native topic or checkpoint handoff; unrelated external edits may remain outside native history and must be preserved and reported separately. For native authoring, use topic_create, session_start, scoped artifact reads and mutations, and topic_complete. Sessions remain pinned and writable while unrelated topics resolve or conflict. Integrate with topic_wait and view_resolve using exact selected revisions. Any checkpoint may be the starting checkpoint; its frontier is included automatically and explicit selections replace revisions for the same topics. Omitting include on the repository base is discovery-only and resolves moving current heads. Validate the exact combined view with execution_run. Promote each intentional output with execution_promote_output using its returned candidate classification and a live topic-owned session over the validated view; resolve the resulting exact revision and create a checkpoint from matching passing evidence. checkpoint_create prefers complete coverage of completed topic heads and rejects an omission by default. Use acknowledge_omitted_completed_heads only for an intentional partial or alternative checkpoint; the omitted heads are recorded. checkpoint_create returns a structured handoff with the exact IDs to report. Copy handoff.copy_report verbatim rather than reconstructing IDs. For a requested Git handoff, call policy_check_export with the exact checkpoint and target ref, then git_export; completion is a returned export_map_id for that checkpoint and ref. artifact_read/list/search accept exactly one scope: session for the authoring frontier or view for session-free read-only access to an exact resolved view. topic_complete and completed topic status return a structured handoff with summary, operations, changed paths, and hashes; use topic_wait instead of polling when another agent owns the topic. Transient repository writer and state-sequence races are retried automatically for safe native and read commands; commands that can replay external side effects are never automatically retried. Use exact IDs and sha256 hashes returned by tools. artifact_write uses expect_hash \"new\" only when the path must be absent. Sessions have fixed topic scope: session_refresh advances only non-write topics already in that session frontier and does not discover newly created topics. execution_run returns bounded stdout/stderr text in that response, phase timings, and only source-like or explicitly generated promotion candidates. No fixture tools or arbitrary host paths are available."
+                        "instructions": "All tools are bound to the canonical repository supplied when this server started. Start with repository_status and use repository.recommended_start as the default exact checkpoint, view, and tree for new work, even when the moving repository head is conflicted. Its repository.worktree field reports whether ordinary editor or agent changes exist outside Sunlight; call worktree_diff to inspect them and worktree_capture only when those edits should enter native history. Capture returns a completed topic revision with exact provenance, which can be combined through view_resolve like any other topic. Before claiming task completion, call repository_status and read completion_guard. Task-owned implementation needs a native topic or checkpoint handoff; unrelated external edits may remain outside native history and must be preserved and reported separately. For native authoring, use topic_create, session_start, scoped artifact reads and mutations, and topic_complete. Sessions remain pinned and writable while unrelated topics resolve or conflict. Unrelated topic, checkpoint, and execution advancement never requires session_refresh or a replacement topic. Integrate with topic_wait and view_resolve using exact selected revisions. Any checkpoint may be the starting checkpoint; its frontier is included automatically and explicit selections replace revisions for the same topics. Omitting include on the repository base is discovery-only and resolves moving current heads. Validate the exact combined view with execution_run. Promote each intentional output with execution_promote_output using its returned candidate classification and a live topic-owned session over the validated view; resolve the resulting exact revision and create a checkpoint from matching passing evidence. checkpoint_create prefers complete coverage of completed topic heads and rejects an omission by default. Use acknowledge_omitted_completed_heads only for an intentional partial or alternative checkpoint; the omitted heads are recorded. checkpoint_create returns a structured handoff with the exact IDs to report. Copy handoff.copy_report verbatim rather than reconstructing IDs. For a requested Git handoff, call policy_check_export with the exact checkpoint and target ref, then git_export; completion is a returned export_map_id for that checkpoint and ref. artifact_read/list/search accept exactly one scope: session for the authoring frontier or view for session-free read-only access to an exact resolved view. topic_complete and completed topic status return a structured handoff with summary, operations, changed paths, and hashes; use topic_wait instead of polling when another agent owns the topic. Transient repository writer and state-sequence races are retried automatically for safe native and read commands; commands that can replay external side effects are never automatically retried. Use exact IDs and sha256 hashes returned by tools. artifact_write uses expect_hash \"new\" only when the path must be absent. Sessions have fixed topic scope: session_refresh advances only non-write topics already in that session frontier and does not discover newly created topics. execution_run returns bounded stdout/stderr text in that response, phase timings, and only source-like or explicitly generated promotion candidates. No fixture tools or arbitrary host paths are available."
                     }),
                 ),
             )
@@ -694,11 +693,6 @@ impl ToolFailure {
     }
 }
 
-#[derive(Debug)]
-struct RepositoryMutationQueueGuard {
-    _file: fs::File,
-}
-
 fn tool_uses_repository_mutation_queue(name: &str) -> bool {
     matches!(
         name,
@@ -725,61 +719,25 @@ fn acquire_repository_mutation_queue(
     repo: &Path,
     cancel: &AtomicBool,
 ) -> Result<RepositoryMutationQueueGuard, ToolFailure> {
-    let lock_path = repo.join(".sunlight/local/mcp-mutation-queue.lock");
-    let parent = lock_path.parent().expect("queue lock has a parent");
-    fs::create_dir_all(parent).map_err(|error| {
-        ToolFailure::new(
-            "repository_queue_io",
-            format!("cannot create the repository mutation queue directory: {error}"),
-        )
-        .detail("lock", lock_path.display().to_string())
-    })?;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&lock_path)
-        .map_err(|error| {
-            ToolFailure::new(
-                "repository_queue_io",
-                format!("cannot open the repository mutation queue: {error}"),
-            )
-            .detail("lock", lock_path.display().to_string())
-        })?;
-    let started = Instant::now();
-    loop {
-        if cancel.load(Ordering::Acquire) {
-            return Err(ToolFailure::new(
+    repository_queue::acquire_repository_mutation_queue(repo, Some(cancel)).map_err(|error| {
+        match error {
+            RepositoryMutationQueueError::Cancelled { lock } => ToolFailure::new(
                 "request_cancelled",
                 "request was cancelled while waiting for the repository mutation queue",
             )
-            .detail("lock", lock_path.display().to_string()));
-        }
-        match file.try_lock() {
-            Ok(()) => return Ok(RepositoryMutationQueueGuard { _file: file }),
-            Err(fs::TryLockError::WouldBlock) => {
-                if started.elapsed() >= REPOSITORY_MUTATION_QUEUE_TIMEOUT {
-                    return Err(ToolFailure::new(
-                        "repository_writer_busy",
-                        "timed out waiting for another MCP writer in this repository",
-                    )
-                    .detail("lock", lock_path.display().to_string())
-                    .detail(
-                        "timeout_ms",
-                        REPOSITORY_MUTATION_QUEUE_TIMEOUT.as_millis() as u64,
-                    ));
-                }
-                thread::sleep(REPOSITORY_MUTATION_QUEUE_POLL);
-            }
-            Err(fs::TryLockError::Error(error)) => {
-                return Err(ToolFailure::new(
-                    "repository_queue_io",
-                    format!("cannot lock the repository mutation queue: {error}"),
-                )
-                .detail("lock", lock_path.display().to_string()));
+            .detail("lock", lock.display().to_string()),
+            RepositoryMutationQueueError::Timeout { lock, timeout } => ToolFailure::new(
+                "repository_writer_busy",
+                "timed out waiting for another repository metadata writer",
+            )
+            .detail("lock", lock.display().to_string())
+            .detail("timeout_ms", timeout.as_millis() as u64),
+            RepositoryMutationQueueError::Io { lock, message } => {
+                ToolFailure::new("repository_queue_io", message)
+                    .detail("lock", lock.display().to_string())
             }
         }
-    }
+    })
 }
 
 fn tool_failure_result(error: ToolFailure) -> Value {
@@ -3046,6 +3004,18 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("returned exact hash and IDs"));
+
+        let concurrency_error = super::super::CliError::new(
+            "concurrent_state_update",
+            "repository state advanced during publication",
+        );
+        let envelope: Value =
+            serde_json::from_str(&super::super::failure_envelope(&concurrency_error)).unwrap();
+        let next_action = envelope["error"]["next_action"].as_str().unwrap();
+        assert!(next_action.contains("existing pinned session"));
+        assert!(next_action.contains("does not require session_refresh or a replacement topic"));
+        assert!(next_action.contains("For execution_run, inspect the exact execution record"));
+        assert!(next_action.contains("never rerun the command"));
     }
 
     #[test]

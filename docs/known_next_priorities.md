@@ -10,13 +10,13 @@ Sunlight execution took 14.61 seconds. Runtime dependency preparation accounted
 for 9.03 seconds. Preserve private execution isolation while avoiding a full
 per-execution dependency-tree preparation.
 
-## 2. Eliminate remaining visible writer retries
+## 2. Validate project binding and bounded writer waits under load
 
-Concurrent execution startup and result publication now work reliably. One
-agent's follow-up edit was correctly rejected after another topic advanced the
-repository, but the agent had to create a fresh topic to finish a one-line fix.
-Make this normal recovery path shorter and clearer without weakening stale-write
-protection.
+Repository-specific MCP identities now prevent project-local servers from
+sharing one generic name, and ordinary canonical-state contention waits inside
+one bounded command budget. Repeat blind multi-project and shared-repository
+tests to confirm clients select the correct binding and no routine status or
+authoring call exposes writer contention.
 
 ## 3. Keep agent guidance easy to follow
 

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 const SKILL: &str = include_str!("../../../integrations/agent-skills/sunlight/SKILL.md");
 const WORKFLOW: &str =
@@ -123,7 +124,14 @@ pub(crate) fn doctor(
             let relative = ".codex/config.toml";
             let expected = codex_block(repository, executable);
             let current = fs::read_to_string(repository.join(relative)).unwrap_or_default();
-            let matches = current.contains(&expected);
+            let server_name = mcp_server_name(repository);
+            let matches = (|| -> Result<bool, AgentSetupError> {
+                let managed = codex_managed_range(&current)?;
+                Ok(current.contains(&expected)
+                    && !contains_mcp_server_outside_managed(&current, "sunlight", managed)?
+                    && !contains_mcp_server_outside_managed(&current, &server_name, managed)?)
+            })()
+            .unwrap_or(false);
             record_check(matches, relative, &mut report);
             report.mcp_binding_verified = matches;
         }
@@ -133,11 +141,13 @@ pub(crate) fn doctor(
                 .ok()
                 .and_then(|text| serde_json::from_str::<Value>(&text).ok());
             let expected = cursor_server(repository, executable);
-            let matches = current
+            let server_name = mcp_server_name(repository);
+            let servers = current
                 .as_ref()
                 .and_then(|value| value.get("mcpServers"))
-                .and_then(|value| value.get("sunlight"))
-                == Some(&expected);
+                .and_then(Value::as_object);
+            let matches = servers.and_then(|servers| servers.get(&server_name)) == Some(&expected)
+                && servers.is_some_and(|servers| !servers.contains_key("sunlight"));
             record_check(matches, relative, &mut report);
             report.mcp_binding_verified = matches;
         }
@@ -203,12 +213,16 @@ fn install_codex(
     let path = repository.join(relative);
     let existing = fs::read_to_string(&path).unwrap_or_default();
     let block = codex_block(repository, executable);
-    let updated = if let Some(start) = existing.find(CODEX_START) {
-        let tail = &existing[start..];
-        let end = tail
-            .find(CODEX_END)
-            .map(|offset| start + offset + CODEX_END.len())
-            .ok_or_else(|| AgentSetupError::new("Codex Sunlight managed block is incomplete"))?;
+    let managed = codex_managed_range(&existing)?;
+    let server_name = mcp_server_name(repository);
+    if contains_mcp_server_outside_managed(&existing, "sunlight", managed)?
+        || contains_mcp_server_outside_managed(&existing, &server_name, managed)?
+    {
+        return Err(AgentSetupError::new(
+            "an unmanaged Sunlight MCP entry exists outside the managed block; remove it before installation",
+        ));
+    }
+    let updated = if let Some((start, end)) = managed {
         if existing[start..end] == block {
             report.unchanged.push(relative.to_string());
             return Ok(());
@@ -217,11 +231,6 @@ fn install_codex(
         value.replace_range(start..end, &block);
         value
     } else {
-        if existing.contains("[mcp_servers.sunlight]") {
-            return Err(AgentSetupError::new(
-                "an unmanaged [mcp_servers.sunlight] entry already exists; rename or remove it before installation",
-            ));
-        }
         if !existing.is_empty() && !force && !existing.ends_with('\n') {
             return Err(AgentSetupError::new(
                 "existing .codex/config.toml does not end with a newline; rerun with --force to append safely",
@@ -233,6 +242,42 @@ fn install_codex(
     write_client_file(&path, relative, &updated, report)?;
     report.restart_required = true;
     Ok(())
+}
+
+fn codex_managed_range(existing: &str) -> Result<Option<(usize, usize)>, AgentSetupError> {
+    let Some(start) = existing.find(CODEX_START) else {
+        return Ok(None);
+    };
+    let end = existing[start..]
+        .find(CODEX_END)
+        .map(|offset| start + offset + CODEX_END.len())
+        .ok_or_else(|| AgentSetupError::new("Codex Sunlight managed block is incomplete"))?;
+    Ok(Some((start, end)))
+}
+
+fn contains_mcp_server_outside_managed(
+    existing: &str,
+    server_name: &str,
+    managed: Option<(usize, usize)>,
+) -> Result<bool, AgentSetupError> {
+    if !codex_config_has_mcp_server(existing, server_name)? {
+        return Ok(false);
+    }
+    let managed_has_server = managed
+        .map(|(start, end)| codex_config_has_mcp_server(&existing[start..end], server_name))
+        .transpose()?
+        .unwrap_or(false);
+    Ok(!managed_has_server)
+}
+
+fn codex_config_has_mcp_server(config: &str, server_name: &str) -> Result<bool, AgentSetupError> {
+    let config = toml::from_str::<toml::Table>(config).map_err(|error| {
+        AgentSetupError::new(format!("cannot parse .codex/config.toml: {error}"))
+    })?;
+    Ok(config
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|servers| servers.contains_key(server_name)))
 }
 
 fn install_cursor(
@@ -261,16 +306,31 @@ fn install_cursor(
         .as_object_mut()
         .ok_or_else(|| AgentSetupError::new(".cursor/mcp.json mcpServers must be an object"))?;
     let expected = cursor_server(repository, executable);
-    if servers.get("sunlight") == Some(&expected) {
+    let server_name = mcp_server_name(repository);
+    let has_legacy_binding = servers
+        .get("sunlight")
+        .is_some_and(|server| cursor_server_targets_repository(server, repository));
+    if servers.contains_key("sunlight") && !has_legacy_binding {
+        return Err(AgentSetupError::new(
+            "a legacy Cursor MCP server named sunlight targets another repository or tool; rename or remove it before installation",
+        ));
+    }
+    if servers.get(&server_name) == Some(&expected) && !has_legacy_binding {
         report.unchanged.push(relative.to_string());
         return Ok(());
     }
-    if servers.contains_key("sunlight") && !force {
+    if servers.contains_key(&server_name) && servers.get(&server_name) != Some(&expected) && !force
+    {
         return Err(AgentSetupError::new(
-            "a different Cursor MCP server named sunlight already exists; rerun with --force after reviewing it",
+            format!(
+                "a different Cursor MCP server named {server_name} already exists; rerun with --force after reviewing it"
+            ),
         ));
     }
-    servers.insert("sunlight".to_string(), expected);
+    if has_legacy_binding {
+        servers.remove("sunlight");
+    }
+    servers.insert(server_name, expected);
     let text = serde_json::to_string_pretty(&root)
         .map_err(|error| AgentSetupError::new(format!("cannot encode `{relative}`: {error}")))?;
     write_client_file(&path, relative, &format!("{text}\n"), report)?;
@@ -296,11 +356,23 @@ fn write_client_file(
 }
 
 fn codex_block(repository: &Path, executable: &Path) -> String {
+    let server_name = mcp_server_name(repository);
     format!(
-        "{CODEX_START}\n[mcp_servers.sunlight]\ncommand = '{}'\nargs = ['mcp', 'serve', '--repo', '{}']\nstartup_timeout_sec = 15\ntool_timeout_sec = 900\n{CODEX_END}",
+        "{CODEX_START}\n[mcp_servers.{server_name}]\ncommand = '{}'\nargs = ['mcp', 'serve', '--repo', '{}']\nstartup_timeout_sec = 15\ntool_timeout_sec = 900\n{CODEX_END}",
         toml_literal(&display_path(executable)),
         toml_literal(&display_path(repository))
     )
+}
+
+pub(crate) fn repository_binding_id(repository: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(display_path(repository).as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+pub(crate) fn mcp_server_name(repository: &Path) -> String {
+    let binding = repository_binding_id(repository);
+    format!("sunlight_{}", &binding["sha256:".len()..][..16])
 }
 
 fn toml_literal(value: &str) -> String {
@@ -326,6 +398,18 @@ fn cursor_server(repository: &Path, executable: &Path) -> Value {
         "command": display_path(executable),
         "args": ["mcp", "serve", "--repo", display_path(repository)]
     })
+}
+
+fn cursor_server_targets_repository(server: &Value, repository: &Path) -> bool {
+    let Some(args) = server.get("args").and_then(Value::as_array) else {
+        return false;
+    };
+    server.get("command").and_then(Value::as_str).is_some()
+        && args.len() == 4
+        && args[0].as_str() == Some("mcp")
+        && args[1].as_str() == Some("serve")
+        && args[2].as_str() == Some("--repo")
+        && args[3].as_str() == Some(display_path(repository).as_str())
 }
 
 fn check_exact(repository: &Path, relative: &str, expected: &str, report: &mut AgentDoctorReport) {
@@ -436,8 +520,9 @@ mod tests {
         let value: Value =
             serde_json::from_str(&fs::read_to_string(cursor.join("mcp.json")).unwrap()).unwrap();
         assert_eq!(value["mcpServers"]["other"]["command"], "other");
+        let server_name = mcp_server_name(&temp.0);
         assert_eq!(
-            value["mcpServers"]["sunlight"]["command"],
+            value["mcpServers"][server_name]["command"],
             executable.display().to_string()
         );
         assert!(doctor(&temp.0, &executable, AgentClient::Cursor).healthy);
@@ -455,5 +540,111 @@ mod tests {
         assert!(config.contains("model = 'example'"));
         assert!(config.contains(CODEX_START));
         assert!(doctor(&temp.0, &executable, AgentClient::Codex).healthy);
+    }
+
+    #[test]
+    fn codex_install_migrates_the_legacy_managed_server_name() {
+        let temp = TempDir::new();
+        let codex = temp.0.join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(
+            codex.join("config.toml"),
+            format!(
+                "model = 'example'\n{CODEX_START}\n[mcp_servers.sunlight]\ncommand = 'old-sun'\nargs = ['mcp', 'serve', '--repo', '{}']\n{CODEX_END}\n",
+                display_path(&temp.0)
+            ),
+        )
+        .unwrap();
+        let executable = temp.0.join("sun");
+
+        install(&temp.0, &executable, AgentClient::Codex, false).unwrap();
+
+        let config = fs::read_to_string(codex.join("config.toml")).unwrap();
+        assert!(config.contains("model = 'example'"));
+        assert!(!config.contains("[mcp_servers.sunlight]"));
+        assert!(config.contains(&format!("[mcp_servers.{}]", mcp_server_name(&temp.0))));
+        assert!(doctor(&temp.0, &executable, AgentClient::Codex).healthy);
+    }
+
+    #[test]
+    fn codex_doctor_and_install_reject_an_unmanaged_legacy_duplicate() {
+        for legacy in [
+            "[mcp_servers.\"sunlight\"]\ncommand = 'old-sun'\nargs = ['mcp', 'serve', '--repo', 'legacy']\n",
+            "[mcp_servers]\nsunlight = { command = 'old-sun', args = ['mcp', 'serve', '--repo', 'legacy'] }\n",
+            "mcp_servers.sunlight.command = 'old-sun'\nmcp_servers.sunlight.args = ['mcp', 'serve', '--repo', 'legacy']\n",
+        ] {
+            let temp = TempDir::new();
+            let executable = temp.0.join("sun");
+            fs::create_dir_all(temp.0.join(".codex")).unwrap();
+            fs::write(
+                temp.0.join(".codex/config.toml"),
+                "# [mcp_servers.sunlight]\n",
+            )
+            .unwrap();
+            install(&temp.0, &executable, AgentClient::Codex, false).unwrap();
+            let config_path = temp.0.join(".codex/config.toml");
+            let config = fs::read_to_string(&config_path).unwrap();
+            fs::write(&config_path, format!("{legacy}\n{config}")).unwrap();
+
+            assert!(!doctor(&temp.0, &executable, AgentClient::Codex).healthy);
+            assert!(install(&temp.0, &executable, AgentClient::Codex, false).is_err());
+        }
+    }
+
+    #[test]
+    fn repository_mcp_names_are_stable_and_distinct() {
+        let first = TempDir::new();
+        let second = TempDir::new();
+        let first_name = mcp_server_name(&first.0);
+        assert_eq!(first_name, mcp_server_name(&first.0));
+        assert_ne!(first_name, mcp_server_name(&second.0));
+        assert!(first_name.starts_with("sunlight_"));
+        assert_eq!(first_name.len(), "sunlight_".len() + 16);
+    }
+
+    #[test]
+    fn cursor_install_migrates_the_legacy_repository_binding() {
+        let temp = TempDir::new();
+        let cursor = temp.0.join(".cursor");
+        fs::create_dir_all(&cursor).unwrap();
+        let executable = temp.0.join("sun");
+        let legacy_executable = temp.0.join("old-sun");
+        fs::write(
+            cursor.join("mcp.json"),
+            serde_json::to_string(&json!({
+                "mcpServers": {"sunlight": cursor_server(&temp.0, &legacy_executable)}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install(&temp.0, &executable, AgentClient::Cursor, false).unwrap();
+
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(cursor.join("mcp.json")).unwrap()).unwrap();
+        assert!(value["mcpServers"].get("sunlight").is_none());
+        assert_eq!(
+            value["mcpServers"][mcp_server_name(&temp.0)],
+            cursor_server(&temp.0, &executable)
+        );
+    }
+
+    #[test]
+    fn cursor_install_removes_a_legacy_duplicate_before_becoming_healthy() {
+        let temp = TempDir::new();
+        let executable = temp.0.join("sun");
+        install(&temp.0, &executable, AgentClient::Cursor, false).unwrap();
+        let config_path = temp.0.join(".cursor/mcp.json");
+        let mut value: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        value["mcpServers"]["sunlight"] = cursor_server(&temp.0, &executable);
+        fs::write(&config_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+        assert!(!doctor(&temp.0, &executable, AgentClient::Cursor).healthy);
+        install(&temp.0, &executable, AgentClient::Cursor, false).unwrap();
+        assert!(doctor(&temp.0, &executable, AgentClient::Cursor).healthy);
+        let migrated: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(migrated["mcpServers"].get("sunlight").is_none());
     }
 }

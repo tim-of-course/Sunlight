@@ -141,11 +141,14 @@ bypass a failed CAS by writing outside Sunlight.
 ## Failure handling
 
 - `precondition_failed`: re-read the artifact and reconsider the patch.
-- `repository_writer_busy` or `concurrent_state_update`: the server queues,
-  reloads, and retries safe native calls automatically. If one is returned,
-  retry the same safe call once after a brief delay. If it recurs, report the
-  exact facts as a repository-service blocker rather than coordinating writers
-  or repairing native state manually.
+- `repository_writer_busy`: Sunlight already waited for ordinary short
+  publication overlap. Inspect the returned lock and timeout facts. Retry one
+  safe native call after the active command finishes; report recurrence as a
+  repository-service blocker.
+- `concurrent_state_update`: safe native calls reload and retry automatically.
+  If one is returned, retry the same safe call once in the existing pinned
+  session. Report recurrence instead of replacing the topic or repairing native
+  state manually.
 - conflicted or stale view: inspect the referenced records and create an
   explicit adaptation. Continue unrelated work from
   `repository.recommended_start` instead of selecting the conflicted moving

@@ -28,8 +28,12 @@ sun agent install --client cursor
 
 All clients receive the same portable skill at
 `.agents/skills/sunlight/SKILL.md`. Codex additionally receives a managed entry
-in `.codex/config.toml`. Cursor additionally receives a `sunlight` stdio server
-entry in `.cursor/mcp.json`. Existing unrelated configuration is preserved.
+in `.codex/config.toml`. Cursor additionally receives a repository-specific
+`sunlight_<digest>` stdio server entry in `.cursor/mcp.json`. Existing unrelated
+configuration is preserved.
+
+Install migrates a managed legacy `sunlight` binding for this repository.
+Doctor remains unhealthy while a duplicate legacy binding is enabled.
 
 The generated client configuration contains local absolute paths. Treat it as
 machine-local unless your team intentionally replaces those paths with a
@@ -37,7 +41,8 @@ portable installation convention. The portable skill itself is safe to share.
 
 Restart the client after the first MCP installation or after changing the
 server executable. Setup is complete when that client exposes
-`repository_status` and the artifact tools for the intended repository.
+`repository_status` and the artifact tools, and their `repository_binding`
+matches the intended repository.
 
 ## Codex plugin
 
@@ -49,8 +54,8 @@ binding still comes from `sun agent install --client codex`.
 
 Cursor reads project MCP servers from `.cursor/mcp.json` and discovers the
 portable Agent Skill from `.agents/skills/sunlight`. Restart or reload Cursor
-after installation, then confirm the `sunlight` server is enabled in its MCP
-tools UI.
+after installation, then confirm the repository-specific `sunlight_<digest>`
+server is enabled in its MCP tools UI.
 
 ## Doctor results
 

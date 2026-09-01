@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
+use super::engine::{execute_engine_with_writer_wait_timeout, WRITER_WAIT_TIMEOUT};
 use super::repository_queue::{self, RepositoryMutationQueueError, RepositoryMutationQueueGuard};
-use super::{execute_engine, EngineCommandInput, EngineContext, EngineOutputFormat, EngineRequest};
+use super::{EngineCommandInput, EngineContext, EngineOutputFormat, EngineRequest};
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
@@ -360,6 +361,7 @@ fn handle_message(
             } else {
                 PROTOCOL_VERSION
             };
+            let repository_binding = repository_binding(repo);
             write_message(
                 stdout,
                 rpc_result(
@@ -368,11 +370,12 @@ fn handle_message(
                         "protocolVersion": negotiated,
                         "capabilities": {"tools": {"listChanged": false}},
                         "serverInfo": {
-                            "name": "sunlight-local",
+                            "name": repository_binding["server_name"],
                             "version": env!("CARGO_PKG_VERSION"),
                             "description": "Repository-confined Sunlight v0.3 authoring and operation tools"
                         },
-                        "instructions": "All tools are bound to the canonical repository supplied when this server started. Start with repository_status and use repository.recommended_start as the default exact checkpoint, view, and tree for new work, even when the moving repository head is conflicted. Its repository.worktree field reports whether ordinary editor or agent changes exist outside Sunlight; call worktree_diff to inspect them and worktree_capture only when those edits should enter native history. Capture returns a completed topic revision with exact provenance, which can be combined through view_resolve like any other topic. Before claiming task completion, call repository_status and read completion_guard. Task-owned implementation needs a native topic or checkpoint handoff; unrelated external edits may remain outside native history and must be preserved and reported separately. For native authoring, use topic_create, session_start, scoped artifact reads and mutations, and topic_complete. Sessions remain pinned and writable while unrelated topics resolve or conflict. Unrelated topic, checkpoint, and execution advancement never requires session_refresh or a replacement topic. Integrate with topic_wait and view_resolve using exact selected revisions. Any checkpoint may be the starting checkpoint; its frontier is included automatically and explicit selections replace revisions for the same topics. Omitting include on the repository base is discovery-only and resolves moving current heads. Validate the exact combined view with execution_run. Promote each intentional output with execution_promote_output using its returned candidate classification and a live topic-owned session over the validated view; resolve the resulting exact revision and create a checkpoint from matching passing evidence. checkpoint_create prefers complete coverage of completed topic heads and rejects an omission by default. Use acknowledge_omitted_completed_heads only for an intentional partial or alternative checkpoint; the omitted heads are recorded. checkpoint_create returns a structured handoff with the exact IDs to report. Copy handoff.copy_report verbatim rather than reconstructing IDs. For a requested Git handoff, call policy_check_export with the exact checkpoint and target ref, then git_export; completion is a returned export_map_id for that checkpoint and ref. artifact_read/list/search accept exactly one scope: session for the authoring frontier or view for session-free read-only access to an exact resolved view. topic_complete and completed topic status return a structured handoff with summary, operations, changed paths, and hashes; use topic_wait instead of polling when another agent owns the topic. Transient repository writer and state-sequence races are retried automatically for safe native and read commands; commands that can replay external side effects are never automatically retried. Use exact IDs and sha256 hashes returned by tools. artifact_write uses expect_hash \"new\" only when the path must be absent. Sessions have fixed topic scope: session_refresh advances only non-write topics already in that session frontier and does not discover newly created topics. execution_run returns bounded stdout/stderr text in that response, phase timings, and only source-like or explicitly generated promotion candidates. No fixture tools or arbitrary host paths are available."
+                        "repositoryBinding": repository_binding,
+                        "instructions": "All tools are bound to the canonical repository supplied when this server started. Verify repositoryBinding against the intended project before trusting repository data. Start with repository_status and use repository.recommended_start as the default exact checkpoint, view, and tree for new work, even when the moving repository head is conflicted. Its repository.worktree field reports whether ordinary editor or agent changes exist outside Sunlight; call worktree_diff to inspect them and worktree_capture only when those edits should enter native history. Capture returns a completed topic revision with exact provenance, which can be combined through view_resolve like any other topic. Before claiming task completion, call repository_status and read completion_guard. Task-owned implementation needs a native topic or checkpoint handoff; unrelated external edits may remain outside native history and must be preserved and reported separately. For native authoring, use topic_create, session_start, scoped artifact reads and mutations, and topic_complete. Sessions remain pinned and writable while unrelated topics resolve or conflict. Unrelated topic, checkpoint, and execution advancement never requires session_refresh or a replacement topic. Integrate with topic_wait and view_resolve using exact selected revisions. Any checkpoint may be the starting checkpoint; its frontier is included automatically and explicit selections replace revisions for the same topics. Omitting include on the repository base is discovery-only and resolves moving current heads. Validate the exact combined view with execution_run. Promote each intentional output with execution_promote_output using its returned candidate classification and a live topic-owned session over the validated view; resolve the resulting exact revision and create a checkpoint from matching passing evidence. checkpoint_create prefers complete coverage of completed topic heads and rejects an omission by default. Use acknowledge_omitted_completed_heads only for an intentional partial or alternative checkpoint; the omitted heads are recorded. checkpoint_create returns a structured handoff with the exact IDs to report. Copy handoff.copy_report verbatim rather than reconstructing IDs. For a requested Git handoff, call policy_check_export with the exact checkpoint and target ref, then git_export; completion is a returned export_map_id for that checkpoint and ref. artifact_read/list/search accept exactly one scope: session for the authoring frontier or view for session-free read-only access to an exact resolved view. topic_complete and completed topic status return a structured handoff with summary, operations, changed paths, and hashes; use topic_wait instead of polling when another agent owns the topic. Short writer contention waits inside the canonical state boundary; state-sequence races are retried automatically for safe native and read commands. Commands that can replay external side effects are never automatically retried. Use exact IDs and sha256 hashes returned by tools. artifact_write uses expect_hash \"new\" only when the path must be absent. Sessions have fixed topic scope: session_refresh advances only non-write topics already in that session frontier and does not discover newly created topics. execution_run returns bounded stdout/stderr text in that response, phase timings, and only source-like or explicitly generated promotion candidates. No fixture tools or arbitrary host paths are available."
                     }),
                 ),
             )
@@ -421,16 +424,13 @@ fn handle_message(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             if !arguments.is_object() {
-                return write_message(
-                    stdout,
-                    rpc_result(
-                        id,
-                        tool_failure_result(ToolFailure::new(
-                            "invalid_request",
-                            "tool arguments must be an object",
-                        )),
-                    ),
-                );
+                let mut result = tool_failure_result(ToolFailure::new(
+                    "invalid_request",
+                    "tool arguments must be an object",
+                ));
+                attach_repository_binding_to_result(&mut result, repo);
+                attach_transport_metrics(&mut result, 0, 0, 0, 0);
+                return write_message(stdout, rpc_result(id, result));
             }
             let repo = repo.to_path_buf();
             let engine = engine.clone();
@@ -467,6 +467,12 @@ fn handle_message(
                     .and_then(|object| object.remove("_automatic_concurrency_retries"))
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0);
+                let writer_wait_ms = result
+                    .as_object_mut()
+                    .and_then(|object| object.remove("_writer_wait_ms"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                attach_repository_binding_to_result(&mut result, &repo);
                 attach_transport_metrics(
                     &mut result,
                     client_queue_ms + repository_queue_time.as_millis(),
@@ -475,6 +481,7 @@ fn handle_message(
                         .saturating_sub(repository_queue_time)
                         .as_millis(),
                     concurrency_retries,
+                    writer_wait_ms,
                 );
                 let _ = tx.send(result);
             });
@@ -750,6 +757,7 @@ fn attach_transport_metrics(
     queue_ms: u128,
     worker_ms: u128,
     automatic_concurrency_retries: u64,
+    writer_wait_ms: u64,
 ) {
     let Some(mut envelope) = result.get("structuredContent").cloned() else {
         return;
@@ -758,6 +766,7 @@ fn attach_transport_metrics(
         "queue_ms": queue_ms,
         "worker_ms": worker_ms,
         "automatic_concurrency_retries": automatic_concurrency_retries,
+        "writer_wait_ms": writer_wait_ms,
     });
     if envelope.get("ok").and_then(Value::as_bool) == Some(true) {
         envelope["data"]["transport"] = transport;
@@ -784,8 +793,9 @@ fn tool_result_content(envelope: &Value) -> Value {
     Value::Array(content)
 }
 
-fn with_concurrency_retries(mut result: Value, count: usize) -> Value {
-    result["_automatic_concurrency_retries"] = json!(count);
+fn with_engine_metrics(mut result: Value, retries: usize, writer_wait_ms: u128) -> Value {
+    result["_automatic_concurrency_retries"] = json!(retries);
+    result["_writer_wait_ms"] = json!(writer_wait_ms);
     result
 }
 
@@ -793,6 +803,15 @@ fn execute_invocation(
     engine: &EngineContext,
     invocation: Invocation,
     cancel: &Arc<AtomicBool>,
+) -> Value {
+    execute_invocation_with_writer_wait_timeout(engine, invocation, cancel, WRITER_WAIT_TIMEOUT)
+}
+
+fn execute_invocation_with_writer_wait_timeout(
+    engine: &EngineContext,
+    invocation: Invocation,
+    cancel: &Arc<AtomicBool>,
+    writer_wait_timeout: Duration,
 ) -> Value {
     let Invocation {
         argv,
@@ -804,7 +823,7 @@ fn execute_invocation(
             "tool call was cancelled",
         ));
     }
-    let response = execute_engine(
+    let response = execute_engine_with_writer_wait_timeout(
         &engine.clone().with_cancellation(Arc::clone(cancel)),
         EngineRequest {
             command: EngineCommandInput::Arguments(argv),
@@ -812,9 +831,10 @@ fn execute_invocation(
             max_stdout_bytes: Some(MAX_STDOUT_BYTES),
             max_stderr_bytes: Some(MAX_STDERR_BYTES),
         },
+        writer_wait_timeout,
     );
     if response.stdout_overflowed {
-        return with_concurrency_retries(
+        return with_engine_metrics(
             tool_failure_result(
                 ToolFailure::new(
                     "mcp_stdout_too_large",
@@ -823,10 +843,11 @@ fn execute_invocation(
                 .detail("max_bytes", MAX_STDOUT_BYTES as u64),
             ),
             response.concurrency_retry_count,
+            response.writer_wait_ms,
         );
     }
     if response.stderr_overflowed {
-        return with_concurrency_retries(
+        return with_engine_metrics(
             tool_failure_result(
                 ToolFailure::new(
                     "mcp_stderr_too_large",
@@ -835,12 +856,13 @@ fn execute_invocation(
                 .detail("max_bytes", MAX_STDERR_BYTES as u64),
             ),
             response.concurrency_retry_count,
+            response.writer_wait_ms,
         );
     }
     let parsed: Value = match serde_json::from_str(&response.stdout) {
         Ok(value) => value,
         Err(error) => {
-            return with_concurrency_retries(
+            return with_engine_metrics(
                 tool_failure_result(
                     ToolFailure::new(
                         "mcp_invalid_engine_contract",
@@ -850,19 +872,47 @@ fn execute_invocation(
                     .detail("stderr", response.stderr),
                 ),
                 response.concurrency_retry_count,
+                response.writer_wait_ms,
             );
         }
     };
     let is_error = !response.success || parsed.get("ok").and_then(Value::as_bool) == Some(false);
     let content = tool_result_content(&parsed);
-    with_concurrency_retries(
+    with_engine_metrics(
         json!({
             "content":content,
             "structuredContent":parsed,
             "isError":is_error
         }),
         response.concurrency_retry_count,
+        response.writer_wait_ms,
     )
+}
+
+fn repository_binding(repo: &Path) -> Value {
+    json!({
+        "binding_id": super::agent_setup::repository_binding_id(repo),
+        "canonical_root": super::agent_setup::display_path(repo),
+        "server_name": super::agent_setup::mcp_server_name(repo),
+    })
+}
+
+fn attach_repository_binding(envelope: &mut Value, repo: &Path) {
+    let binding = repository_binding(repo);
+    if envelope.get("ok").and_then(Value::as_bool) == Some(true) {
+        envelope["data"]["repository_binding"] = binding;
+    } else {
+        envelope["error"]["details"]["repository_binding"] = binding;
+    }
+}
+
+fn attach_repository_binding_to_result(result: &mut Value, repo: &Path) {
+    let Some(mut envelope) = result.get("structuredContent").cloned() else {
+        return;
+    };
+    attach_repository_binding(&mut envelope, repo);
+    result["content"] = tool_result_content(&envelope);
+    result["structuredContent"] = envelope;
 }
 
 fn tool_result_with_wait(mut result: Value, outcome: &str, elapsed_ms: u128) -> Value {
@@ -913,23 +963,46 @@ fn execute_topic_wait(engine: &EngineContext, value: &Value, cancel: &Arc<Atomic
         Err(error) => return tool_failure_result(error),
     };
     let started = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    let mut remaining_writer_wait = WRITER_WAIT_TIMEOUT.min(timeout);
+    let mut total_retries = 0usize;
+    let mut total_writer_wait_ms = 0u128;
     loop {
         if cancel.load(Ordering::Acquire) {
-            return tool_failure_result(ToolFailure::new(
-                "request_cancelled",
-                "tool call was cancelled",
-            ));
+            return with_engine_metrics(
+                tool_failure_result(ToolFailure::new(
+                    "request_cancelled",
+                    "tool call was cancelled",
+                )),
+                total_retries,
+                total_writer_wait_ms,
+            );
         }
-        let result = execute_invocation(
+        let mut result = execute_invocation_with_writer_wait_timeout(
             engine,
             Invocation {
                 argv: vec!["status".into(), "--topic".into(), topic.clone()],
                 staged: Vec::new(),
             },
             cancel,
+            remaining_writer_wait.min(timeout.saturating_sub(started.elapsed())),
         );
+        let retries = result
+            .as_object_mut()
+            .and_then(|object| object.remove("_automatic_concurrency_retries"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        total_retries = total_retries.saturating_add(retries.try_into().unwrap_or(usize::MAX));
+        let writer_wait_ms = result
+            .as_object_mut()
+            .and_then(|object| object.remove("_writer_wait_ms"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        total_writer_wait_ms = total_writer_wait_ms.saturating_add(u128::from(writer_wait_ms));
+        remaining_writer_wait =
+            remaining_writer_wait.saturating_sub(Duration::from_millis(writer_wait_ms));
         if result.get("isError").and_then(Value::as_bool) == Some(true) {
-            return result;
+            return with_engine_metrics(result, total_retries, total_writer_wait_ms);
         }
         let completed = result
             .get("structuredContent")
@@ -939,14 +1012,21 @@ fn execute_topic_wait(engine: &EngineContext, value: &Value, cancel: &Arc<Atomic
             .and_then(Value::as_str)
             == Some("completed");
         if completed {
-            return tool_result_with_wait(result, "completed", started.elapsed().as_millis());
+            return with_engine_metrics(
+                tool_result_with_wait(result, "completed", started.elapsed().as_millis()),
+                total_retries,
+                total_writer_wait_ms,
+            );
         }
-        if started.elapsed() >= Duration::from_millis(timeout_ms) {
-            return tool_result_with_wait(result, "timeout", started.elapsed().as_millis());
+        if started.elapsed() >= timeout {
+            return with_engine_metrics(
+                tool_result_with_wait(result, "timeout", started.elapsed().as_millis()),
+                total_retries,
+                total_writer_wait_ms,
+            );
         }
         thread::sleep(
-            Duration::from_millis(poll_interval_ms)
-                .min(Duration::from_millis(timeout_ms).saturating_sub(started.elapsed())),
+            Duration::from_millis(poll_interval_ms).min(timeout.saturating_sub(started.elapsed())),
         );
     }
 }
@@ -2162,11 +2242,26 @@ fn output_schema(name: &str) -> Value {
         json!({
             "type":"object",
             "description":"Per-call MCP observability for interactive latency and contention measurement.",
-            "required":["queue_ms","worker_ms","automatic_concurrency_retries"],
+            "required":["queue_ms","worker_ms","automatic_concurrency_retries","writer_wait_ms"],
             "properties":{
                 "queue_ms":{"type":"integer","minimum":0,"description":"Time spent in the local server queue plus any cross-process repository mutation queue, excluding worker execution."},
                 "worker_ms":{"type":"integer","minimum":0,"description":"Total time spent validating and executing this tool in its worker."},
-                "automatic_concurrency_retries":{"type":"integer","minimum":0,"description":"Safe engine retries caused by writer-lock or state-sequence contention."}
+                "automatic_concurrency_retries":{"type":"integer","minimum":0,"description":"Safe engine retries caused by state-sequence contention."},
+                "writer_wait_ms":{"type":"integer","minimum":0,"description":"Time spent waiting for the canonical repository-state lock across this call and its safe retries."}
+            },
+            "additionalProperties":false
+        }),
+    );
+    data.insert(
+        "repository_binding".to_string(),
+        json!({
+            "type":"object",
+            "description":"Canonical repository identity for detecting an MCP client connected to the wrong project server.",
+            "required":["binding_id","canonical_root","server_name"],
+            "properties":{
+                "binding_id":{"type":"string","pattern":r"^sha256:[0-9a-f]{64}$"},
+                "canonical_root":{"type":"string"},
+                "server_name":{"type":"string","pattern":r"^sunlight_[0-9a-f]{16}$"}
             },
             "additionalProperties":false
         }),
@@ -2746,6 +2841,7 @@ mod tests {
             assert_eq!(error["properties"]["next_action"]["type"], "string");
             let transport = &tool["outputSchema"]["properties"]["data"]["properties"]["transport"];
             assert_eq!(transport["properties"]["queue_ms"]["type"], "integer");
+            assert_eq!(transport["properties"]["writer_wait_ms"]["type"], "integer");
             assert_eq!(
                 transport["properties"]["automatic_concurrency_retries"]["type"],
                 "integer"
@@ -2982,14 +3078,14 @@ mod tests {
             "artifact_read_scope_invalid",
             "choose one read scope",
         ));
-        attach_transport_metrics(&mut tool_error, 7, 11, 2);
+        attach_transport_metrics(&mut tool_error, 7, 11, 2, 5);
         assert_eq!(
             tool_error["structuredContent"]["error"]["next_action"],
             "Supply exactly one scope: a session for topic-bound authoring context or an exact resolved view for read-only access."
         );
         assert_eq!(
             tool_error["structuredContent"]["error"]["details"]["transport"],
-            json!({"queue_ms":7,"worker_ms":11,"automatic_concurrency_retries":2})
+            json!({"queue_ms":7,"worker_ms":11,"automatic_concurrency_retries":2,"writer_wait_ms":5})
         );
 
         let native_error = super::super::CliError::new(

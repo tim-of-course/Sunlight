@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -5,8 +6,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ignore::gitignore::GitignoreBuilder;
 use sha2::{Digest, Sha256};
@@ -535,6 +538,9 @@ pub enum RepoStateError {
         lock: PathBuf,
         timeout_ms: u64,
     },
+    WriterWaitCancelled {
+        lock: PathBuf,
+    },
     ConcurrentStateUpdate {
         path: PathBuf,
         expected_sequence: u64,
@@ -598,6 +604,11 @@ impl Display for RepoStateError {
             Self::WriterBusy { lock, timeout_ms } => write!(
                 f,
                 "Sunlight repository writer is busy after {timeout_ms}ms; lock={}",
+                lock.display()
+            ),
+            Self::WriterWaitCancelled { lock } => write!(
+                f,
+                "Sunlight repository writer wait was cancelled; lock={}",
                 lock.display()
             ),
             Self::ConcurrentStateUpdate {
@@ -3151,7 +3162,130 @@ fn read_publication_sequence(path: &Path) -> Result<u64, RepoStateError> {
 #[cfg(debug_assertions)]
 const STATE_PUBLICATION_FAILPOINT_ENV: &str = "SUNLIGHT_TEST_FAILPOINT";
 const PUBLICATION_OUTBOX_SCHEMA_VERSION: u64 = 1;
-const WRITER_LOCK_TIMEOUT_MS: u64 = 0;
+const WRITER_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITER_LOCK_POLL: Duration = Duration::from_millis(10);
+
+struct WriterLockWaitContext {
+    remaining: Duration,
+    waited: Duration,
+    cancellation: Arc<AtomicBool>,
+}
+
+thread_local! {
+    static WRITER_LOCK_WAIT_CONTEXT: RefCell<Option<WriterLockWaitContext>> = const { RefCell::new(None) };
+}
+
+pub fn with_repository_writer_lock_wait<T>(
+    timeout: Duration,
+    cancellation: Arc<AtomicBool>,
+    operation: impl FnOnce() -> T,
+) -> (T, Duration) {
+    let previous = WRITER_LOCK_WAIT_CONTEXT.with(|context| {
+        let mut context = context.borrow_mut();
+        assert!(
+            context.is_none(),
+            "repository writer lock wait contexts cannot be nested"
+        );
+        context.replace(WriterLockWaitContext {
+            remaining: timeout,
+            waited: Duration::ZERO,
+            cancellation,
+        })
+    });
+    let guard = WriterLockWaitContextGuard {
+        previous,
+        active: true,
+    };
+    let result = operation();
+    let waited = guard.finish();
+    (result, waited)
+}
+
+struct WriterLockWaitContextGuard {
+    previous: Option<WriterLockWaitContext>,
+    active: bool,
+}
+
+impl WriterLockWaitContextGuard {
+    fn finish(mut self) -> Duration {
+        let completed =
+            WRITER_LOCK_WAIT_CONTEXT.with(|context| context.replace(self.previous.take()));
+        self.active = false;
+        completed
+            .expect("repository writer lock wait context remains installed")
+            .waited
+    }
+}
+
+impl Drop for WriterLockWaitContextGuard {
+    fn drop(&mut self) {
+        if self.active {
+            WRITER_LOCK_WAIT_CONTEXT.with(|context| {
+                context.replace(self.previous.take());
+            });
+        }
+    }
+}
+
+struct WriterLockWaitBudget {
+    local_remaining: Duration,
+    timeout_ms: u64,
+    shared: bool,
+}
+
+impl WriterLockWaitBudget {
+    fn new(timeout: Duration) -> Self {
+        let shared = WRITER_LOCK_WAIT_CONTEXT.with(|context| context.borrow().is_some());
+        Self {
+            local_remaining: timeout,
+            timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
+            shared,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.shared
+            && WRITER_LOCK_WAIT_CONTEXT.with(|context| {
+                context
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|context| context.cancellation.load(Ordering::Acquire))
+            })
+    }
+
+    fn remaining(&self) -> Duration {
+        if self.shared {
+            WRITER_LOCK_WAIT_CONTEXT.with(|context| {
+                context
+                    .borrow()
+                    .as_ref()
+                    .expect("shared writer wait context exists")
+                    .remaining
+            })
+        } else {
+            self.local_remaining
+        }
+    }
+
+    fn consume(&mut self, elapsed: Duration) {
+        if self.shared {
+            WRITER_LOCK_WAIT_CONTEXT.with(|context| {
+                let mut context = context.borrow_mut();
+                let context = context.as_mut().expect("shared writer wait context exists");
+                context.remaining = context.remaining.saturating_sub(elapsed);
+                context.waited = context.waited.saturating_add(elapsed);
+            });
+        } else {
+            self.local_remaining = self.local_remaining.saturating_sub(elapsed);
+        }
+    }
+
+    fn sleep_once(&mut self) {
+        let started = Instant::now();
+        thread::sleep(WRITER_LOCK_POLL.min(self.remaining()));
+        self.consume(started.elapsed());
+    }
+}
 
 struct RepositoryWriterLock {
     file: File,
@@ -3174,30 +3308,57 @@ impl RepositoryWriterLock {
 
 #[cfg(windows)]
 fn acquire_repository_writer_lock(path: &Path) -> Result<RepositoryWriterLock, RepoStateError> {
+    acquire_repository_writer_lock_with_timeout(path, WRITER_LOCK_TIMEOUT)
+}
+
+#[cfg(windows)]
+fn acquire_repository_writer_lock_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<RepositoryWriterLock, RepoStateError> {
     use std::os::windows::fs::OpenOptionsExt;
 
-    // A zero share mode gives the open file an OS-owned, process-scoped exclusive lease. It is
-    // released automatically even if the process exits while publishing.
-    match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .share_mode(0)
-        .open(path)
-    {
-        Ok(file) => Ok(RepositoryWriterLock { file }),
-        Err(error) if matches!(error.raw_os_error(), Some(32) | Some(33)) => {
-            Err(RepoStateError::WriterBusy {
+    let mut wait = WriterLockWaitBudget::new(timeout);
+    loop {
+        if wait.cancelled() {
+            return Err(RepoStateError::WriterWaitCancelled {
                 lock: path.to_path_buf(),
-                timeout_ms: WRITER_LOCK_TIMEOUT_MS,
-            })
+            });
         }
-        Err(error) => Err(io_error(path, "failed to acquire writer lock", error)),
+        // A zero share mode gives the open file an OS-owned, process-scoped exclusive lease. It is
+        // released automatically even if the process exits while publishing.
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .open(path)
+        {
+            Ok(file) => return Ok(RepositoryWriterLock { file }),
+            Err(error) if matches!(error.raw_os_error(), Some(32) | Some(33)) => {
+                if wait.remaining().is_zero() {
+                    return Err(RepoStateError::WriterBusy {
+                        lock: path.to_path_buf(),
+                        timeout_ms: wait.timeout_ms,
+                    });
+                }
+                wait.sleep_once();
+            }
+            Err(error) => return Err(io_error(path, "failed to acquire writer lock", error)),
+        }
     }
 }
 
 #[cfg(not(windows))]
 fn acquire_repository_writer_lock(path: &Path) -> Result<RepositoryWriterLock, RepoStateError> {
+    acquire_repository_writer_lock_with_timeout(path, WRITER_LOCK_TIMEOUT)
+}
+
+#[cfg(not(windows))]
+fn acquire_repository_writer_lock_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<RepositoryWriterLock, RepoStateError> {
     use std::os::fd::AsRawFd;
 
     const LOCK_EX: i32 = 2;
@@ -3213,22 +3374,31 @@ fn acquire_repository_writer_lock(path: &Path) -> Result<RepositoryWriterLock, R
         .truncate(false)
         .open(path)
         .map_err(|error| io_error(path, "failed to open writer lock", error))?;
-    // SAFETY: `file` owns a valid descriptor for the duration of this call and the guard.
-    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
-        Ok(RepositoryWriterLock {
-            file,
-            path: path.to_path_buf(),
-        })
-    } else {
-        let error = std::io::Error::last_os_error();
-        if matches!(error.kind(), std::io::ErrorKind::WouldBlock) {
-            Err(RepoStateError::WriterBusy {
+    let mut wait = WriterLockWaitBudget::new(timeout);
+    loop {
+        if wait.cancelled() {
+            return Err(RepoStateError::WriterWaitCancelled {
                 lock: path.to_path_buf(),
-                timeout_ms: WRITER_LOCK_TIMEOUT_MS,
-            })
-        } else {
-            Err(io_error(path, "failed to acquire writer lock", error))
+            });
         }
+        // SAFETY: `file` owns a valid descriptor for the duration of this call and the guard.
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+            return Ok(RepositoryWriterLock {
+                file,
+                path: path.to_path_buf(),
+            });
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(error.kind(), std::io::ErrorKind::WouldBlock) {
+            return Err(io_error(path, "failed to acquire writer lock", error));
+        }
+        if wait.remaining().is_zero() {
+            return Err(RepoStateError::WriterBusy {
+                lock: path.to_path_buf(),
+                timeout_ms: wait.timeout_ms,
+            });
+        }
+        wait.sleep_once();
     }
 }
 
@@ -9181,7 +9351,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_cannot_recover_prepared_batch_while_other_process_holds_writer_lock() {
+    fn reader_waits_for_writer_before_recovering_prepared_batch() {
         let _failpoint_guard = FAILPOINT_ENV_LOCK.lock().unwrap();
         let repo = temp_repo("publication-reader-writer-lock");
         fs::write(repo.join("README.md"), b"# lock\n").unwrap();
@@ -9218,27 +9388,82 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
 
+        let lock_path = repo.join(".sunlight/local/command-transaction.lock");
         let started = Instant::now();
-        let error = RealRepoState::load(&repo).unwrap_err();
+        let error = match acquire_repository_writer_lock_with_timeout(
+            &lock_path,
+            Duration::from_millis(50),
+        ) {
+            Ok(_) => panic!("writer lock acquisition should time out while the child holds it"),
+            Err(error) => error,
+        };
         assert_eq!(
             error,
             RepoStateError::WriterBusy {
-                lock: repo.join(".sunlight/local/command-transaction.lock"),
-                timeout_ms: 0,
+                lock: lock_path.clone(),
+                timeout_ms: 50,
             }
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() >= Duration::from_millis(50));
         assert!(transaction_root.join("manifest.json").exists());
         assert!(transaction_root.join("staged/0000.json").exists());
 
-        fs::write(repo.join("writer-lock-release"), b"release").unwrap();
-        assert!(child.wait().unwrap().success());
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_signal = Arc::clone(&cancellation);
+        let cancel = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            cancellation_signal.store(true, Ordering::Release);
+        });
+        let (cancelled, writer_wait) =
+            with_repository_writer_lock_wait(Duration::from_secs(10), cancellation, || {
+                acquire_repository_writer_lock(&lock_path)
+            });
+        assert_eq!(
+            match cancelled {
+                Ok(_) => panic!("writer wait should stop after cancellation"),
+                Err(error) => error,
+            },
+            RepoStateError::WriterWaitCancelled {
+                lock: lock_path.clone(),
+            }
+        );
+        assert!(writer_wait >= Duration::from_millis(40));
+        assert!(writer_wait < Duration::from_secs(1));
+        cancel.join().unwrap();
+
+        let release = repo.join("writer-lock-release");
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            fs::write(release, b"release").unwrap();
+        });
+        let started = Instant::now();
         let loaded = RealRepoState::load(&repo).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        releaser.join().unwrap();
+        assert!(child.wait().unwrap().success());
         assert_eq!(loaded.publication_sequence, 1);
         assert!(!publication_outbox_root(&repo).exists());
         assert!(!repo.join(".sunlight/operations/op_prepared.json").exists());
 
         fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn writer_wait_budget_is_shared_across_lock_acquisitions() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (_, waited) =
+            with_repository_writer_lock_wait(Duration::from_millis(100), cancellation, || {
+                let mut first = WriterLockWaitBudget::new(Duration::from_secs(10));
+                first.consume(Duration::from_millis(60));
+                assert_eq!(first.remaining(), Duration::from_millis(40));
+
+                let mut second = WriterLockWaitBudget::new(Duration::from_secs(10));
+                assert_eq!(second.remaining(), Duration::from_millis(40));
+                second.consume(Duration::from_millis(40));
+                assert!(second.remaining().is_zero());
+            });
+        assert_eq!(waited, Duration::from_millis(100));
     }
 
     #[test]

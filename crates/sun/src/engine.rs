@@ -79,12 +79,35 @@ pub struct EngineResponse {
     pub stdout_overflowed: bool,
     pub stderr_overflowed: bool,
     pub concurrency_retry_count: usize,
+    pub writer_wait_ms: u128,
 }
 
 const CONCURRENCY_RETRY_LIMIT: usize = 8;
 const CONCURRENCY_RETRY_MAX_DELAY_MS: u64 = 64;
+pub(crate) const WRITER_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn execute_engine(context: &EngineContext, request: EngineRequest) -> EngineResponse {
+    execute_engine_with_writer_wait_timeout(context, request, WRITER_WAIT_TIMEOUT)
+}
+
+pub(crate) fn execute_engine_with_writer_wait_timeout(
+    context: &EngineContext,
+    request: EngineRequest,
+    writer_wait_timeout: Duration,
+) -> EngineResponse {
+    let (mut response, writer_wait) = sunlight_core::repo_state::with_repository_writer_lock_wait(
+        writer_wait_timeout,
+        Arc::clone(&context.cancellation),
+        || execute_engine_with_writer_wait(context, request),
+    );
+    response.writer_wait_ms = writer_wait.as_millis();
+    response
+}
+
+fn execute_engine_with_writer_wait(
+    context: &EngineContext,
+    request: EngineRequest,
+) -> EngineResponse {
     let EngineRequest {
         command,
         output_format,
@@ -133,6 +156,7 @@ pub fn execute_engine(context: &EngineContext, request: EngineRequest) -> Engine
                 stdout_overflowed,
                 stderr_overflowed: false,
                 concurrency_retry_count: retry_count,
+                writer_wait_ms: 0,
             },
             Err(error) if json => {
                 use std::fmt::Write as _;
@@ -147,6 +171,7 @@ pub fn execute_engine(context: &EngineContext, request: EngineRequest) -> Engine
                     stdout_overflowed,
                     stderr_overflowed: false,
                     concurrency_retry_count: retry_count,
+                    writer_wait_ms: 0,
                 }
             }
             Err(error) => {
@@ -162,6 +187,7 @@ pub fn execute_engine(context: &EngineContext, request: EngineRequest) -> Engine
                     stdout_overflowed,
                     stderr_overflowed,
                     concurrency_retry_count: retry_count,
+                    writer_wait_ms: 0,
                 }
             }
         };
@@ -173,7 +199,7 @@ fn concurrency_retry_delay_ms(retry_count: usize) -> u64 {
 }
 
 fn is_transient_concurrency_error(code: &str) -> bool {
-    matches!(code, "repository_writer_busy" | "concurrent_state_update")
+    code == "concurrent_state_update"
 }
 
 fn command_allows_automatic_concurrency_retry(arguments: &[String]) -> bool {

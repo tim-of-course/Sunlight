@@ -89,8 +89,14 @@ fn agent_install_and_doctor_create_a_discoverable_cursor_setup() {
     let cursor: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(repo.path().join(".cursor/mcp.json")).unwrap())
             .unwrap();
-    assert_eq!(cursor["mcpServers"]["sunlight"]["args"][0], "mcp");
-    assert_eq!(cursor["mcpServers"]["sunlight"]["args"][1], "serve");
+    let servers = cursor["mcpServers"].as_object().unwrap();
+    let (server_name, server) = servers
+        .iter()
+        .find(|(name, _)| name.starts_with("sunlight_"))
+        .expect("repository-specific Sunlight MCP server");
+    assert_eq!(server_name.len(), "sunlight_".len() + 16);
+    assert_eq!(server["args"][0], "mcp");
+    assert_eq!(server["args"][1], "serve");
 
     let doctor = run_real_json(&repo, &["agent", "doctor", "--client", "cursor"]);
     assert_success(&doctor);

@@ -374,6 +374,11 @@ impl From<RepoStateError> for CliError {
             )
             .with_detail("lock", lock.display().to_string())
             .with_detail("timeout_ms", timeout_ms.to_string()),
+            RepoStateError::WriterWaitCancelled { lock } => CliError::new(
+                "request_cancelled",
+                "request was cancelled while waiting for repository state",
+            )
+            .with_detail("lock", lock.display().to_string()),
             RepoStateError::ConcurrentStateUpdate {
                 path,
                 expected_sequence,
@@ -6079,11 +6084,8 @@ fn publish_real_execution_start(
         match state.save_with_records(repo_root, &records) {
             Ok(()) => return Ok(()),
             Err(error)
-                if matches!(
-                    error,
-                    RepoStateError::ConcurrentStateUpdate { .. }
-                        | RepoStateError::WriterBusy { .. }
-                ) && retry_count < EXECUTION_FINALIZATION_RETRY_LIMIT =>
+                if matches!(error, RepoStateError::ConcurrentStateUpdate { .. })
+                    && retry_count < EXECUTION_FINALIZATION_RETRY_LIMIT =>
             {
                 thread::sleep(Duration::from_millis(1_u64 << retry_count.min(6)));
                 retry_count += 1;
@@ -6096,19 +6098,7 @@ fn publish_real_execution_start(
 const EXECUTION_FINALIZATION_RETRY_LIMIT: usize = 64;
 
 fn load_real_state_for_execution_merge(repo_root: &Path) -> Result<RealRepoState, RepoStateError> {
-    let mut retry_count = 0_usize;
-    loop {
-        match RealRepoState::load(repo_root) {
-            Ok(state) => return Ok(state),
-            Err(RepoStateError::WriterBusy { .. })
-                if retry_count < EXECUTION_FINALIZATION_RETRY_LIMIT =>
-            {
-                thread::sleep(Duration::from_millis(1_u64 << retry_count.min(6)));
-                retry_count += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    RealRepoState::load(repo_root)
 }
 
 fn finalize_real_execution(
@@ -6188,11 +6178,8 @@ fn finalize_real_execution(
         match state.save_with_records(repo_root, &records) {
             Ok(()) => return Ok(load_real_state_for_execution_merge(repo_root)?),
             Err(error)
-                if matches!(
-                    error,
-                    RepoStateError::ConcurrentStateUpdate { .. }
-                        | RepoStateError::WriterBusy { .. }
-                ) && retry_count < EXECUTION_FINALIZATION_RETRY_LIMIT =>
+                if matches!(error, RepoStateError::ConcurrentStateUpdate { .. })
+                    && retry_count < EXECUTION_FINALIZATION_RETRY_LIMIT =>
             {
                 thread::sleep(Duration::from_millis(1_u64 << retry_count.min(6)));
                 retry_count += 1;
@@ -21430,7 +21417,10 @@ fn next_action_for_error_code(code: &str) -> &'static str {
         "checkpoint_omits_completed_topic_heads" => {
             "Resolve the intended completed revisions together and checkpoint that exact view, or explicitly acknowledge a partial or alternative checkpoint so every omitted head is recorded."
         }
-        "repository_writer_busy" | "concurrent_state_update" => {
+        "repository_writer_busy" => {
+            "Sunlight already waited for ordinary short publication overlap. Inspect the returned lock and timeout, then retry one safe native call after the active command finishes. For execution_run, inspect the exact execution record and never rerun an external command solely because metadata publication timed out."
+        }
+        "concurrent_state_update" => {
             "Inspect repository_status before deciding. For a safe session mutation, retry the same operation in the existing pinned session; unrelated advancement does not require session_refresh or a replacement topic. For execution_run, inspect the exact execution record and status, and never rerun the command solely because metadata publication contended."
         }
         "request_cancelled" => {

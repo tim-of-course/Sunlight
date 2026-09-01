@@ -36,7 +36,11 @@ Use one client value per installation. `generic` installs only
 tools. Configure a generic client separately to launch `sun mcp serve --repo
 <repository-directory>`. Codex also manages `.codex/config.toml`, and Cursor
 also manages `.cursor/mcp.json`. Existing unrelated client configuration is
-preserved. Verify an adapter-managed result with:
+preserved. Adapter-managed server names include a stable digest of the canonical
+repository path so two projects cannot share the same MCP server identity.
+Install migrates the prior managed `sunlight` name for the same repository;
+doctor rejects a remaining duplicate legacy entry.
+Verify an adapter-managed result with:
 
 ```powershell
 sun agent doctor --client codex
@@ -70,7 +74,7 @@ Cursor uses an equivalent project-local `.cursor/mcp.json` entry:
 ```json
 {
   "mcpServers": {
-    "sunlight": {
+    "sunlight_my_repo": {
       "command": "C:\\src\\sunlight\\target\\release\\sun.exe",
       "args": ["mcp", "serve", "--repo", "C:\\src\\my-repo"]
     }
@@ -152,13 +156,14 @@ structured error contains `code`, `message`, inspectable `details`, and a
 `next_action`. Treat `next_action` as the safe normal recovery rule, then use
 the returned exact IDs, hashes, conflicts, or staleness facts from `details`
 before acting; never retry a mutation blindly.
-Successful tool results also include `data.transport.queue_ms`, `worker_ms`, and
-`automatic_concurrency_retries`. `queue_ms` includes both this server's local
-call queue and any cross-process repository-mutation queue; `worker_ms` excludes
-that wait. Automatic retries count repository CAS/writer retries, not queue
-polls. These are observational facts for diagnosing interactive latency and
-writer contention; they do not change operation semantics. Failed tool calls
-put the same transport object under `error.details.transport`.
+Successful tool results also include `data.transport.queue_ms`, `worker_ms`,
+`writer_wait_ms`, and `automatic_concurrency_retries`. `queue_ms` includes both
+this server's local call queue and any cross-process repository-mutation queue;
+`writer_wait_ms` isolates time spent waiting for canonical repository state.
+Automatic retries count repository CAS retries. These are observational facts
+for diagnosing interactive latency and writer contention; they do not change
+operation semantics. Failed tool calls put the same transport object under
+`error.details.transport`.
 
 Source inclusion follows the [repository README](../README.md) and the portable
 skill's [workflow reference](../integrations/agent-skills/sunlight/references/workflow.md).
@@ -180,6 +185,11 @@ export repositories, or a generic CLI argv. Patch and whole-file content arrive
 as JSON strings and are written with create-new semantics to a process-exclusive
 directory below `.sunlight/local/mcp`; each file is removed after its call and
 the directory is removed at shutdown.
+
+Initialization and every tool result include the canonical repository root, a
+stable binding digest, and the repository-specific server name. Clients and
+agents can therefore identify a stale or incorrectly reused server connection
+before trusting its repository data.
 
 `execution_run` accepts a bare, non-shell program plus a JSON string array of
 arguments and an optional repository-relative cwd. It rejects shell programs,

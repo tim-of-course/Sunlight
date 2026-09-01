@@ -155,6 +155,23 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
         initialized["result"]["capabilities"]["tools"]["listChanged"],
         false
     );
+    let binding = &initialized["result"]["repositoryBinding"];
+    assert_eq!(
+        initialized["result"]["serverInfo"]["name"],
+        binding["server_name"]
+    );
+    assert_eq!(
+        binding["canonical_root"],
+        fs::canonicalize(&repo).unwrap().display().to_string()
+    );
+    assert!(binding["binding_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert!(binding["server_name"]
+        .as_str()
+        .unwrap()
+        .starts_with("sunlight_"));
     let instructions = initialized["result"]["instructions"].as_str().unwrap();
     assert!(instructions.contains("read completion_guard"));
     assert!(instructions.contains("Copy handoff.copy_report verbatim"));
@@ -162,6 +179,22 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
         "Unrelated topic, checkpoint, and execution advancement never requires session_refresh or a replacement topic"
     ));
     mcp.notify("notifications/initialized", json!({}));
+
+    let invalid_arguments = mcp.call_error(9_000, "repository_status", json!([]));
+    assert_eq!(invalid_arguments["error"]["code"], "invalid_request");
+    assert_eq!(
+        invalid_arguments["error"]["details"]["transport"],
+        json!({
+            "queue_ms": 0,
+            "worker_ms": 0,
+            "automatic_concurrency_retries": 0,
+            "writer_wait_ms": 0
+        })
+    );
+    assert_eq!(
+        invalid_arguments["error"]["details"]["repository_binding"],
+        *binding
+    );
 
     let listed = mcp.request(2, "tools/list", json!({}));
     let tools = listed["result"]["tools"].as_array().unwrap();
@@ -194,8 +227,21 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
     let reinit = mcp.call(3, "repository_init", json!({}));
     assert_eq!(reinit["ok"], true);
     assert_eq!(reinit["data"]["command"], "repository.init");
+    assert_eq!(reinit["data"]["repository_binding"], *binding);
     let status = mcp.call(4, "repository_status", json!({}));
     assert_eq!(status["data"]["command"], "status.repository");
+    assert_eq!(status["data"]["repository_binding"], *binding);
+    assert!(status["data"]["transport"]["writer_wait_ms"].is_number());
+    let invalid = mcp.request(
+        400,
+        "tools/call",
+        json!({"name":"repository_status","arguments":[]}),
+    );
+    assert_eq!(invalid["result"]["isError"], true);
+    assert_eq!(
+        invalid["result"]["structuredContent"]["error"]["details"]["repository_binding"],
+        *binding
+    );
     let repository = mcp.call(5, "inspect", json!({"selector":"repository"}));
     assert_eq!(repository["data"]["command"], "inspect.repository");
 
@@ -2419,6 +2465,7 @@ fn normalize_repository_identity(mut value: Value) -> Value {
         match value {
             Value::Object(object) => {
                 object.remove("transport");
+                object.remove("repository_binding");
                 for (key, value) in object {
                     if key == "repository_id" {
                         *value = Value::String("<repository>".to_string());

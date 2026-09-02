@@ -884,7 +884,7 @@ fn checkpoint_recommendation_seeds_exact_follow_up_resolution_and_handoff() {
     let recommended = &status["data"]["repository"]["recommended_start"];
     assert_eq!(recommended["checkpoint_id"], checkpoint_id);
     assert_eq!(recommended["resolved_view_id"], foundation_view);
-    assert_eq!(recommended["source"], "latest_complete_checkpoint");
+    assert_eq!(recommended["source"], "canonical_checkpoint");
     assert_eq!(
         recommended["topic_frontier"]["topic_checkpoint_foundation"],
         foundation_revision
@@ -976,7 +976,95 @@ fn checkpoint_recommendation_seeds_exact_follow_up_resolution_and_handoff() {
 }
 
 #[test]
-fn checkpoint_requires_complete_frontier_or_records_explicit_partial_acknowledgement() {
+fn canonical_checkpoint_accepts_a_descendant_revision_from_the_same_topic() {
+    let temp = TempDir::new("sun-mcp-checkpoint-descendant");
+    let repo = temp.path().join("repository");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    git(&repo, &["config", "user.name", "Sun MCP Test"]);
+    git(&repo, &["config", "user.email", "sun-mcp@example.invalid"]);
+    fs::write(repo.join("README.md"), "# checkpoint descendant\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+
+    let mut mcp = initialized_mcp(&repo);
+    mcp.call(2, "repository_init", json!({}));
+    mcp.call(
+        3,
+        "topic_create",
+        json!({"slug":"canonical-descendant","display_name":"Canonical descendant"}),
+    );
+    let session = mcp.call(
+        4,
+        "session_start",
+        json!({"topic":"canonical-descendant","view":"view_base_0001","actor":"descendant-agent"}),
+    )["data"]["ids"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first = mcp.call(
+        5,
+        "artifact_write",
+        json!({
+            "path":"lineage.txt",
+            "session":session,
+            "expect_hash":"new",
+            "content":"revision one\n",
+            "classification":"source"
+        }),
+    );
+    let first_revision = first["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_checkpoint = mcp.call(
+        6,
+        "checkpoint_create",
+        json!({
+            "view":first["data"]["view"]["resolved_view_id"],
+            "expected_canonical_checkpoint":"checkpoint_base_0001"
+        }),
+    )["data"]["checkpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let second = mcp.call(
+        7,
+        "artifact_write",
+        json!({
+            "path":"lineage-follow-up.txt",
+            "session":session,
+            "expect_hash":"new",
+            "content":"revision two\n",
+            "classification":"source"
+        }),
+    );
+    let second_revision = second["data"]["ids"]["topic_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(second_revision, first_revision);
+    let second_checkpoint = mcp.call(
+        8,
+        "checkpoint_create",
+        json!({
+            "view":second["data"]["view"]["resolved_view_id"],
+            "expected_canonical_checkpoint":first_checkpoint
+        }),
+    );
+    assert_eq!(second_checkpoint["data"]["canonical"]["advanced"], true);
+    let status = mcp.call(9, "repository_status", json!({}));
+    assert_eq!(
+        status["data"]["repository"]["recommended_start"]["topic_frontier"]
+            ["topic_canonical_descendant"],
+        second_revision
+    );
+    mcp.shutdown();
+}
+
+#[test]
+fn canonical_checkpoint_never_regresses_when_a_side_checkpoint_is_created() {
     let temp = TempDir::new("sun-mcp-checkpoint-frontier");
     let repo = temp.path().join("repository");
     fs::create_dir_all(&repo).unwrap();
@@ -1061,6 +1149,10 @@ fn checkpoint_requires_complete_frontier_or_records_explicit_partial_acknowledge
         .as_str()
         .unwrap()
         .to_string();
+    let view_b = write_b["data"]["view"]["resolved_view_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     mcp.call(
         10,
         "topic_complete",
@@ -1072,75 +1164,97 @@ fn checkpoint_requires_complete_frontier_or_records_explicit_partial_acknowledge
         }),
     );
 
-    let rejected = mcp.call_error(11, "checkpoint_create", json!({"view":view_a}));
-    assert_eq!(
-        rejected["error"]["code"],
-        "checkpoint_omits_completed_topic_heads"
-    );
-    assert_eq!(
-        rejected["error"]["details"]["omitted_completed_topic_heads"]["topic_frontier_b"],
-        revision_b
-    );
-
-    let partial = mcp.call(
-        12,
+    let canonical_a = mcp.call(
+        11,
         "checkpoint_create",
-        json!({"view":view_a,"acknowledge_omitted_completed_heads":true}),
+        json!({"view":view_a,"expected_canonical_checkpoint":"checkpoint_base_0001"}),
     );
-    assert_eq!(
-        partial["data"]["completed_frontier_coverage"]["complete"],
-        false
-    );
-    assert_eq!(
-        partial["data"]["completed_frontier_coverage"]["acknowledged"],
-        true
-    );
-    assert_eq!(
-        partial["data"]["completed_frontier_coverage"]["omitted_completed_topic_heads"]
-            ["topic_frontier_b"],
-        revision_b
-    );
-    let partial_id = partial["data"]["checkpoint_id"]
+    let canonical_a_id = canonical_a["data"]["checkpoint_id"]
         .as_str()
         .unwrap()
         .to_string();
-    assert!(partial_id.contains("_partial_"));
-    let partial_status = mcp.call(13, "repository_status", json!({}));
+    assert_eq!(canonical_a["data"]["canonical"]["advanced"], true);
     assert_eq!(
-        partial_status["data"]["repository"]["recommended_start"]["source"],
-        "latest_partial_checkpoint"
+        canonical_a["data"]["completed_frontier_coverage"]["omitted_completed_topic_heads"]
+            ["topic_frontier_b"],
+        revision_b
+    );
+
+    let stale_canonical = mcp.call_error(
+        12,
+        "checkpoint_create",
+        json!({"view":view_a,"expected_canonical_checkpoint":"checkpoint_base_0001"}),
     );
     assert_eq!(
-        partial_status["data"]["repository"]["recommended_start"]["completed_frontier_coverage"]
-            ["acknowledged"],
-        true
+        stale_canonical["error"]["code"],
+        "canonical_checkpoint_advanced"
+    );
+    assert_eq!(
+        stale_canonical["error"]["details"]["canonical_checkpoint_id"],
+        canonical_a_id
+    );
+
+    let rejected = mcp.call_error(
+        13,
+        "checkpoint_create",
+        json!({"view":view_b,"expected_canonical_checkpoint":canonical_a_id}),
+    );
+    assert_eq!(
+        rejected["error"]["code"],
+        "checkpoint_does_not_extend_canonical"
+    );
+    assert_eq!(
+        rejected["error"]["details"]["regressed_topic_revisions"]["topic_frontier_a"],
+        revision_a
+    );
+
+    let side = mcp.call(
+        14,
+        "checkpoint_create",
+        json!({"view":view_b,"side_checkpoint":true}),
+    );
+    assert_eq!(side["data"]["canonical"]["side_checkpoint"], true);
+    assert_eq!(side["data"]["canonical"]["advanced"], false);
+    assert_eq!(
+        side["data"]["completed_frontier_coverage"]["omitted_completed_topic_heads"]
+            ["topic_frontier_a"],
+        revision_a
+    );
+    let side_status = mcp.call(15, "repository_status", json!({}));
+    assert_eq!(
+        side_status["data"]["repository"]["recommended_start"]["checkpoint_id"],
+        canonical_a_id
+    );
+    assert_eq!(
+        side_status["data"]["repository"]["recommended_start"]["source"],
+        "canonical_checkpoint"
     );
 
     let combined = mcp.call(
-        14,
+        16,
         "view_resolve",
         json!({
-            "base":"checkpoint_base_0001",
-            "include":[
-                {"topic":"topic_frontier_a","revision":revision_a},
-                {"topic":"topic_frontier_b","revision":revision_b}
-            ]
+            "base":canonical_a_id,
+            "include":[{"topic":"topic_frontier_b","revision":revision_b}]
         }),
     );
     let combined_view = combined["data"]["resolved_view_id"]
         .as_str()
         .unwrap()
         .to_string();
-    let complete = mcp.call(15, "checkpoint_create", json!({"view":combined_view}));
+    let complete = mcp.call(
+        17,
+        "checkpoint_create",
+        json!({"view":combined_view,"expected_canonical_checkpoint":canonical_a_id}),
+    );
     assert_eq!(
         complete["data"]["completed_frontier_coverage"]["complete"],
         true
     );
-    assert_ne!(complete["data"]["checkpoint_id"], partial_id);
-    let final_status = mcp.call(16, "repository_status", json!({}));
+    let final_status = mcp.call(18, "repository_status", json!({}));
     assert_eq!(
         final_status["data"]["repository"]["recommended_start"]["source"],
-        "latest_complete_checkpoint"
+        "canonical_checkpoint"
     );
     assert_eq!(
         final_status["data"]["repository"]["recommended_start"]["completed_frontier_coverage"]

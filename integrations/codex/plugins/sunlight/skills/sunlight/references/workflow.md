@@ -12,6 +12,9 @@ mix native operations with direct tracked-source edits.
 - An **operation** records an atomic artifact mutation and its preconditions.
 - A **checkpoint** freezes a conflict-free exact view with optional passing
   execution evidence.
+- The **canonical checkpoint** is the non-regressing default integration line
+  returned as `repository.recommended_start`. Other checkpoints are isolated
+  or alternative snapshots.
 - A **projection** is a managed filesystem adapter. It is never source truth.
 - A `source` artifact checkpoints and exports normally. A `generated` artifact
   checkpoints normally and exports only when its exact bytes have reachable
@@ -91,11 +94,12 @@ bypass a failed CAS by writing outside Sunlight.
 1. When the task has an explicit dependency, wait for its topic with
    `topic_wait`; do not infer dependencies from topic visibility or poll status
    in a loop. Consume the returned structured handoff.
-2. Call `view_resolve` with the intended starting checkpoint and the exact new
-   or replacement revisions being integrated. Sunlight carries that
-   checkpoint's frontier forward automatically. Omitting `include` on a later
-   checkpoint reproduces it exactly. Omitting `include` on the repository base
-   resolves moving current heads and is discovery-only.
+2. Call `repository_status` immediately before integration. Use its canonical
+   `repository.recommended_start.checkpoint_id` as the `view_resolve` base and
+   select the task's exact revision plus any explicit dependencies. Sunlight
+   carries the canonical frontier forward automatically. Omitting `include` on
+   a later checkpoint reproduces it exactly. Omitting `include` on the
+   repository base resolves moving current heads and is discovery-only.
 3. Stop on conflicts or staleness and report the structured records. Adapt
    through new topic-owned operations rather than editing a projection.
 4. Inspect combined artifacts through view-scoped reads.
@@ -113,12 +117,15 @@ bypass a failed CAS by writing outside Sunlight.
    promotion. Resolve its returned revision into a new exact view and rerun the
    matching validation.
 7. Create a checkpoint using passing evidence that matches the exact view and
-   tree. Prefer one combined checkpoint that includes every completed topic
-   head. Creating an intentional partial or alternative checkpoint requires
-   `acknowledge_omitted_completed_heads`; report the recorded omitted heads and
-   do not present that checkpoint as complete frontier coverage. Preserve the
-   returned `handoff.exact_ids` as the integration result. Materialize an
-   inspection projection only when a filesystem consumer needs one.
+   tree. Pass the checkpoint ID from step 2 as
+   `expected_canonical_checkpoint`. A successful canonical advance preserves
+   all previously integrated topic revisions; other completed topics remain
+   pending until deliberately integrated. If another agent advances first,
+   repeat steps 2 through 7 on the new recommendation. Use `side_checkpoint`
+   only when the user requests an isolated or alternative checkpoint; it never
+   changes `repository.recommended_start`. Preserve the returned
+   `handoff.exact_ids` as the integration result. Materialize an inspection
+   projection only when a filesystem consumer needs one.
 8. For a requested Git handoff, call `policy_check_export` with the exact
    checkpoint and target Git ref, then call `git_export`. `policy_check_commit`
    checks only `.sunlight/**` metadata candidates (or the managed `.gitignore`
@@ -149,6 +156,10 @@ bypass a failed CAS by writing outside Sunlight.
   If one is returned, retry the same safe call once in the existing pinned
   session. Report recurrence instead of replacing the topic or repairing native
   state manually.
+- `canonical_checkpoint_advanced` or `checkpoint_does_not_extend_canonical`:
+  read `repository.recommended_start`, resolve the task revision onto it,
+  validate the new exact view, and retry with that checkpoint as the expected
+  canonical value.
 - conflicted or stale view: inspect the referenced records and create an
   explicit adaptation. Continue unrelated work from
   `repository.recommended_start` instead of selecting the conflicted moving

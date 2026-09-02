@@ -83,6 +83,7 @@ pub struct RealRepoState {
     pub publication_sequence: u64,
     pub repository_id: String,
     pub base_checkpoint_id: String,
+    pub canonical_checkpoint_id: String,
     pub base_resolved_view_id: String,
     pub resolved_view_id: String,
     pub tree_hash: String,
@@ -240,6 +241,7 @@ pub struct RealOperationRecord {
     pub operation_transaction_id: String,
     pub topic_id: String,
     pub topic_revision_id: String,
+    pub parent_topic_revision_id: Option<String>,
     pub session_id: String,
     pub artifact_id: String,
     pub path: String,
@@ -409,6 +411,9 @@ pub struct RealExecutionSnapshot {
     pub network_policy: String,
     pub filesystem_write_policy_requested: String,
     pub filesystem_write_policy: String,
+    pub runtime_layers: Vec<RealExecutionRuntimeLayer>,
+    // Legacy runtime dependency provenance remains readable. New execution records leave these
+    // fields empty and persist only `runtime_layers`.
     pub runtime_dependency_paths: Vec<String>,
     pub preexisting_runtime_dependency_paths: Vec<String>,
     pub runtime_dependency_bindings: Vec<RealExecutionRuntimeDependencyBinding>,
@@ -417,6 +422,47 @@ pub struct RealExecutionSnapshot {
     pub started_at: String,
     pub finished_at: String,
     pub privacy_class: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealExecutionRuntimeLayer {
+    pub layer_set_id: String,
+    pub provider_id: String,
+    pub provider_semantics_digest: String,
+    pub lookup_key: String,
+    pub lookup_inputs: Vec<RealExecutionRuntimeLayerInput>,
+    pub content_id: String,
+    pub acquisition: String,
+    pub construction: RealExecutionRuntimeLayerConstruction,
+    pub targets: Vec<RealExecutionRuntimeLayerTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealExecutionRuntimeLayerInput {
+    pub path: String,
+    pub artifact_id: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealExecutionRuntimeLayerConstruction {
+    pub origin: String,
+    pub command_argv: Vec<String>,
+    pub working_directory: String,
+    pub tool_name: String,
+    pub tool_executable_digest: String,
+    pub tool_reported_version: String,
+    pub environment: BTreeMap<String, String>,
+    pub environment_digest: String,
+    pub network_policy_requested: String,
+    pub network_policy_effective: String,
+    pub filesystem_write_policy_effective: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealExecutionRuntimeLayerTarget {
+    pub path: String,
+    pub materialization_strategy: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -696,6 +742,7 @@ impl RealRepoState {
         let state = Self {
             publication_sequence: 0,
             repository_id: repository_id.to_string(),
+            canonical_checkpoint_id: base_checkpoint_id.clone(),
             base_checkpoint_id,
             base_resolved_view_id: base_resolved_view_id.clone(),
             resolved_view_id: base_resolved_view_id,
@@ -934,6 +981,8 @@ impl RealRepoState {
                 }
             }
         };
+        let persisted_canonical_checkpoint_id =
+            optional_string(&object, "canonical_checkpoint_id", &path)?;
 
         if topics.is_empty() {
             if let Some(legacy_topic_id) = topic_id.clone() {
@@ -1032,11 +1081,15 @@ impl RealRepoState {
             }
         }
 
+        let base_checkpoint_id = required_string(&object, "base_checkpoint_id", &path)?;
         let mut state = Self {
             publication_sequence: optional_u64(&object, "publication_sequence", &path)?
                 .unwrap_or(0),
             repository_id: required_string(&object, "repository_id", &path)?,
-            base_checkpoint_id: required_string(&object, "base_checkpoint_id", &path)?,
+            base_checkpoint_id: base_checkpoint_id.clone(),
+            canonical_checkpoint_id: persisted_canonical_checkpoint_id
+                .clone()
+                .unwrap_or(base_checkpoint_id),
             base_resolved_view_id: required_string(&object, "base_resolved_view_id", &path)?,
             resolved_view_id: required_string(&object, "resolved_view_id", &path)?,
             tree_hash: required_string(&object, "tree_hash", &path)?,
@@ -1063,6 +1116,22 @@ impl RealRepoState {
             entries,
             quarantine,
         };
+        if persisted_canonical_checkpoint_id.is_none() {
+            state.canonical_checkpoint_id = infer_legacy_canonical_checkpoint_id(&state);
+        } else if state.canonical_checkpoint_id != state.base_checkpoint_id
+            && !state
+                .checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.checkpoint_id == state.canonical_checkpoint_id)
+        {
+            return Err(invalid_state(
+                &path,
+                format!(
+                    "canonical_checkpoint_id `{}` does not identify a persisted checkpoint",
+                    state.canonical_checkpoint_id
+                ),
+            ));
+        }
         state.sync_compat_fields();
         state.validate_embedded_checkpoint_entries(&path)?;
         if !compact_entries
@@ -1471,6 +1540,10 @@ impl RealRepoState {
             JsonValue::String(self.base_checkpoint_id.clone()),
         );
         object.insert(
+            "canonical_checkpoint_id".to_string(),
+            JsonValue::String(self.canonical_checkpoint_id.clone()),
+        );
+        object.insert(
             "base_resolved_view_id".to_string(),
             JsonValue::String(self.base_resolved_view_id.clone()),
         );
@@ -1785,6 +1858,69 @@ impl RealRepoState {
         };
         Ok(())
     }
+}
+
+fn infer_legacy_canonical_checkpoint_id(state: &RealRepoState) -> String {
+    let mut canonical_id = state.base_checkpoint_id.clone();
+    let mut canonical_frontier = BTreeMap::<String, String>::new();
+
+    for checkpoint in &state.checkpoints {
+        if checkpoint.completed_frontier_acknowledged {
+            continue;
+        }
+        let candidate_frontier = checkpoint
+            .topic_frontier
+            .iter()
+            .cloned()
+            .collect::<BTreeMap<_, _>>();
+        let extends_canonical = canonical_frontier.iter().all(|(topic_id, revision_id)| {
+            candidate_frontier.get(topic_id).is_some_and(|candidate| {
+                real_topic_revision_is_same_or_descendant(state, topic_id, candidate, revision_id)
+            })
+        });
+        if extends_canonical {
+            canonical_id = checkpoint.checkpoint_id.clone();
+            canonical_frontier = candidate_frontier;
+        }
+    }
+
+    canonical_id
+}
+
+pub fn real_topic_revision_is_same_or_descendant(
+    state: &RealRepoState,
+    topic_id: &str,
+    candidate_revision_id: &str,
+    ancestor_revision_id: &str,
+) -> bool {
+    let mut pending = vec![candidate_revision_id.to_string()];
+    let mut visited = BTreeSet::new();
+    while let Some(revision_id) = pending.pop() {
+        if revision_id == ancestor_revision_id {
+            return true;
+        }
+        if !visited.insert(revision_id.clone()) {
+            continue;
+        }
+        let Some((index, operation)) =
+            state.operations.iter().enumerate().find(|(_, operation)| {
+                operation.topic_id == topic_id && operation.topic_revision_id == revision_id
+            })
+        else {
+            continue;
+        };
+        if let Some(parent) = &operation.parent_topic_revision_id {
+            pending.push(parent.clone());
+            continue;
+        }
+        if let Some(parent) = state.operations[..index].iter().rev().find(|candidate| {
+            candidate.topic_id == topic_id
+                && candidate.topic_revision_id != operation.topic_revision_id
+        }) {
+            pending.push(parent.topic_revision_id.clone());
+        }
+    }
+    false
 }
 
 pub fn resolve_real_repo_view(
@@ -2989,6 +3125,13 @@ pub fn path_is_gitignored(repo_root: &Path, relative: &str) -> Result<bool, Repo
 
 pub fn directory_is_gitignored(repo_root: &Path, relative: &str) -> Result<bool, RepoStateError> {
     path_is_gitignored_with_kind(repo_root, relative, true)
+}
+
+pub fn directory_is_gitignored_by_repository_file(
+    repository_files_root: &Path,
+    relative: &str,
+) -> Result<bool, RepoStateError> {
+    path_is_ignored_by_file(repository_files_root, relative, true, ".gitignore")
 }
 
 fn path_is_gitignored_with_kind(
@@ -6536,6 +6679,7 @@ fn parse_operation(
         operation_transaction_id: required_string(object, "operation_transaction_id", state_path)?,
         topic_id: required_string(object, "topic_id", state_path)?,
         topic_revision_id: required_string(object, "topic_revision_id", state_path)?,
+        parent_topic_revision_id: optional_string(object, "parent_topic_revision_id", state_path)?,
         session_id: required_string(object, "session_id", state_path)?,
         artifact_id: required_string(object, "artifact_id", state_path)?,
         path: required_string(object, "path", state_path)?,
@@ -6957,6 +7101,10 @@ fn parse_execution_snapshot(
         .unwrap_or_else(|| "legacy_unrecorded".to_string()),
         filesystem_write_policy: optional_string(object, "filesystem_write_policy", state_path)?
             .unwrap_or_else(|| "legacy_unrecorded".to_string()),
+        runtime_layers: optional_array(object, "runtime_layers", state_path)?
+            .iter()
+            .map(|value| parse_execution_runtime_layer(value, state_path))
+            .collect::<Result<Vec<_>, _>>()?,
         runtime_dependency_paths: optional_array(object, "runtime_dependency_paths", state_path)?
             .iter()
             .map(|value| match value {
@@ -6989,16 +7137,150 @@ fn parse_execution_snapshot(
         .iter()
         .map(|value| parse_execution_runtime_dependency_binding(value, state_path))
         .collect::<Result<Vec<_>, _>>()?,
-        runtime_dependency_strategy: optional_string(
-            object,
-            "runtime_dependency_strategy",
-            state_path,
-        )?
-        .unwrap_or_else(|| "legacy_unrecorded".to_string()),
+        runtime_dependency_strategy: if object.contains_key("runtime_layers")
+            && !object.contains_key("runtime_dependency_strategy")
+        {
+            "runtime_layers_v1".to_string()
+        } else {
+            optional_string(object, "runtime_dependency_strategy", state_path)?
+                .unwrap_or_else(|| "legacy_unrecorded".to_string())
+        },
         outputs,
         started_at: required_string(object, "started_at", state_path)?,
         finished_at: required_string(object, "finished_at", state_path)?,
         privacy_class: required_string(object, "privacy_class", state_path)?,
+    })
+}
+
+fn parse_execution_runtime_layer(
+    value: &JsonValue,
+    state_path: &Path,
+) -> Result<RealExecutionRuntimeLayer, RepoStateError> {
+    let JsonValue::Object(object) = value else {
+        return Err(invalid_state(
+            state_path,
+            "execution runtime layer must be a JSON object",
+        ));
+    };
+    let lookup_inputs = required_array(object, "lookup_inputs", state_path)?
+        .iter()
+        .map(|value| {
+            let JsonValue::Object(input) = value else {
+                return Err(invalid_state(
+                    state_path,
+                    "execution runtime layer input must be a JSON object",
+                ));
+            };
+            Ok(RealExecutionRuntimeLayerInput {
+                path: required_string(input, "path", state_path)?,
+                artifact_id: required_string(input, "artifact_id", state_path)?,
+                content_hash: required_string(input, "content_hash", state_path)?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let targets = required_array(object, "targets", state_path)?
+        .iter()
+        .map(|value| {
+            let JsonValue::Object(target) = value else {
+                return Err(invalid_state(
+                    state_path,
+                    "execution runtime layer target must be a JSON object",
+                ));
+            };
+            Ok(RealExecutionRuntimeLayerTarget {
+                path: required_string(target, "path", state_path)?,
+                materialization_strategy: required_string(
+                    target,
+                    "materialization_strategy",
+                    state_path,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let construction = match object.get("construction") {
+        Some(JsonValue::Object(value)) => value,
+        _ => {
+            return Err(invalid_state(
+                state_path,
+                "execution runtime layer construction must be a JSON object",
+            ))
+        }
+    };
+    let tool = match construction.get("tool") {
+        Some(JsonValue::Object(value)) => value,
+        _ => {
+            return Err(invalid_state(
+                state_path,
+                "execution runtime layer construction tool must be a JSON object",
+            ))
+        }
+    };
+    let environment = match construction.get("environment") {
+        Some(JsonValue::Object(values)) => values
+            .iter()
+            .map(|(name, value)| match value {
+                JsonValue::String(value) => Ok((name.clone(), value.clone())),
+                _ => Err(invalid_state(
+                    state_path,
+                    "execution runtime layer construction environment values must be strings",
+                )),
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?,
+        _ => {
+            return Err(invalid_state(
+                state_path,
+                "execution runtime layer construction environment must be a JSON object",
+            ))
+        }
+    };
+    let command_argv = required_array(construction, "command_argv", state_path)?
+        .iter()
+        .map(|value| match value {
+            JsonValue::String(value) => Ok(value.clone()),
+            _ => Err(invalid_state(
+                state_path,
+                "execution runtime layer construction command_argv must contain strings",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RealExecutionRuntimeLayer {
+        layer_set_id: required_string(object, "layer_set_id", state_path)?,
+        provider_id: required_string(object, "provider_id", state_path)?,
+        provider_semantics_digest: required_string(
+            object,
+            "provider_semantics_digest",
+            state_path,
+        )?,
+        lookup_key: required_string(object, "lookup_key", state_path)?,
+        lookup_inputs,
+        content_id: required_string(object, "content_id", state_path)?,
+        acquisition: required_string(object, "acquisition", state_path)?,
+        construction: RealExecutionRuntimeLayerConstruction {
+            origin: required_string(construction, "origin", state_path)?,
+            command_argv,
+            working_directory: required_string(construction, "working_directory", state_path)?,
+            tool_name: required_string(tool, "name", state_path)?,
+            tool_executable_digest: required_string(tool, "executable_digest", state_path)?,
+            tool_reported_version: required_string(tool, "reported_version", state_path)?,
+            environment,
+            environment_digest: required_string(construction, "environment_digest", state_path)?,
+            network_policy_requested: required_string(
+                construction,
+                "network_policy_requested",
+                state_path,
+            )?,
+            network_policy_effective: required_string(
+                construction,
+                "network_policy_effective",
+                state_path,
+            )?,
+            filesystem_write_policy_effective: required_string(
+                construction,
+                "filesystem_write_policy_effective",
+                state_path,
+            )?,
+        },
+        targets,
     })
 }
 
@@ -7653,60 +7935,73 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
         "filesystem_write_policy".to_string(),
         JsonValue::String(execution.filesystem_write_policy.clone()),
     );
-    object.insert(
-        "runtime_dependency_paths".to_string(),
-        JsonValue::Array(
-            execution
-                .runtime_dependency_paths
-                .iter()
-                .map(|path| JsonValue::String(path.clone()))
-                .collect(),
-        ),
-    );
-    object.insert(
-        "preexisting_runtime_dependency_paths".to_string(),
-        JsonValue::Array(
-            execution
-                .preexisting_runtime_dependency_paths
-                .iter()
-                .map(|path| JsonValue::String(path.clone()))
-                .collect(),
-        ),
-    );
-    object.insert(
-        "runtime_dependency_bindings".to_string(),
-        JsonValue::Array(
-            execution
-                .runtime_dependency_bindings
-                .iter()
-                .map(|binding| {
-                    JsonValue::Object(BTreeMap::from([
-                        ("path".to_string(), JsonValue::String(binding.path.clone())),
-                        (
-                            "origin".to_string(),
-                            JsonValue::String(binding.origin.clone()),
-                        ),
-                        (
-                            "binding_fingerprint".to_string(),
-                            JsonValue::String(binding.binding_fingerprint.clone()),
-                        ),
-                        (
-                            "source_snapshot_fingerprint".to_string(),
-                            optional_json(&binding.source_snapshot_fingerprint),
-                        ),
-                        (
-                            "binding_reuse".to_string(),
-                            JsonValue::String(binding.binding_reuse.clone()),
-                        ),
-                    ]))
-                })
-                .collect(),
-        ),
-    );
-    object.insert(
-        "runtime_dependency_strategy".to_string(),
-        JsonValue::String(execution.runtime_dependency_strategy.clone()),
-    );
+    if execution.runtime_dependency_strategy == "runtime_layers_v1" {
+        object.insert(
+            "runtime_layers".to_string(),
+            JsonValue::Array(
+                execution
+                    .runtime_layers
+                    .iter()
+                    .map(execution_runtime_layer_json)
+                    .collect(),
+            ),
+        );
+    } else {
+        object.insert(
+            "runtime_dependency_paths".to_string(),
+            JsonValue::Array(
+                execution
+                    .runtime_dependency_paths
+                    .iter()
+                    .map(|path| JsonValue::String(path.clone()))
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "preexisting_runtime_dependency_paths".to_string(),
+            JsonValue::Array(
+                execution
+                    .preexisting_runtime_dependency_paths
+                    .iter()
+                    .map(|path| JsonValue::String(path.clone()))
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "runtime_dependency_bindings".to_string(),
+            JsonValue::Array(
+                execution
+                    .runtime_dependency_bindings
+                    .iter()
+                    .map(|binding| {
+                        JsonValue::Object(BTreeMap::from([
+                            ("path".to_string(), JsonValue::String(binding.path.clone())),
+                            (
+                                "origin".to_string(),
+                                JsonValue::String(binding.origin.clone()),
+                            ),
+                            (
+                                "binding_fingerprint".to_string(),
+                                JsonValue::String(binding.binding_fingerprint.clone()),
+                            ),
+                            (
+                                "source_snapshot_fingerprint".to_string(),
+                                optional_json(&binding.source_snapshot_fingerprint),
+                            ),
+                            (
+                                "binding_reuse".to_string(),
+                                JsonValue::String(binding.binding_reuse.clone()),
+                            ),
+                        ]))
+                    })
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "runtime_dependency_strategy".to_string(),
+            JsonValue::String(execution.runtime_dependency_strategy.clone()),
+        );
+    }
     object.insert(
         "outputs".to_string(),
         JsonValue::Array(
@@ -7730,6 +8025,142 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
         JsonValue::String(execution.privacy_class.clone()),
     );
     JsonValue::Object(object)
+}
+
+fn execution_runtime_layer_json(layer: &RealExecutionRuntimeLayer) -> JsonValue {
+    let construction = &layer.construction;
+    JsonValue::Object(BTreeMap::from([
+        (
+            "layer_set_id".to_string(),
+            JsonValue::String(layer.layer_set_id.clone()),
+        ),
+        (
+            "provider_id".to_string(),
+            JsonValue::String(layer.provider_id.clone()),
+        ),
+        (
+            "provider_semantics_digest".to_string(),
+            JsonValue::String(layer.provider_semantics_digest.clone()),
+        ),
+        (
+            "lookup_key".to_string(),
+            JsonValue::String(layer.lookup_key.clone()),
+        ),
+        (
+            "lookup_inputs".to_string(),
+            JsonValue::Array(
+                layer
+                    .lookup_inputs
+                    .iter()
+                    .map(|input| {
+                        JsonValue::Object(BTreeMap::from([
+                            ("path".to_string(), JsonValue::String(input.path.clone())),
+                            (
+                                "artifact_id".to_string(),
+                                JsonValue::String(input.artifact_id.clone()),
+                            ),
+                            (
+                                "content_hash".to_string(),
+                                JsonValue::String(input.content_hash.clone()),
+                            ),
+                        ]))
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "content_id".to_string(),
+            JsonValue::String(layer.content_id.clone()),
+        ),
+        (
+            "acquisition".to_string(),
+            JsonValue::String(layer.acquisition.clone()),
+        ),
+        (
+            "construction".to_string(),
+            JsonValue::Object(BTreeMap::from([
+                (
+                    "origin".to_string(),
+                    JsonValue::String(construction.origin.clone()),
+                ),
+                (
+                    "command_argv".to_string(),
+                    JsonValue::Array(
+                        construction
+                            .command_argv
+                            .iter()
+                            .map(|value| JsonValue::String(value.clone()))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "working_directory".to_string(),
+                    JsonValue::String(construction.working_directory.clone()),
+                ),
+                (
+                    "tool".to_string(),
+                    JsonValue::Object(BTreeMap::from([
+                        (
+                            "name".to_string(),
+                            JsonValue::String(construction.tool_name.clone()),
+                        ),
+                        (
+                            "executable_digest".to_string(),
+                            JsonValue::String(construction.tool_executable_digest.clone()),
+                        ),
+                        (
+                            "reported_version".to_string(),
+                            JsonValue::String(construction.tool_reported_version.clone()),
+                        ),
+                    ])),
+                ),
+                (
+                    "environment".to_string(),
+                    JsonValue::Object(
+                        construction
+                            .environment
+                            .iter()
+                            .map(|(name, value)| (name.clone(), JsonValue::String(value.clone())))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "environment_digest".to_string(),
+                    JsonValue::String(construction.environment_digest.clone()),
+                ),
+                (
+                    "network_policy_requested".to_string(),
+                    JsonValue::String(construction.network_policy_requested.clone()),
+                ),
+                (
+                    "network_policy_effective".to_string(),
+                    JsonValue::String(construction.network_policy_effective.clone()),
+                ),
+                (
+                    "filesystem_write_policy_effective".to_string(),
+                    JsonValue::String(construction.filesystem_write_policy_effective.clone()),
+                ),
+            ])),
+        ),
+        (
+            "targets".to_string(),
+            JsonValue::Array(
+                layer
+                    .targets
+                    .iter()
+                    .map(|target| {
+                        JsonValue::Object(BTreeMap::from([
+                            ("path".to_string(), JsonValue::String(target.path.clone())),
+                            (
+                                "materialization_strategy".to_string(),
+                                JsonValue::String(target.materialization_strategy.clone()),
+                            ),
+                        ]))
+                    })
+                    .collect(),
+            ),
+        ),
+    ]))
 }
 
 fn execution_output_snapshot_json(output: &RealExecutionOutputSnapshot) -> JsonValue {
@@ -7962,6 +8393,10 @@ fn operation_json(operation: &RealOperationRecord) -> JsonValue {
     object.insert(
         "topic_revision_id".to_string(),
         JsonValue::String(operation.topic_revision_id.clone()),
+    );
+    object.insert(
+        "parent_topic_revision_id".to_string(),
+        optional_json(&operation.parent_topic_revision_id),
     );
     object.insert(
         "session_id".to_string(),
@@ -8689,6 +9124,115 @@ mod tests {
         assert_eq!(loaded.entries.len(), 2);
         assert!(real_state_path(&repo).is_file());
         assert_eq!(loaded.tree_hash, state.tree_hash);
+
+        fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn legacy_checkpoint_history_infers_the_last_non_regressing_canonical_checkpoint() {
+        let repo = temp_repo("legacy-canonical-checkpoint");
+        fs::write(repo.join("README.md"), b"# legacy canonical\n").unwrap();
+        let mut state = RealRepoState::ingest(&repo, "repo_legacy_canonical").unwrap();
+        let base = state.entries[0].clone();
+        state.operations = vec![
+            operation(
+                "op_a_0001",
+                "topic_a",
+                "rev_a_0001",
+                &base,
+                b"revision one\n",
+            ),
+            operation(
+                "op_a_0002",
+                "topic_a",
+                "rev_a_0002",
+                &base,
+                b"revision two\n",
+            ),
+        ];
+        let checkpoint = |checkpoint_id: &str,
+                          topic_frontier: Vec<(&str, &str)>,
+                          side_checkpoint: bool| {
+            RealCheckpointSnapshot {
+                checkpoint_id: checkpoint_id.to_string(),
+                resolved_view_id: state.base_resolved_view_id.clone(),
+                tree_hash: state.tree_hash.clone(),
+                topic_frontier: topic_frontier
+                    .into_iter()
+                    .map(|(topic_id, revision_id)| (topic_id.to_string(), revision_id.to_string()))
+                    .collect(),
+                omitted_completed_topic_heads: Vec::new(),
+                completed_frontier_acknowledged: side_checkpoint,
+                evidence_refs: Vec::new(),
+                created_at: checkpoint_id.to_string(),
+                entries: state.entries.clone(),
+            }
+        };
+        state.checkpoints = vec![
+            checkpoint("checkpoint_a_1", vec![("topic_a", "rev_a_0001")], false),
+            checkpoint("checkpoint_a_2", vec![("topic_a", "rev_a_0002")], false),
+            checkpoint("checkpoint_side_a_1", vec![("topic_a", "rev_a_0001")], true),
+        ];
+        assert_eq!(
+            infer_legacy_canonical_checkpoint_id(&state),
+            "checkpoint_a_2"
+        );
+
+        state.persist_blobs(&repo).unwrap();
+        let mut json = state.to_json_value();
+        let JsonValue::Object(root) = &mut json else {
+            unreachable!()
+        };
+        root.remove("canonical_checkpoint_id");
+        let JsonValue::Array(operations) = root.get_mut("operations").unwrap() else {
+            unreachable!()
+        };
+        for operation in operations {
+            let JsonValue::Object(operation) = operation else {
+                unreachable!()
+            };
+            operation.remove("parent_topic_revision_id");
+        }
+        let JsonValue::Array(checkpoints) = root.get_mut("checkpoints").unwrap() else {
+            unreachable!()
+        };
+        for checkpoint in checkpoints {
+            let JsonValue::Object(checkpoint) = checkpoint else {
+                unreachable!()
+            };
+            checkpoint.insert(
+                "entries".to_string(),
+                JsonValue::Array(
+                    state
+                        .entries
+                        .iter()
+                        .map(|entry| {
+                            JsonValue::Object(BTreeMap::from([
+                                ("path".to_string(), JsonValue::String(entry.path.clone())),
+                                (
+                                    "artifact_id".to_string(),
+                                    JsonValue::String(entry.artifact_id.clone()),
+                                ),
+                                (
+                                    "content_hash".to_string(),
+                                    JsonValue::String(entry.content_hash.clone()),
+                                ),
+                                ("executable".to_string(), JsonValue::Bool(entry.executable)),
+                                (
+                                    "classification".to_string(),
+                                    JsonValue::String(entry.classification.clone()),
+                                ),
+                                ("tombstone".to_string(), JsonValue::Bool(entry.tombstone)),
+                            ]))
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        write_state_json(&repo, json);
+
+        let loaded = RealRepoState::load(&repo).unwrap();
+        assert_eq!(loaded.canonical_checkpoint_id, "checkpoint_a_2");
 
         fs::remove_dir_all(repo).unwrap();
     }
@@ -9960,6 +10504,7 @@ mod tests {
             publication_sequence: 0,
             repository_id: "repo_paths".to_string(),
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
+            canonical_checkpoint_id: "checkpoint_base_0001".to_string(),
             base_resolved_view_id: "view_base_0001".to_string(),
             resolved_view_id: "view_base_0001".to_string(),
             tree_hash: real_tree_hash(&entries),
@@ -10008,6 +10553,7 @@ mod tests {
             publication_sequence: 0,
             repository_id: "repo_resolve".to_string(),
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
+            canonical_checkpoint_id: "checkpoint_base_0001".to_string(),
             base_resolved_view_id: "view_base_0001".to_string(),
             resolved_view_id: "view_base_0001".to_string(),
             tree_hash: real_tree_hash(&[readme.clone(), lib.clone()]),
@@ -10285,6 +10831,7 @@ mod tests {
             operation_transaction_id: operation_id.to_string(),
             topic_id: topic_id.to_string(),
             topic_revision_id: revision_id.to_string(),
+            parent_topic_revision_id: None,
             session_id: format!("session_{topic_id}"),
             artifact_id: before.artifact_id.clone(),
             path: before.path.clone(),

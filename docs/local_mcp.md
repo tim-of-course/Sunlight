@@ -115,14 +115,24 @@ The server exposes these typed tools:
 - `policy_check_export`, `policy_check_commit`, `policy_explain`
 - `git_export`, `inspect`
 
-Repository status returns `repository.recommended_start`, the newest usable
-checkpoint, view, and tree for new work. `session_start` accepts that exact view
-and remains pinned to it while unrelated topics resolve or conflict.
+Repository status returns `repository.recommended_start`, the canonical
+checkpoint, view, and tree for new work. The canonical checkpoint is a durable,
+non-regressing integration line. `session_start` accepts that exact view and
+remains pinned to it while unrelated topics resolve, integrate, or conflict.
 For durable integration, pass the recommended checkpoint to `view_resolve.base`
 and exact new or replacement topic revisions to `view_resolve.include`.
 Sunlight includes the checkpoint's existing frontier automatically. Omitting
 `include` on a later checkpoint reproduces that checkpoint; omitting it on the
 repository base is discovery-only and resolves moving current heads.
+Call `repository_status` again immediately before integration. Pass the
+recommended checkpoint used as the resolution base to
+`checkpoint_create.expected_canonical_checkpoint`. If another agent advanced
+it first, Sunlight returns `canonical_checkpoint_advanced`; resolve and validate
+again on the new recommendation. A normal checkpoint cannot remove revisions
+from the canonical frontier. Use `side_checkpoint` only for an intentionally
+isolated or alternative snapshot. It never changes the recommended start.
+Completed topics not selected for integration remain independent pending
+candidates and do not block a canonical advance.
 `checkpoint_create` returns `handoff.exact_ids` with the exact checkpoint, view,
 tree, and execution IDs to report or pass to the next agent.
 `compat_diff` re-echoes the projection's `session_generation_id`, and MCP

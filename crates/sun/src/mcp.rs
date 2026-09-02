@@ -22,6 +22,18 @@ use super::{EngineCommandInput, EngineContext, EngineOutputFormat, EngineRequest
 const PROTOCOL_VERSION: &str = "2025-11-25";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const MCP_SERVER_INSTRUCTIONS: &str = concat!(
+    "All tools are bound to the canonical repository supplied when this server started. ",
+    "Verify repositoryBinding, then call repository_status. Use repository.recommended_start as the exact default base and inspect repository.worktree for external edits. ",
+    "For authored work, create one topic and actor-owned pinned session, use scoped artifact tools, and complete the exact topic revision with a factual handoff. ",
+    "Unrelated topic, checkpoint, and execution advancement never requires session_refresh or a replacement topic. ",
+    "Integrate by reading repository_status again, resolving the task revision onto the current recommended checkpoint, and validating that exact combined view. ",
+    "Call checkpoint_create with the recommended checkpoint as expected_canonical_checkpoint. If the canonical checkpoint advanced, resolve and validate again before retrying. ",
+    "Use side_checkpoint only for a user-requested isolated or alternative result; it never changes repository.recommended_start. ",
+    "Call worktree_diff and worktree_capture only when external edits should enter native history. Promote only intentional execution outputs. ",
+    "Before claiming completion, call repository_status and read completion_guard. Copy handoff.copy_report verbatim. Preserve and report unrelated external edits separately. ",
+    "Export an exact checkpoint to Git only when requested. Use exact IDs and returned hashes; no fixture tools or arbitrary host paths are available."
+);
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
@@ -375,7 +387,7 @@ fn handle_message(
                             "description": "Repository-confined Sunlight v0.3 authoring and operation tools"
                         },
                         "repositoryBinding": repository_binding,
-                        "instructions": "All tools are bound to the canonical repository supplied when this server started. Verify repositoryBinding against the intended project before trusting repository data. Start with repository_status and use repository.recommended_start as the default exact checkpoint, view, and tree for new work, even when the moving repository head is conflicted. Its repository.worktree field reports whether ordinary editor or agent changes exist outside Sunlight; call worktree_diff to inspect them and worktree_capture only when those edits should enter native history. Capture returns a completed topic revision with exact provenance, which can be combined through view_resolve like any other topic. Before claiming task completion, call repository_status and read completion_guard. Task-owned implementation needs a native topic or checkpoint handoff; unrelated external edits may remain outside native history and must be preserved and reported separately. For native authoring, use topic_create, session_start, scoped artifact reads and mutations, and topic_complete. Sessions remain pinned and writable while unrelated topics resolve or conflict. Unrelated topic, checkpoint, and execution advancement never requires session_refresh or a replacement topic. Integrate with topic_wait and view_resolve using exact selected revisions. Any checkpoint may be the starting checkpoint; its frontier is included automatically and explicit selections replace revisions for the same topics. Omitting include on the repository base is discovery-only and resolves moving current heads. Validate the exact combined view with execution_run. Promote each intentional output with execution_promote_output using its returned candidate classification and a live topic-owned session over the validated view; resolve the resulting exact revision and create a checkpoint from matching passing evidence. checkpoint_create prefers complete coverage of completed topic heads and rejects an omission by default. Use acknowledge_omitted_completed_heads only for an intentional partial or alternative checkpoint; the omitted heads are recorded. checkpoint_create returns a structured handoff with the exact IDs to report. Copy handoff.copy_report verbatim rather than reconstructing IDs. For a requested Git handoff, call policy_check_export with the exact checkpoint and target ref, then git_export; completion is a returned export_map_id for that checkpoint and ref. artifact_read/list/search accept exactly one scope: session for the authoring frontier or view for session-free read-only access to an exact resolved view. topic_complete and completed topic status return a structured handoff with summary, operations, changed paths, and hashes; use topic_wait instead of polling when another agent owns the topic. Short writer contention waits inside the canonical state boundary; state-sequence races are retried automatically for safe native and read commands. Commands that can replay external side effects are never automatically retried. Use exact IDs and sha256 hashes returned by tools. artifact_write uses expect_hash \"new\" only when the path must be absent. Sessions have fixed topic scope: session_refresh advances only non-write topics already in that session frontier and does not discover newly created topics. execution_run returns bounded stdout/stderr text in that response, phase timings, and only source-like or explicitly generated promotion candidates. No fixture tools or arbitrary host paths are available."
+                        "instructions": MCP_SERVER_INSTRUCTIONS
                     }),
                 ),
             )
@@ -1278,6 +1290,19 @@ fn build_invocation(
             if let Some(execution) = optional_identifier(args, "execution")? {
                 argv.extend(["--execution".into(), execution]);
             }
+            if let Some(expected) = optional_identifier(args, "expected_canonical_checkpoint")? {
+                argv.extend(["--expected-canonical-checkpoint".into(), expected]);
+            }
+            match args.get("side_checkpoint") {
+                Some(Value::Bool(true)) => argv.push("--side-checkpoint".into()),
+                Some(Value::Bool(false)) | None => {}
+                Some(_) => {
+                    return Err(ToolFailure::new(
+                        "invalid_request",
+                        "`side_checkpoint` must be a boolean",
+                    ));
+                }
+            }
             match args.get("acknowledge_omitted_completed_heads") {
                 Some(Value::Bool(true)) => {
                     argv.push("--acknowledge-omitted-completed-heads".into());
@@ -1936,7 +1961,13 @@ const TOOL_CONTRACTS: &[ToolContract] = &[
     },
     ToolContract {
         name: "checkpoint_create",
-        allowed: &["view", "execution", "acknowledge_omitted_completed_heads"],
+        allowed: &[
+            "view",
+            "execution",
+            "expected_canonical_checkpoint",
+            "side_checkpoint",
+            "acknowledge_omitted_completed_heads",
+        ],
         required: &["view"],
     },
     ToolContract {
@@ -2164,8 +2195,8 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "checkpoint_create",
-            "Freeze an exact resolved view with optional validated passing execution evidence. By default, completed topic heads may not be silently omitted. Set acknowledge_omitted_completed_heads only for an intentional partial or alternative checkpoint; the omitted heads are recorded. source and generated artifacts are both checkpointed; export later requires reachable promotion provenance for each generated artifact.",
-            json!({"view":id_schema("Exact conflict-free resolved_view_id to freeze."),"execution":id_schema("Optional passing execution_id whose view and tree exactly match."),"acknowledge_omitted_completed_heads":{"type":"boolean","description":"Explicitly permit an intentional partial checkpoint and persist every omitted completed topic head."}}),
+            "Freeze an exact resolved view with optional validated passing execution evidence. The normal path advances the canonical checkpoint only when the view preserves its entire current frontier. Pass repository.recommended_start.checkpoint_id as expected_canonical_checkpoint so a concurrent advance returns exact retry guidance. Set side_checkpoint only for an intentionally isolated or alternative checkpoint; side checkpoints never change repository.recommended_start. Completed topic heads outside the canonical frontier remain pending integration. source and generated artifacts are both checkpointed; export later requires reachable promotion provenance for each generated artifact.",
+            json!({"view":id_schema("Exact conflict-free resolved_view_id to freeze."),"execution":id_schema("Optional passing execution_id whose view and tree exactly match."),"expected_canonical_checkpoint":id_schema("Optional compare-and-swap precondition. Use the checkpoint_id from repository.recommended_start used for integration."),"side_checkpoint":{"type":"boolean","description":"Freeze an isolated or alternative checkpoint without advancing repository.recommended_start."},"acknowledge_omitted_completed_heads":{"type":"boolean","description":"Legacy alias for an intentional side checkpoint that records omitted completed heads."}}),
             &["view"],
             true,
         ),

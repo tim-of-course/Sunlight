@@ -2110,37 +2110,46 @@ fn ignored_execution_outputs_are_batched_bounded_and_not_promotable() {
 
 #[cfg(unix)]
 #[test]
-fn execution_keeps_preexisting_and_created_node_modules_private_and_opaque() {
-    use std::os::unix::fs::symlink;
+fn execution_builds_and_reuses_runtime_layers_without_reading_worktree_dependencies() {
+    use std::os::unix::fs::PermissionsExt;
 
-    let repo = TestRepo::new("private-runtime-dependencies");
+    let repo = TestRepo::new("runtime-layers");
     init_local_git_repo(&repo);
-    repo.write_file(".gitignore", "node_modules/\n");
-    write_nested_file(repo.path(), "packages/app/main.py", "print('app')\n");
-    write_nested_file(repo.path(), "packages/app/package.json", "{}\n");
+    repo.write_file(".gitignore", "node_modules/\nfake-bin/\n");
+    repo.write_file(
+        "package.json",
+        "{\"name\":\"runtime-layer-test\",\"dependencies\":{\"pkg\":\"1.0.0\"}}\n",
+    );
+    repo.write_file(
+        "bun.lock",
+        "{\"lockfileVersion\":1,\"workspaces\":{\"\":{\"dependencies\":{\"pkg\":\"1.0.0\"}}},\"packages\":{}}\n",
+    );
     write_nested_file(
         repo.path(),
         "node_modules/pkg/index.js",
-        "original dependency\n",
+        "untrusted worktree dependency\n",
     );
-    fs::create_dir_all(repo.path().join("node_modules/.bin")).unwrap();
-    symlink(
-        "../pkg/index.js",
-        repo.path().join("node_modules/.bin/tool"),
-    )
-    .unwrap();
+    write_nested_file(
+        repo.path(),
+        "fake-bin/bun",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.3.14; exit 0; fi\nmkdir -p node_modules/pkg\nprintf 'prepared dependency\\n' > node_modules/pkg/index.js\n",
+    );
+    let fake_bun = repo.path().join("fake-bin/bun");
+    let mut permissions = fs::metadata(&fake_bun).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_bun, permissions).unwrap();
     git(
         repo.path(),
-        &[
-            "add",
-            ".gitignore",
-            "packages/app/main.py",
-            "packages/app/package.json",
-        ],
+        &["add", ".gitignore", "package.json", "bun.lock"],
     );
-    git(repo.path(), &["commit", "-m", "add app"]);
+    git(repo.path(), &["commit", "-m", "add Bun inputs"]);
     assert_success(&run_real_json(&repo, &["init"]));
 
+    let fake_path = format!(
+        "{}:{}",
+        repo.path().join("fake-bin").display(),
+        std::env::var("PATH").unwrap()
+    );
     let run = sun()
         .args([
             "run",
@@ -2152,75 +2161,57 @@ fn execution_keeps_preexisting_and_created_node_modules_private_and_opaque() {
             "-c",
             concat!(
                 "from pathlib import Path; ",
-                "root=Path('node_modules'); ",
-                "assert (root/'.bin/tool').read_text() == 'original dependency\\n'; ",
-                "(root/'pkg/index.js').write_text('private mutation\\n'); ",
-                "local=Path('packages/app/node_modules'); (local/'pkg').mkdir(parents=True); ",
-                "(local/'pkg/bin.py').write_text('print(1)\\n'); ",
-                "(local/'.bin').mkdir(); (local/'.bin/local').symlink_to('../pkg/bin.py')"
+                "path=Path('node_modules/pkg/index.js'); ",
+                "assert path.read_text() == 'prepared dependency\\n'; ",
+                "path.write_text('private mutation\\n')"
             ),
         ])
+        .env("PATH", &fake_path)
         .current_dir(repo.path())
         .output()
-        .expect("dependency-bound execution should run");
+        .expect("runtime-layer execution should run");
     assert_success(&run);
     let body: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
     assert_eq!(body["data"]["result"]["status"], "pass");
     assert_eq!(body["data"]["promotion_candidates"], serde_json::json!([]));
-    assert!(body["data"]["phase_timings_ms"]["dependency_prepare"].is_number());
-    assert_eq!(
-        body["data"]["runtime_policy"]["runtime_dependencies"]["preexisting_private_paths"],
-        serde_json::json!(["node_modules"])
-    );
-    let bindings = body["data"]["runtime_policy"]["runtime_dependencies"]["bindings"]
+    assert!(body["data"]["phase_timings_ms"]["runtime_provider_preparation"].is_number());
+    let layers = body["data"]["runtime_policy"]["runtime_layers"]
         .as_array()
         .unwrap();
-    let root_binding = bindings
-        .iter()
-        .find(|binding| binding["path"] == "node_modules")
-        .unwrap();
-    assert_eq!(root_binding["origin"], "worktree_gitignored");
-    assert_eq!(root_binding["binding_reuse"], "computed");
-    assert!(root_binding["source_snapshot_fingerprint"]
+    assert_eq!(layers.len(), 1);
+    assert_eq!(layers[0]["provider_id"], "bun_single_root");
+    assert_eq!(layers[0]["acquisition"], "provider_preparation");
+    assert!(layers[0]["content_id"]
         .as_str()
         .unwrap()
         .starts_with("sha256:"));
-    let first_root_fingerprint = root_binding["binding_fingerprint"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(first_root_fingerprint.starts_with("sha256:"));
-    let created_binding = bindings
-        .iter()
-        .find(|binding| binding["path"] == "packages/app/node_modules")
-        .unwrap();
-    assert_eq!(created_binding["origin"], "execution_created");
-    assert!(created_binding["binding_fingerprint"]
-        .as_str()
-        .unwrap()
-        .starts_with("sha256:"));
-    assert!(
-        body["data"]["runtime_policy"]["runtime_dependencies"]["opaque_paths"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|path| path == "packages/app/node_modules")
-    );
+    let first_content_id = layers[0]["content_id"].as_str().unwrap().to_string();
     assert_eq!(
         fs::read_to_string(repo.path().join("node_modules/pkg/index.js")).unwrap(),
-        "original dependency\n"
+        "untrusted worktree dependency\n"
     );
-    assert!(!repo.path().join("packages/app/node_modules").exists());
 
     let state = RealRepoState::load(repo.path()).unwrap();
     let execution = state.executions.last().unwrap();
     assert!(execution.outputs.is_empty());
+    assert_eq!(execution.runtime_layers.len(), 1);
+    assert!(execution.runtime_dependency_bindings.is_empty());
+    assert_eq!(execution.runtime_dependency_strategy, "runtime_layers_v1");
+    let execution_status =
+        run_real_json(&repo, &["status", "--execution", &execution.execution_id]);
+    assert_success(&execution_status);
+    let execution_status: serde_json::Value =
+        serde_json::from_str(&stdout(&execution_status)).unwrap();
     assert_eq!(
-        execution.preexisting_runtime_dependency_paths,
-        vec!["node_modules"]
+        execution_status["data"]["runtime_policy"]["runtime_layers"][0]["provider_id"],
+        "bun_single_root"
     );
-    assert_eq!(execution.runtime_dependency_bindings.len(), 2);
 
+    fs::write(
+        repo.path().join("node_modules/pkg/index.js"),
+        "changed worktree dependency\n",
+    )
+    .unwrap();
     let unchanged = sun()
         .args([
             "run",
@@ -2230,69 +2221,176 @@ fn execution_keeps_preexisting_and_created_node_modules_private_and_opaque() {
             "--",
             PYTHON,
             "-c",
-            "from pathlib import Path; assert Path('node_modules/pkg/index.js').read_text() == 'original dependency\\n'",
+            "from pathlib import Path; assert Path('node_modules/pkg/index.js').read_text() == 'prepared dependency\\n'",
         ])
+        .env("PATH", "/usr/bin:/bin")
         .current_dir(repo.path())
         .output()
-        .expect("unchanged dependency-bound execution should rerun");
+        .expect("cached runtime-layer execution should rerun without Bun");
     assert_success(&unchanged);
     let unchanged_body: serde_json::Value = serde_json::from_str(&stdout(&unchanged)).unwrap();
-    let unchanged_binding = unchanged_body["data"]["runtime_policy"]["runtime_dependencies"]
-        ["bindings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|binding| binding["path"] == "node_modules")
-        .unwrap();
-    assert_eq!(
-        unchanged_binding["binding_fingerprint"],
-        first_root_fingerprint
-    );
-    assert_eq!(
-        unchanged_binding["binding_reuse"],
-        "reused_unchanged_source"
-    );
+    let unchanged_layer = &unchanged_body["data"]["runtime_policy"]["runtime_layers"][0];
+    assert_eq!(unchanged_layer["content_id"], first_content_id);
+    assert_eq!(unchanged_layer["acquisition"], "cache_reuse");
+}
 
-    fs::write(
-        repo.path().join("node_modules/pkg/index.js"),
-        "replacement dependency\n",
-    )
-    .unwrap();
-    let rerun = sun()
+#[cfg(unix)]
+#[test]
+fn concurrent_executions_publish_one_runtime_layer() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TestRepo::new("runtime-layer-single-flight");
+    init_local_git_repo(&repo);
+    repo.write_file(".gitignore", "node_modules/\nfake-bin/\n");
+    repo.write_file(
+        "package.json",
+        "{\"name\":\"runtime-layer-test\",\"dependencies\":{\"pkg\":\"1.0.0\"}}\n",
+    );
+    repo.write_file(
+        "bun.lock",
+        "{\"lockfileVersion\":1,\"workspaces\":{\"\":{\"dependencies\":{\"pkg\":\"1.0.0\"}}},\"packages\":{}}\n",
+    );
+    let build_count = repo
+        .path()
+        .join(".sunlight/local/runtime-layer-build-count");
+    write_nested_file(
+        repo.path(),
+        "fake-bin/bun",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.3.14; exit 0; fi\nprintf 'build\\n' >> '{}'\nsleep 1\nmkdir -p node_modules/pkg\nprintf 'prepared dependency\\n' > node_modules/pkg/index.js\n",
+            build_count.display()
+        ),
+    );
+    let fake_bun = repo.path().join("fake-bin/bun");
+    let mut permissions = fs::metadata(&fake_bun).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_bun, permissions).unwrap();
+    git(
+        repo.path(),
+        &["add", ".gitignore", "package.json", "bun.lock"],
+    );
+    git(repo.path(), &["commit", "-m", "add Bun inputs"]);
+    assert_success(&run_real_json(&repo, &["init"]));
+
+    let fake_path = format!(
+        "{}:{}",
+        repo.path().join("fake-bin").display(),
+        std::env::var("PATH").unwrap()
+    );
+    let spawn = || {
+        let mut command = sun();
+        command
+            .args([
+                "run",
+                "--view",
+                "view_base_0001",
+                "--json",
+                "--",
+                PYTHON,
+                "-c",
+                "from pathlib import Path; assert Path('node_modules/pkg/index.js').read_text() == 'prepared dependency\\n'",
+            ])
+            .env("PATH", &fake_path)
+            .current_dir(repo.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let first = spawn();
+    let second = spawn();
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    assert_success(&first);
+    assert_success(&second);
+    assert_eq!(fs::read_to_string(&build_count).unwrap().lines().count(), 1);
+    let first: serde_json::Value = serde_json::from_str(&stdout(&first)).unwrap();
+    let second: serde_json::Value = serde_json::from_str(&stdout(&second)).unwrap();
+    assert_eq!(
+        first["data"]["runtime_policy"]["runtime_layers"][0]["lookup_key"],
+        second["data"]["runtime_policy"]["runtime_layers"][0]["lookup_key"]
+    );
+    let acquisitions = [
+        first["data"]["runtime_policy"]["runtime_layers"][0]["acquisition"]
+            .as_str()
+            .unwrap(),
+        second["data"]["runtime_policy"]["runtime_layers"][0]["acquisition"]
+            .as_str()
+            .unwrap(),
+    ];
+    assert!(acquisitions.contains(&"provider_preparation"));
+    assert!(acquisitions.contains(&"cache_reuse"));
+}
+
+#[cfg(unix)]
+#[test]
+fn disabled_network_cold_miss_does_not_launch_provider_or_target() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TestRepo::new("runtime-layer-disabled-network");
+    init_local_git_repo(&repo);
+    repo.write_file(".gitignore", "node_modules/\nfake-bin/\n");
+    repo.write_file("package.json", "{\"name\":\"runtime-layer-test\"}\n");
+    repo.write_file(
+        "bun.lock",
+        "{\"lockfileVersion\":1,\"workspaces\":{\"\":{}},\"packages\":{}}\n",
+    );
+    let provider_ran = repo.path().join("PROVIDER_RAN");
+    write_nested_file(
+        repo.path(),
+        "fake-bin/bun",
+        &format!(
+            "#!/bin/sh\nprintf 'ran\\n' > '{}'\nif [ \"$1\" = \"--version\" ]; then echo 1.3.14; fi\n",
+            provider_ran.display()
+        ),
+    );
+    let fake_bun = repo.path().join("fake-bin/bun");
+    let mut permissions = fs::metadata(&fake_bun).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_bun, permissions).unwrap();
+    git(
+        repo.path(),
+        &["add", ".gitignore", "package.json", "bun.lock"],
+    );
+    git(repo.path(), &["commit", "-m", "add Bun inputs"]);
+    assert_success(&run_real_json(&repo, &["init"]));
+
+    let target_ran = repo.path().join("TARGET_RAN");
+    let run = sun()
         .args([
             "run",
             "--view",
             "view_base_0001",
+            "--network",
+            "disabled",
             "--json",
             "--",
             PYTHON,
             "-c",
-            "from pathlib import Path; assert Path('node_modules/pkg/index.js').read_text() == 'replacement dependency\\n'",
         ])
+        .arg(format!(
+            "from pathlib import Path; Path({:?}).write_text('ran')",
+            target_ran.display().to_string()
+        ))
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                repo.path().join("fake-bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
         .current_dir(repo.path())
         .output()
-        .expect("dependency-bound execution should rerun");
-    assert_success(&rerun);
-    let rerun_body: serde_json::Value = serde_json::from_str(&stdout(&rerun)).unwrap();
-    let second_root_fingerprint = rerun_body["data"]["runtime_policy"]["runtime_dependencies"]
-        ["bindings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|binding| binding["path"] == "node_modules")
-        .unwrap()["binding_fingerprint"]
-        .as_str()
         .unwrap();
-    assert_ne!(first_root_fingerprint, second_root_fingerprint);
-    assert_eq!(
-        rerun_body["data"]["runtime_policy"]["runtime_dependencies"]["bindings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|binding| binding["path"] == "node_modules")
-            .unwrap()["binding_reuse"],
-        "computed"
-    );
+    assert_failure(&run);
+    assert!(stdout(&run).contains("runtime_layer_network_unavailable"));
+    assert!(!provider_ran.exists());
+    assert!(!target_ran.exists());
+    assert!(RealRepoState::load(repo.path())
+        .unwrap()
+        .executions
+        .is_empty());
 }
 
 #[test]
@@ -2451,11 +2549,7 @@ fn sunignored_node_modules_is_not_registered_or_exposed_to_execution() {
     let body: serde_json::Value = serde_json::from_str(&stdout(&run)).unwrap();
     assert_eq!(body["data"]["result"]["status"], "pass");
     assert_eq!(
-        body["data"]["runtime_policy"]["runtime_dependencies"]["opaque_paths"],
-        serde_json::json!([])
-    );
-    assert_eq!(
-        body["data"]["runtime_policy"]["runtime_dependencies"]["bindings"],
+        body["data"]["runtime_policy"]["runtime_layers"],
         serde_json::json!([])
     );
 }
@@ -2485,7 +2579,7 @@ fn absent_nonignored_node_modules_remains_a_promotable_execution_output() {
     assert_eq!(body["data"]["result"]["status"], "pass");
     assert_eq!(body["data"]["output_summary_counts"]["file_delta"], 1);
     assert_eq!(
-        body["data"]["runtime_policy"]["runtime_dependencies"]["opaque_paths"],
+        body["data"]["runtime_policy"]["runtime_layers"],
         serde_json::json!([])
     );
     assert_eq!(

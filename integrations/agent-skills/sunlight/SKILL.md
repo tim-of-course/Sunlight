@@ -41,7 +41,10 @@ authoring or integration.
   the recommended checkpoint and exact selected revisions for integration; the
   checkpoint frontier is carried forward automatically.
 - Run validation on the exact combined view. Promote only intentional outputs,
-  then create a checkpoint from matching passing evidence.
+  then create a checkpoint from matching passing evidence using the recommended
+  checkpoint as the canonical compare-and-swap precondition. Retry integration
+  on a concurrent canonical advance. Create a side checkpoint only for a
+  user-requested isolated or alternative result.
 - Export to Git only when the user requests that compatibility handoff.
 
 Treat conflicts, staleness, policy failures, and execution results as facts to

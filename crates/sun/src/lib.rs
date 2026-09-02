@@ -16,6 +16,7 @@ mod agent_setup;
 pub mod engine;
 mod mcp;
 mod repository_queue;
+mod runtime_layers;
 #[cfg(windows)]
 mod windows_isolation;
 #[cfg(windows)]
@@ -98,21 +99,20 @@ use sunlight_core::projection::{
 };
 use sunlight_core::records::{canonical_json_bytes, parse_json_record, JsonValue};
 use sunlight_core::repo_state::{
-    directory_is_gitignored, materialize_private_runtime_dependency_tree,
     materialize_real_projection, native_session_generation_id, path_is_gitignored,
     path_is_sunignored, process_may_be_live, read_real_blob, real_artifact_id_for_path,
     real_content_hash, real_execution_environment_summary_digest,
-    real_runtime_dependency_binding_fingerprint,
-    real_runtime_dependency_source_snapshot_fingerprint, real_tree_hash,
+    real_topic_revision_is_same_or_descendant, real_tree_hash,
     scan_real_execution_projection_files_with_quarantine, validate_topic_metadata,
     verify_real_readonly_projection, DerivedRecordPublication, RealArtifactEntry,
     RealCheckpointSnapshot, RealExecutionEnvironmentSummary, RealExecutionOutputSnapshot,
-    RealExecutionPromotionSnapshot, RealExecutionRuntimeDependencyBinding, RealExecutionSnapshot,
-    RealExecutionToolHint, RealExportMapSnapshot, RealOperationEffect, RealOperationRecord,
-    RealProjectionMaterialization, RealProjectionMaterializationMetrics,
-    RealProjectionMaterializationRequest, RealProjectionSnapshot, RealProjectionStrategy,
-    RealRepoState, RealResolvedRepoView, RealSessionGenerationRecord, RealSessionRecord,
-    RealTopicRecord, RealWorktreeAnchor, RepoStateError, TopicMetadataValidationError,
+    RealExecutionPromotionSnapshot, RealExecutionRuntimeDependencyBinding,
+    RealExecutionRuntimeLayer, RealExecutionSnapshot, RealExecutionToolHint, RealExportMapSnapshot,
+    RealOperationEffect, RealOperationRecord, RealProjectionMaterialization,
+    RealProjectionMaterializationMetrics, RealProjectionMaterializationRequest,
+    RealProjectionSnapshot, RealProjectionStrategy, RealRepoState, RealResolvedRepoView,
+    RealSessionGenerationRecord, RealSessionRecord, RealTopicRecord, RealWorktreeAnchor,
+    RepoStateError, TopicMetadataValidationError,
 };
 use sunlight_core::repository::{
     init_repository, resolve_projection_policy, ExecutionPolicy, RepositoryConfig,
@@ -322,6 +322,13 @@ impl CliError {
 
     fn with_detail(mut self, key: &'static str, value: impl Into<String>) -> Self {
         self.details.push((key, value.into()));
+        self
+    }
+
+    fn with_default_detail(mut self, key: &'static str, value: impl Into<String>) -> Self {
+        if !self.details.iter().any(|(existing, _)| *existing == key) {
+            self.details.push((key, value.into()));
+        }
         self
     }
 
@@ -1578,7 +1585,11 @@ fn checkpoint_create(ctx: &CommandContext) -> Result<(), CliError> {
         .map_err(checkpoint_error)?;
 
     if ctx.json {
-        outputln!(ctx, "{}", checkpoint_create_success_envelope(&checkpoint));
+        outputln!(
+            ctx,
+            "{}",
+            checkpoint_create_success_envelope(&checkpoint, None)
+        );
     } else {
         outputln!(ctx, "{} {}", checkpoint.id, checkpoint.resolved_view_id);
     }
@@ -5256,6 +5267,27 @@ fn run_bounded_process(
     #[cfg(windows)] isolation: &windows_isolation::PreparedIsolation,
     on_starting: impl FnOnce() -> Result<(), RepoStateError>,
 ) -> Result<BoundedProcessOutput, ProcessRunError> {
+    run_bounded_process_with_environment(
+        argv,
+        cwd,
+        policy,
+        cancellation,
+        #[cfg(windows)]
+        isolation,
+        None,
+        on_starting,
+    )
+}
+
+fn run_bounded_process_with_environment(
+    argv: &[String],
+    cwd: &Path,
+    policy: &ExecutionPolicy,
+    cancellation: &AtomicBool,
+    #[cfg(windows)] isolation: &windows_isolation::PreparedIsolation,
+    controlled_environment: Option<&BTreeMap<String, String>>,
+    on_starting: impl FnOnce() -> Result<(), RepoStateError>,
+) -> Result<BoundedProcessOutput, ProcessRunError> {
     let allowlist = execution_environment_allowlist();
     #[cfg(windows)]
     let mut command = isolation
@@ -5270,9 +5302,15 @@ fn run_bounded_process(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for name in &allowlist {
-        if let Some(value) = env::var_os(name) {
+    if let Some(environment) = controlled_environment {
+        for (name, value) in environment {
             command.env(name, value);
+        }
+    } else {
+        for name in &allowlist {
+            if let Some(value) = env::var_os(name) {
+                command.env(name, value);
+            }
         }
     }
     #[cfg(windows)]
@@ -5523,8 +5561,6 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         .with_detail("resolved_view_id", resolved.result.resolved_view_id));
     }
     let view_state = real_view_state(&state, &resolved);
-    let runtime_dependency_paths =
-        execution_runtime_dependency_paths(&repo_root, &relative_cwd, &view_state.entries)?;
     let start_reservation = reserve_real_execution_start(&repo_root)?;
     let execution_sequence = start_reservation.sequence;
     let provisional_projection_id =
@@ -5552,21 +5588,37 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     let cache_validation_ms = u128::from(materialization.metrics.cache_validation_ms);
     let projection_materialization_ms =
         u128::from(materialization.metrics.projection_materialization_ms);
-    let dependency_prepare_started = Instant::now();
-    let runtime_dependency_bindings = materialize_execution_runtime_dependencies(
+    let runtime_layer_resolution = runtime_layers::acquire_runtime_layers(
         &repo_root,
+        &projection_policy.managed_root,
         &projection_root,
-        &runtime_dependency_paths,
-        &state.executions,
+        &relative_cwd,
+        &view_state.entries,
+        &execution_policy,
+        &ctx.cancellation,
     )
+    .map_err(|error| {
+        error
+            .with_default_detail("command_started", "false")
+            .with_default_detail("provider_id", "bun_single_root")
+            .with_default_detail("target", "node_modules")
+            .with_default_detail(
+                "network_policy_requested",
+                execution_policy.network_policy.clone(),
+            )
+            .with_default_detail(
+                "network_policy_effective",
+                if cfg!(windows) && execution_policy.network_policy == DISABLED_NETWORK_POLICY {
+                    "windows_appcontainer_no_network_capabilities_v1"
+                } else {
+                    "not_enforced"
+                },
+            )
+    })
     .inspect_err(|_| {
         remove_unpublished_execution_root(&projection_root);
     })?;
-    let preexisting_runtime_dependency_paths = runtime_dependency_bindings
-        .iter()
-        .map(|binding| binding.path.clone())
-        .collect::<Vec<_>>();
-    let dependency_prepare_ms = dependency_prepare_started.elapsed().as_millis();
+    let runtime_dependency_paths = runtime_layer_resolution.target_paths.clone();
     #[cfg(windows)]
     let mut isolation = windows_isolation::PreparedIsolation::prepare(
         &repo_root,
@@ -5663,7 +5715,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     );
     let started_at = real_now_id();
     let empty_output_digest = real_content_hash(&[]);
-    let mut running_execution = RealExecutionSnapshot {
+    let running_execution = RealExecutionSnapshot {
         execution_id: execution_id.clone(),
         projection_id: projection_id.clone(),
         resolved_view_id: view_state.resolved_view_id.clone(),
@@ -5715,10 +5767,11 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         network_policy: network_policy_effective.clone(),
         filesystem_write_policy_requested: execution_policy.filesystem_write_policy.clone(),
         filesystem_write_policy: filesystem_write_policy_effective.clone(),
-        runtime_dependency_paths: runtime_dependency_paths.clone(),
-        preexisting_runtime_dependency_paths: preexisting_runtime_dependency_paths.clone(),
-        runtime_dependency_bindings,
-        runtime_dependency_strategy: "private_cow_or_copy_opaque_v1".to_string(),
+        runtime_layers: runtime_layer_resolution.layers.clone(),
+        runtime_dependency_paths: Vec::new(),
+        preexisting_runtime_dependency_paths: Vec::new(),
+        runtime_dependency_bindings: Vec::new(),
+        runtime_dependency_strategy: "runtime_layers_v1".to_string(),
         outputs: Vec::new(),
         started_at: started_at.clone(),
         finished_at: String::new(),
@@ -5767,36 +5820,6 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         &mut projected_entries,
         &mut quarantine,
     )?;
-    for relative in &runtime_dependency_paths {
-        if running_execution
-            .runtime_dependency_bindings
-            .iter()
-            .any(|binding| binding.path == *relative)
-        {
-            continue;
-        }
-        let root = projection_root.join(relative);
-        if !path_exists_without_following(&root)? {
-            continue;
-        }
-        let binding_fingerprint =
-            real_runtime_dependency_binding_fingerprint(&root).map_err(|error| {
-                CliError::new(
-                    "execution_runtime_dependency_fingerprint_failed",
-                    error.to_string(),
-                )
-                .with_detail("path", relative.clone())
-            })?;
-        running_execution
-            .runtime_dependency_bindings
-            .push(RealExecutionRuntimeDependencyBinding {
-                path: relative.clone(),
-                origin: "execution_created".to_string(),
-                binding_fingerprint,
-                source_snapshot_fingerprint: None,
-                binding_reuse: "computed".to_string(),
-            });
-    }
     projected_entries.sort_by(|left, right| left.path.cmp(&right.path));
     let outputs = if command_output.cancelled {
         Vec::new()
@@ -5904,7 +5927,11 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
                 cache_build_ms,
                 cache_validation_ms,
                 projection_materialization_ms,
-                dependency_prepare_ms,
+                runtime_layer_resolution.timings.provider_discovery_ms,
+                runtime_layer_resolution.timings.cache_lookup_ms,
+                runtime_layer_resolution.timings.cache_wait_ms,
+                runtime_layer_resolution.timings.provider_preparation_ms,
+                runtime_layer_resolution.timings.private_binding_ms,
                 command_ms,
                 output_scan_ms,
                 publication_ms,
@@ -6279,177 +6306,6 @@ fn real_execution_relative_cwd(cwd: &str) -> Result<PathBuf, CliError> {
     Ok(relative)
 }
 
-fn execution_runtime_dependency_paths(
-    repo_root: &Path,
-    relative_cwd: &Path,
-    view_entries: &[RealArtifactEntry],
-) -> Result<Vec<String>, CliError> {
-    let mut candidates = BTreeSet::new();
-    let mut current = PathBuf::new();
-    candidates.insert("node_modules".to_string());
-    for component in relative_cwd.components() {
-        if let std::path::Component::Normal(part) = component {
-            current.push(part);
-            candidates.insert(
-                current
-                    .join("node_modules")
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            );
-        }
-    }
-    for entry in view_entries.iter().filter(|entry| !entry.tombstone) {
-        let path = Path::new(&entry.path);
-        if path.file_name().and_then(|name| name.to_str()) != Some("package.json") {
-            continue;
-        }
-        let parent = path.parent().unwrap_or_else(|| Path::new(""));
-        candidates.insert(
-            parent
-                .join("node_modules")
-                .to_string_lossy()
-                .replace('\\', "/"),
-        );
-    }
-
-    let mut eligible = Vec::new();
-    for candidate in candidates {
-        let prefix = format!("{candidate}/");
-        if view_entries.iter().any(|entry| {
-            !entry.tombstone && (entry.path == candidate || entry.path.starts_with(&prefix))
-        }) {
-            continue;
-        }
-        if path_is_sunignored(repo_root, &candidate, true)? {
-            continue;
-        }
-        let source = repo_root.join(&candidate);
-        let gitignored = directory_is_gitignored(repo_root, &candidate).map_err(|error| {
-            CliError::new(
-                "execution_ignore_policy_failed",
-                format!("failed to evaluate Git ignore policy: {error}"),
-            )
-            .with_detail("path", candidate.clone())
-        })?;
-        if !gitignored {
-            if !path_exists_without_following(&source)? {
-                continue;
-            }
-            return Err(CliError::new(
-                "execution_runtime_dependency_not_gitignored",
-                "a preexisting runtime dependency path must be Git-ignored before managed execution",
-            )
-            .with_detail("path", candidate));
-        }
-        eligible.push(candidate);
-    }
-    Ok(eligible)
-}
-
-fn materialize_execution_runtime_dependencies(
-    repo_root: &Path,
-    projection_root: &Path,
-    runtime_dependency_paths: &[String],
-    prior_executions: &[RealExecutionSnapshot],
-) -> Result<Vec<RealExecutionRuntimeDependencyBinding>, CliError> {
-    let mut bindings = Vec::new();
-    for relative in runtime_dependency_paths {
-        let source = repo_root.join(relative);
-        if !path_exists_without_following(&source)? {
-            continue;
-        }
-        let source_snapshot_before = real_runtime_dependency_source_snapshot_fingerprint(&source)
-            .map_err(|error| {
-            CliError::new(
-                "execution_runtime_dependency_fingerprint_failed",
-                error.to_string(),
-            )
-            .with_detail("path", relative.clone())
-        })?;
-        let reusable_binding = source_snapshot_before.as_ref().and_then(|snapshot| {
-            prior_executions.iter().rev().find_map(|execution| {
-                execution
-                    .runtime_dependency_bindings
-                    .iter()
-                    .find(|binding| {
-                        binding.path == *relative
-                            && binding.origin == "worktree_gitignored"
-                            && binding.source_snapshot_fingerprint.as_ref() == Some(snapshot)
-                    })
-            })
-        });
-        let destination = projection_root.join(relative);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                CliError::new(
-                    "execution_runtime_dependency_materialization_failed",
-                    format!("failed to create private dependency parent: {error}"),
-                )
-                .with_detail("path", relative.clone())
-            })?;
-        }
-        materialize_private_runtime_dependency_tree(&source, &destination, projection_root)
-            .map_err(|error| {
-                CliError::new(
-                    "execution_runtime_dependency_materialization_failed",
-                    error.to_string(),
-                )
-                .with_detail("path", relative.clone())
-            })?;
-        let source_snapshot_after = real_runtime_dependency_source_snapshot_fingerprint(&source)
-            .map_err(|error| {
-                CliError::new(
-                    "execution_runtime_dependency_fingerprint_failed",
-                    error.to_string(),
-                )
-                .with_detail("path", relative.clone())
-            })?;
-        let source_stable =
-            source_snapshot_before.is_some() && source_snapshot_before == source_snapshot_after;
-        let (binding_fingerprint, binding_reuse) = if source_stable {
-            match reusable_binding {
-                Some(binding) => (
-                    binding.binding_fingerprint.clone(),
-                    "reused_unchanged_source".to_string(),
-                ),
-                None => (
-                    real_runtime_dependency_binding_fingerprint(&destination).map_err(|error| {
-                        CliError::new(
-                            "execution_runtime_dependency_fingerprint_failed",
-                            error.to_string(),
-                        )
-                        .with_detail("path", relative.clone())
-                    })?,
-                    "computed".to_string(),
-                ),
-            }
-        } else {
-            (
-                real_runtime_dependency_binding_fingerprint(&destination).map_err(|error| {
-                    CliError::new(
-                        "execution_runtime_dependency_fingerprint_failed",
-                        error.to_string(),
-                    )
-                    .with_detail("path", relative.clone())
-                })?,
-                "computed_unstable_source".to_string(),
-            )
-        };
-        bindings.push(RealExecutionRuntimeDependencyBinding {
-            path: relative.clone(),
-            origin: "worktree_gitignored".to_string(),
-            binding_fingerprint,
-            source_snapshot_fingerprint: if source_stable {
-                source_snapshot_after
-            } else {
-                None
-            },
-            binding_reuse,
-        });
-    }
-    Ok(bindings)
-}
-
 fn path_exists_without_following(path: &Path) -> Result<bool, CliError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -6731,6 +6587,20 @@ fn real_checkpoint_create(
     options: CheckpointCreateOptions,
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&ctx.repo_root)?;
+    let previous_canonical_checkpoint_id = state.canonical_checkpoint_id.clone();
+    if let Some(expected) = options.expected_canonical_checkpoint_id.as_deref() {
+        if expected != previous_canonical_checkpoint_id {
+            return Err(CliError::new(
+                "canonical_checkpoint_advanced",
+                "the canonical checkpoint advanced before this integration attempt",
+            )
+            .with_raw_details_json(format!(
+                "{{\"expected_canonical_checkpoint_id\":\"{}\",\"canonical_checkpoint_id\":\"{}\",\"next_action\":\"Resolve the topic revision onto repository.recommended_start, validate that exact view, and retry with its checkpoint ID as expected_canonical_checkpoint.\"}}",
+                json_escape(expected),
+                json_escape(&previous_canonical_checkpoint_id),
+            )));
+        }
+    }
     let resolved = real_resolve_view_by_id(&ctx.repo_root, &state, &options.view_id)?;
     if !resolved.result.conflict_free() {
         return Err(CliError::new(
@@ -6741,23 +6611,29 @@ fn real_checkpoint_create(
     }
     let view_state = real_view_state(&state, &resolved);
     reject_real_export_blocked_entries(&view_state)?;
+    if !options.side_checkpoint {
+        let canonical_frontier = real_canonical_checkpoint_frontier(&state)?;
+        let regressions = canonical_frontier_regressions(
+            &state,
+            &canonical_frontier,
+            &resolved.result.topic_frontier,
+        );
+        if !regressions.is_empty() {
+            return Err(CliError::new(
+                "checkpoint_does_not_extend_canonical",
+                "the exact view does not preserve the current canonical checkpoint frontier",
+            )
+            .with_raw_details_json(format!(
+                "{{\"canonical_checkpoint_id\":\"{}\",\"canonical_topic_frontier\":{},\"candidate_topic_frontier\":{},\"regressed_topic_revisions\":{},\"next_action\":\"Resolve this task's exact revision onto repository.recommended_start, validate the combined view, and retry. Use side_checkpoint only when an isolated or alternative checkpoint is intentional.\"}}",
+                json_escape(&previous_canonical_checkpoint_id),
+                string_map_object_json(&canonical_frontier),
+                string_map_object_json(&resolved.result.topic_frontier),
+                string_map_object_json(&regressions),
+            )));
+        }
+    }
     let omitted_completed_topic_heads =
         completed_topic_frontier_omissions(&state, &resolved.result.topic_frontier);
-    if !omitted_completed_topic_heads.is_empty() && !options.acknowledge_omitted_completed_heads {
-        let omitted = omitted_completed_topic_heads
-            .iter()
-            .map(|entry| (entry.topic_id.clone(), entry.topic_revision_id.clone()))
-            .collect::<BTreeMap<_, _>>();
-        return Err(CliError::new(
-            "checkpoint_omits_completed_topic_heads",
-            "the exact view omits completed topic heads; acknowledge an intentional partial checkpoint or resolve the completed heads together",
-        )
-        .with_raw_details_json(format!(
-            "{{\"resolved_view_id\":\"{}\",\"omitted_completed_topic_heads\":{},\"acknowledgement_flag\":\"--acknowledge-omitted-completed-heads\"}}",
-            json_escape(&resolved.result.resolved_view_id),
-            string_map_object_json(&omitted),
-        )));
-    }
     let evidence_refs = match options.execution_id.as_deref() {
         Some(execution_id) => {
             let execution = state
@@ -6821,6 +6697,11 @@ fn real_checkpoint_create(
             entries: view_state.entries.clone(),
         });
     }
+    let canonical_advanced =
+        !options.side_checkpoint && state.canonical_checkpoint_id != checkpoint.id;
+    if !options.side_checkpoint {
+        state.canonical_checkpoint_id = checkpoint.id.clone();
+    }
     let records = vec![state.record_publication(
         "checkpoints",
         &checkpoint.id,
@@ -6828,11 +6709,71 @@ fn real_checkpoint_create(
     )?];
     state.save_with_records(&ctx.repo_root, &records)?;
     if ctx.json {
-        outputln!(ctx, "{}", checkpoint_create_success_envelope(&checkpoint));
+        outputln!(
+            ctx,
+            "{}",
+            checkpoint_create_success_envelope(
+                &checkpoint,
+                Some(CheckpointCanonicalOutcome {
+                    previous_checkpoint_id: &previous_canonical_checkpoint_id,
+                    current_checkpoint_id: &state.canonical_checkpoint_id,
+                    advanced: canonical_advanced,
+                    side_checkpoint: options.side_checkpoint,
+                }),
+            )
+        );
     } else {
         outputln!(ctx, "{} {}", checkpoint.id, checkpoint.resolved_view_id);
     }
     Ok(())
+}
+
+fn real_canonical_checkpoint_frontier(
+    state: &RealRepoState,
+) -> Result<BTreeMap<String, String>, CliError> {
+    if state.canonical_checkpoint_id == state.base_checkpoint_id {
+        return Ok(BTreeMap::new());
+    }
+    state
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.checkpoint_id == state.canonical_checkpoint_id)
+        .map(|checkpoint| checkpoint.topic_frontier.iter().cloned().collect())
+        .ok_or_else(|| {
+            CliError::new(
+                "persisted_state_invalid",
+                "the canonical checkpoint pointer does not identify a persisted checkpoint",
+            )
+            .with_detail("canonical_checkpoint_id", &state.canonical_checkpoint_id)
+        })
+}
+
+fn canonical_frontier_regressions(
+    state: &RealRepoState,
+    canonical_frontier: &BTreeMap<String, String>,
+    candidate_frontier: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    canonical_frontier
+        .iter()
+        .filter_map(|(topic_id, canonical_revision)| {
+            let candidate_revision = candidate_frontier.get(topic_id)?;
+            (!real_topic_revision_is_same_or_descendant(
+                state,
+                topic_id,
+                candidate_revision,
+                canonical_revision,
+            ))
+            .then(|| (topic_id.clone(), canonical_revision.clone()))
+        })
+        .chain(
+            canonical_frontier
+                .iter()
+                .filter_map(|(topic_id, revision_id)| {
+                    (!candidate_frontier.contains_key(topic_id))
+                        .then(|| (topic_id.clone(), revision_id.clone()))
+                }),
+        )
+        .collect()
 }
 
 fn completed_topic_frontier_omissions(
@@ -7568,6 +7509,7 @@ fn real_accept_mutation(
         operation_transaction_id: operation_id.clone(),
         topic_id: topic_id.clone(),
         topic_revision_id: revision_id.clone(),
+        parent_topic_revision_id: parent_revision_id.clone(),
         session_id: session_id.to_string(),
         artifact_id: mutated_artifact_id.clone(),
         path: after.path.clone(),
@@ -10073,6 +10015,25 @@ fn real_execution_snapshot_record_json(
 }
 
 fn real_execution_runtime_policy_json(execution: &RealExecutionSnapshot) -> String {
+    let runtime_provenance = if execution.runtime_dependency_strategy == "runtime_layers_v1" {
+        format!(
+            "\"runtime_layers\":{}",
+            execution_runtime_layers_json(&execution.runtime_layers)
+        )
+    } else {
+        format!(
+            "\"runtime_dependencies\":{{\"strategy\":\"{}\",\"opaque_paths\":{},\"preexisting_private_paths\":{},\"bindings\":{}}}",
+            json_escape(&execution.runtime_dependency_strategy),
+            string_array_json(execution.runtime_dependency_paths.iter().map(String::as_str)),
+            string_array_json(
+                execution
+                    .preexisting_runtime_dependency_paths
+                    .iter()
+                    .map(String::as_str)
+            ),
+            execution_runtime_dependency_bindings_json(&execution.runtime_dependency_bindings),
+        )
+    };
     format!(
         concat!(
             "{{\"timeout_ms\":{},",
@@ -10082,7 +10043,7 @@ fn real_execution_runtime_policy_json(execution: &RealExecutionSnapshot) -> Stri
             "\"network\":{{\"requested\":\"{}\",\"effective\":\"{}\"}},",
             "\"filesystem_writes_requested\":\"{}\",",
             "\"filesystem_writes\":\"{}\",",
-            "\"runtime_dependencies\":{{\"strategy\":\"{}\",\"opaque_paths\":{},\"preexisting_private_paths\":{},\"bindings\":{}}}}}"
+            "{}}}"
         ),
         execution
             .timeout_ms
@@ -10113,15 +10074,82 @@ fn real_execution_runtime_policy_json(execution: &RealExecutionSnapshot) -> Stri
         json_escape(&execution.network_policy),
         json_escape(&execution.filesystem_write_policy_requested),
         json_escape(&execution.filesystem_write_policy),
-        json_escape(&execution.runtime_dependency_strategy),
-        string_array_json(execution.runtime_dependency_paths.iter().map(String::as_str)),
-        string_array_json(
-            execution
-                .preexisting_runtime_dependency_paths
-                .iter()
-                .map(String::as_str)
-        ),
-        execution_runtime_dependency_bindings_json(&execution.runtime_dependency_bindings),
+        runtime_provenance,
+    )
+}
+
+fn execution_runtime_layers_json(layers: &[RealExecutionRuntimeLayer]) -> String {
+    format!(
+        "[{}]",
+        layers
+            .iter()
+            .map(|layer| {
+                let inputs = layer
+                    .lookup_inputs
+                    .iter()
+                    .map(|input| format!(
+                        "{{\"path\":\"{}\",\"artifact_id\":\"{}\",\"content_hash\":\"{}\"}}",
+                        json_escape(&input.path),
+                        json_escape(&input.artifact_id),
+                        json_escape(&input.content_hash),
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let environment = layer
+                    .construction
+                    .environment
+                    .iter()
+                    .map(|(name, value)| format!(
+                        "\"{}\":\"{}\"",
+                        json_escape(name),
+                        json_escape(value),
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let targets = layer
+                    .targets
+                    .iter()
+                    .map(|target| format!(
+                        "{{\"path\":\"{}\",\"materialization_strategy\":\"{}\"}}",
+                        json_escape(&target.path),
+                        json_escape(&target.materialization_strategy),
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    concat!(
+                        "{{\"layer_set_id\":\"{}\",\"provider_id\":\"{}\",",
+                        "\"provider_semantics_digest\":\"{}\",\"lookup_key\":\"{}\",",
+                        "\"lookup_inputs\":[{}],\"content_id\":\"{}\",\"acquisition\":\"{}\",",
+                        "\"construction\":{{\"origin\":\"{}\",\"command_argv\":{},\"working_directory\":\"{}\",",
+                        "\"tool\":{{\"name\":\"{}\",\"executable_digest\":\"{}\",\"reported_version\":\"{}\"}},",
+                        "\"environment\":{{{}}},\"environment_digest\":\"{}\",",
+                        "\"network_policy_requested\":\"{}\",\"network_policy_effective\":\"{}\",",
+                        "\"filesystem_write_policy_effective\":\"{}\"}},\"targets\":[{}]}}"
+                    ),
+                    json_escape(&layer.layer_set_id),
+                    json_escape(&layer.provider_id),
+                    json_escape(&layer.provider_semantics_digest),
+                    json_escape(&layer.lookup_key),
+                    inputs,
+                    json_escape(&layer.content_id),
+                    json_escape(&layer.acquisition),
+                    json_escape(&layer.construction.origin),
+                    string_array_json(layer.construction.command_argv.iter().map(String::as_str)),
+                    json_escape(&layer.construction.working_directory),
+                    json_escape(&layer.construction.tool_name),
+                    json_escape(&layer.construction.tool_executable_digest),
+                    json_escape(&layer.construction.tool_reported_version),
+                    environment,
+                    json_escape(&layer.construction.environment_digest),
+                    json_escape(&layer.construction.network_policy_requested),
+                    json_escape(&layer.construction.network_policy_effective),
+                    json_escape(&layer.construction.filesystem_write_policy_effective),
+                    targets,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     )
 }
 
@@ -10315,7 +10343,11 @@ fn real_execution_run_success_envelope(
     cache_build_ms: u128,
     cache_validation_ms: u128,
     projection_materialization_ms: u128,
-    dependency_prepare_ms: u128,
+    runtime_provider_discovery_ms: u128,
+    runtime_cache_lookup_ms: u128,
+    runtime_cache_wait_ms: u128,
+    runtime_provider_preparation_ms: u128,
+    runtime_private_binding_ms: u128,
     command_ms: u128,
     output_scan_ms: u128,
     publication_ms: u128,
@@ -10343,7 +10375,9 @@ fn real_execution_run_success_envelope(
             "\"runtime_policy\":{},",
             "\"output_capture\":{},",
             "\"output_text\":{{\"stdout\":\"{}\",\"stderr\":\"{}\",\"durability\":\"response_only\"}},",
-            "\"phase_timings_ms\":{{\"materialization\":{},\"cache_build\":{},\"cache_validation\":{},\"projection_materialization\":{},\"dependency_prepare\":{},\"command\":{},",
+            "\"phase_timings_ms\":{{\"materialization\":{},\"cache_build\":{},\"cache_validation\":{},\"projection_materialization\":{},",
+            "\"runtime_provider_discovery\":{},\"runtime_cache_lookup\":{},\"runtime_cache_wait\":{},",
+            "\"runtime_provider_preparation\":{},\"runtime_private_binding\":{},\"command\":{},",
             "\"output_scan_and_classification\":{},\"publication\":{},\"total\":{}}},",
             "\"output_summary_counts\":{},",
             "\"promotion_candidates\":[{}]",
@@ -10369,7 +10403,11 @@ fn real_execution_run_success_envelope(
         cache_build_ms,
         cache_validation_ms,
         projection_materialization_ms,
-        dependency_prepare_ms,
+        runtime_provider_discovery_ms,
+        runtime_cache_lookup_ms,
+        runtime_cache_wait_ms,
+        runtime_provider_preparation_ms,
+        runtime_private_binding_ms,
         command_ms,
         output_scan_ms,
         publication_ms,
@@ -10447,6 +10485,7 @@ fn real_checkpoint_snapshot_json(
             "\"tree_identity\":{},",
             "\"topic_frontier\":{},",
             "\"completed_frontier_coverage\":{},",
+            "\"canonical\":{},",
             "\"evidence_refs\":[{}],",
             "\"entry_count\":{},",
             "\"created_at\":\"{}\",",
@@ -10464,6 +10503,7 @@ fn real_checkpoint_snapshot_json(
         }),
         real_topic_frontier_pairs_json(&checkpoint.topic_frontier),
         real_checkpoint_completed_frontier_coverage_json(checkpoint),
+        checkpoint.checkpoint_id == state.canonical_checkpoint_id,
         checkpoint
             .evidence_refs
             .iter()
@@ -10870,10 +10910,11 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
         .iter()
         .map(|checkpoint| {
             format!(
-                "{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"exported\":{}}}",
+                "{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"canonical\":{},\"exported\":{}}}",
                 json_escape(&checkpoint.checkpoint_id),
                 json_escape(&checkpoint.resolved_view_id),
                 json_escape(&checkpoint.tree_hash),
+                checkpoint.checkpoint_id == state.canonical_checkpoint_id,
                 state
                     .export_maps
                     .iter()
@@ -10904,7 +10945,7 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
         .join(",");
     format!(
         concat!(
-            "{{\"repository\":{{\"repository_id\":\"{}\",\"base_checkpoint_id\":\"{}\",\"base_resolved_view_id\":\"{}\",\"current_resolved_view_id\":\"{}\",\"tree_hash\":\"{}\"}},",
+            "{{\"repository\":{{\"repository_id\":\"{}\",\"base_checkpoint_id\":\"{}\",\"canonical_checkpoint_id\":\"{}\",\"base_resolved_view_id\":\"{}\",\"current_resolved_view_id\":\"{}\",\"tree_hash\":\"{}\"}},",
             "\"worktree\":{{\"state\":\"{}\",\"anchor\":{},\"candidate_count\":{},\"candidate_counts\":{{{}}},\"worktree_diff_id\":{},\"scan_error\":{}}},",
             "\"artifacts\":{{\"active\":{},\"legacy_quarantine_excluded\":{}}},",
             "\"topics\":{{\"count\":{},\"heads\":{}}},",
@@ -10919,6 +10960,7 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
         ),
         json_escape(&state.repository_id),
         json_escape(&state.base_checkpoint_id),
+        json_escape(&state.canonical_checkpoint_id),
         json_escape(&state.base_resolved_view_id),
         json_escape(&head.result.resolved_view_id),
         json_escape(&head_tree_hash),
@@ -10972,25 +11014,22 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
 fn recommended_start_checkpoint(
     state: &RealRepoState,
 ) -> Option<(&RealCheckpointSnapshot, Vec<TopicFrontierEntry>)> {
-    let mut newest_valid = None;
-    for checkpoint in state.checkpoints.iter().rev() {
-        if real_resolve_checkpoint_by_id(state, &checkpoint.checkpoint_id).is_err() {
-            continue;
-        }
-        let frontier = checkpoint
-            .topic_frontier
-            .iter()
-            .cloned()
-            .collect::<BTreeMap<_, _>>();
-        let omissions = completed_topic_frontier_omissions(state, &frontier);
-        if omissions.is_empty() {
-            return Some((checkpoint, omissions));
-        }
-        if newest_valid.is_none() {
-            newest_valid = Some((checkpoint, omissions));
-        }
+    if state.canonical_checkpoint_id == state.base_checkpoint_id {
+        return None;
     }
-    newest_valid
+    let checkpoint = state
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.checkpoint_id == state.canonical_checkpoint_id.as_str())?;
+    let frontier = checkpoint
+        .topic_frontier
+        .iter()
+        .cloned()
+        .collect::<BTreeMap<_, _>>();
+    Some((
+        checkpoint,
+        completed_topic_frontier_omissions(state, &frontier),
+    ))
 }
 
 fn real_recommended_start_json(state: &RealRepoState) -> String {
@@ -11005,11 +11044,6 @@ fn real_recommended_start_json(state: &RealRepoState) -> String {
             .cloned()
             .collect::<BTreeMap<_, _>>();
         let acknowledged = checkpoint.completed_frontier_acknowledged && recorded == omitted;
-        let source = if omissions.is_empty() {
-            "latest_complete_checkpoint"
-        } else {
-            "latest_partial_checkpoint"
-        };
         return format!(
             "{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\",\"tree_hash\":\"{}\",\"topic_frontier\":{},\"completed_frontier_coverage\":{{\"complete\":{},\"acknowledged\":{},\"omitted_completed_topic_heads\":{}}},\"source\":\"{}\"}}",
             json_escape(&checkpoint.checkpoint_id),
@@ -11019,7 +11053,7 @@ fn real_recommended_start_json(state: &RealRepoState) -> String {
             omissions.is_empty(),
             acknowledged,
             string_map_object_json(&omitted),
-            source,
+            "canonical_checkpoint",
         );
     }
 
@@ -11082,7 +11116,7 @@ fn real_operational_warnings_json(
                 .map(|entry| (entry.topic_id, entry.topic_revision_id))
                 .collect::<BTreeMap<_, _>>();
             warnings.push(format!(
-                "{{\"code\":\"recommended_start_omits_completed_topic_heads\",\"message\":\"no complete checkpoint covers every completed topic head\",\"details\":{{\"omitted_completed_topic_heads\":{},\"next_action\":\"Resolve the intended completed revisions together and checkpoint that exact view, or use the explicit partial-checkpoint acknowledgement when omission is intentional.\"}}}}",
+                "{{\"code\":\"completed_topics_pending_integration\",\"message\":\"completed topic heads remain outside the canonical checkpoint\",\"details\":{{\"pending_completed_topic_heads\":{},\"next_action\":\"Resolve each intended topic revision onto repository.recommended_start, validate the combined view, and create the next canonical checkpoint. Deferred or alternative topics may remain separate.\"}}}}",
                 string_map_object_json(&omitted),
             ));
         }
@@ -11147,6 +11181,7 @@ fn print_real_status_text(
         head.result.resolved_view_id,
         head_tree_hash
     );
+    outputln!(ctx, "canonical {}", state.canonical_checkpoint_id);
     outputln!(
         ctx,
         "worktree {}  anchor-generation={}  candidates={}",
@@ -11397,7 +11432,7 @@ fn real_status_envelope(
         })
         .unwrap_or_default();
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"recommended_start\":{},\"automatic_secret_detection\":false,\"legacy_quarantine_excluded_count\":{},\"ignore_policy\":{{\"gitignore\":\"git_semantics\",\"sunignore\":\".sunignore\",\"sunignore_owner\":\"human_worktree\",\"sunignore_change_command\":\"sun init\",\"intrinsic\":[\".git/\",\".sunlight/\"]}},\"worktree\":{}}},\"completion_guard\":{},\"topic\":{},\"handoff\":{},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"{}\",\"repository_id\":\"{}\",\"ids\":{{\"repository_id\":\"{}\",\"session_id\":{},\"topic_id\":{},\"resolved_view_id\":\"{}\"}},\"view\":{},\"repository\":{{\"artifact_count\":{},\"tree_hash\":\"{}\",\"base_checkpoint_id\":\"{}\",\"canonical_checkpoint_id\":\"{}\",\"recommended_start\":{},\"automatic_secret_detection\":false,\"legacy_quarantine_excluded_count\":{},\"ignore_policy\":{{\"gitignore\":\"git_semantics\",\"sunignore\":\".sunignore\",\"sunignore_owner\":\"human_worktree\",\"sunignore_change_command\":\"sun init\",\"intrinsic\":[\".git/\",\".sunlight/\"]}},\"worktree\":{}}},\"completion_guard\":{},\"topic\":{},\"handoff\":{},\"session\":{{\"session_id\":{},\"session_generation_id\":\"{}\",\"compatibility_projections\":[{}]{}}}{}}},\"warnings\":{}}}",
         command,
         json_escape(&state.repository_id),
         json_escape(&state.repository_id),
@@ -11408,6 +11443,7 @@ fn real_status_envelope(
         state.entries.iter().filter(|entry| !entry.tombstone).count(),
         json_escape(&state.tree_hash),
         json_escape(&state.base_checkpoint_id),
+        json_escape(&state.canonical_checkpoint_id),
         real_recommended_start_json(state),
         state.quarantine.len(),
         real_worktree_status_json(state, summary),
@@ -11436,6 +11472,12 @@ fn real_completion_guard_json(state: &RealRepoState, summary: &RealOperationalSu
         .map(|checkpoint| checkpoint.checkpoint_id.as_str())
         .collect::<Vec<_>>();
     let native_handoff_available = !completed_topic_ids.is_empty() || !checkpoint_ids.is_empty();
+    let canonical_frontier = real_canonical_checkpoint_frontier(state).unwrap_or_default();
+    let pending_completed_topic_heads =
+        completed_topic_frontier_omissions(state, &canonical_frontier)
+            .into_iter()
+            .map(|entry| (entry.topic_id, entry.topic_revision_id))
+            .collect::<BTreeMap<_, _>>();
     let status = match summary.worktree_state.as_str() {
         "unavailable" => "worktree_scan_unavailable",
         "dirty" if native_handoff_available => "native_handoff_with_external_changes",
@@ -11457,9 +11499,11 @@ fn real_completion_guard_json(state: &RealRepoState, summary: &RealOperationalSu
         _ => "Create or identify the native topic handoff before claiming implementation.",
     };
     format!(
-        "{{\"status\":\"{}\",\"native_handoff_available\":{},\"completed_topic_ids\":{},\"checkpoint_ids\":{},\"repository_worktree_clean\":{},\"external_change_count\":{},\"next_action\":\"{}\"}}",
+        "{{\"status\":\"{}\",\"native_handoff_available\":{},\"canonical_checkpoint_id\":\"{}\",\"pending_completed_topic_heads\":{},\"completed_topic_ids\":{},\"checkpoint_ids\":{},\"repository_worktree_clean\":{},\"external_change_count\":{},\"next_action\":\"{}\"}}",
         status,
         native_handoff_available,
+        json_escape(&state.canonical_checkpoint_id),
+        string_map_object_json(&pending_completed_topic_heads),
         string_array_json(completed_topic_ids.iter().copied()),
         string_array_json(checkpoint_ids.iter().copied()),
         summary.worktree_state == "clean",
@@ -11853,6 +11897,8 @@ struct CheckpointCreateOptions {
     view_id: String,
     execution_id: Option<String>,
     acknowledge_omitted_completed_heads: bool,
+    side_checkpoint: bool,
+    expected_canonical_checkpoint_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -12379,6 +12425,8 @@ fn parse_checkpoint_create_options(
     let mut view_id = None;
     let mut execution_id = None;
     let mut acknowledge_omitted_completed_heads = false;
+    let mut side_checkpoint = false;
+    let mut expected_canonical_checkpoint_id = None;
     let mut args = ctx.args.iter().skip(2);
 
     while let Some(arg) = args.next() {
@@ -12407,6 +12455,18 @@ fn parse_checkpoint_create_options(
             }
             "--acknowledge-omitted-completed-heads" => {
                 acknowledge_omitted_completed_heads = true;
+                side_checkpoint = true;
+            }
+            "--side-checkpoint" => {
+                side_checkpoint = true;
+            }
+            "--expected-canonical-checkpoint" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request(
+                        "usage: sun checkpoint create --expected-canonical-checkpoint requires <checkpoint-id>",
+                    )
+                })?;
+                expected_canonical_checkpoint_id = Some(value.clone());
             }
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
@@ -12424,7 +12484,7 @@ fn parse_checkpoint_create_options(
 
     let view_id = view_id.ok_or_else(|| {
         invalid_request(
-            "usage: sun checkpoint create --view <resolved-view-id> [--execution <execution-id>] [--acknowledge-omitted-completed-heads] [--fixture basic-app]",
+            "usage: sun checkpoint create --view <resolved-view-id> [--execution <execution-id>] [--expected-canonical-checkpoint <checkpoint-id>] [--side-checkpoint] [--fixture basic-app]",
         )
     })?;
 
@@ -12433,6 +12493,8 @@ fn parse_checkpoint_create_options(
         view_id,
         execution_id,
         acknowledge_omitted_completed_heads,
+        side_checkpoint,
+        expected_canonical_checkpoint_id,
     })
 }
 
@@ -16809,7 +16871,17 @@ fn phase1_capabilities_json() -> String {
     )
 }
 
-fn checkpoint_create_success_envelope(checkpoint: &CheckpointRecord) -> String {
+struct CheckpointCanonicalOutcome<'a> {
+    previous_checkpoint_id: &'a str,
+    current_checkpoint_id: &'a str,
+    advanced: bool,
+    side_checkpoint: bool,
+}
+
+fn checkpoint_create_success_envelope(
+    checkpoint: &CheckpointRecord,
+    canonical: Option<CheckpointCanonicalOutcome<'_>>,
+) -> String {
     let execution_id = checkpoint
         .evidence_refs
         .first()
@@ -16839,6 +16911,7 @@ fn checkpoint_create_success_envelope(checkpoint: &CheckpointRecord) -> String {
             "\"tree_identity\":{},",
             "\"topic_frontier\":{},",
             "\"completed_frontier_coverage\":{},",
+            "\"canonical\":{},",
             "\"evidence_refs\":[{}],",
             "\"export_refs\":{},",
             "\"export_ready\":true,",
@@ -16861,6 +16934,17 @@ fn checkpoint_create_success_envelope(checkpoint: &CheckpointRecord) -> String {
         single_repo_tree_json(&checkpoint.tree_identity),
         checkpoint_topic_frontier_json(checkpoint),
         checkpoint_completed_frontier_coverage_json(checkpoint),
+        canonical.map_or_else(
+            || "null".to_string(),
+            |canonical| format!(
+                "{{\"advanced\":{},\"side_checkpoint\":{},\"previous_checkpoint_id\":\"{}\",\"current_checkpoint_id\":\"{}\",\"recommended\":{}}}",
+                canonical.advanced,
+                canonical.side_checkpoint,
+                json_escape(canonical.previous_checkpoint_id),
+                json_escape(canonical.current_checkpoint_id),
+                !canonical.side_checkpoint && canonical.current_checkpoint_id == checkpoint.id,
+            ),
+        ),
         checkpoint
             .evidence_refs
             .iter()
@@ -21414,8 +21498,8 @@ fn next_action_for_error_code(code: &str) -> &'static str {
         "checkpoint_stale_view" | "resolver_frontier_input_lost" | "persisted_view_mismatch" => {
             "Inspect the returned staleness or frontier facts, reselect exact completed revisions, and create a fresh resolved view before retrying."
         }
-        "checkpoint_omits_completed_topic_heads" => {
-            "Resolve the intended completed revisions together and checkpoint that exact view, or explicitly acknowledge a partial or alternative checkpoint so every omitted head is recorded."
+        "canonical_checkpoint_advanced" | "checkpoint_does_not_extend_canonical" => {
+            "Resolve the task's exact topic revision onto repository.recommended_start, validate the combined view, and retry with that checkpoint ID as expected_canonical_checkpoint. Use a side checkpoint only for intentionally isolated or alternative work."
         }
         "repository_writer_busy" => {
             "Sunlight already waited for ordinary short publication overlap. Inspect the returned lock and timeout, then retry one safe native call after the active command finishes. For execution_run, inspect the exact execution record and never rerun an external command solely because metadata publication timed out."
@@ -21435,6 +21519,28 @@ fn next_action_for_error_code(code: &str) -> &'static str {
         }
         "execution_network_isolation_cleanup_failed" => {
             "Inspect the recorded execution and cleanup facts, run the documented bounded cleanup or restart recovery, and do not assume isolation state was removed."
+        }
+        "runtime_layer_network_unavailable" => {
+            "Allow dependency downloads for one execution to populate the shared layer, or retry after another permitted execution has prepared the same exact dependency inputs."
+        }
+        "runtime_layer_provider_ambiguous" | "runtime_layer_provider_unsupported"
+        | "runtime_layer_target_conflict" | "runtime_layer_target_not_gitignored" => {
+            "Inspect the reported provider, input, and target facts. Make the repository's package-manager intent and ignored dependency target unambiguous, then resolve and run a new exact view."
+        }
+        "runtime_layer_provider_tool_missing"
+        | "runtime_layer_provider_tool_version_mismatch"
+        | "runtime_layer_provider_tool_incompatible" => {
+            "Install the declared package-manager version in the controlled PATH, or use an already cached layer with the same exact dependency inputs."
+        }
+        "runtime_layer_preparation_failed" | "runtime_layer_preparation_modified_source"
+        | "runtime_layer_invalid_content" => {
+            "Inspect the bounded provider error and resolved dependency inputs. Correct the lockfile, unsupported lifecycle behavior, or unsafe output before retrying; no target command or layer was published."
+        }
+        "runtime_layer_binding_failed" | "runtime_layer_publication_failed"
+        | "runtime_layer_cache_corrupt" | "runtime_layer_storage_failed"
+        | "runtime_layer_storage_full" | "runtime_layer_lock_failed"
+        | "runtime_layer_acquisition_timeout" => {
+            "Inspect the managed runtime-layer path and timing facts. Free local cache space or correct the reported local storage problem, then retry the same exact view."
         }
         "commit_policy_failed" => {
             "Inspect the inline metadata-policy failures, then correct the supplied .sunlight metadata candidate paths or restore the managed .gitignore block before rerunning policy_check_commit."
@@ -21540,7 +21646,7 @@ Usage:
   sun compat capture --worktree --topic <slug> --actor <actor> [--candidate <candidate>...|--path <path>...] [--json]
   sun run --view <view> [runtime policy options] -- <command> [args...]
   sun execution promote-output <execution> --path <path> --session <session> --classification source_like_delta|generated_artifact [--json]
-  sun checkpoint create --view <view> [--execution <execution>] [--acknowledge-omitted-completed-heads] [--json]
+  sun checkpoint create --view <view> [--execution <execution>] [--expected-canonical-checkpoint <checkpoint>] [--side-checkpoint] [--json]
   sun policy check-export --checkpoint <checkpoint> --branch <ref> [--json]
   sun policy check-commit [--paths <.sunlight/path>...] [--json]
   sun policy explain <validation-report> [--json]
@@ -21610,7 +21716,7 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
         "compat" | "compat project" | "compat diff" | "compat import" | "compat capture" => outputln!(ctx, "sun compat\n\nUsage:\n  sun compat project --session <session> [--json]\n  sun compat diff --projection <projection> [--json]\n  sun compat import --projection <projection> --candidate <candidate> --session-generation <generation> [--json]\n  sun compat diff --worktree [--json]\n  sun compat capture --worktree --topic <slug> --actor <actor> [--anchor-generation <number>] [--candidate <candidate>...|--path <path>...] [--json]\n\nProjection imports enter an existing session. Direct worktree capture creates one completed topic and advances the durable worktree anchor without rewriting repository files."),
         "policy" | "policy check-export" | "policy check-commit" | "policy explain" => outputln!(ctx, "sun policy\n\nUsage:\n  sun policy check-export --checkpoint <checkpoint> --branch <ref> [--json]\n  sun policy check-commit [--paths <.sunlight/path>...] [--json]\n  sun policy explain <validation-report> [--json]\n\ncheck-commit validates only Sunlight metadata or, with no paths, the managed .gitignore block. It returns an inline report. Source-artifact safety uses a checkpoint plus check-export; that persisted export report can be passed to policy explain."),
         "git" | "git export" => outputln!(ctx, "sun git export\n\nUsage:\n  sun git export --checkpoint <checkpoint> --branch <ref> [--write-plan|--execute-local] [--repo <path>] [--json]"),
-        "checkpoint" | "checkpoint create" => outputln!(ctx, "sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--execution <passing-execution-id>] [--acknowledge-omitted-completed-heads] [--json]\n\nWhen supplied, execution evidence must pass and exactly match the resolved view and tree. Completed topic heads cannot be omitted by default; the acknowledgement flag records an intentional partial or alternative checkpoint."),
+        "checkpoint" | "checkpoint create" => outputln!(ctx, "sun checkpoint create\n\nUsage:\n  sun checkpoint create --view <resolved-view-id> [--execution <passing-execution-id>] [--expected-canonical-checkpoint <checkpoint-id>] [--side-checkpoint] [--json]\n\nWhen supplied, execution evidence must pass and exactly match the resolved view and tree. The normal path advances repository.recommended_start only when the view preserves the current canonical checkpoint frontier. Pass the recommended checkpoint as the expected value for concurrent compare-and-swap behavior. Use --side-checkpoint only for an isolated or alternative checkpoint."),
         "run" => outputln!(ctx, "sun run\n\nUsage:\n  sun run --view <resolved-view-id> [--network disabled|not_enforced] -- <command> [args...]\n\nRuntime bounds come from [execution_policy] in .sunlight/config.toml. Windows runs always use restricted low-integrity filesystem isolation and a dedicated Job Object. Network disabled adds a capability-less per-execution AppContainer; not_enforced retains compatibility with ordinary user toolchains."),
         "read" | "list" | "search" | "patch" | "write" | "move" | "delete" | "metadata" | "metadata set" => outputln!(ctx, "sun artifact operations\n\nUsage:\n  sun read <path> (--session <session> | --view <resolved-view>) [--json]\n  sun list [path-prefix] (--session <session> | --view <resolved-view>) [--json]\n  sun search <query> (--session <session> | --view <resolved-view>) [--json]\n  sun patch <path> --session <session> --expect-hash <hash> --patch-file <file> [--json]\n  sun write <path> --session <session> --expect-hash <hash-or-new> --content-file <file> --classification source|generated [--json]\n  sun move <from> <to> --session <session> --expect-hash <hash> [--json]\n  sun delete <path> --session <session> --expect-hash <hash> [--json]\n  sun metadata set <path> --session <session> --expect-hash <hash> --classification source|generated [--json]\n\nsource checkpoints and exports normally. generated checkpoints normally but exports only with reachable execution-output promotion provenance; relabeling does not create provenance."),
         "view" | "view resolve" => outputln!(ctx, "sun view resolve\n\nUsage:\n  sun view resolve --base <checkpoint> [--include <topic>:<revision>] [--json]\n\nStart from any exact checkpoint. Its topic frontier is included automatically, and explicit selections replace revisions for the same topic. Omitting include on a later checkpoint reproduces it exactly. Omitting include on the repository base is discovery-only and resolves moving current heads. Conflicts and staleness remain inspectable records."),

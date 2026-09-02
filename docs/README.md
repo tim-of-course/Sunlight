@@ -5,7 +5,11 @@ public MCP schemas. These documents explain that behavior:
 
 - the repository [README](../README.md);
 - [local MCP reference](local_mcp.md);
-- the harness-neutral [Sunlight Agent Skill](../integrations/agent-skills/sunlight/SKILL.md).
+- the harness-neutral [Sunlight Agent Skill](../integrations/agent-skills/sunlight/SKILL.md);
+- the implemented [Canonical Checkpoint Approved Addendum](sunlight_canonical_checkpoint_addendum.md),
+  which defines the non-regressing recommended integration line; and
+- the implemented [Runtime Layers Approved Addendum](sunlight_runtime_layers_addendum.md),
+  which replaces the execution projection contract's runtime-dependency design.
 
 [Open-alpha acceptance](open_alpha_acceptance.md) and its retained evidence are
 release-test records. They demonstrate tested behavior but are not operational

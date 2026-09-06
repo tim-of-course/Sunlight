@@ -31,12 +31,15 @@ authoring or integration.
 
 - Create one bounded topic and one actor-owned session from an exact view.
 - Keep that session pinned while unrelated topics resolve or conflict. The
-  session remains writable until its own topic is completed.
+  session remains writable until its own topic is completed or abandoned.
 - Inspect and mutate tracked artifacts through Sunlight. Use returned hashes as
   compare-and-swap preconditions.
 - Keep authoring scoped to that exact session while other topics are open;
   their changes matter only when selected for integration.
 - Complete work at the exact head revision with a factual immutable handoff.
+- If an experiment or replaced attempt is genuinely obsolete, abandon its
+  exact head with the owning session. Abandonment preserves history and is not
+  patch-error recovery.
 - Use `topic_wait` only for an explicit task dependency. Use `view_resolve` with
   the recommended checkpoint and exact selected revisions for integration; the
   checkpoint frontier is carried forward automatically.

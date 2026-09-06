@@ -79,6 +79,9 @@ the captured revision.
    `generated` for output promoted from a recorded execution. When one logical
    edit spans multiple existing text files, pass `artifact_patch.edits` so all
    per-file hashes and patches succeed as one operation and topic revision.
+   Each entry contains only the hunks for its own `path`; do not repeat a
+   combined multi-file patch envelope in every entry. Use `artifact_search.limit`
+   to bound broad searches.
 6. Re-read important changes from the session view. If a focused validation is
    useful before integration, resolve the topic revision into an exact view and
    run it there.
@@ -87,7 +90,14 @@ the captured revision.
    performed. Completion makes the topic immutable; it is not a quality claim.
 
 Treat stale or ambiguous patch context as a request for a fresh read. Never
-bypass a failed CAS by writing outside Sunlight.
+bypass a failed CAS by writing outside Sunlight. Re-read only the affected path
+and retry in the same pinned session. A patch failure does not call for session
+refresh or a replacement topic.
+
+When a topic is genuinely obsolete, use `topic_abandon` with its owning
+session, exact current head (or `none`), and a factual reason. Abandonment keeps
+the history inspectable while removing it from normal integration guidance. It
+cannot discard canonical work.
 
 ## Coordinate and integrate
 
@@ -147,7 +157,10 @@ bypass a failed CAS by writing outside Sunlight.
 
 ## Failure handling
 
-- `precondition_failed`: re-read the artifact and reconsider the patch.
+- `precondition_failed`: re-read the affected artifact and retry against its
+  returned hash in the same pinned session.
+- `patch_scope_mismatch`, `patch_parse_failed`, or `patch_apply_failed`: rebuild
+  the per-file patch and retry in the same session. Keep the current topic.
 - `repository_writer_busy`: Sunlight already waited for ordinary short
   publication overlap. Inspect the returned lock and timeout facts. Retry one
   safe native call after the active command finishes; report recurrence as a

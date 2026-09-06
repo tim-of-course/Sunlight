@@ -2258,7 +2258,8 @@ pub fn is_projection_local_metadata_path(root: &Path, path: &Path) -> bool {
                 (Some(first), Some(second))
                     if first.as_os_str() == ".sunlight"
                         && (second.as_os_str() == "projections"
-                            || second.as_os_str() == "quarantine")
+                            || second.as_os_str() == "quarantine"
+                            || second.as_os_str() == "local")
             )
         })
         .unwrap_or(false)
@@ -3115,7 +3116,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_local_metadata_path_excludes_projection_and_quarantine_metadata_only() {
+    fn projection_local_metadata_path_excludes_internal_metadata_only() {
         let root = Path::new("/tmp/projection-root");
 
         assert!(is_projection_local_metadata_path(
@@ -3125,6 +3126,10 @@ mod tests {
         assert!(is_projection_local_metadata_path(
             root,
             &root.join(".sunlight/quarantine/projections/projection_exec_auth_profile_0001/execution_store_integrity_failed.json")
+        ));
+        assert!(is_projection_local_metadata_path(
+            root,
+            &root.join(".sunlight/local/record-publication/staged.json")
         ));
         assert!(!is_projection_local_metadata_path(
             root,
@@ -3158,6 +3163,7 @@ mod tests {
             root.join(".sunlight/quarantine/projections/projection_exec_auth_profile_0001"),
         )
         .unwrap();
+        fs::create_dir_all(root.join(".sunlight/local/record-publication")).unwrap();
         fs::create_dir_all(root.join(".sunlight/other")).unwrap();
 
         assert_eq!(count_materialized_directories(&root).unwrap(), 5);

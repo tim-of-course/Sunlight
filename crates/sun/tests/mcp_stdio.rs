@@ -198,7 +198,7 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
 
     let listed = mcp.request(2, "tools/list", json!({}));
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 30);
+    assert_eq!(tools.len(), 31);
     let advertised = serde_json::to_string(tools).unwrap();
     assert!(!advertised.to_ascii_lowercase().contains("fixture"));
     for required in [
@@ -213,6 +213,7 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
         "worktree_diff",
         "worktree_capture",
         "topic_complete",
+        "topic_abandon",
         "execution_run",
         "checkpoint_create",
         "git_export",
@@ -1329,21 +1330,21 @@ fn two_mcp_processes_start_executions_without_id_root_or_command_replay_collisio
     assert_eq!(command_runs, vec!["first", "second"]);
 
     let state = RealRepoState::load(&repo).unwrap();
-    assert_eq!(state.executions.len(), 2);
+    assert!(state.executions.is_empty());
     assert!(state
-        .executions
-        .iter()
-        .all(|execution| execution.status == "pass"));
-    let execution_projections = state
         .projections
         .iter()
-        .filter(|projection| projection.purpose == "execution")
-        .collect::<Vec<_>>();
+        .all(|projection| projection.purpose != "execution"));
+    let executions = standalone_execution_records(&repo);
+    assert_eq!(executions.len(), 2);
+    assert!(executions
+        .iter()
+        .all(|execution| execution["snapshot"]["status"] == "pass"));
+    let execution_projections = standalone_execution_projection_records(&repo);
     assert_eq!(execution_projections.len(), 2);
     assert!(execution_projections.iter().all(|projection| {
-        projection
-            .materialized_root
-            .as_ref()
+        projection["snapshot"]["materialized_root"]
+            .as_str()
             .is_some_and(|root| Path::new(root).is_dir())
     }));
     assert_eq!(
@@ -1512,36 +1513,16 @@ fn pinned_session_remains_writable_during_unrelated_checkpoint_and_execution_com
     start_queue.lock().unwrap();
     first_runner.start_call(2, "execution_run", execution_args("first"));
     second_runner.start_call(2, "execution_run", execution_args("second"));
-    wait_for_directory_entry_count(
-        &repo.join(".sunlight/local/execution-start-reservations"),
-        2,
-    );
-    assert_path_remains_absent_for(&started, std::time::Duration::from_millis(250));
+    wait_for_file_line_count(&started, 2);
+    wait_for_execution_status_count(&repo, "running", 2);
     assert!(
         RealRepoState::load(&repo).unwrap().executions.is_empty(),
-        "execution starts published while the repository mutation queue was held"
+        "standalone execution starts entered canonical authoring state"
     );
-    drop(start_queue);
-
-    wait_for_file_line_count(&started, 2);
     assert!(
         !finished.exists(),
         "both command bodies must still be active"
     );
-    let running = RealRepoState::load(&repo).unwrap();
-    assert_eq!(running.executions.len(), 2);
-    assert!(running
-        .executions
-        .iter()
-        .all(|execution| execution.status == "running"));
-
-    let finish_queue = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&queue_path)
-        .unwrap();
-    finish_queue.lock().unwrap();
     author.start_call(
         7,
         "artifact_patch",
@@ -1554,8 +1535,8 @@ fn pinned_session_remains_writable_during_unrelated_checkpoint_and_execution_com
     );
     fs::write(&release, "finish\n").unwrap();
     wait_for_file_line_count(&finished, 2);
-    assert_executions_remain_running_for(&repo, 2, std::time::Duration::from_millis(250));
-    drop(finish_queue);
+    wait_for_execution_status_count(&repo, "pass", 2);
+    drop(start_queue);
 
     let patch = author.finish_call(7);
     let first_execution = first_runner.finish_call(2);
@@ -1589,11 +1570,10 @@ fn pinned_session_remains_writable_during_unrelated_checkpoint_and_execution_com
     assert_eq!(status["data"]["operational_summary"]["topics"]["count"], 2);
     let state = RealRepoState::load(&repo).unwrap();
     assert_eq!(state.topics.len(), 2);
-    assert_eq!(state.executions.len(), 2);
-    assert!(state
-        .executions
+    assert!(state.executions.is_empty());
+    assert!(standalone_execution_records(&repo)
         .iter()
-        .all(|execution| execution.status == "pass"));
+        .all(|execution| execution["snapshot"]["status"] == "pass"));
 
     author.shutdown();
     integrator.shutdown();
@@ -2453,51 +2433,52 @@ fn wait_for_file_line_count(path: &Path, expected: usize) {
     }
 }
 
-fn wait_for_directory_entry_count(path: &Path, expected: usize) {
+fn standalone_execution_records(repo: &Path) -> Vec<Value> {
+    standalone_store_records(&repo.join(".sunlight/executions"))
+        .into_iter()
+        .filter(|record| record.get("snapshot").is_some())
+        .collect()
+}
+
+fn standalone_execution_projection_records(repo: &Path) -> Vec<Value> {
+    standalone_store_records(&repo.join(".sunlight/projections"))
+        .into_iter()
+        .filter(|record| {
+            record["snapshot"]["purpose"] == "execution" && record.get("execution_id").is_some()
+        })
+        .collect()
+}
+
+fn standalone_store_records(root: &Path) -> Vec<Value> {
+    let mut records = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
+        .filter_map(|entry| fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        left.get("id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("id").and_then(Value::as_str))
+    });
+    records
+}
+
+fn wait_for_execution_status_count(repo: &Path, status: &str, expected: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let entry_count = fs::read_dir(path)
-            .map(|entries| entries.filter_map(Result::ok).count())
-            .unwrap_or(0);
-        if entry_count >= expected {
+        let count = standalone_execution_records(repo)
+            .iter()
+            .filter(|execution| execution["snapshot"]["status"] == status)
+            .count();
+        if count >= expected {
             return;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "{} did not reach {expected} entries before timeout",
-            path.display()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
-fn assert_path_remains_absent_for(path: &Path, duration: std::time::Duration) {
-    let deadline = std::time::Instant::now() + duration;
-    while std::time::Instant::now() < deadline {
-        assert!(
-            !path.exists(),
-            "{} appeared while execution start publication was queued",
-            path.display()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
-fn assert_executions_remain_running_for(
-    repo: &Path,
-    expected: usize,
-    duration: std::time::Duration,
-) {
-    let deadline = std::time::Instant::now() + duration;
-    while std::time::Instant::now() < deadline {
-        let state = RealRepoState::load(repo).unwrap();
-        assert_eq!(state.executions.len(), expected);
-        assert!(
-            state
-                .executions
-                .iter()
-                .all(|execution| execution.status == "running"),
-            "execution result published while the repository mutation queue was held"
+            "execution store did not reach {expected} `{status}` records before timeout"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }

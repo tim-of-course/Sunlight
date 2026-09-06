@@ -27,6 +27,7 @@ const MCP_SERVER_INSTRUCTIONS: &str = concat!(
     "Verify repositoryBinding, then call repository_status. Use repository.recommended_start as the exact default base and inspect repository.worktree for external edits. ",
     "For authored work, create one topic and actor-owned pinned session, use scoped artifact tools, and complete the exact topic revision with a factual handoff. ",
     "Unrelated topic, checkpoint, and execution advancement never requires session_refresh or a replacement topic. ",
+    "Patch errors are corrected in the same pinned session. Abandon only work that is genuinely obsolete. ",
     "Integrate by reading repository_status again, resolving the task revision onto the current recommended checkpoint, and validating that exact combined view. ",
     "Call checkpoint_create with the recommended checkpoint as expected_canonical_checkpoint. If the canonical checkpoint advanced, resolve and validate again before retrying. ",
     "Use side_checkpoint only for a user-requested isolated or alternative result; it never changes repository.recommended_start. ",
@@ -718,6 +719,7 @@ fn tool_uses_repository_mutation_queue(name: &str) -> bool {
         "repository_init"
             | "topic_create"
             | "topic_complete"
+            | "topic_abandon"
             | "session_start"
             | "session_refresh"
             | "artifact_patch"
@@ -1016,16 +1018,20 @@ fn execute_topic_wait(engine: &EngineContext, value: &Value, cancel: &Arc<Atomic
         if result.get("isError").and_then(Value::as_bool) == Some(true) {
             return with_engine_metrics(result, total_retries, total_writer_wait_ms);
         }
-        let completed = result
+        let terminal_outcome = match result
             .get("structuredContent")
             .and_then(|value| value.get("data"))
             .and_then(|value| value.get("topic"))
             .and_then(|value| value.get("status"))
             .and_then(Value::as_str)
-            == Some("completed");
-        if completed {
+        {
+            Some("completed") => Some("completed"),
+            Some("abandoned") => Some("abandoned"),
+            _ => None,
+        };
+        if let Some(outcome) = terminal_outcome {
             return with_engine_metrics(
-                tool_result_with_wait(result, "completed", started.elapsed().as_millis()),
+                tool_result_with_wait(result, outcome, started.elapsed().as_millis()),
                 total_retries,
                 total_writer_wait_ms,
             );
@@ -1107,6 +1113,18 @@ fn build_invocation(
             }
             v
         }
+        "topic_abandon" => vec![
+            "topic".into(),
+            "abandon".into(),
+            "--topic".into(),
+            identifier(args, "topic")?,
+            "--session".into(),
+            identifier(args, "session")?,
+            "--expected-head".into(),
+            identifier(args, "expected_head")?,
+            "--reason".into(),
+            text(args, "reason")?,
+        ],
         "session_start" => vec![
             "session".into(),
             "start".into(),
@@ -1139,6 +1157,18 @@ fn build_invocation(
         }
         "artifact_search" => {
             let mut v = vec!["search".into(), text(args, "query")?];
+            if let Some(value) = args.get("limit") {
+                let limit = value
+                    .as_u64()
+                    .filter(|value| (1..=200).contains(value))
+                    .ok_or_else(|| {
+                        ToolFailure::new(
+                            "invalid_request",
+                            "`limit` must be an integer from 1 through 200",
+                        )
+                    })?;
+                v.extend(["--limit".into(), limit.to_string()]);
+            }
             v.extend(artifact_read_scope_argv(args)?);
             v
         }
@@ -1352,7 +1382,8 @@ fn reject_unknown(args: &Map<String, Value>, allowed: &[&str]) -> Result<(), Too
     if let Some(key) = args.keys().find(|key| !allowed.contains(&key.as_str())) {
         Err(
             ToolFailure::new("invalid_request", format!("unknown argument `{key}`"))
-                .detail("argument", key.clone()),
+                .detail("argument", key.clone())
+                .detail("allowed_arguments", json!(allowed)),
         )
     } else {
         Ok(())
@@ -1848,6 +1879,11 @@ const TOOL_CONTRACTS: &[ToolContract] = &[
         required: &["topic", "revision", "session"],
     },
     ToolContract {
+        name: "topic_abandon",
+        allowed: &["topic", "session", "expected_head", "reason"],
+        required: &["topic", "session", "expected_head", "reason"],
+    },
+    ToolContract {
         name: "topic_wait",
         allowed: &["topic", "timeout_ms", "poll_interval_ms"],
         required: &["topic"],
@@ -1874,7 +1910,7 @@ const TOOL_CONTRACTS: &[ToolContract] = &[
     },
     ToolContract {
         name: "artifact_search",
-        allowed: &["query", "session", "view"],
+        allowed: &["query", "session", "view", "limit"],
         required: &["query"],
     },
     ToolContract {
@@ -2045,6 +2081,13 @@ fn tools() -> Vec<Value> {
             true,
         ),
         tool(
+            "topic_abandon",
+            "Remove obsolete or intentionally discarded work from normal integration guidance without deleting its history. Requires the owning session and exact current head. Repeating the identical request is an idempotent no-op. Canonical topics cannot be abandoned.",
+            json!({"topic":id_schema("Exact topic_id owned by session."),"session":id_schema("Exact owning authoring session_id."),"expected_head":{"type":"string","minLength":1,"description":"Exact current topic_revision_id, or the literal none when the topic has no revision."},"reason":{"type":"string","minLength":1,"maxLength":512,"description":"Short factual reason this topic is no longer an integration candidate."}}),
+            &["topic", "session", "expected_head", "reason"],
+            true,
+        ),
+        tool(
             "topic_wait",
             "Wait efficiently until another agent's topic is durably completed, the timeout expires, or the request is cancelled. Returns the same topic status and structured handoff as repository_status plus wait.outcome; this replaces repeated status polling.",
             json!({"topic":id_schema("Exact topic_id to observe."),"timeout_ms":{"type":"integer","minimum":0,"maximum":900000,"default":300000,"description":"Maximum wait in milliseconds. A timeout returns the latest status with wait.outcome=timeout."},"poll_interval_ms":{"type":"integer","minimum":50,"maximum":5000,"default":250,"description":"Internal local status check interval; normally leave at the default."}}),
@@ -2079,14 +2122,14 @@ fn tools() -> Vec<Value> {
         ),
         scoped_read_tool(
             "artifact_search",
-            "Search persisted artifact content in either an authoring session or an exact resolved view.",
-            json!({"query":s(),"session":id_schema("Exact session_id for session-scoped search."),"view":id_schema("Exact resolved_view_id for session-free read-only access.")}),
+            "Search persisted artifact content in stable path and line order in either an authoring session or an exact resolved view. Results and snippets are bounded.",
+            json!({"query":s(),"session":id_schema("Exact session_id for session-scoped search."),"view":id_schema("Exact resolved_view_id for session-free read-only access."),"limit":{"type":"integer","minimum":1,"maximum":200,"default":50,"description":"Maximum number of matches to return."}}),
             &["query"],
         ),
         tool(
             "artifact_patch",
-            "Patch one or more UTF-8 artifacts using compare-and-swap. Pass path, expect_hash, and patch for one edit, or pass edits for one atomic multi-file operation and one topic revision. Standard unified diffs and *** Begin Patch / *** Update File envelopes are accepted. Numeric hunk positions and counts are treated as hints; ambiguous or stale context is rejected.",
-            json!({"path":path_schema(),"session":id_schema("Exact authoring session_id."),"expect_hash":existing_hash_schema(),"patch":patch_schema(),"edits":{"type":"array","description":"Nonempty atomic batch of per-file compare-and-swap patches. Do not combine with top-level path, expect_hash, or patch.","minItems":1,"items":{"type":"object","properties":{"path":path_schema(),"expect_hash":existing_hash_schema(),"patch":patch_schema()},"required":["path","expect_hash","patch"],"additionalProperties":false}}}),
+            "Patch one or more UTF-8 artifacts using compare-and-swap. Pass path, expect_hash, and patch for one edit, or pass edits for one atomic multi-file operation and one topic revision. In a batch, each edits[i].patch contains only hunks for edits[i].path; never repeat one combined multi-file envelope in each entry. Standard unified diffs and a single matching *** Update File marker are accepted. Numeric hunk positions and counts are treated as hints; ambiguous or stale context is rejected.",
+            json!({"path":path_schema(),"session":id_schema("Exact authoring session_id."),"expect_hash":existing_hash_schema(),"patch":patch_schema(),"edits":{"type":"array","description":"Nonempty atomic batch of per-file compare-and-swap patches. Each patch contains only that entry's hunks. Example: [{path: 'a.txt', expect_hash: '<hash-a>', patch: '@@\\n-old a\\n+new a'}, {path: 'b.txt', expect_hash: '<hash-b>', patch: '@@\\n-old b\\n+new b'}]. Do not combine with top-level path, expect_hash, or patch.","minItems":1,"items":{"type":"object","properties":{"path":path_schema(),"expect_hash":existing_hash_schema(),"patch":patch_schema()},"required":["path","expect_hash","patch"],"additionalProperties":false}}}),
             &["session"],
             true,
         ),
@@ -2255,7 +2298,7 @@ fn tool(
 ) -> Value {
     let contract = tool_contract(name).expect("every advertised tool has one contract row");
     debug_assert_eq!(required, contract.required);
-    json!({"name":name,"description":description,"inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":contract.required},"outputSchema":output_schema(name),"annotations":{"readOnlyHint":!mutating,"destructiveHint":matches!(name,"artifact_delete"|"git_export"),"idempotentHint":matches!(name,"repository_init"|"repository_status"|"topic_complete"|"topic_wait"|"artifact_read"|"artifact_list"|"artifact_search"|"compat_diff"|"worktree_diff"|"policy_check_export"|"policy_check_commit"|"policy_explain"|"inspect")}})
+    json!({"name":name,"description":description,"inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":contract.required},"outputSchema":output_schema(name),"annotations":{"readOnlyHint":!mutating,"destructiveHint":matches!(name,"artifact_delete"|"git_export"),"idempotentHint":matches!(name,"repository_init"|"repository_status"|"topic_complete"|"topic_abandon"|"topic_wait"|"artifact_read"|"artifact_list"|"artifact_search"|"compat_diff"|"worktree_diff"|"policy_check_export"|"policy_check_commit"|"policy_explain"|"inspect")}})
 }
 
 fn output_schema(name: &str) -> Value {
@@ -2374,7 +2417,9 @@ fn output_ids(name: &str) -> &'static [&'static str] {
         "repository_init" => &["repository_id", "checkpoint_id", "resolved_view_id"],
         "repository_status" => &["repository_id"],
         "topic_create" => &["topic_id", "topic_revision_id"],
-        "topic_complete" | "topic_wait" => &["topic_id", "topic_revision_id", "session_id"],
+        "topic_complete" | "topic_abandon" | "topic_wait" => {
+            &["topic_id", "topic_revision_id", "session_id"]
+        }
         "session_start" | "session_refresh" => &[
             "topic_id",
             "session_id",
@@ -2433,6 +2478,10 @@ fn output_payloads(name: &str) -> &'static [(&'static str, &'static str)] {
         "topic_complete" => &[
             ("topic", "Completed topic record."),
             ("handoff", "Immutable factual completion handoff."),
+        ],
+        "topic_abandon" => &[
+            ("topic", "Abandoned topic with preserved completion facts."),
+            ("abandonment", "Immutable abandonment disposition."),
         ],
         "topic_wait" => &[
             ("topic", "Observed topic status."),
@@ -2777,6 +2826,7 @@ mod tests {
             "repository_init",
             "topic_create",
             "topic_complete",
+            "topic_abandon",
             "session_start",
             "session_refresh",
             "artifact_patch",
@@ -3127,10 +3177,9 @@ mod tests {
         let envelope: Value =
             serde_json::from_str(&super::super::failure_envelope(&native_error)).unwrap();
         assert_eq!(envelope["error"]["details"]["actual"], "sha256:current");
-        assert!(envelope["error"]["next_action"]
-            .as_str()
-            .unwrap()
-            .contains("returned exact hash and IDs"));
+        let next_action = envelope["error"]["next_action"].as_str().unwrap();
+        assert!(next_action.contains("affected artifact in the same session"));
+        assert!(next_action.contains("Do not refresh the session or create another topic"));
 
         let concurrency_error = super::super::CliError::new(
             "concurrent_state_update",

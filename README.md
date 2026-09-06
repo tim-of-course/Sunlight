@@ -5,14 +5,20 @@ topic-owned operations against exact repository views, compose exact revisions,
 run validation, and freeze checkpoints without creating a Git worktree or full
 checkout for every authoring agent.
 
-The open alpha supports **Windows only**. The current product scope is a local,
-single-repository workflow on Windows/NTFS. macOS and Linux builds are not
-supported alpha targets; their compilation or best-effort behavior is not a
-claim of enforced isolation or product support.
+**Internal alpha is established on macOS and Windows as of September 6, 2026.**
+The scope is local, single-repository workflows on trusted development machines,
+with normal backups and review of Git handoffs. Linux is not an alpha target.
 
-macOS is available as a development and test host. Passing its test lane does
-not change the Windows-only product scope: process-tree, resource, network, and
-filesystem isolation remain unenforced where the CLI reports them as such.
+The [September 6 evaluation](docs/acceptance/evidence/audit_fixes_tasgrid_2026-09-06.md)
+validated the current build on macOS with 507 passing tests, passing smoke
+scripts, and four fresh-agent TasGrid tasks. Windows has
+[prior open-alpha acceptance evidence](docs/open_alpha_acceptance.md);
+the September evaluation did not rerun the current build on Windows.
+
+Internal-alpha status does not imply enforced isolation. Process-tree,
+resource, network, and filesystem isolation remain unenforced wherever the CLI
+reports them as such. See the [known next priorities](docs/known_next_priorities.md)
+for ongoing performance and usability work.
 
 ## Build
 

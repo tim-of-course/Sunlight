@@ -2,10 +2,10 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Phase 3 planning contract |
+| Status | Implemented contract, amended by the runtime-layer addendum and triple-agent follow-up |
 | Date | July 3, 2026 |
 | Scope | Execution sandbox materialization, `sun run`, execution/evidence records, output promotion, cache policy, status/inspect exposure, failure modes, and acceptance tests |
-| Sources | `docs/sunlight_consolidated_architecture_v0_3.md`, `docs/sunlight_implementation_backlog_v0_1.md`, `docs/sunlight_schema_contracts_v0_1.md`, `docs/sunlight_native_io_phase1_spec_v0_1.md`, `docs/sunlight_resolver_conflict_fixtures_v0_1.md`, `docs/sunlight_checkpoint_git_export_v0_1.md`, `docs/sunlight_cli_status_inspect_v0_1.md` |
+| Sources | `docs/sunlight_consolidated_architecture_v0_3.md`, `docs/sunlight_implementation_backlog_v0_1.md`, `docs/sunlight_schema_contracts_v0_1.md`, `docs/sunlight_native_io_phase1_spec_v0_1.md`, `docs/sunlight_resolver_conflict_fixtures_v0_1.md`, `docs/sunlight_checkpoint_git_export_v0_1.md`, `docs/sunlight_cli_status_inspect_v0_1.md`, `docs/sunlight_runtime_layers_addendum.md`, `docs/sunlight_triple_agent_followup_proposal.md` |
 
 ## Purpose
 
@@ -149,6 +149,26 @@ The Phase 3 `execution` record uses the v1 schema contract.
 
 Identity inputs follow the schema contract: resolved view ID, tree identity, normalized command, working directory, environment summary digest, input refs, and projection strategy. Timestamps describe the run but should not be the only identity inputs.
 
+### Durable local execution storage
+
+New execution and projection records are stored as separate, atomically
+published JSON files under `.sunlight/executions/` and
+`.sunlight/projections/`. They are not embedded in the canonical repository
+record. Topics, sessions, resolved views, checkpoints, and the canonical
+checkpoint remain in canonical state.
+
+Each run reserves an execution ID, holds that execution's local lock, publishes
+its projection, then publishes a visible running record with an opaque runner
+token. Terminal publication must present the same token. Status and inspection
+read the standalone records without taking the long-held execution lock.
+
+Recovery uses the same per-execution lock. It removes a projection that was
+published without a corresponding execution record. A stranded running record
+becomes `interrupted` with `command_outcome: "unknown"`; its projection is
+quarantined and its outputs cannot be promoted. Readers also accept legacy
+execution and projection records embedded in canonical state, preferring a
+standalone record when both use the same ID.
+
 ## Environment Summary
 
 Environment summaries are reproducibility hints, not full machine snapshots. Capture enough to explain common MVP failures without leaking secrets.
@@ -242,6 +262,8 @@ Suggested error codes: `execution_conflicted_view`, `execution_missing_tree`, `e
 | Store integrity failure | Quarantine projection/cache entry and return `execution_store_integrity_failed`. |
 | Command non-zero exit | Persist execution record with `result.status: "fail"` and captured summaries. |
 | Timeout | Stop the process tree when possible, record `timed_out: true`, and retain local-only logs according to policy. |
+| Crash before visible execution publication | Remove the orphan projection after acquiring the execution lock; expose no execution. |
+| Crash after running publication | Recover the record as interrupted with unknown command outcome; quarantine the projection and block promotion. |
 | Secret-like output | Mark output `secret` or quarantine; block export and promotion unless policy supplies a safe reference. |
 | Promotion precondition failure | Write no operation transaction; return expected/actual hashes and unchanged topic/session state. |
 | Partial promotion | Either write all selected operation transactions for one promotion request or none; expose retryable details. |

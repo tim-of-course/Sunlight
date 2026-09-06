@@ -234,7 +234,7 @@ fn open_alpha_oa05_exact_checkpoint_exports_to_safe_buildable_git_handoff() {
         passing_source
     );
 
-    // An existing unrelated branch is never moved.
+    // A second destination for this checkpoint is rejected before moving its branch.
     let unrelated = git(
         &repo,
         &["commit-tree", "HEAD^{tree}", "-m", "unrelated collision"],
@@ -256,7 +256,7 @@ fn open_alpha_oa05_exact_checkpoint_exports_to_safe_buildable_git_handoff() {
         ],
         false,
     );
-    assert_eq!(rejected["error"]["code"], "export_target_ref_conflict");
+    assert_eq!(rejected["error"]["code"], "export_map_conflict");
     assert_eq!(git(&repo, &["rev-parse", collision]).trim(), unrelated);
 
     // Retrying the same exact handoff is idempotent and does not duplicate native mappings.

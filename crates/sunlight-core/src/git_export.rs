@@ -3982,6 +3982,7 @@ mod tests {
                     .find(|entry| entry.topic_id == *topic_id)
                     .map(|entry| entry.topic_revision_id.clone()),
                 completed_revision_id: None,
+                abandonment: None,
                 revision_number: 1,
             })
             .collect();

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod agent_setup;
 pub mod engine;
+mod execution_store;
 mod mcp;
 mod repository_queue;
 mod runtime_layers;
@@ -24,15 +25,18 @@ mod windows_job;
 
 use sha2::{Digest, Sha256};
 
+use execution_store::ExecutionStore;
+
 use sunlight_core::artifacts::{
-    ArtifactIoError, ArtifactKind, ContentBlob, ContentTree, DeleteRequest, ExpectedHash,
-    InMemoryArtifactStore, ListResponse, MetadataSetRequest, MoveRequest, MutationArtifactView,
-    MutationKind, MutationPayload, MutationRefs, MutationResponse, OperationTransactionRecord,
-    PatchRequest, ReadResponse, SearchResponse, SessionGenerationMutationRecord, SessionView,
-    SessionVisibleArtifactView, TopicRevisionRecord, TreeEntry, TreeIdentityView, WriteMode,
-    WriteRequest, FILE_OPERATION_SEMANTICS_VERSION, FIXTURE_ACTOR_ID, FIXTURE_REPOSITORY_ID,
+    bounded_search_snippet, ArtifactIoError, ArtifactKind, ContentBlob, ContentTree, DeleteRequest,
+    ExpectedHash, InMemoryArtifactStore, ListResponse, MetadataSetRequest, MoveRequest,
+    MutationArtifactView, MutationKind, MutationPayload, MutationRefs, MutationResponse,
+    OperationTransactionRecord, PatchRequest, ReadResponse, SearchResponse,
+    SessionGenerationMutationRecord, SessionView, SessionVisibleArtifactView, TopicRevisionRecord,
+    TreeEntry, TreeIdentityView, WriteMode, WriteRequest, DEFAULT_ARTIFACT_SEARCH_LIMIT,
+    FILE_OPERATION_SEMANTICS_VERSION, FIXTURE_ACTOR_ID, FIXTURE_REPOSITORY_ID,
     FIXTURE_RESOLVED_VIEW_ID, FIXTURE_SESSION_GENERATION_ID, FIXTURE_SESSION_ID, FIXTURE_TREE_HASH,
-    FIXTURE_WRITE_TOPIC_ID, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
+    FIXTURE_WRITE_TOPIC_ID, MAX_ARTIFACT_SEARCH_LIMIT, POSIX_CASE_SENSITIVE_PATH_POLICY_ID,
 };
 use sunlight_core::checkpoint::{
     fixture_checkpoint_from_resolved_view, validated_execution_evidence, CheckpointRecord,
@@ -107,12 +111,12 @@ use sunlight_core::repo_state::{
     verify_real_readonly_projection, DerivedRecordPublication, RealArtifactEntry,
     RealCheckpointSnapshot, RealExecutionEnvironmentSummary, RealExecutionOutputSnapshot,
     RealExecutionPromotionSnapshot, RealExecutionRuntimeDependencyBinding,
-    RealExecutionRuntimeLayer, RealExecutionSnapshot, RealExecutionToolHint, RealExportMapSnapshot,
-    RealOperationEffect, RealOperationRecord, RealProjectionMaterialization,
+    RealExecutionRuntimeLayer, RealExecutionSnapshot, RealExecutionTimings, RealExecutionToolHint,
+    RealExportMapSnapshot, RealOperationEffect, RealOperationRecord, RealProjectionMaterialization,
     RealProjectionMaterializationMetrics, RealProjectionMaterializationRequest,
     RealProjectionSnapshot, RealProjectionStrategy, RealRepoState, RealResolvedRepoView,
-    RealSessionGenerationRecord, RealSessionRecord, RealTopicRecord, RealWorktreeAnchor,
-    RepoStateError, TopicMetadataValidationError,
+    RealSessionGenerationRecord, RealSessionRecord, RealTopicAbandonmentRecord, RealTopicRecord,
+    RealWorktreeAnchor, RepoStateError, TopicMetadataValidationError,
 };
 use sunlight_core::repository::{
     init_repository, resolve_projection_policy, ExecutionPolicy, RepositoryConfig,
@@ -482,6 +486,7 @@ fn run(ctx: &CommandContext) -> Result<(), CliError> {
         [scope, command, ..] if scope == "agent" && command == "doctor" => agent_doctor(ctx),
         [scope, command, ..] if scope == "topic" && command == "create" => topic_create(&ctx),
         [scope, command, ..] if scope == "topic" && command == "complete" => topic_complete(&ctx),
+        [scope, command, ..] if scope == "topic" && command == "abandon" => topic_abandon(&ctx),
         [scope, command, ..] if scope == "session" && command == "start" => session_start(&ctx),
         [scope, command, ..] if scope == "session" && command == "refresh" => session_refresh(&ctx),
         [scope, command, ..] if scope == "view" && command == "resolve" => view_resolve(&ctx),
@@ -758,6 +763,8 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
             }
             let sunignore_policy_changed = state.sunignore_policy_changed(&report.repo_root)?;
             if !state.quarantine.is_empty() || sunignore_policy_changed {
+                let has_standalone_execution_state =
+                    ExecutionStore::new(&report.repo_root).has_records()?;
                 let has_authored_state = !state.topics.is_empty()
                     || !state.sessions.is_empty()
                     || !state.operations.is_empty()
@@ -766,6 +773,7 @@ fn init(ctx: &CommandContext, repo_root: PathBuf) -> Result<(), CliError> {
                     || !state.promotions.is_empty()
                     || !state.checkpoints.is_empty()
                     || !state.export_maps.is_empty();
+                let has_authored_state = has_authored_state || has_standalone_execution_state;
                 if has_authored_state {
                     if sunignore_policy_changed {
                         return Err(CliError::new(
@@ -957,6 +965,10 @@ fn topic_complete(ctx: &CommandContext) -> Result<(), CliError> {
     real_topic_complete(ctx, parse_topic_complete_options(ctx)?)
 }
 
+fn topic_abandon(ctx: &CommandContext) -> Result<(), CliError> {
+    real_topic_abandon(ctx, parse_topic_abandon_options(ctx)?)
+}
+
 fn session_start(ctx: &CommandContext) -> Result<(), CliError> {
     let options = parse_session_start_options(ctx)?;
     if let Some(fixture) = &options.fixture {
@@ -1046,7 +1058,7 @@ fn artifact_search(ctx: &CommandContext) -> Result<(), CliError> {
         .as_deref()
         .expect("fixture artifact reads require a session");
     let response = store
-        .search(session_id, &options.operands[0])
+        .search(session_id, &options.operands[0], options.limit)
         .map_err(artifact_error)?;
 
     if ctx.json {
@@ -2284,6 +2296,7 @@ fn real_worktree_capture(
             .unwrap_or_else(|| state.base_checkpoint_id.clone()),
         head_revision_id: None,
         completed_revision_id: None,
+        abandonment: None,
         revision_number: 0,
     });
     state.sessions.push(RealSessionRecord {
@@ -3465,6 +3478,7 @@ fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Resul
         base_checkpoint_id: state.base_checkpoint_id.clone(),
         head_revision_id: None,
         completed_revision_id: None,
+        abandonment: None,
         revision_number: 0,
     });
     state.sync_compat_fields();
@@ -3522,6 +3536,9 @@ fn real_topic_complete(
         .position(|topic| topic.topic_id == options.topic_id)
         .ok_or_else(|| object_not_found("topic", &options.topic_id))?;
     let topic = &state.topics[topic_index];
+    if let Some(abandonment) = &topic.abandonment {
+        return Err(topic_abandoned_error(topic, abandonment));
+    }
     if topic.head_revision_id.as_deref() != Some(options.revision_id.as_str()) {
         return Err(CliError::new(
             "topic_head_mismatch",
@@ -3632,10 +3649,166 @@ fn real_topic_complete(
     Ok(())
 }
 
+fn real_topic_abandon(ctx: &CommandContext, options: TopicAbandonOptions) -> Result<(), CliError> {
+    const MAX_CAS_RETRIES: usize = 16;
+    let repo_root = ctx.repo_root.clone();
+    for _ in 0..MAX_CAS_RETRIES {
+        let mut state = RealRepoState::load_metadata(&repo_root)?;
+        let session = real_session(&state, &options.session_id)?.clone();
+        if session.write_topic_id != options.topic_id {
+            return Err(CliError::new(
+                "topic_session_mismatch",
+                "the session does not own the topic being abandoned",
+            )
+            .with_detail("session_id", session.session_id)
+            .with_detail("session_topic_id", session.write_topic_id)
+            .with_detail("requested_topic_id", options.topic_id));
+        }
+        let topic_index = state
+            .topics
+            .iter()
+            .position(|topic| topic.topic_id == options.topic_id)
+            .ok_or_else(|| object_not_found("topic", &options.topic_id))?;
+        let topic = &state.topics[topic_index];
+        let canonical_frontier = real_canonical_checkpoint_frontier(&state)?;
+        if canonical_frontier.contains_key(&topic.topic_id) {
+            return Err(CliError::new(
+                "topic_abandonment_canonical",
+                "a topic represented by the canonical checkpoint cannot be abandoned",
+            )
+            .with_detail("topic_id", topic.topic_id.clone())
+            .with_detail(
+                "canonical_checkpoint_id",
+                state.canonical_checkpoint_id.clone(),
+            ));
+        }
+        if topic.head_revision_id != options.expected_head_revision_id {
+            return Err(CliError::new(
+                "topic_head_mismatch",
+                "topic abandonment requires the exact current head revision",
+            )
+            .with_detail("topic_id", topic.topic_id.clone())
+            .with_detail(
+                "expected_revision_id",
+                options
+                    .expected_head_revision_id
+                    .as_deref()
+                    .unwrap_or("none"),
+            )
+            .with_detail(
+                "current_head_revision_id",
+                topic.head_revision_id.as_deref().unwrap_or("none"),
+            ));
+        }
+        if let Some(existing) = &topic.abandonment {
+            if existing.session_id == session.session_id
+                && existing.actor_id == session.actor_id
+                && existing.expected_head_revision_id == options.expected_head_revision_id
+                && existing.reason == options.reason
+            {
+                return finish_real_topic_abandon(ctx, &state, topic_index, false);
+            }
+            return Err(CliError::new(
+                "topic_abandonment_conflict",
+                "the topic already has a different immutable abandonment disposition",
+            )
+            .with_detail("topic_id", topic.topic_id.clone())
+            .with_detail("existing_session_id", existing.session_id.clone())
+            .with_detail("existing_reason", existing.reason.clone()));
+        }
+
+        let abandonment = RealTopicAbandonmentRecord {
+            actor_id: session.actor_id.clone(),
+            session_id: session.session_id.clone(),
+            expected_head_revision_id: options.expected_head_revision_id.clone(),
+            reason: options.reason.clone(),
+            abandoned_at: real_now_id(),
+        };
+        state.topics[topic_index].abandonment = Some(abandonment.clone());
+        state.sync_compat_fields();
+        let topic = &state.topics[topic_index];
+        let abandonment_id = format!("abandonment_{}", topic.topic_id);
+        let abandonment_json = real_topic_abandonment_json(&abandonment);
+        let records = vec![
+            state.record_publication(
+                "topics",
+                &topic.topic_id,
+                &format!(
+                    "{{\"record_type\":\"topic\",\"id\":\"{}\",\"repository_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"owner_actor_id\":\"{}\",\"visibility\":\"{}\",\"acceptance_criteria\":{},\"base_checkpoint_id\":\"{}\",\"head_revision_id\":{},\"completed_revision_id\":{},\"abandonment\":{}}}\n",
+                    json_escape(&topic.topic_id),
+                    json_escape(&state.repository_id),
+                    json_escape(&topic.slug),
+                    json_escape(&topic.display_name),
+                    json_escape(&topic.owner_actor_id),
+                    json_escape(&topic.visibility),
+                    string_array_json(topic.acceptance_criteria.iter().map(String::as_str)),
+                    json_escape(&topic.base_checkpoint_id),
+                    optional_string_json(topic.head_revision_id.as_deref()),
+                    optional_string_json(topic.completed_revision_id.as_deref()),
+                    abandonment_json,
+                ),
+            )?,
+            state.record_publication(
+                "topics",
+                &abandonment_id,
+                &format!(
+                    "{{\"record_type\":\"topic_abandonment\",\"id\":\"{}\",\"repository_id\":\"{}\",\"topic_id\":\"{}\",\"disposition\":{},\"immutable\":true}}\n",
+                    json_escape(&abandonment_id),
+                    json_escape(&state.repository_id),
+                    json_escape(&topic.topic_id),
+                    abandonment_json,
+                ),
+            )?,
+        ];
+        match state.save_with_records(&repo_root, &records) {
+            Ok(()) => return finish_real_topic_abandon(ctx, &state, topic_index, true),
+            Err(RepoStateError::ConcurrentStateUpdate { .. }) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(CliError::new(
+        "concurrent_state_update",
+        "repository state kept changing while topic abandonment was prepared",
+    )
+    .with_detail("topic_id", options.topic_id))
+}
+
+fn finish_real_topic_abandon(
+    ctx: &CommandContext,
+    state: &RealRepoState,
+    topic_index: usize,
+    changed: bool,
+) -> Result<(), CliError> {
+    let topic = &state.topics[topic_index];
+    let abandonment = topic
+        .abandonment
+        .as_ref()
+        .expect("topic abandonment response requires a disposition");
+    if ctx.json {
+        outputln!(
+            ctx,
+            "{{\"ok\":true,\"data\":{{\"command\":\"topic.abandon\",\"repository_id\":\"{}\",\"ids\":{{\"topic_id\":\"{}\",\"session_id\":\"{}\",\"topic_revision_id\":{}}},\"changed\":{},\"immutable\":true,\"topic\":{},\"abandonment\":{}}},\"warnings\":[]}}",
+            json_escape(&state.repository_id),
+            json_escape(&topic.topic_id),
+            json_escape(&abandonment.session_id),
+            optional_string_json(topic.head_revision_id.as_deref()),
+            changed,
+            real_topic_metadata_json(topic),
+            real_topic_abandonment_json(abandonment),
+        );
+    } else {
+        outputln!(ctx, "abandoned topic {}", topic.topic_id);
+    }
+    Ok(())
+}
+
 fn real_session_start(ctx: &CommandContext, options: SessionStartOptions) -> Result<(), CliError> {
     let repo_root = ctx.repo_root.clone();
     let mut state = RealRepoState::load_metadata(&repo_root)?;
     let topic = real_topic(&state, &options.topic)?.clone();
+    if let Some(abandonment) = &topic.abandonment {
+        return Err(topic_abandoned_error(&topic, abandonment));
+    }
     let selected = real_resolve_view_by_id(&repo_root, &state, &options.view_id)?;
     if !selected.result.conflict_free() {
         return Err(CliError::new(
@@ -3779,6 +3952,10 @@ fn real_session_refresh(
     let repo_root = ctx.repo_root.clone();
     let mut state = RealRepoState::load_metadata(&repo_root)?;
     let current = real_session(&state, &options.session_id)?.clone();
+    let write_topic = real_topic(&state, &current.write_topic_id)?;
+    if let Some(abandonment) = &write_topic.abandonment {
+        return Err(topic_abandoned_error(write_topic, abandonment));
+    }
     let mut candidate_frontier = current.topic_frontier.clone();
 
     if matches!(options.policy.as_str(), "manual" | "follow") {
@@ -3790,6 +3967,7 @@ fn real_session_refresh(
                 .topics
                 .iter()
                 .find(|topic| topic.topic_id == *topic_id)
+                .filter(|topic| topic.abandonment.is_none())
                 .and_then(|topic| topic.head_revision_id.clone())
             {
                 candidate_frontier.insert(topic_id.clone(), head);
@@ -4007,7 +4185,13 @@ fn real_artifact_search(
 ) -> Result<(), CliError> {
     let state = RealRepoState::load(&ctx.repo_root)?;
     if let Some(view_id) = options.view_id.as_deref() {
-        return real_artifact_search_view(ctx, &state, view_id, &options.operands[0]);
+        return real_artifact_search_view(
+            ctx,
+            &state,
+            view_id,
+            &options.operands[0],
+            options.limit,
+        );
     }
     let session_id = options
         .session_id
@@ -4016,26 +4200,42 @@ fn real_artifact_search(
     let resolved = state.resolve_session_view(session);
     let query = &options.operands[0];
     let mut matches = Vec::new();
-    for entry in resolved.entries.iter().filter(|entry| !entry.tombstone) {
+    let mut entries = resolved
+        .entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    'entries: for entry in entries {
         if let Ok(text) = std::str::from_utf8(&entry.bytes) {
             for (line_index, line) in text.lines().enumerate() {
                 if line.contains(query) {
+                    let (snippet, snippet_truncated) = bounded_search_snippet(line, query);
                     matches.push(sunlight_core::artifacts::SearchMatch {
                         artifact_id: entry.artifact_id.clone(),
                         path: entry.path.clone(),
                         content_hash: entry.content_hash.clone(),
                         line: line_index + 1,
-                        snippet: line.to_string(),
+                        snippet,
+                        snippet_truncated,
                     });
+                    if matches.len() > options.limit {
+                        break 'entries;
+                    }
                 }
             }
         }
     }
+    let truncated = matches.len() > options.limit;
+    matches.truncate(options.limit);
     let response = SearchResponse {
         command: "artifact.search",
         repository_id: state.repository_id.clone(),
         session_id,
         view: real_resolved_session_view(&state, session, &resolved),
+        returned: matches.len(),
+        limit: options.limit,
+        truncated,
         matches,
     };
     if ctx.json {
@@ -4163,29 +4363,43 @@ fn real_artifact_search_view(
     state: &RealRepoState,
     view_id: &str,
     query: &str,
+    limit: usize,
 ) -> Result<(), CliError> {
     let resolved = real_readable_view(ctx, state, view_id)?;
     let mut matches = Vec::new();
-    for entry in resolved.entries.iter().filter(|entry| !entry.tombstone) {
+    let mut entries = resolved
+        .entries
+        .iter()
+        .filter(|entry| !entry.tombstone)
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    'entries: for entry in entries {
         if let Ok(text) = std::str::from_utf8(&entry.bytes) {
             for (line_index, line) in text.lines().enumerate() {
                 if line.contains(query) {
+                    let (snippet, snippet_truncated) = bounded_search_snippet(line, query);
                     matches.push(sunlight_core::artifacts::SearchMatch {
                         artifact_id: entry.artifact_id.clone(),
                         path: entry.path.clone(),
                         content_hash: entry.content_hash.clone(),
                         line: line_index + 1,
-                        snippet: line.to_string(),
+                        snippet,
+                        snippet_truncated,
                     });
+                    if matches.len() > limit {
+                        break 'entries;
+                    }
                 }
             }
         }
     }
+    let truncated = matches.len() > limit;
+    matches.truncate(limit);
     if ctx.json {
         outputln!(
             ctx,
             "{}",
-            view_search_success_envelope(state, &resolved.result, &matches)
+            view_search_success_envelope(state, &resolved.result, &matches, limit, truncated)
         );
     } else {
         for item in matches {
@@ -4225,20 +4439,24 @@ fn real_artifact_patch(
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&ctx.repo_root)?;
     let session = real_session(&state, &options.session_id)?.clone();
+    ensure_session_write_topic_active(&state, &session)?;
     let resolved = state.resolve_session_view(&session);
     let path = options.operands[0].clone();
     ensure_path_visible_to_sunlight(&ctx.repo_root, &path)?;
     let before = real_entry(&state, &resolved.entries, &path)?.clone();
+    validate_patch_scope(&patch, &path, &session, &before.content_hash, None)?;
     if before.content_hash != options.expect_hash.as_deref().unwrap_or("") {
         return Err(real_precondition_error(
-            &state,
+            &session,
             &before,
             options.expect_hash.as_deref().unwrap_or(""),
         ));
     }
     let before_text = std::str::from_utf8(&before.bytes)
         .map_err(|_| CliError::new("invalid_content_encoding", "path is not UTF-8 text"))?;
-    let (after_text, _) = apply_real_patch(before_text, &patch)?;
+    let (after_text, _) = apply_real_patch(before_text, &patch).map_err(|error| {
+        with_patch_recovery_context(error, &path, &session, &before.content_hash, None)
+    })?;
     let mut after = before.clone();
     after.bytes = after_text.into_bytes();
     after.content_hash = real_content_hash(&after.bytes);
@@ -4260,10 +4478,11 @@ fn real_artifact_patch_batch(
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&ctx.repo_root)?;
     let session = real_session(&state, session_id)?.clone();
+    ensure_session_write_topic_active(&state, &session)?;
     let resolved = state.resolve_session_view(&session);
     let mut seen_paths = BTreeSet::new();
     let mut prepared = Vec::with_capacity(edits.len());
-    for edit in edits {
+    for (edit_index, edit) in edits.into_iter().enumerate() {
         if !seen_paths.insert(edit.path.clone()) {
             return Err(CliError::new(
                 "duplicate_patch_path",
@@ -4273,12 +4492,30 @@ fn real_artifact_patch_batch(
         }
         ensure_path_visible_to_sunlight(&ctx.repo_root, &edit.path)?;
         let before = real_entry(&state, &resolved.entries, &edit.path)?.clone();
+        validate_patch_scope(
+            &edit.patch,
+            &edit.path,
+            &session,
+            &before.content_hash,
+            Some(edit_index),
+        )?;
         if before.content_hash != edit.expect_hash {
-            return Err(real_precondition_error(&state, &before, &edit.expect_hash));
+            return Err(
+                real_precondition_error(&session, &before, &edit.expect_hash)
+                    .with_detail("edit_index", edit_index.to_string()),
+            );
         }
         let before_text = std::str::from_utf8(&before.bytes)
             .map_err(|_| CliError::new("invalid_content_encoding", "path is not UTF-8 text"))?;
-        let (after_text, _) = apply_real_patch(before_text, &edit.patch)?;
+        let (after_text, _) = apply_real_patch(before_text, &edit.patch).map_err(|error| {
+            with_patch_recovery_context(
+                error,
+                &edit.path,
+                &session,
+                &before.content_hash,
+                Some(edit_index),
+            )
+        })?;
         let mut after = before.clone();
         after.bytes = after_text.into_bytes();
         after.content_hash = real_content_hash(&after.bytes);
@@ -4403,6 +4640,7 @@ fn real_artifact_write(
         ExpectedHash::Existing(_) => RealRepoState::load(&ctx.repo_root)?,
     };
     let session = real_session(&state, &options.session_id)?.clone();
+    ensure_session_write_topic_active(&state, &session)?;
     let resolved = state.resolve_session_view(&session);
     let path = options.operands[0].clone();
     ensure_path_visible_to_sunlight(&ctx.repo_root, &path)?;
@@ -4414,10 +4652,10 @@ fn real_artifact_write(
     let before = existing;
     match (&expected_hash, &before) {
         (ExpectedHash::New, Some(entry)) => {
-            return Err(real_precondition_error(&state, entry, "new"))
+            return Err(real_precondition_error(&session, entry, "new"))
         }
         (ExpectedHash::Existing(expected), Some(entry)) if entry.content_hash != *expected => {
-            return Err(real_precondition_error(&state, entry, expected));
+            return Err(real_precondition_error(&session, entry, expected));
         }
         (ExpectedHash::Existing(expected), None) => {
             return Err(CliError::new(
@@ -4433,8 +4671,11 @@ fn real_artifact_write(
                 "hint",
                 "Use expect_hash \"new\" only if creating this absent path is intended.",
             )
+            .with_detail("session_id", session.session_id.clone())
             .with_detail("session_generation_id", session.session_generation_id)
-            .with_detail("resolved_view_id", session.resolved_view_id));
+            .with_detail("resolved_view_id", session.resolved_view_id)
+            .with_detail("recoverable_in_same_session", "true")
+            .with_detail("state_changed", "false"));
         }
         _ => {}
     }
@@ -4478,6 +4719,7 @@ fn real_artifact_move(
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&ctx.repo_root)?;
     let session = real_session(&state, &options.session_id)?.clone();
+    ensure_session_write_topic_active(&state, &session)?;
     let resolved = state.resolve_session_view(&session);
     let source = options.operands[0].clone();
     let target = options.operands[1].clone();
@@ -4485,7 +4727,7 @@ fn real_artifact_move(
     ensure_path_visible_to_sunlight(&ctx.repo_root, &target)?;
     let before = real_entry(&state, &resolved.entries, &source)?.clone();
     if before.content_hash != expected {
-        return Err(real_precondition_error(&state, &before, &expected));
+        return Err(real_precondition_error(&session, &before, &expected));
     }
     let mut after = before.clone();
     after.path = target.clone();
@@ -4507,12 +4749,13 @@ fn real_artifact_delete(
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&ctx.repo_root)?;
     let session = real_session(&state, &options.session_id)?.clone();
+    ensure_session_write_topic_active(&state, &session)?;
     let resolved = state.resolve_session_view(&session);
     let path = options.operands[0].clone();
     ensure_path_visible_to_sunlight(&ctx.repo_root, &path)?;
     let before = real_entry(&state, &resolved.entries, &path)?.clone();
     if before.content_hash != expected {
-        return Err(real_precondition_error(&state, &before, &expected));
+        return Err(real_precondition_error(&session, &before, &expected));
     }
     let mut after = before.clone();
     after.tombstone = true;
@@ -4535,12 +4778,13 @@ fn real_artifact_metadata_set(
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&ctx.repo_root)?;
     let session = real_session(&state, &options.session_id)?.clone();
+    ensure_session_write_topic_active(&state, &session)?;
     let resolved = state.resolve_session_view(&session);
     let path = options.operands[0].clone();
     ensure_path_visible_to_sunlight(&ctx.repo_root, &path)?;
     let before = real_entry(&state, &resolved.entries, &path)?.clone();
     if before.content_hash != expected {
-        return Err(real_precondition_error(&state, &before, &expected));
+        return Err(real_precondition_error(&session, &before, &expected));
     }
     let mut after = before.clone();
     after.classification = classification;
@@ -4910,6 +5154,7 @@ fn terminal_execution_after_process_error(
     let failure = error.published_execution_failure()?;
     let mut execution = running_execution.clone();
     execution.command_started = failure.command_started;
+    execution.command_outcome = "known".to_string();
     execution.status = failure.status.to_string();
     execution.runner_process_id = None;
     execution.termination_reason = Some(failure.termination_reason.to_string());
@@ -5531,6 +5776,10 @@ fn run_bounded_process_with_environment(
     Ok(output)
 }
 
+fn millis_u64(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Result<(), CliError> {
     let overall_started = Instant::now();
     let repo_root = ctx.repo_root.clone();
@@ -5550,7 +5799,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     if let Some(network_policy) = options.network_policy {
         execution_policy.network_policy = network_policy.as_str().to_string();
     }
-    let mut state = load_real_state_for_execution_merge(&repo_root)?;
+    let mut state = RealRepoState::load(&repo_root)?;
     let relative_cwd = real_execution_relative_cwd(&options.cwd)?;
     let resolved = real_resolve_view_by_id(&repo_root, &state, &options.view_id)?;
     if !resolved.result.conflict_free() {
@@ -5561,11 +5810,14 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         .with_detail("resolved_view_id", resolved.result.resolved_view_id));
     }
     let view_state = real_view_state(&state, &resolved);
-    let start_reservation = reserve_real_execution_start(&repo_root)?;
+    let execution_store = ExecutionStore::new(&repo_root);
+    let start_reservation = execution_store.reserve(&state)?;
     let execution_sequence = start_reservation.sequence;
     let provisional_projection_id =
         format!("projection_execution_native_{:04}", execution_sequence);
     let execution_id = format!("exec_native_{execution_sequence:04}");
+    let _execution_lock = execution_store.acquire_lock(&execution_id)?;
+    let runner_instance_token = execution_store.runner_instance_token(&execution_id);
     let provisional_root = projection_policy.execution_root(&provisional_projection_id);
     let materialization_started = Instant::now();
     let materialization = materialize_repo_projection(
@@ -5588,6 +5840,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     let cache_validation_ms = u128::from(materialization.metrics.cache_validation_ms);
     let projection_materialization_ms =
         u128::from(materialization.metrics.projection_materialization_ms);
+    let runtime_layers_started = Instant::now();
     let runtime_layer_resolution = runtime_layers::acquire_runtime_layers(
         &repo_root,
         &projection_policy.managed_root,
@@ -5618,6 +5871,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     .inspect_err(|_| {
         remove_unpublished_execution_root(&projection_root);
     })?;
+    let runtime_layers_ms = runtime_layers_started.elapsed().as_millis();
     let runtime_dependency_paths = runtime_layer_resolution.target_paths.clone();
     #[cfg(windows)]
     let mut isolation = windows_isolation::PreparedIsolation::prepare(
@@ -5726,6 +5980,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         status: "running".to_string(),
         runner_process_id: Some(std::process::id()),
         command_started: true,
+        command_outcome: "pending".to_string(),
         timed_out: false,
         termination_reason: None,
         termination_failed: false,
@@ -5772,12 +6027,44 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         preexisting_runtime_dependency_paths: Vec::new(),
         runtime_dependency_bindings: Vec::new(),
         runtime_dependency_strategy: "runtime_layers_v1".to_string(),
+        timings: RealExecutionTimings {
+            cache_build_ms: millis_u64(cache_build_ms),
+            cache_validation_ms: millis_u64(cache_validation_ms),
+            projection_materialization_ms: millis_u64(projection_materialization_ms),
+            projection_overhead_ms: millis_u64(
+                materialization_ms.saturating_sub(
+                    cache_build_ms
+                        .saturating_add(cache_validation_ms)
+                        .saturating_add(projection_materialization_ms),
+                ),
+            ),
+            runtime_provider_discovery_ms: millis_u64(
+                runtime_layer_resolution.timings.provider_discovery_ms,
+            ),
+            runtime_cache_lookup_ms: millis_u64(runtime_layer_resolution.timings.cache_lookup_ms),
+            runtime_cache_wait_ms: millis_u64(runtime_layer_resolution.timings.cache_wait_ms),
+            runtime_provider_preparation_ms: millis_u64(
+                runtime_layer_resolution.timings.provider_preparation_ms,
+            ),
+            runtime_private_binding_ms: millis_u64(
+                runtime_layer_resolution.timings.private_binding_ms,
+            ),
+            runtime_overhead_ms: millis_u64(runtime_layers_ms.saturating_sub(
+                runtime_layer_resolution.timings.provider_discovery_ms
+                    + runtime_layer_resolution.timings.cache_lookup_ms
+                    + runtime_layer_resolution.timings.cache_wait_ms
+                    + runtime_layer_resolution.timings.provider_preparation_ms
+                    + runtime_layer_resolution.timings.private_binding_ms,
+            )),
+            ..RealExecutionTimings::default()
+        },
         outputs: Vec::new(),
         started_at: started_at.clone(),
         finished_at: String::new(),
         privacy_class: "policy_gated".to_string(),
     };
     let command_started = Instant::now();
+    let mut command_start_publication_ms = 0_u128;
     let command_result = run_bounded_process(
         &options.command_argv,
         &execution_cwd,
@@ -5785,7 +6072,17 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         &ctx.cancellation,
         #[cfg(windows)]
         &isolation,
-        || publish_real_execution_start(&repo_root, &execution_projection, &running_execution),
+        || {
+            let publication_started = Instant::now();
+            let result = execution_store.publish_start(
+                &state,
+                &execution_projection,
+                &running_execution,
+                &runner_instance_token,
+            );
+            command_start_publication_ms = publication_started.elapsed().as_millis();
+            result
+        },
     );
     drop(start_reservation);
     let command_output = match command_result {
@@ -5794,8 +6091,13 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
             if let Some(failed_execution) =
                 terminal_execution_after_process_error(&running_execution, &error)
             {
-                finalize_real_execution(&repo_root, &failed_execution, true)?;
-            } else {
+                execution_store.finalize(
+                    &state,
+                    &failed_execution,
+                    &runner_instance_token,
+                    true,
+                )?;
+            } else if !execution_store.has_projection(&execution_projection.projection_id)? {
                 remove_unpublished_execution_root(&projection_root);
             }
             return Err(process_run_cli_error(
@@ -5805,7 +6107,10 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
             ));
         }
     };
-    let command_ms = command_started.elapsed().as_millis();
+    let command_ms = command_started
+        .elapsed()
+        .as_millis()
+        .saturating_sub(command_start_publication_ms);
     let stdout_text = String::from_utf8_lossy(&command_output.stdout.captured_bytes).into_owned();
     let stderr_text = String::from_utf8_lossy(&command_output.stderr.captured_bytes).into_owned();
     let finished_at = real_now_id();
@@ -5832,10 +6137,12 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
         )?
     };
     let output_scan_ms = output_scan_started.elapsed().as_millis();
+    let cleanup_started = Instant::now();
     #[cfg(windows)]
     let cleanup_error = isolation.finish().err().map(|error| error.to_string());
     #[cfg(not(windows))]
     let cleanup_error: Option<String> = None;
+    let cleanup_ms = cleanup_started.elapsed().as_millis();
     let status = if command_output.cancelled {
         "canceled"
     } else if command_output.resource_termination.is_some() || cleanup_error.is_some() {
@@ -5878,6 +6185,7 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     execution.exit_code = command_output.status.and_then(|status| status.code());
     execution.status = status.to_string();
     execution.runner_process_id = None;
+    execution.command_outcome = "known".to_string();
     execution.timed_out = command_output.timed_out;
     execution.termination_reason = termination_reason;
     execution.termination_failed = command_output.termination_failed;
@@ -5894,9 +6202,38 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
     execution.stderr_capture_failed = command_output.stderr.capture_failed;
     execution.outputs = outputs;
     execution.finished_at = finished_at;
+    let prepublication_total_ms = overall_started.elapsed().as_millis();
+    execution.timings.command_start_publication_ms = millis_u64(command_start_publication_ms);
+    execution.timings.command_ms = millis_u64(command_ms);
+    execution.timings.output_scan_and_classification_ms = millis_u64(output_scan_ms);
+    execution.timings.cleanup_ms = millis_u64(cleanup_ms);
+    execution.timings.prepublication_total_ms = millis_u64(prepublication_total_ms);
+    let named_prepublication_ms = u128::from(execution.timings.cache_build_ms)
+        + u128::from(execution.timings.cache_validation_ms)
+        + u128::from(execution.timings.projection_materialization_ms)
+        + u128::from(execution.timings.projection_overhead_ms)
+        + u128::from(execution.timings.runtime_provider_discovery_ms)
+        + u128::from(execution.timings.runtime_cache_lookup_ms)
+        + u128::from(execution.timings.runtime_cache_wait_ms)
+        + u128::from(execution.timings.runtime_provider_preparation_ms)
+        + u128::from(execution.timings.runtime_private_binding_ms)
+        + u128::from(execution.timings.runtime_overhead_ms)
+        + u128::from(execution.timings.command_start_publication_ms)
+        + u128::from(execution.timings.command_ms)
+        + u128::from(execution.timings.output_scan_and_classification_ms)
+        + u128::from(execution.timings.cleanup_ms);
+    execution.timings.other_prepublication_ms =
+        millis_u64(prepublication_total_ms.saturating_sub(named_prepublication_ms));
     let publication_started = Instant::now();
-    state = finalize_real_execution(&repo_root, &execution, cleanup_error.is_some())?;
+    let finalized_projection = execution_store.finalize(
+        &state,
+        &execution,
+        &runner_instance_token,
+        cleanup_error.is_some(),
+    )?;
     let publication_ms = publication_started.elapsed().as_millis();
+    state.projections.push(finalized_projection);
+    state.executions.push(execution.clone());
     let total_ms = overall_started.elapsed().as_millis();
     if let Some(cleanup_error) = cleanup_error {
         return Err(CliError::new(
@@ -5923,17 +6260,6 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
                 &execution,
                 &stdout_text,
                 &stderr_text,
-                materialization_ms,
-                cache_build_ms,
-                cache_validation_ms,
-                projection_materialization_ms,
-                runtime_layer_resolution.timings.provider_discovery_ms,
-                runtime_layer_resolution.timings.cache_lookup_ms,
-                runtime_layer_resolution.timings.cache_wait_ms,
-                runtime_layer_resolution.timings.provider_preparation_ms,
-                runtime_layer_resolution.timings.private_binding_ms,
-                command_ms,
-                output_scan_ms,
                 publication_ms,
                 total_ms,
             )
@@ -5947,272 +6273,6 @@ fn real_execution_run(ctx: &CommandContext, options: ExecutionRunOptions) -> Res
 fn remove_unpublished_execution_root(projection_root: &Path) {
     if let Some(allocation_root) = projection_root.parent() {
         let _ = fs::remove_dir_all(allocation_root);
-    }
-}
-
-struct RealExecutionStartReservation {
-    sequence: usize,
-    path: PathBuf,
-}
-
-impl Drop for RealExecutionStartReservation {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
-    }
-}
-
-fn reserve_real_execution_start(
-    repo_root: &Path,
-) -> Result<RealExecutionStartReservation, CliError> {
-    let reservation_root = repo_root.join(".sunlight/local/execution-start-reservations");
-    fs::create_dir_all(&reservation_root).map_err(|error| {
-        CliError::new(
-            "execution_start_reservation_failed",
-            format!("failed to create execution start reservation storage: {error}"),
-        )
-        .with_detail("path", reservation_root.display().to_string())
-        .with_detail("command_started", "false")
-    })?;
-    let mut sequence = load_real_state_for_execution_merge(repo_root)?
-        .executions
-        .len()
-        + 1;
-    loop {
-        let path = reservation_root.join(format!("{sequence:04}"));
-        match fs::create_dir(&path) {
-            Ok(()) => {
-                let state = match load_real_state_for_execution_merge(repo_root) {
-                    Ok(state) => state,
-                    Err(error) => {
-                        let _ = fs::remove_dir(&path);
-                        return Err(CliError::from(error));
-                    }
-                };
-                let execution_id = format!("exec_native_{sequence:04}");
-                let projection_suffix = format!("native_{sequence:04}");
-                if state
-                    .executions
-                    .iter()
-                    .any(|execution| execution.execution_id == execution_id)
-                    || state.projections.iter().any(|projection| {
-                        projection.purpose == "execution"
-                            && projection.projection_id.ends_with(&projection_suffix)
-                    })
-                {
-                    let _ = fs::remove_dir(&path);
-                    sequence += 1;
-                    continue;
-                }
-                return Ok(RealExecutionStartReservation { sequence, path });
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                sequence += 1;
-            }
-            Err(error) => {
-                return Err(CliError::new(
-                    "execution_start_reservation_failed",
-                    format!("failed to reserve unique execution identity: {error}"),
-                )
-                .with_detail("path", path.display().to_string())
-                .with_detail("command_started", "false"));
-            }
-        }
-    }
-}
-
-fn acquire_execution_metadata_publication_queue(
-    repo_root: &Path,
-) -> Result<repository_queue::RepositoryMutationQueueGuard, RepoStateError> {
-    repository_queue::acquire_repository_mutation_queue(repo_root, None).map_err(
-        |error| match error {
-            repository_queue::RepositoryMutationQueueError::Timeout { lock, timeout } => {
-                RepoStateError::WriterBusy {
-                    lock,
-                    timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
-                }
-            }
-            repository_queue::RepositoryMutationQueueError::Io { lock, message } => {
-                RepoStateError::Io {
-                    path: lock,
-                    message,
-                }
-            }
-            repository_queue::RepositoryMutationQueueError::Cancelled { lock } => {
-                RepoStateError::WriterBusy {
-                    lock,
-                    timeout_ms: 0,
-                }
-            }
-        },
-    )
-}
-
-fn publish_real_execution_start(
-    repo_root: &Path,
-    projection: &RealProjectionSnapshot,
-    execution: &RealExecutionSnapshot,
-) -> Result<(), RepoStateError> {
-    let _publication_queue = acquire_execution_metadata_publication_queue(repo_root)?;
-    let mut retry_count = 0_usize;
-    loop {
-        let mut state = load_real_state_for_execution_merge(repo_root)?;
-        if let Some(persisted) = state
-            .executions
-            .iter()
-            .find(|persisted| persisted.execution_id == execution.execution_id)
-        {
-            if persisted == execution
-                && state
-                    .projections
-                    .iter()
-                    .any(|persisted| persisted == projection)
-            {
-                return Ok(());
-            }
-            return Err(RepoStateError::InvalidState {
-                path: repo_root.to_path_buf(),
-                message: format!(
-                    "execution start identity `{}` is already bound to different facts",
-                    execution.execution_id
-                ),
-            });
-        }
-        if state
-            .projections
-            .iter()
-            .any(|persisted| persisted.projection_id == projection.projection_id)
-        {
-            return Err(RepoStateError::InvalidState {
-                path: repo_root.to_path_buf(),
-                message: format!(
-                    "execution projection identity `{}` is already bound to different facts",
-                    projection.projection_id
-                ),
-            });
-        }
-        state.projections.push(projection.clone());
-        state.executions.push(execution.clone());
-        let records = vec![
-            real_projection_publication(&state, projection).map_err(|error| {
-                RepoStateError::InvalidState {
-                    path: repo_root.to_path_buf(),
-                    message: error.message,
-                }
-            })?,
-            state.record_publication(
-                "executions",
-                &execution.execution_id,
-                &format!(
-                    "{}\n",
-                    real_execution_snapshot_record_json(&state, execution)
-                ),
-            )?,
-        ];
-        match state.save_with_records(repo_root, &records) {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if matches!(error, RepoStateError::ConcurrentStateUpdate { .. })
-                    && retry_count < EXECUTION_FINALIZATION_RETRY_LIMIT =>
-            {
-                thread::sleep(Duration::from_millis(1_u64 << retry_count.min(6)));
-                retry_count += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-const EXECUTION_FINALIZATION_RETRY_LIMIT: usize = 64;
-
-fn load_real_state_for_execution_merge(repo_root: &Path) -> Result<RealRepoState, RepoStateError> {
-    RealRepoState::load(repo_root)
-}
-
-fn finalize_real_execution(
-    repo_root: &Path,
-    execution: &RealExecutionSnapshot,
-    quarantine_projection: bool,
-) -> Result<RealRepoState, CliError> {
-    let _publication_queue = acquire_execution_metadata_publication_queue(repo_root)?;
-    let mut retry_count = 0_usize;
-    loop {
-        let mut state = load_real_state_for_execution_merge(repo_root)?;
-        let persisted_execution = state
-            .executions
-            .iter_mut()
-            .find(|persisted| persisted.execution_id == execution.execution_id)
-            .ok_or_else(|| object_not_found("execution", &execution.execution_id))?;
-        if persisted_execution.projection_id != execution.projection_id
-            || persisted_execution.resolved_view_id != execution.resolved_view_id
-            || persisted_execution.tree_hash != execution.tree_hash
-        {
-            return Err(CliError::new(
-                "execution_finalization_identity_mismatch",
-                "the durable running execution no longer matches the completed command",
-            )
-            .with_detail("execution_id", execution.execution_id.clone())
-            .with_detail("projection_id", execution.projection_id.clone()));
-        }
-        if persisted_execution == execution {
-            return Ok(state);
-        }
-        if persisted_execution.status != "running" {
-            return Err(CliError::new(
-                "execution_finalization_conflict",
-                "the durable execution was finalized with different result facts",
-            )
-            .with_detail("execution_id", execution.execution_id.clone())
-            .with_detail("durable_status", persisted_execution.status.clone())
-            .with_detail("completed_status", execution.status.clone()));
-        }
-        *persisted_execution = execution.clone();
-
-        let projection = state
-            .projections
-            .iter_mut()
-            .find(|projection| projection.projection_id == execution.projection_id)
-            .ok_or_else(|| object_not_found("projection", &execution.projection_id))?;
-        if projection.resolved_view_id != execution.resolved_view_id
-            || projection.tree_hash != execution.tree_hash
-        {
-            return Err(CliError::new(
-                "execution_finalization_identity_mismatch",
-                "the durable execution projection no longer matches the completed command",
-            )
-            .with_detail("execution_id", execution.execution_id.clone())
-            .with_detail("projection_id", execution.projection_id.clone()));
-        }
-        if quarantine_projection {
-            projection.retention_state = "quarantined".to_string();
-        }
-
-        let mut records = vec![state.record_publication(
-            "executions",
-            &execution.execution_id,
-            &format!(
-                "{}\n",
-                real_execution_snapshot_record_json(&state, execution)
-            ),
-        )?];
-        if quarantine_projection {
-            let projection = state
-                .projections
-                .iter()
-                .find(|projection| projection.projection_id == execution.projection_id)
-                .expect("execution projection remains present");
-            records.push(real_projection_publication(&state, projection)?);
-        }
-        match state.save_with_records(repo_root, &records) {
-            Ok(()) => return Ok(load_real_state_for_execution_merge(repo_root)?),
-            Err(error)
-                if matches!(error, RepoStateError::ConcurrentStateUpdate { .. })
-                    && retry_count < EXECUTION_FINALIZATION_RETRY_LIMIT =>
-            {
-                thread::sleep(Duration::from_millis(1_u64 << retry_count.min(6)));
-                retry_count += 1;
-            }
-            Err(error) => return Err(CliError::from(error)),
-        }
     }
 }
 
@@ -6240,6 +6300,7 @@ fn recover_interrupted_executions(
         if interrupted_ids.contains(&execution.execution_id) {
             execution.status = "interrupted".to_string();
             execution.runner_process_id = None;
+            execution.command_outcome = "unknown".to_string();
             execution.termination_reason = Some("runner_process_terminated".to_string());
             execution.wait_failed = true;
             execution.finished_at = recovered_at.clone();
@@ -6277,6 +6338,14 @@ fn recover_interrupted_executions(
     state
         .save_with_records(repo_root, &records)
         .map_err(CliError::from)
+}
+
+fn load_execution_inventory(repo_root: &Path, state: &mut RealRepoState) -> Result<(), CliError> {
+    recover_interrupted_executions(repo_root, state)?;
+    let store = ExecutionStore::new(repo_root);
+    store.recover(state)?;
+    store.merge_into(state)?;
+    Ok(())
 }
 
 fn real_execution_relative_cwd(cwd: &str) -> Result<PathBuf, CliError> {
@@ -6375,6 +6444,7 @@ fn real_execution_promote_output(
     let repo_root = ctx.repo_root.clone();
     let projection_policy = require_projection_policy(&repo_root)?;
     let mut state = RealRepoState::load(&repo_root)?;
+    load_execution_inventory(&repo_root, &mut state)?;
     let path = options.path.clone().ok_or_else(|| {
         invalid_request("usage: sun execution promote-output requires --path <path>")
     })?;
@@ -6587,6 +6657,9 @@ fn real_checkpoint_create(
     options: CheckpointCreateOptions,
 ) -> Result<(), CliError> {
     let mut state = RealRepoState::load(&ctx.repo_root)?;
+    if options.execution_id.is_some() {
+        load_execution_inventory(&ctx.repo_root, &mut state)?;
+    }
     let previous_canonical_checkpoint_id = state.canonical_checkpoint_id.clone();
     if let Some(expected) = options.expected_canonical_checkpoint_id.as_deref() {
         if expected != previous_canonical_checkpoint_id {
@@ -6612,6 +6685,17 @@ fn real_checkpoint_create(
     let view_state = real_view_state(&state, &resolved);
     reject_real_export_blocked_entries(&view_state)?;
     if !options.side_checkpoint {
+        if let Some(topic) = state.topics.iter().find(|topic| {
+            topic.abandonment.is_some()
+                && resolved.result.topic_frontier.contains_key(&topic.topic_id)
+        }) {
+            return Err(CliError::new(
+                "checkpoint_contains_abandoned_topic",
+                "a canonical checkpoint cannot include an abandoned topic",
+            )
+            .with_detail("topic_id", topic.topic_id.clone())
+            .with_detail("resolved_view_id", resolved.result.resolved_view_id.clone()));
+        }
         let canonical_frontier = real_canonical_checkpoint_frontier(&state)?;
         let regressions = canonical_frontier_regressions(
             &state,
@@ -6707,6 +6791,7 @@ fn real_checkpoint_create(
         &checkpoint.id,
         &format!("{}\n", checkpoint_json(&checkpoint)),
     )?];
+    ExecutionStore::new(&ctx.repo_root).strip_standalone_from(&mut state)?;
     state.save_with_records(&ctx.repo_root, &records)?;
     if ctx.json {
         outputln!(
@@ -6784,6 +6869,9 @@ fn completed_topic_frontier_omissions(
         .topics
         .iter()
         .filter_map(|topic| {
+            if topic.abandonment.is_some() {
+                return None;
+            }
             let completed_revision_id = topic.completed_revision_id.as_ref()?;
             (frontier.get(&topic.topic_id) != Some(completed_revision_id)).then(|| {
                 TopicFrontierEntry {
@@ -6836,19 +6924,58 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
             checkpoint.clone(),
             report.clone(),
         )?;
-        let mut store = InMemoryGitExportMapStore::default();
-        let result = execute_local_git_export_writer(input, content_files, &mut store)
-            .map_err(git_export_planning_error)?;
-        let commit_id = result.created_commit_id.clone().ok_or_else(|| {
-            invalid_request(
-                result
-                    .error
-                    .as_ref()
-                    .map(|error| error.message.clone())
-                    .unwrap_or_else(|| "git export did not create a commit".to_string()),
-            )
-        })?;
         let export_id = format!("export_map_{}", checkpoint.id);
+        let existing = state
+            .export_maps
+            .iter()
+            .find(|map| map.export_map_id == export_id);
+        let commit_id = if let Some(existing) = existing {
+            if existing.git_ref != git_ref
+                || existing.tree_hash != tree_hash
+                || existing.validation_report_id.as_deref() != Some(report.id.as_str())
+            {
+                return Err(CliError::new(
+                    "export_map_conflict",
+                    "the durable export-map ID already identifies a different Git handoff",
+                )
+                .with_detail("export_map_id", &export_id));
+            }
+            let current_tip =
+                run_git_capture(&repo_root, &["rev-parse", "--verify", &git_ref]).ok();
+            let recorded_commit = existing.git_commit_ids.first();
+            if recorded_commit.is_none()
+                || current_tip.as_deref().map(str::trim) != recorded_commit.map(String::as_str)
+            {
+                return Err(CliError::new(
+                    "export_target_ref_conflict",
+                    "the previously exported branch no longer points to its recorded handoff",
+                )
+                .with_detail("target_ref", &git_ref)
+                .with_detail("export_map_id", &export_id));
+            }
+            recorded_commit.expect("recorded handoff exists").clone()
+        } else {
+            let mut store = InMemoryGitExportMapStore::default();
+            let result = execute_local_git_export_writer(input, content_files, &mut store)
+                .map_err(git_export_planning_error)?;
+            if let Some(error) = &result.error {
+                return Err(CliError::new(error.code.as_str(), error.message.clone())
+                    .with_detail("failed_step", error.failed_step.as_str())
+                    .with_detail("checkpoint_id", &checkpoint.id)
+                    .with_detail("validation_report_id", &report.id)
+                    .with_detail("target_ref", &git_ref)
+                    .with_detail("parent_commit_id", &result.parent_commit_id)
+                    .with_detail(
+                        "created_commit_id",
+                        error.created_commit_id.as_deref().unwrap_or("none"),
+                    )
+                    .with_detail("ref_updated", result.summary.ref_updated.to_string())
+                    .with_detail("export_map_written", "false"));
+            }
+            result
+                .created_commit_id
+                .ok_or_else(|| invalid_request("git export did not create a commit"))?
+        };
         let export_snapshot = RealExportMapSnapshot {
             export_map_id: export_id.clone(),
             checkpoint_id: checkpoint.id.clone(),
@@ -6858,24 +6985,11 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
             exported_at: real_now_id(),
             validation_report_id: Some(report.id.clone()),
         };
-        if let Some(existing) = state
+        if !state
             .export_maps
             .iter()
-            .find(|existing| existing.export_map_id == export_id)
+            .any(|map| map.export_map_id == export_id)
         {
-            if existing.checkpoint_id != export_snapshot.checkpoint_id
-                || existing.tree_hash != export_snapshot.tree_hash
-                || existing.git_ref != export_snapshot.git_ref
-                || existing.git_commit_ids != export_snapshot.git_commit_ids
-                || existing.validation_report_id != export_snapshot.validation_report_id
-            {
-                return Err(CliError::new(
-                    "export_map_conflict",
-                    "the durable export-map ID already identifies a different Git handoff",
-                )
-                .with_detail("export_map_id", export_id));
-            }
-        } else {
             state.export_maps.push(export_snapshot);
             let records = vec![state.record_publication(
                 "export-map",
@@ -6891,7 +7005,14 @@ fn real_git_export(ctx: &CommandContext, options: GitExportOptions) -> Result<()
                     json_escape(&report.id),
                 ),
             )?];
-            state.save_with_records(&repo_root, &records)?;
+            state.save_with_records(&repo_root, &records).map_err(|error| {
+                CliError::new("export_map_write_failed", format!("Git branch was updated but the export map could not be published: {error}"))
+                    .with_detail("checkpoint_id", &checkpoint.id)
+                    .with_detail("target_ref", &git_ref)
+                    .with_detail("created_commit_id", &commit_id)
+                    .with_detail("ref_updated", "true")
+                    .with_detail("export_map_written", "false")
+            })?;
         }
         if ctx.json {
             outputln!(ctx,
@@ -7058,7 +7179,7 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
     {
         state = RealRepoState::load(&repo_root)?;
     }
-    recover_interrupted_executions(&repo_root, &mut state)?;
+    load_execution_inventory(&repo_root, &mut state)?;
     if let [_, flag, value] = ctx.args.as_slice() {
         match flag.as_str() {
             "--projection" => {
@@ -7292,7 +7413,7 @@ fn real_inspect(ctx: &CommandContext) -> Result<bool, CliError> {
         Err(RepoStateError::NotInitialized { .. }) => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    recover_interrupted_executions(&ctx.repo_root, &mut state)?;
+    load_execution_inventory(&ctx.repo_root, &mut state)?;
     let selector = match ctx.args.iter().skip(1).find(|arg| !arg.starts_with("--")) {
         Some(selector) => selector,
         None => return Ok(false),
@@ -7456,6 +7577,9 @@ fn real_accept_mutation(
             )
             .with_detail("topic", session.write_topic_id.clone())
         })?;
+    if let Some(abandonment) = &topic.abandonment {
+        return Err(topic_abandoned_error(&topic, abandonment));
+    }
     if let Some(completed_revision_id) = &topic.completed_revision_id {
         return Err(CliError::new(
             "topic_completed",
@@ -7752,7 +7876,7 @@ fn finish_real_mutation_with_artifacts(
 
 fn finish_real_promotion(
     ctx: &CommandContext,
-    state: RealRepoState,
+    mut state: RealRepoState,
     response: MutationResponse,
     record: ExecutionOutputPromotionRecord,
 ) -> Result<(), CliError> {
@@ -7787,6 +7911,7 @@ fn finish_real_promotion(
             &format!("{}\n", promotion_record_json(&record)),
         )?,
     ];
+    ExecutionStore::new(&repo_root).strip_standalone_from(&mut state)?;
     state.save_with_records(&repo_root, &records)?;
     if ctx.json {
         let candidate = PromotionCandidateProvenance {
@@ -7887,10 +8012,11 @@ fn repository_ignored_execution_paths(
             "failed to open Git ignore policy input",
         ));
     };
-    let input_written = paths
-        .iter()
-        .all(|path| stdin.write_all(path.as_bytes()).is_ok() && stdin.write_all(&[0]).is_ok());
-    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let input = paths.join("\0") + "\0";
+    let stdin_writer = thread::Builder::new()
+        .name("sun-git-ignore-writer".to_string())
+        .spawn(move || stdin.write_all(input.as_bytes()));
     let stdout_reader = child.stdout.take().and_then(|mut stdout| {
         thread::Builder::new()
             .name("sun-git-ignore-reader".to_string())
@@ -7909,15 +8035,14 @@ fn repository_ignored_execution_paths(
             })
             .ok()
     });
-    if !input_written {
+    if stdin_writer.is_err() || stdout_reader.is_none() || stderr_reader.is_none() {
         let _ = child.kill();
         let _ = child.wait();
         return Err(CliError::new(
             "execution_ignore_policy_failed",
-            "failed to send paths to Git ignore evaluation",
+            "failed to start Git ignore evaluation stream workers",
         ));
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
     let status = loop {
         if cancellation.load(Ordering::Acquire) || Instant::now() >= deadline {
             let _ = child.kill();
@@ -7948,6 +8073,21 @@ fn repository_ignored_execution_paths(
             }
         }
     };
+    stdin_writer
+        .expect("input worker started")
+        .join()
+        .map_err(|_| {
+            CliError::new(
+                "execution_ignore_policy_failed",
+                "Git ignore input writer stopped unexpectedly",
+            )
+        })?
+        .map_err(|error| {
+            CliError::new(
+                "execution_ignore_policy_failed",
+                format!("failed to send paths to Git ignore evaluation: {error}"),
+            )
+        })?;
     let stdout = stdout_reader
         .ok_or_else(|| {
             CliError::new(
@@ -8153,7 +8293,7 @@ fn real_artifact_view(entry: &RealArtifactEntry) -> SessionVisibleArtifactView {
 }
 
 fn real_precondition_error(
-    state: &RealRepoState,
+    session: &RealSessionRecord,
     entry: &RealArtifactEntry,
     expected: &str,
 ) -> CliError {
@@ -8166,11 +8306,130 @@ fn real_precondition_error(
     .with_detail("artifact_id", entry.artifact_id.clone())
     .with_detail("expected", expected)
     .with_detail("actual", entry.content_hash.clone())
+    .with_detail("current_content_hash", entry.content_hash.clone())
+    .with_detail("session_id", session.session_id.clone())
     .with_detail(
         "session_generation_id",
-        real_view(&state).session_generation_id,
+        session.session_generation_id.clone(),
     )
-    .with_detail("resolved_view_id", state.resolved_view_id.clone())
+    .with_detail("resolved_view_id", session.resolved_view_id.clone())
+    .with_detail("recoverable_in_same_session", "true")
+    .with_detail("state_changed", "false")
+}
+
+fn explicit_patch_update_paths(patch: &str) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for raw_line in patch.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if let Some(path) = line.strip_prefix("*** Update File:") {
+            paths.insert(path.trim().to_string());
+        }
+    }
+    for raw_line in patch.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.starts_with("@@") {
+            break;
+        }
+        if let Some(header) = line.strip_prefix("diff --git ") {
+            let mut fields = header.split_whitespace();
+            match (fields.next(), fields.next(), fields.next()) {
+                (Some(old), Some(new), None) => {
+                    paths.insert(normalized_standard_patch_path(old));
+                    paths.insert(normalized_standard_patch_path(new));
+                }
+                _ => {
+                    paths.insert(format!("invalid_header:{line}"));
+                }
+            }
+            continue;
+        }
+        if let Some(path) = line
+            .strip_prefix("--- ")
+            .or_else(|| line.strip_prefix("+++ "))
+        {
+            let path = path.split_once('\t').map(|(path, _)| path).unwrap_or(path);
+            paths.insert(normalized_standard_patch_path(path));
+        } else if line.starts_with("diff ") {
+            paths.insert(format!("invalid_header:{line}"));
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn normalized_standard_patch_path(path: &str) -> String {
+    let path = path.trim().trim_matches('"');
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn validate_patch_scope(
+    patch: &str,
+    path: &str,
+    session: &RealSessionRecord,
+    current_content_hash: &str,
+    edit_index: Option<usize>,
+) -> Result<(), CliError> {
+    let declared_paths = explicit_patch_update_paths(patch);
+    if declared_paths.is_empty()
+        || (declared_paths.len() == 1 && declared_paths[0].as_str() == path)
+    {
+        return Ok(());
+    }
+    let edit_index_json = edit_index
+        .map(|index| index.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    Err(CliError::new(
+        "patch_scope_mismatch",
+        "the patch declares files outside its artifact_patch target",
+    )
+    .with_raw_details_json(format!(
+        concat!(
+            "{{",
+            "\"edit_index\":{},",
+            "\"path\":\"{}\",",
+            "\"declared_paths\":{},",
+            "\"session_id\":\"{}\",",
+            "\"session_generation_id\":\"{}\",",
+            "\"resolved_view_id\":\"{}\",",
+            "\"current_content_hash\":\"{}\",",
+            "\"recoverable_in_same_session\":true,",
+            "\"state_changed\":false",
+            "}}"
+        ),
+        edit_index_json,
+        json_escape(path),
+        string_array_json(declared_paths.iter().map(String::as_str)),
+        json_escape(&session.session_id),
+        json_escape(&session.session_generation_id),
+        json_escape(&session.resolved_view_id),
+        json_escape(current_content_hash),
+    )))
+}
+
+fn with_patch_recovery_context(
+    error: CliError,
+    path: &str,
+    session: &RealSessionRecord,
+    current_content_hash: &str,
+    edit_index: Option<usize>,
+) -> CliError {
+    let mut error = error
+        .with_default_detail("path", path)
+        .with_default_detail("session_id", session.session_id.clone())
+        .with_default_detail(
+            "session_generation_id",
+            session.session_generation_id.clone(),
+        )
+        .with_default_detail("resolved_view_id", session.resolved_view_id.clone())
+        .with_default_detail("current_content_hash", current_content_hash)
+        .with_default_detail("recoverable_in_same_session", "true")
+        .with_default_detail("state_changed", "false");
+    if let Some(edit_index) = edit_index {
+        error = error.with_default_detail("edit_index", edit_index.to_string());
+    }
+    error
 }
 
 #[derive(Debug)]
@@ -8913,14 +9172,7 @@ fn real_git_export_writer_input(
         ))
     })?;
     let repo_root_string = repo_root.display().to_string();
-    let base_commit_id = run_git_capture(&repo_root, &["rev-parse", "--verify", "HEAD^{commit}"])
-        .map_err(|message| {
-            invalid_request(format!(
-                "sun git export --execute-local requires a local Git repository with HEAD: {message}"
-            ))
-        })?
-        .trim()
-        .to_string();
+    let base_commit_id = state.imported_base_git_commit_id.clone();
     let target_ref = if options.git_ref.starts_with("refs/") {
         options.git_ref.clone()
     } else {
@@ -8938,7 +9190,20 @@ fn real_git_export_writer_input(
         })
         .into_iter()
         .collect();
-    let mut reachable_commit_ids = vec![base_commit_id.clone()];
+    let mut reachable_commit_ids = Vec::new();
+    if let Some(base) = &base_commit_id {
+        run_git_capture(
+            &repo_root,
+            &["cat-file", "-e", &format!("{base}^{{commit}}")],
+        )
+        .map_err(|message| {
+            CliError::new(
+                "export_parent_not_found",
+                format!("the recorded imported Git base is unavailable: {message}"),
+            )
+        })?;
+        reachable_commit_ids.push(base.clone());
+    }
     if let Some(commit_id) = target_ref_commit_id {
         if !reachable_commit_ids.contains(&commit_id) {
             reachable_commit_ids.push(commit_id);
@@ -8970,11 +9235,14 @@ fn real_git_export_writer_input(
         })
         .collect();
     Ok(GitExportWriterInput {
-        base_checkpoint_ids: vec!["checkpoint_base_0001".to_string()],
-        imported_base_commits: vec![ImportedBaseGitCommit {
-            checkpoint_id: "checkpoint_base_0001".to_string(),
-            git_commit_id: base_commit_id.clone(),
-        }],
+        base_checkpoint_ids: vec![state.base_checkpoint_id.clone()],
+        imported_base_commits: base_commit_id
+            .into_iter()
+            .map(|git_commit_id| ImportedBaseGitCommit {
+                checkpoint_id: state.base_checkpoint_id.clone(),
+                git_commit_id,
+            })
+            .collect(),
         prior_export_maps,
         planned_commit_id: "planned_commit_id_replaced_by_real_git".to_string(),
         export_map_id: format!("export_map_{}", checkpoint.id),
@@ -9021,13 +9289,15 @@ fn real_topic_create_success_envelope(state: &RealRepoState) -> String {
 }
 
 fn real_topic_metadata_json(topic: &RealTopicRecord) -> String {
-    let status = if topic.completed_revision_id.is_some() {
+    let status = if topic.abandonment.is_some() {
+        "abandoned"
+    } else if topic.completed_revision_id.is_some() {
         "completed"
     } else {
         "open"
     };
     format!(
-        "{{\"topic_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"status\":\"{}\",\"lifecycle\":\"{}\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":{},\"completed_revision_id\":{},\"owner_actor_id\":\"{}\",\"visibility\":\"{}\",\"acceptance_criteria\":{}}}",
+        "{{\"topic_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"status\":\"{}\",\"lifecycle\":\"{}\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":{},\"completed_revision_id\":{},\"abandonment\":{},\"owner_actor_id\":\"{}\",\"visibility\":\"{}\",\"acceptance_criteria\":{}}}",
         json_escape(&topic.topic_id),
         json_escape(&topic.slug),
         json_escape(&topic.display_name),
@@ -9036,10 +9306,50 @@ fn real_topic_metadata_json(topic: &RealTopicRecord) -> String {
         json_escape(&topic.base_checkpoint_id),
         optional_string_json(topic.head_revision_id.as_deref()),
         optional_string_json(topic.completed_revision_id.as_deref()),
+        topic
+            .abandonment
+            .as_ref()
+            .map(real_topic_abandonment_json)
+            .unwrap_or_else(|| "null".to_string()),
         json_escape(&topic.owner_actor_id),
         json_escape(&topic.visibility),
         string_array_json(topic.acceptance_criteria.iter().map(String::as_str)),
     )
+}
+
+fn real_topic_abandonment_json(abandonment: &RealTopicAbandonmentRecord) -> String {
+    format!(
+        "{{\"actor_id\":\"{}\",\"session_id\":\"{}\",\"expected_head_revision_id\":{},\"reason\":\"{}\",\"abandoned_at\":\"{}\"}}",
+        json_escape(&abandonment.actor_id),
+        json_escape(&abandonment.session_id),
+        optional_string_json(abandonment.expected_head_revision_id.as_deref()),
+        json_escape(&abandonment.reason),
+        json_escape(&abandonment.abandoned_at),
+    )
+}
+
+fn topic_abandoned_error(
+    topic: &RealTopicRecord,
+    abandonment: &RealTopicAbandonmentRecord,
+) -> CliError {
+    CliError::new(
+        "topic_abandoned",
+        "the topic is abandoned and cannot accept new sessions or writes",
+    )
+    .with_detail("topic_id", topic.topic_id.clone())
+    .with_detail("abandoned_by_session_id", abandonment.session_id.clone())
+    .with_detail("reason", abandonment.reason.clone())
+}
+
+fn ensure_session_write_topic_active(
+    state: &RealRepoState,
+    session: &RealSessionRecord,
+) -> Result<(), CliError> {
+    let topic = real_topic(state, &session.write_topic_id)?;
+    if let Some(abandonment) = &topic.abandonment {
+        return Err(topic_abandoned_error(topic, abandonment));
+    }
+    Ok(())
 }
 
 fn real_topic_handoff_json(
@@ -10005,9 +10315,11 @@ fn real_execution_snapshot_record_json(
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{{},\"command_started\":{},\"runtime_policy\":{},\"output_capture\":{},\"output_files\":[{}],\"raw_output_policy\":\"not_persisted\",\"source_truth\":\"sunlight_persisted_execution\"}}",
+        "{{{},\"command_started\":{},\"command_outcome\":\"{}\",\"phase_timings_ms\":{},\"runtime_policy\":{},\"output_capture\":{},\"output_files\":[{}],\"raw_output_policy\":\"not_persisted\",\"source_truth\":\"sunlight_persisted_execution\"}}",
         execution_record_json(&record).trim_start_matches('{').trim_end_matches('}'),
         execution.command_started,
+        json_escape(&execution.command_outcome),
+        real_execution_persisted_timings_json(&execution.timings),
         real_execution_runtime_policy_json(execution),
         real_execution_output_capture_json(execution),
         output_paths,
@@ -10303,6 +10615,7 @@ fn real_execution_status_envelope(
             "\"resolved_view_id\":\"{}\",",
             "\"tree_identity\":{},",
             "\"result\":{},",
+            "\"command_outcome\":\"{}\",",
             "\"environment_summary\":{},",
             "\"runtime_policy\":{},",
             "\"output_capture\":{},",
@@ -10323,6 +10636,7 @@ fn real_execution_status_envelope(
         json_escape(&execution.resolved_view_id),
         single_repo_tree_json(&record.tree_identity),
         execution_result_json(&record),
+        json_escape(&execution.command_outcome),
         execution_environment_summary_json(&record.environment_summary),
         real_execution_runtime_policy_json(execution),
         real_execution_output_capture_json(execution),
@@ -10339,17 +10653,6 @@ fn real_execution_run_success_envelope(
     execution: &RealExecutionSnapshot,
     stdout_text: &str,
     stderr_text: &str,
-    materialization_ms: u128,
-    cache_build_ms: u128,
-    cache_validation_ms: u128,
-    projection_materialization_ms: u128,
-    runtime_provider_discovery_ms: u128,
-    runtime_cache_lookup_ms: u128,
-    runtime_cache_wait_ms: u128,
-    runtime_provider_preparation_ms: u128,
-    runtime_private_binding_ms: u128,
-    command_ms: u128,
-    output_scan_ms: u128,
     publication_ms: u128,
     total_ms: u128,
 ) -> String {
@@ -10371,14 +10674,12 @@ fn real_execution_run_success_envelope(
             "\"projection\":{},",
             "\"tree_identity\":{},",
             "\"result\":{},",
+            "\"command_outcome\":\"{}\",",
             "\"environment_summary\":{},",
             "\"runtime_policy\":{},",
             "\"output_capture\":{},",
             "\"output_text\":{{\"stdout\":\"{}\",\"stderr\":\"{}\",\"durability\":\"response_only\"}},",
-            "\"phase_timings_ms\":{{\"materialization\":{},\"cache_build\":{},\"cache_validation\":{},\"projection_materialization\":{},",
-            "\"runtime_provider_discovery\":{},\"runtime_cache_lookup\":{},\"runtime_cache_wait\":{},",
-            "\"runtime_provider_preparation\":{},\"runtime_private_binding\":{},\"command\":{},",
-            "\"output_scan_and_classification\":{},\"publication\":{},\"total\":{}}},",
+            "\"phase_timings_ms\":{},",
             "\"output_summary_counts\":{},",
             "\"promotion_candidates\":[{}]",
             "}},\"warnings\":[]}}"
@@ -10394,26 +10695,63 @@ fn real_execution_run_success_envelope(
         real_execution_projection_json(state, execution),
         single_repo_tree_json(&record.tree_identity),
         execution_result_json(&record),
+        json_escape(&execution.command_outcome),
         execution_environment_summary_json(&record.environment_summary),
         real_execution_runtime_policy_json(execution),
         real_execution_output_capture_json(execution),
         json_escape(stdout_text),
         json_escape(stderr_text),
-        materialization_ms,
-        cache_build_ms,
-        cache_validation_ms,
-        projection_materialization_ms,
-        runtime_provider_discovery_ms,
-        runtime_cache_lookup_ms,
-        runtime_cache_wait_ms,
-        runtime_provider_preparation_ms,
-        runtime_private_binding_ms,
-        command_ms,
-        output_scan_ms,
-        publication_ms,
-        total_ms,
+        real_execution_response_timings_json(
+            &execution.timings,
+            publication_ms,
+            total_ms,
+        ),
         output_summary_counts_json(&record),
         real_execution_promotion_candidates_json(state, execution),
+    )
+}
+
+fn real_execution_persisted_timings_json(timings: &RealExecutionTimings) -> String {
+    format!(
+        concat!(
+            "{{\"cache_build\":{},\"cache_validation\":{},\"projection_materialization\":{},",
+            "\"projection_overhead\":{},\"runtime_provider_discovery\":{},",
+            "\"runtime_cache_lookup\":{},\"runtime_cache_wait\":{},",
+            "\"runtime_provider_preparation\":{},\"runtime_private_binding\":{},",
+            "\"runtime_overhead\":{},\"command_start_publication\":{},\"command\":{},",
+            "\"output_scan_and_classification\":{},\"cleanup\":{},",
+            "\"other_prepublication\":{},\"prepublication_total\":{}}}"
+        ),
+        timings.cache_build_ms,
+        timings.cache_validation_ms,
+        timings.projection_materialization_ms,
+        timings.projection_overhead_ms,
+        timings.runtime_provider_discovery_ms,
+        timings.runtime_cache_lookup_ms,
+        timings.runtime_cache_wait_ms,
+        timings.runtime_provider_preparation_ms,
+        timings.runtime_private_binding_ms,
+        timings.runtime_overhead_ms,
+        timings.command_start_publication_ms,
+        timings.command_ms,
+        timings.output_scan_and_classification_ms,
+        timings.cleanup_ms,
+        timings.other_prepublication_ms,
+        timings.prepublication_total_ms,
+    )
+}
+
+fn real_execution_response_timings_json(
+    timings: &RealExecutionTimings,
+    terminal_publication_ms: u128,
+    end_to_end_ms: u128,
+) -> String {
+    let persisted = real_execution_persisted_timings_json(timings);
+    format!(
+        "{{{},\"terminal_publication\":{},\"end_to_end\":{}}}",
+        persisted.trim_start_matches('{').trim_end_matches('}'),
+        terminal_publication_ms,
+        end_to_end_ms,
     )
 }
 
@@ -10859,6 +11197,7 @@ fn real_topic_heads_json(state: &RealRepoState) -> String {
         state
             .topics
             .iter()
+            .filter(|topic| topic.abandonment.is_none())
             .map(|topic| format!(
                 "{{\"topic_id\":\"{}\",\"slug\":\"{}\",\"status\":\"{}\",\"head_revision_id\":{},\"completed_revision_id\":{},\"revision_number\":{}}}",
                 json_escape(&topic.topic_id),
@@ -10948,7 +11287,7 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
             "{{\"repository\":{{\"repository_id\":\"{}\",\"base_checkpoint_id\":\"{}\",\"canonical_checkpoint_id\":\"{}\",\"base_resolved_view_id\":\"{}\",\"current_resolved_view_id\":\"{}\",\"tree_hash\":\"{}\"}},",
             "\"worktree\":{{\"state\":\"{}\",\"anchor\":{},\"candidate_count\":{},\"candidate_counts\":{{{}}},\"worktree_diff_id\":{},\"scan_error\":{}}},",
             "\"artifacts\":{{\"active\":{},\"legacy_quarantine_excluded\":{}}},",
-            "\"topics\":{{\"count\":{},\"heads\":{}}},",
+            "\"topics\":{{\"count\":{},\"actionable_count\":{},\"abandoned_count\":{},\"heads\":{}}},",
             "\"sessions\":{{\"count\":{},\"heads\":{}}},",
             "\"resolution\":{{\"conflicts\":{},\"staleness\":{}}},",
             "\"projections\":{{\"total\":{},\"by_purpose\":{{{}}},\"lifecycle\":{{\"materialized\":{},\"dirty\":{},\"invalid\":{}}}}},",
@@ -10973,6 +11312,16 @@ fn operational_summary_json(state: &RealRepoState, summary: &RealOperationalSumm
         summary.artifact_count,
         summary.quarantined_count,
         state.topics.len(),
+        state
+            .topics
+            .iter()
+            .filter(|topic| topic.abandonment.is_none())
+            .count(),
+        state
+            .topics
+            .iter()
+            .filter(|topic| topic.abandonment.is_some())
+            .count(),
         real_topic_heads_json(state),
         state.sessions.len(),
         real_session_heads_json(state),
@@ -11146,7 +11495,13 @@ fn real_operational_warnings_json(
     if !summary.invalid_projection_ids.is_empty() {
         warnings.push(format!("{{\"code\":\"invalid_projection_records\",\"message\":\"inspect or recreate unreadable compatibility projections\",\"details\":{{\"projection_ids\":{}}}}}", string_array_json(summary.invalid_projection_ids.iter().map(String::as_str))));
     }
-    if !state.operations.is_empty() && state.checkpoints.is_empty() {
+    let has_unabandoned_operations = state.operations.iter().any(|operation| {
+        !state
+            .topics
+            .iter()
+            .any(|topic| topic.topic_id == operation.topic_id && topic.abandonment.is_some())
+    });
+    if has_unabandoned_operations && state.checkpoints.is_empty() {
         warnings.push("{\"code\":\"checkpoint_missing\",\"message\":\"create a checkpoint for the authored resolved view\",\"details\":{}}".to_string());
     }
     if !summary.unexported_checkpoint_ids.is_empty() {
@@ -11233,13 +11588,25 @@ fn print_real_status_text(
         );
     }
     if command == "status.repository" || command == "inspect.repository" {
-        for topic in &state.topics {
+        for topic in state
+            .topics
+            .iter()
+            .filter(|topic| topic.abandonment.is_none())
+        {
             outputln!(
                 ctx,
                 "  topic {}  head {}",
                 topic.slug,
                 topic.head_revision_id.as_deref().unwrap_or("none")
             );
+        }
+        let abandoned_count = state
+            .topics
+            .iter()
+            .filter(|topic| topic.abandonment.is_some())
+            .count();
+        if abandoned_count > 0 {
+            outputln!(ctx, "  abandoned topics {abandoned_count}");
         }
         for session in &state.sessions {
             outputln!(
@@ -11463,7 +11830,7 @@ fn real_completion_guard_json(state: &RealRepoState, summary: &RealOperationalSu
     let completed_topic_ids = state
         .topics
         .iter()
-        .filter(|topic| topic.completed_revision_id.is_some())
+        .filter(|topic| topic.completed_revision_id.is_some() && topic.abandonment.is_none())
         .map(|topic| topic.topic_id.as_str())
         .collect::<Vec<_>>();
     let checkpoint_ids = state
@@ -11553,6 +11920,7 @@ fn available_newer_topic_heads(
                 .topics
                 .iter()
                 .find(|topic| topic.topic_id == *topic_id)
+                .filter(|topic| topic.abandonment.is_none())
                 .and_then(|topic| topic.head_revision_id.as_ref())
                 .filter(|head| *head != revision_id)
                 .map(|head| (topic_id.clone(), head.clone()))
@@ -15061,6 +15429,14 @@ struct TopicCompleteOptions {
 }
 
 #[derive(Debug)]
+struct TopicAbandonOptions {
+    topic_id: String,
+    session_id: String,
+    expected_head_revision_id: Option<String>,
+    reason: String,
+}
+
+#[derive(Debug)]
 struct SessionStartOptions {
     topic: String,
     view_id: String,
@@ -15079,6 +15455,7 @@ struct ArtifactCommandOptions {
     session_id: Option<String>,
     view_id: Option<String>,
     fixture: Option<String>,
+    limit: usize,
     operands: Vec<String>,
 }
 
@@ -15257,6 +15634,84 @@ fn parse_topic_complete_options(ctx: &CommandContext) -> Result<TopicCompleteOpt
     })
 }
 
+fn parse_topic_abandon_options(ctx: &CommandContext) -> Result<TopicAbandonOptions, CliError> {
+    let mut topic_id = None;
+    let mut session_id = None;
+    let mut expected_head = None;
+    let mut reason = None;
+    let mut args = ctx.args.iter().skip(2);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--topic" => {
+                topic_id = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request("sun topic abandon requires --topic <topic-id>")
+                        })?
+                        .clone(),
+                );
+            }
+            "--session" => {
+                session_id = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request("sun topic abandon requires --session <session-id>")
+                        })?
+                        .clone(),
+                );
+            }
+            "--expected-head" => {
+                expected_head = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request(
+                                "sun topic abandon requires --expected-head <revision-id|none>",
+                            )
+                        })?
+                        .clone(),
+                );
+            }
+            "--reason" => {
+                reason = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            invalid_request("sun topic abandon requires --reason <text>")
+                        })?
+                        .clone(),
+                );
+            }
+            flag if flag.starts_with("--") => {
+                return Err(invalid_request(format!(
+                    "unknown flag `{flag}` for sun topic abandon"
+                )));
+            }
+            value => {
+                return Err(invalid_request(format!(
+                    "unexpected topic abandon argument `{value}`"
+                )));
+            }
+        }
+    }
+    let reason =
+        reason.ok_or_else(|| invalid_request("sun topic abandon requires --reason <text>"))?;
+    if reason.is_empty() || reason.len() > 512 || reason.chars().any(char::is_control) {
+        return Err(invalid_request(
+            "topic abandonment reason must be 1 through 512 printable characters",
+        ));
+    }
+    let expected_head = expected_head.ok_or_else(|| {
+        invalid_request("sun topic abandon requires --expected-head <revision-id|none>")
+    })?;
+    Ok(TopicAbandonOptions {
+        topic_id: topic_id
+            .ok_or_else(|| invalid_request("sun topic abandon requires --topic <topic-id>"))?,
+        session_id: session_id
+            .ok_or_else(|| invalid_request("sun topic abandon requires --session <session-id>"))?,
+        expected_head_revision_id: (expected_head != "none").then_some(expected_head),
+        reason,
+    })
+}
+
 fn parse_session_start_options(ctx: &CommandContext) -> Result<SessionStartOptions, CliError> {
     let mut topic = None;
     let mut view_id = None;
@@ -15371,6 +15826,7 @@ fn parse_artifact_options(
     let mut session_id = None;
     let mut view_id = None;
     let mut fixture = None;
+    let mut limit = DEFAULT_ARTIFACT_SEARCH_LIMIT;
     let mut operands = Vec::new();
     let mut args = ctx.args.iter().skip(1);
 
@@ -15395,6 +15851,21 @@ fn parse_artifact_options(
                     invalid_request(format!("usage: sun {command} requires --fixture basic-app"))
                 })?;
                 fixture = Some(value.clone());
+            }
+            "--limit" if command == "search" => {
+                let value = args.next().ok_or_else(|| {
+                    invalid_request("usage: sun search --limit requires an integer")
+                })?;
+                limit = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|value| (1..=MAX_ARTIFACT_SEARCH_LIMIT).contains(value))
+                    .ok_or_else(|| {
+                        invalid_request(format!(
+                        "search limit must be an integer from 1 through {MAX_ARTIFACT_SEARCH_LIMIT}"
+                    ))
+                        .with_detail("limit", value)
+                    })?;
             }
             flag if flag.starts_with("--") => {
                 return Err(invalid_request(format!(
@@ -15426,6 +15897,7 @@ fn parse_artifact_options(
         session_id,
         view_id,
         fixture,
+        limit,
         operands,
     })
 }
@@ -15434,7 +15906,7 @@ fn artifact_usage(command: &str) -> String {
     match command {
         "read" => "usage: sun read <path-or-artifact-id> (--session <session> | --view <resolved-view>) [--fixture basic-app]",
         "list" => "usage: sun list [path-prefix] (--session <session> | --view <resolved-view>) [--fixture basic-app]",
-        "search" => "usage: sun search <query> (--session <session> | --view <resolved-view>) [--fixture basic-app]",
+        "search" => "usage: sun search <query> (--session <session> | --view <resolved-view>) [--limit 1..200] [--fixture basic-app]",
         "patch" => {
             "usage: sun patch <path> --session <session> [--fixture basic-app] --expect-hash <hash> --patch-file <file>"
         }
@@ -19821,6 +20293,9 @@ fn search_success_envelope(response: &SearchResponse) -> String {
             "\"repository_id\":\"{}\",",
             "\"ids\":{{\"session_id\":\"{}\"}},",
             "\"view\":{},",
+            "\"returned\":{},",
+            "\"limit\":{},",
+            "\"truncated\":{},",
             "\"matches\":[{}]",
             "}},",
             "\"warnings\":[]",
@@ -19830,6 +20305,9 @@ fn search_success_envelope(response: &SearchResponse) -> String {
         json_escape(&response.repository_id),
         json_escape(&response.session_id),
         view_json(&response.view),
+        response.returned,
+        response.limit,
+        response.truncated,
         response
             .matches
             .iter()
@@ -19841,7 +20319,8 @@ fn search_success_envelope(response: &SearchResponse) -> String {
                         "\"path\":\"{}\",",
                         "\"content_hash\":\"{}\",",
                         "\"line\":{},",
-                        "\"snippet\":\"{}\"",
+                        "\"snippet\":\"{}\",",
+                        "\"snippet_truncated\":{}",
                         "}}"
                     ),
                     json_escape(&item.artifact_id),
@@ -19849,6 +20328,7 @@ fn search_success_envelope(response: &SearchResponse) -> String {
                     json_escape(&item.content_hash),
                     item.line,
                     json_escape(&item.snippet),
+                    item.snippet_truncated,
                 )
             })
             .collect::<Vec<_>>()
@@ -19913,6 +20393,8 @@ fn view_search_success_envelope(
     state: &RealRepoState,
     view: &ResolvedViewResult,
     matches: &[sunlight_core::artifacts::SearchMatch],
+    limit: usize,
+    truncated: bool,
 ) -> String {
     format!(
         concat!(
@@ -19922,22 +20404,29 @@ fn view_search_success_envelope(
             "\"ids\":{{\"resolved_view_id\":\"{}\"}},",
             "\"access_mode\":\"read_only_view\",",
             "\"view\":{},",
+            "\"returned\":{},",
+            "\"limit\":{},",
+            "\"truncated\":{},",
             "\"matches\":[{}]",
             "}},\"warnings\":[]}}"
         ),
         json_escape(&state.repository_id),
         json_escape(&view.resolved_view_id),
         view_resolve_view_json(view),
+        matches.len(),
+        limit,
+        truncated,
         matches
             .iter()
             .map(|item| {
                 format!(
-                    "{{\"artifact_id\":\"{}\",\"path\":\"{}\",\"content_hash\":\"{}\",\"line\":{},\"snippet\":\"{}\"}}",
+                    "{{\"artifact_id\":\"{}\",\"path\":\"{}\",\"content_hash\":\"{}\",\"line\":{},\"snippet\":\"{}\",\"snippet_truncated\":{}}}",
                     json_escape(&item.artifact_id),
                     json_escape(&item.path),
                     json_escape(&item.content_hash),
                     item.line,
                     json_escape(&item.snippet),
+                    item.snippet_truncated,
                 )
             })
             .collect::<Vec<_>>()
@@ -21445,11 +21934,17 @@ fn next_action_for_error_code(code: &str) -> &'static str {
         "legacy_quarantine_migration_blocked" => {
             "Preserve or export needed historical work, back up .sunlight, then remove only .sunlight and rerun repository_init with this build."
         }
-        "precondition_failed" | "compat_precondition_failed" | "promotion_precondition_failed" => {
+        "precondition_failed" => {
+            "Read only the affected artifact in the same session, rebuild the change against its current hash, and retry in that session. Do not refresh the session or create another topic."
+        }
+        "compat_precondition_failed" | "promotion_precondition_failed" => {
             "Read the current artifact or inspect the referenced object, use the returned exact hash and IDs, then retry only after adapting the intended change."
         }
+        "patch_scope_mismatch" => {
+            "Split the patch into one patch per edits entry, reread only paths whose hashes changed, and retry in the same session. Do not refresh the session or create another topic."
+        }
         "patch_apply_failed" | "patch_parse_failed" => {
-            "Read the current artifact, rebuild the patch with exact unique context, keep the current content hash as the compare-and-swap guard, and retry."
+            "Read the affected artifact, rebuild the patch with exact unique context, keep the current content hash as the compare-and-swap guard, and retry in the same session. Do not refresh the session or create another topic."
         }
         "session_not_found" => {
             "Inspect repository status for current sessions; start a new session on the intended topic and exact view when the supplied session does not exist."
@@ -21462,6 +21957,15 @@ fn next_action_for_error_code(code: &str) -> &'static str {
         }
         "topic_completed" | "topic_already_completed" => {
             "Treat the completed revision as immutable; create a dependent topic and session for any follow-up change."
+        }
+        "topic_abandoned" => {
+            "Treat this topic as read-only history. Continue intended work in a distinct topic and session."
+        }
+        "topic_abandonment_canonical" | "checkpoint_contains_abandoned_topic" => {
+            "Keep canonical work accepted. Inspect the topic and canonical checkpoint instead of abandoning or reintegrating that topic."
+        }
+        "topic_abandonment_conflict" => {
+            "Inspect the topic's existing immutable abandonment and use it as the authoritative disposition."
         }
         "topic_session_mismatch" | "topic_head_mismatch" | "topic_conflict" => {
             "Inspect the topic and session facts, then use the session that owns the topic and its exact current revision; do not guess or reuse another writer's session."
@@ -21544,6 +22048,12 @@ fn next_action_for_error_code(code: &str) -> &'static str {
         }
         "commit_policy_failed" => {
             "Inspect the inline metadata-policy failures, then correct the supplied .sunlight metadata candidate paths or restore the managed .gitignore block before rerunning policy_check_commit."
+        }
+        "export_parent_not_found" => {
+            "Preserve native history. Restore the recorded Git base if available; repositories initialized without a recorded base cannot infer one from current HEAD. Use a recognized prior export lineage, or preserve the native result and initialize a fresh Git-backed repository for a new handoff."
+        }
+        "export_ref_update_failed" | "export_map_write_failed" => {
+            "Preserve the checkpoint and reported created_commit_id, target_ref, and ref_updated facts. Correct the reported lock or storage failure before retrying; do not claim a complete handoff without a durable export map."
         }
         "export_policy_failed" | "checkpoint_evidence_failed"
         | "checkpoint_evidence_view_mismatch" | "checkpoint_evidence_tree_mismatch" => {
@@ -21633,6 +22143,7 @@ Usage:
   sun agent doctor --client generic|codex|cursor [--repo <path>] [--json]
   sun topic create <slug> --display-name <name> [--owner <actor>] [--visibility local|private] [--acceptance-criterion <text>...] [--json]
   sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]
+  sun topic abandon --topic <topic> --session <session> --expected-head <revision|none> --reason <text> [--json]
   sun session start --topic <topic> --view <view> --actor <actor-id> [--json]
   sun session refresh <session> --policy manual|follow|none [--json]
   sun read|list|search ... (--session <session> | --view <resolved-view>) [--json]
@@ -21658,7 +22169,7 @@ Usage:
 Commands:
   init       Ingest the repository into persisted Sunlight native state
   agent      Install the portable skill and client MCP adapter; diagnose setup
-  topic      Create and durably complete authoring topics
+  topic      Create, complete, and abandon authoring topics
   session    Start and explicitly refresh topic-bound sessions over exact views
   read/list/search/inspect
              Query persisted artifacts and provenance
@@ -21707,9 +22218,10 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
         "agent doctor" => outputln!(ctx, "sun agent doctor\n\nUsage:\n  sun agent doctor --client generic|codex|cursor [--repo <path>] [--json]\n\nVerifies the portable skill and, for Codex or Cursor, the selected client MCP entry. Generic doctor does not inspect client transport or live tool visibility. Setup is complete when repository_status and artifact tools are visible in the client."),
         "status" => outputln!(ctx, "sun status\n\nUsage:\n  sun status [--json]\n  sun status --topic <topic> [--json]\n  sun status --session <session> [--json]\n  sun status --view <view> [--json]\n  sun status --projection <projection> [--json]\n  sun status --execution <execution> [--json]\n  sun status --checkpoint <checkpoint> [--json]\n  sun status --export <export-map> [--json]\n\nRepository status reports native state plus direct worktree differences relative to Sunlight's durable anchor. Git state remains a separate diagnostic."),
         "inspect" => outputln!(ctx, "sun inspect\n\nUsage:\n  sun inspect repository [--json]\n  sun inspect topic:<topic>|session:<session>|view:<view> [--json]\n  sun inspect artifact:<path>|operation:<id>|conflict:<id> [--json]\n  sun inspect projection:<id>|execution:<id>|checkpoint:<id>|export:<id> [--json]"),
-        "topic" => outputln!(ctx, "sun topic\n\nUsage:\n  sun topic create <slug> --display-name <name> [options] [--json]\n  sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]"),
+        "topic" => outputln!(ctx, "sun topic\n\nUsage:\n  sun topic create <slug> --display-name <name> [options] [--json]\n  sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]\n  sun topic abandon --topic <topic> --session <session> --expected-head <revision|none> --reason <text> [--json]"),
         "topic create" => outputln!(ctx, "sun topic create\n\nUsage:\n  sun topic create <slug> --display-name <name> [--owner <actor>] [--visibility local|private] [--acceptance-criterion <text>...] [--json]\n\nCreates a durable topic in the initialized repository. Defaults: owner=local, visibility=local."),
         "topic complete" => outputln!(ctx, "sun topic complete\n\nUsage:\n  sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]\n\nRecords an idempotent durable completion fact for the exact current topic revision; it does not assert review or quality."),
+        "topic abandon" => outputln!(ctx, "sun topic abandon\n\nUsage:\n  sun topic abandon --topic <topic> --session <session> --expected-head <revision|none> --reason <text> [--json]\n\nRecords an immutable disposition for obsolete work without deleting its history. Canonical topics cannot be abandoned."),
         "session" => outputln!(ctx, "sun session\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]\n  sun session refresh <session> --policy manual|follow|none [--json]"),
         "session start" => outputln!(ctx, "sun session start\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]\n\nThe exact view may be the repository base, current head, or a persisted checkpoint view."),
         "session refresh" => outputln!(ctx, "sun session refresh\n\nUsage:\n  sun session refresh <session> --policy manual|follow|none [--json]\n\nmanual and follow immediately advance already-selected non-write topics to current heads; none pins them. The write topic always remains at the session revision. An unchanged policy/frontier is an idempotent no-op."),

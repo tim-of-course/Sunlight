@@ -9,8 +9,11 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
-use sunlight_core::records::parse_json_record;
-use sunlight_core::repo_state::{RealQuarantineEntry, RealRepoState};
+use sunlight_core::records::{parse_json_record, JsonValue};
+use sunlight_core::repo_state::{
+    parse_real_execution_snapshot_value, parse_real_projection_snapshot_value,
+    RealExecutionSnapshot, RealProjectionSnapshot, RealQuarantineEntry, RealRepoState,
+};
 
 #[cfg(windows)]
 const PYTHON: &str = "python";
@@ -19,6 +22,62 @@ const PYTHON: &str = "python3";
 
 fn sun() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sun"))
+}
+
+fn load_native_executions(repo: &Path) -> Vec<RealExecutionSnapshot> {
+    let state = RealRepoState::load(repo).unwrap();
+    let mut executions = state
+        .executions
+        .into_iter()
+        .map(|execution| (execution.execution_id.clone(), execution))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let root = repo.join(".sunlight/executions");
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(value) = fs::read(&path).map(|bytes| parse_json_record(&bytes).unwrap()) else {
+                continue;
+            };
+            let JsonValue::Object(object) = value else {
+                continue;
+            };
+            let Some(snapshot) = object.get("snapshot") else {
+                continue;
+            };
+            let execution = parse_real_execution_snapshot_value(snapshot, &path).unwrap();
+            executions.insert(execution.execution_id.clone(), execution);
+        }
+    }
+    executions.into_values().collect()
+}
+
+fn load_native_execution_projections(repo: &Path) -> Vec<RealProjectionSnapshot> {
+    let state = RealRepoState::load(repo).unwrap();
+    let mut projections = state
+        .projections
+        .into_iter()
+        .filter(|projection| projection.purpose == "execution")
+        .map(|projection| (projection.projection_id.clone(), projection))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let root = repo.join(".sunlight/projections");
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(OsStr::to_str) != Some("json") {
+                continue;
+            }
+            let value = parse_json_record(&fs::read(&path).unwrap()).unwrap();
+            let JsonValue::Object(object) = value else {
+                continue;
+            };
+            let Some(snapshot) = object.get("snapshot") else {
+                continue;
+            };
+            let projection = parse_real_projection_snapshot_value(repo, snapshot, &path).unwrap();
+            projections.insert(projection.projection_id.clone(), projection);
+        }
+    }
+    projections.into_values().collect()
 }
 
 #[test]
@@ -358,7 +417,9 @@ fn no_fixture_repository_status_clean_initial_and_active_human_journey() {
     let clean = stdout(&clean);
     assert_valid_json(&clean);
     assert!(clean.contains("\"command\":\"status.repository\""));
-    assert!(clean.contains("\"topics\":{\"count\":0,\"heads\":[]}"));
+    assert!(clean.contains(
+        "\"topics\":{\"count\":0,\"actionable_count\":0,\"abandoned_count\":0,\"heads\":[]}"
+    ));
     assert!(clean.contains("\"executions\":{\"total\":0"));
     assert!(clean.contains("\"checkpoints\":{\"count\":0,\"unexported\":0,\"records\":[]}"));
     assert!(clean.contains(if cfg!(windows) {
@@ -1041,7 +1102,7 @@ fn init_json_returns_repository_success_envelope() {
         .expect("second sun init should run");
     assert_success(&second);
     assert!(String::from_utf8_lossy(&second.stdout).contains("\"ok\":true"));
-    assert_eq!(fs::read(state_path).unwrap(), state_before);
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
 }
 
 #[test]
@@ -2175,6 +2236,30 @@ fn execution_builds_and_reuses_runtime_layers_without_reading_worktree_dependenc
     assert_eq!(body["data"]["result"]["status"], "pass");
     assert_eq!(body["data"]["promotion_candidates"], serde_json::json!([]));
     assert!(body["data"]["phase_timings_ms"]["runtime_provider_preparation"].is_number());
+    let timings = body["data"]["phase_timings_ms"].as_object().unwrap();
+    let explained = [
+        "cache_build",
+        "cache_validation",
+        "projection_materialization",
+        "projection_overhead",
+        "runtime_provider_discovery",
+        "runtime_cache_lookup",
+        "runtime_cache_wait",
+        "runtime_provider_preparation",
+        "runtime_private_binding",
+        "runtime_overhead",
+        "command_start_publication",
+        "command",
+        "output_scan_and_classification",
+        "cleanup",
+        "other_prepublication",
+    ]
+    .iter()
+    .map(|field| timings[*field].as_u64().unwrap())
+    .sum::<u64>();
+    assert_eq!(explained, timings["prepublication_total"].as_u64().unwrap());
+    assert!(timings["terminal_publication"].is_u64());
+    assert!(timings["end_to_end"].is_u64());
     let layers = body["data"]["runtime_policy"]["runtime_layers"]
         .as_array()
         .unwrap();
@@ -2186,17 +2271,57 @@ fn execution_builds_and_reuses_runtime_layers_without_reading_worktree_dependenc
         .unwrap()
         .starts_with("sha256:"));
     let first_content_id = layers[0]["content_id"].as_str().unwrap().to_string();
+    let cache_key = layers[0]["lookup_key"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("sha256:");
+    let cache_target = repo
+        .path()
+        .join(".sunlight/projections/.runtime-layers/entries")
+        .join(cache_key)
+        .join("targets/root/node_modules");
+    let cache_file = cache_target.join("pkg/index.js");
+    let cache_manifest = cache_target
+        .ancestors()
+        .nth(3)
+        .unwrap()
+        .join("manifest.json");
+    assert_eq!(
+        fs::read_to_string(&cache_file).unwrap(),
+        "prepared dependency\n"
+    );
+    assert!(fs::metadata(&cache_target)
+        .unwrap()
+        .permissions()
+        .readonly());
+    assert_eq!(
+        fs::metadata(cache_target.join("pkg"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o222,
+        0
+    );
+    assert_eq!(
+        fs::metadata(&cache_file).unwrap().permissions().mode() & 0o222,
+        0
+    );
+    assert!(fs::write(&cache_file, "poisoned dependency\n").is_err());
+    assert!(fs::read_to_string(cache_manifest)
+        .unwrap()
+        .contains("\"binding_layout\":\"protected_content_private_repermission_v1\""));
     assert_eq!(
         fs::read_to_string(repo.path().join("node_modules/pkg/index.js")).unwrap(),
         "untrusted worktree dependency\n"
     );
 
-    let state = RealRepoState::load(repo.path()).unwrap();
-    let execution = state.executions.last().unwrap();
+    let executions = load_native_executions(repo.path());
+    let execution = executions.last().unwrap();
     assert!(execution.outputs.is_empty());
     assert_eq!(execution.runtime_layers.len(), 1);
     assert!(execution.runtime_dependency_bindings.is_empty());
     assert_eq!(execution.runtime_dependency_strategy, "runtime_layers_v1");
+    assert_eq!(execution.timings.prepublication_total_ms, explained);
     let execution_status =
         run_real_json(&repo, &["status", "--execution", &execution.execution_id]);
     assert_success(&execution_status);
@@ -2466,21 +2591,22 @@ fn simultaneous_execution_start_reserves_unique_ids_and_runs_each_command_once()
     command_runs.sort();
     assert_eq!(command_runs, vec!["first", "second"]);
 
-    let state = RealRepoState::load(repo.path()).unwrap();
-    assert_eq!(state.executions.len(), 2);
+    let canonical_state = RealRepoState::load(repo.path()).unwrap();
+    assert!(canonical_state.executions.is_empty());
+    assert!(canonical_state
+        .projections
+        .iter()
+        .all(|projection| projection.purpose != "execution"));
+    let executions = load_native_executions(repo.path());
+    assert_eq!(executions.len(), 2);
     for execution_id in [first_id, second_id] {
-        let execution = state
-            .executions
+        let execution = executions
             .iter()
             .find(|execution| execution.execution_id == execution_id)
             .unwrap();
         assert_eq!(execution.status, "pass");
     }
-    let execution_projections = state
-        .projections
-        .iter()
-        .filter(|projection| projection.purpose == "execution")
-        .collect::<Vec<_>>();
+    let execution_projections = load_native_execution_projections(repo.path());
     assert_eq!(execution_projections.len(), 2);
     assert_ne!(
         execution_projections[0].projection_id,
@@ -2511,6 +2637,82 @@ fn simultaneous_execution_start_reserves_unique_ids_and_runs_each_command_once()
         .count(),
         0
     );
+}
+
+#[test]
+fn execution_store_failpoints_recover_without_exposing_orphan_or_promotable_work() {
+    let repo = TestRepo::new("execution-store-failpoints");
+    repo.write_file("README.md", "# execution store failpoints\n");
+    init_local_git_repo(&repo);
+    git(repo.path(), &["add", "README.md"]);
+    git(repo.path(), &["commit", "-m", "base"]);
+    assert_success(&run_real_json(&repo, &["init"]));
+
+    let fail = |name: &str| {
+        sun()
+            .args([
+                "run",
+                "--view",
+                "view_base_0001",
+                "--json",
+                "--",
+                PYTHON,
+                "-c",
+                "pass",
+            ])
+            .env("SUNLIGHT_INTERNAL_TEST_EXECUTION_STORE_FAILPOINT", name)
+            .current_dir(repo.path())
+            .output()
+            .unwrap()
+    };
+
+    let before_projection = fail("before_projection_publication");
+    assert_failure(&before_projection);
+    assert!(load_native_executions(repo.path()).is_empty());
+    assert!(load_native_execution_projections(repo.path()).is_empty());
+
+    let between_records = fail("between_projection_and_execution_publication");
+    assert_failure(&between_records);
+    assert!(load_native_executions(repo.path()).is_empty());
+    let orphan = load_native_execution_projections(repo.path());
+    assert_eq!(orphan.len(), 1);
+    let orphan_root = PathBuf::from(orphan[0].materialized_root.as_ref().unwrap());
+    assert!(orphan_root.is_dir());
+    let recovered_orphan = run_real_json(&repo, &["status"]);
+    assert_success(&recovered_orphan);
+    assert!(load_native_execution_projections(repo.path()).is_empty());
+    assert!(!orphan_root.exists());
+
+    let after_running = fail("after_running_publication");
+    assert_failure(&after_running);
+    let running = load_native_executions(repo.path());
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].status, "running");
+    let execution_id = running[0].execution_id.clone();
+
+    let recovered = run_real_json(&repo, &["status", "--execution", &execution_id]);
+    assert_success(&recovered);
+    let recovered: serde_json::Value = serde_json::from_str(&stdout(&recovered)).unwrap();
+    assert_eq!(recovered["data"]["result"]["status"], "interrupted");
+    assert_eq!(recovered["data"]["command_outcome"], "unknown");
+    assert_eq!(recovered["data"]["promotion_status"], "none");
+    assert_eq!(
+        recovered["data"]["promotion_candidates"],
+        serde_json::json!([])
+    );
+
+    let executions = load_native_executions(repo.path());
+    assert_eq!(executions[0].status, "interrupted");
+    assert_eq!(executions[0].command_outcome, "unknown");
+    let projections = load_native_execution_projections(repo.path());
+    assert_eq!(projections.len(), 1);
+    assert_eq!(projections[0].retention_state, "quarantined");
+    let canonical = RealRepoState::load(repo.path()).unwrap();
+    assert!(canonical.executions.is_empty());
+    assert!(canonical
+        .projections
+        .iter()
+        .all(|projection| projection.purpose != "execution"));
 }
 
 #[test]
@@ -2728,6 +2930,409 @@ fn batch_patch_is_one_atomic_multi_effect_revision() {
         checkpoint["data"]["ids"]["execution_id"],
         serde_json::Value::Null
     );
+}
+
+#[test]
+fn repeated_multi_file_patch_envelope_is_rejected_without_state_change() {
+    let repo = TestRepo::new("batch-patch-scope");
+    init_local_git_repo(&repo);
+    repo.write_file("a.txt", "alpha\n");
+    repo.write_file("b.txt", "beta\n");
+    git(repo.path(), &["add", "a.txt", "b.txt"]);
+    git(repo.path(), &["commit", "-m", "add patch inputs"]);
+    start_native_session(&repo, "batch-patch-scope");
+
+    let a_hash = json_string_field(
+        &stdout(&run_real_json(
+            &repo,
+            &["read", "a.txt", "--session", "session_agent_a"],
+        )),
+        "content_hash",
+    );
+    let b_hash = json_string_field(
+        &stdout(&run_real_json(
+            &repo,
+            &["read", "b.txt", "--session", "session_agent_a"],
+        )),
+        "content_hash",
+    );
+    let combined = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: a.txt\n",
+        "@@\n-alpha\n+alpha changed\n",
+        "*** Update File: b.txt\n",
+        "@@\n-beta\n+beta changed\n",
+        "*** End Patch\n"
+    );
+    let batch_path = repo.path().join("invalid-patch-batch.json");
+    fs::write(
+        &batch_path,
+        serde_json::to_vec(&serde_json::json!([
+            {"path":"a.txt","expect_hash":a_hash,"patch":combined},
+            {"path":"b.txt","expect_hash":b_hash,"patch":combined}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let state_path = repo.path().join(".sunlight/records/native-state.json");
+    let state_before = fs::read(&state_path).unwrap();
+
+    let failed = sun()
+        .args(["patch", "--session", "session_agent_a", "--batch-file"])
+        .arg(&batch_path)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("scope-invalid batch patch should return an error");
+
+    assert_failure(&failed);
+    let body: serde_json::Value = serde_json::from_str(&stdout(&failed)).unwrap();
+    assert_eq!(body["error"]["code"], "patch_scope_mismatch");
+    assert_eq!(body["error"]["details"]["edit_index"], 0);
+    assert_eq!(body["error"]["details"]["path"], "a.txt");
+    assert_eq!(
+        body["error"]["details"]["declared_paths"],
+        serde_json::json!(["a.txt", "b.txt"])
+    );
+    assert_eq!(body["error"]["details"]["state_changed"], false);
+    assert!(body["error"]["next_action"]
+        .as_str()
+        .unwrap()
+        .contains("same session"));
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+
+    let standard_header_path = repo.path().join("standard-header.patch");
+    fs::write(
+        &standard_header_path,
+        concat!(
+            "diff --git a/b.txt b/b.txt\n",
+            "--- a/b.txt\n",
+            "+++ b/b.txt\n",
+            "@@ -1 +1 @@\n",
+            "-alpha\n",
+            "+changed\n"
+        ),
+    )
+    .unwrap();
+    let failed = sun()
+        .args([
+            "patch",
+            "a.txt",
+            "--session",
+            "session_agent_a",
+            "--expect-hash",
+            &a_hash,
+            "--patch-file",
+        ])
+        .arg(&standard_header_path)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .expect("standard diff header for another path should return an error");
+    assert_failure(&failed);
+    let body: serde_json::Value = serde_json::from_str(&stdout(&failed)).unwrap();
+    assert_eq!(body["error"]["code"], "patch_scope_mismatch");
+    assert_eq!(
+        body["error"]["details"]["declared_paths"],
+        serde_json::json!(["b.txt"])
+    );
+    assert_eq!(fs::read(state_path).unwrap(), state_before);
+}
+
+#[test]
+fn artifact_search_limit_bounds_long_lines_in_stable_order() {
+    let repo = TestRepo::new("bounded-artifact-search");
+    init_local_git_repo(&repo);
+    repo.write_file(
+        "a.txt",
+        &format!("{}needle{}\n", "a".repeat(10_000), "b".repeat(10_000)),
+    );
+    repo.write_file("b.txt", "needle second\n");
+    git(repo.path(), &["add", "a.txt", "b.txt"]);
+    git(repo.path(), &["commit", "-m", "add search inputs"]);
+    start_native_session(&repo, "bounded-artifact-search");
+
+    let search = run_real_json(
+        &repo,
+        &[
+            "search",
+            "needle",
+            "--session",
+            "session_agent_a",
+            "--limit",
+            "1",
+        ],
+    );
+
+    assert_success(&search);
+    let output = stdout(&search);
+    assert!(output.len() < 1_000_000);
+    let body: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(body["data"]["returned"], 1);
+    assert_eq!(body["data"]["limit"], 1);
+    assert_eq!(body["data"]["truncated"], true);
+    assert_eq!(body["data"]["matches"][0]["path"], "a.txt");
+    assert_eq!(body["data"]["matches"][0]["snippet_truncated"], true);
+    assert!(
+        body["data"]["matches"][0]["snippet"]
+            .as_str()
+            .unwrap()
+            .len()
+            <= 512
+    );
+}
+
+#[test]
+fn topic_abandonment_preserves_history_and_removes_actionable_work() {
+    let repo = TestRepo::new("topic-abandonment");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "abandon-flow");
+    let before_hash = json_string_field(
+        &stdout(&run_real_json(
+            &repo,
+            &["read", "base.txt", "--session", "session_agent_a"],
+        )),
+        "content_hash",
+    );
+    let patch_path = repo.path().join(".sunlight/local/abandon.patch");
+    fs::create_dir_all(patch_path.parent().unwrap()).unwrap();
+    fs::write(&patch_path, "@@\n-base\n+candidate\n").unwrap();
+    let patched = sun()
+        .args([
+            "patch",
+            "base.txt",
+            "--session",
+            "session_agent_a",
+            "--expect-hash",
+            &before_hash,
+            "--patch-file",
+        ])
+        .arg(&patch_path)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&patched);
+    let revision = json_string_field(&stdout(&patched), "topic_revision_id");
+    let completed = run_real_json(
+        &repo,
+        &[
+            "topic",
+            "complete",
+            "--topic",
+            "topic_abandon_flow",
+            "--revision",
+            &revision,
+            "--session",
+            "session_agent_a",
+            "--summary",
+            "candidate was replaced",
+        ],
+    );
+    assert_success(&completed);
+
+    let stale = run_real_json(
+        &repo,
+        &[
+            "topic",
+            "abandon",
+            "--topic",
+            "topic_abandon_flow",
+            "--session",
+            "session_agent_a",
+            "--expected-head",
+            "none",
+            "--reason",
+            "stale request",
+        ],
+    );
+    assert_failure(&stale);
+    assert!(stdout(&stale).contains("\"code\":\"topic_head_mismatch\""));
+
+    let abandon_args = [
+        "topic",
+        "abandon",
+        "--topic",
+        "topic_abandon_flow",
+        "--session",
+        "session_agent_a",
+        "--expected-head",
+        revision.as_str(),
+        "--reason",
+        "replaced by a cleaner attempt",
+    ];
+    let abandoned = run_real_json(&repo, &abandon_args);
+    assert_success(&abandoned);
+    let abandoned_json: serde_json::Value = serde_json::from_str(&stdout(&abandoned)).unwrap();
+    assert_eq!(abandoned_json["data"]["changed"], true);
+    assert_eq!(abandoned_json["data"]["topic"]["status"], "abandoned");
+    assert_eq!(
+        abandoned_json["data"]["topic"]["completed_revision_id"],
+        revision
+    );
+
+    let repeated = run_real_json(&repo, &abandon_args);
+    assert_success(&repeated);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout(&repeated)).unwrap()["data"]["changed"],
+        false
+    );
+    let status = run_real_json(&repo, &["status"]);
+    assert_success(&status);
+    let status: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(
+        status["data"]["operational_summary"]["topics"]["abandoned_count"],
+        1
+    );
+    assert_eq!(
+        status["data"]["completion_guard"]["pending_completed_topic_heads"],
+        serde_json::json!({})
+    );
+    assert!(!status["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning["code"] == "checkpoint_missing"));
+
+    let write_after = sun()
+        .args([
+            "patch",
+            "base.txt",
+            "--session",
+            "session_agent_a",
+            "--expect-hash",
+            &json_string_field(
+                &stdout(&run_real_json(
+                    &repo,
+                    &["read", "base.txt", "--session", "session_agent_a"],
+                )),
+                "content_hash",
+            ),
+            "--patch-file",
+        ])
+        .arg(&patch_path)
+        .arg("--json")
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_failure(&write_after);
+    assert!(stdout(&write_after).contains("\"code\":\"topic_abandoned\""));
+
+    let new_session = run_real_json(
+        &repo,
+        &[
+            "session",
+            "start",
+            "--topic",
+            "topic_abandon_flow",
+            "--view",
+            "view_base_0001",
+            "--actor",
+            "agent-b",
+        ],
+    );
+    assert_failure(&new_session);
+    assert!(stdout(&new_session).contains("\"code\":\"topic_abandoned\""));
+
+    let conflict = run_real_json(
+        &repo,
+        &[
+            "topic",
+            "abandon",
+            "--topic",
+            "topic_abandon_flow",
+            "--session",
+            "session_agent_a",
+            "--expected-head",
+            &revision,
+            "--reason",
+            "a different reason",
+        ],
+    );
+    assert_failure(&conflict);
+    assert!(stdout(&conflict).contains("\"code\":\"topic_abandonment_conflict\""));
+}
+
+#[test]
+fn canonical_topic_cannot_be_abandoned() {
+    let repo = TestRepo::new("canonical-topic-abandonment");
+    init_local_git_repo(&repo);
+    start_native_session(&repo, "canonical-work");
+    let content_path = repo.path().join(".sunlight/local/canonical-content.txt");
+    fs::create_dir_all(content_path.parent().unwrap()).unwrap();
+    fs::write(&content_path, "canonical candidate\n").unwrap();
+    let written = sun()
+        .args([
+            "write",
+            "candidate.txt",
+            "--session",
+            "session_agent_a",
+            "--expect-hash",
+            "new",
+            "--content-file",
+        ])
+        .arg(&content_path)
+        .args(["--classification", "source", "--json"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&written);
+    let revision = json_string_field(&stdout(&written), "topic_revision_id");
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "topic",
+            "complete",
+            "--topic",
+            "topic_canonical_work",
+            "--revision",
+            &revision,
+            "--session",
+            "session_agent_a",
+        ],
+    ));
+    let resolved = run_real_json(
+        &repo,
+        &[
+            "view",
+            "resolve",
+            "--base",
+            "checkpoint_base_0001",
+            "--include",
+            &format!("topic_canonical_work:{revision}"),
+        ],
+    );
+    assert_success(&resolved);
+    let view = json_string_field(&stdout(&resolved), "resolved_view_id");
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "checkpoint",
+            "create",
+            "--view",
+            &view,
+            "--expected-canonical-checkpoint",
+            "checkpoint_base_0001",
+        ],
+    ));
+
+    let abandoned = run_real_json(
+        &repo,
+        &[
+            "topic",
+            "abandon",
+            "--topic",
+            "topic_canonical_work",
+            "--session",
+            "session_agent_a",
+            "--expected-head",
+            &revision,
+            "--reason",
+            "should be rejected",
+        ],
+    );
+    assert_failure(&abandoned);
+    assert!(stdout(&abandoned).contains("\"code\":\"topic_abandonment_canonical\""));
 }
 
 #[test]
@@ -3940,9 +4545,8 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
         .unwrap()
         .starts_with("sha256:"));
 
-    let reloaded = RealRepoState::load(repo.path()).unwrap();
+    let reloaded = load_native_executions(repo.path());
     let persisted_execution = reloaded
-        .executions
         .iter()
         .find(|execution| execution.execution_id == execution_id)
         .unwrap();
@@ -3999,6 +4603,7 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
     let state_path = repo.path().join(".sunlight/records/native-state.json");
     let canonical_state = fs::read(&state_path).unwrap();
     let mut legacy_state: serde_json::Value = serde_json::from_slice(&canonical_state).unwrap();
+    legacy_state["executions"] = serde_json::json!([persisted_record["snapshot"].clone()]);
     legacy_state["executions"][0]
         .as_object_mut()
         .unwrap()
@@ -4010,8 +4615,8 @@ fn no_fixture_execution_runtime_policy_is_enforced_and_reported() {
         "legacy_unrecorded"
     );
 
-    fs::write(&state_path, &canonical_state).unwrap();
     let mut tampered_state: serde_json::Value = serde_json::from_slice(&canonical_state).unwrap();
+    tampered_state["executions"] = serde_json::json!([persisted_record["snapshot"].clone()]);
     let tampered_execution = tampered_state["executions"]
         .as_array_mut()
         .unwrap()
@@ -7635,13 +8240,13 @@ fn search_json_fixture_basic_app_returns_match_shape() {
     assert!(stdout.contains("\"command\":\"artifact.search\""));
     assert!(stdout.contains("\"matches\":["));
     assert!(stdout.contains(
-        "{\"artifact_id\":\"artifact_readme_md\",\"path\":\"README.md\",\"content_hash\":\"sha256:readme_base\",\"line\":3,\"snippet\":\"Uses User.email for login.\"}"
+        "{\"artifact_id\":\"artifact_readme_md\",\"path\":\"README.md\",\"content_hash\":\"sha256:readme_base\",\"line\":3,\"snippet\":\"Uses User.email for login.\",\"snippet_truncated\":false}"
     ));
     assert!(stdout.contains(
-        "{\"artifact_id\":\"artifact_docs_guide_md\",\"path\":\"docs/guide.md\",\"content_hash\":\"sha256:guide_base\",\"line\":1,\"snippet\":\"Search token: User.email\"}"
+        "{\"artifact_id\":\"artifact_docs_guide_md\",\"path\":\"docs/guide.md\",\"content_hash\":\"sha256:guide_base\",\"line\":1,\"snippet\":\"Search token: User.email\",\"snippet_truncated\":false}"
     ));
     assert!(stdout.contains(
-        "{\"artifact_id\":\"artifact_src_profile_ts\",\"path\":\"src/profile.ts\",\"content_hash\":\"sha256:profile_base\",\"line\":1,\"snippet\":\"export const profileLabel = \\\"User.email\\\";\"}"
+        "{\"artifact_id\":\"artifact_src_profile_ts\",\"path\":\"src/profile.ts\",\"content_hash\":\"sha256:profile_base\",\"line\":1,\"snippet\":\"export const profileLabel = \\\"User.email\\\";\",\"snippet_truncated\":false}"
     ));
 }
 
@@ -12251,6 +12856,234 @@ fn no_fixture_policy_check_and_git_export_share_persisted_validation() {
     .unwrap();
     assert!(export_record.contains(&format!("\"validation_report_id\":\"{report_id}\"")));
     assert_eq!(fs::read(&report_path).unwrap(), report_bytes);
+}
+
+#[test]
+fn native_export_preserves_ingested_git_parent_after_head_advances() {
+    let repo = TestRepo::new("export-pinned-git-base");
+    let base = init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+    let checkpoint = create_real_base_checkpoint(&repo);
+    repo.write_file("later-human.txt", "later human work\n");
+    git(repo.path(), &["add", "later-human.txt"]);
+    git(repo.path(), &["commit", "-m", "later human work"]);
+    let head = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string();
+    assert_ne!(base, head);
+    assert_success(&run_real_json(&repo, &["init"]));
+    assert_eq!(
+        RealRepoState::load(repo.path())
+            .unwrap()
+            .imported_base_git_commit_id,
+        Some(base.clone())
+    );
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "git",
+            "export",
+            "--checkpoint",
+            &checkpoint,
+            "--branch",
+            "audit-parent",
+            "--execute-local",
+        ],
+    ));
+    assert_eq!(
+        git(repo.path(), &["rev-parse", "audit-parent^"]).trim(),
+        base
+    );
+    assert!(!git(
+        repo.path(),
+        &["ls-tree", "-r", "--name-only", "audit-parent"]
+    )
+    .contains("later-human.txt"));
+    git(repo.path(), &["merge", "--no-edit", "audit-parent"]);
+    assert_eq!(
+        fs::read_to_string(repo.path().join("later-human.txt")).unwrap(),
+        "later human work\n"
+    );
+}
+
+#[test]
+fn native_export_missing_recorded_base_never_guesses_current_head() {
+    let repo = TestRepo::new("export-missing-git-base");
+    init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+    let checkpoint = create_real_base_checkpoint(&repo);
+    let mut state = RealRepoState::load(repo.path()).unwrap();
+    state.imported_base_git_commit_id = None;
+    state.save(repo.path()).unwrap();
+    let output = run_real_json(
+        &repo,
+        &[
+            "git",
+            "export",
+            "--checkpoint",
+            &checkpoint,
+            "--branch",
+            "missing-base",
+            "--execute-local",
+        ],
+    );
+    assert_failure(&output);
+    assert!(stdout(&output).contains("export_parent_not_found"));
+    assert!(RealRepoState::load(repo.path())
+        .unwrap()
+        .export_maps
+        .is_empty());
+    assert!(
+        !git(repo.path(), &["for-each-ref", "refs/heads/missing-base"]).contains("missing-base")
+    );
+}
+
+#[test]
+fn native_export_locked_ref_is_partial_failure_and_can_be_retried() {
+    let repo = TestRepo::new("export-locked-ref");
+    init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+    let checkpoint = create_real_base_checkpoint(&repo);
+    repo.write_file(".git/refs/heads/audit-lock.lock", "held\n");
+    let args = [
+        "git",
+        "export",
+        "--checkpoint",
+        &checkpoint,
+        "--branch",
+        "audit-lock",
+        "--execute-local",
+    ];
+    let output = run_real_json(&repo, &args);
+    assert_failure(&output);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["error"]["code"], "export_ref_update_failed");
+    assert_eq!(value["error"]["details"]["ref_updated"], "false");
+    let created = value["error"]["details"]["created_commit_id"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        git(repo.path(), &["cat-file", "-t", created]).trim(),
+        "commit"
+    );
+    assert!(RealRepoState::load(repo.path())
+        .unwrap()
+        .export_maps
+        .is_empty());
+    assert!(git(repo.path(), &["for-each-ref", "refs/heads/audit-lock"])
+        .trim()
+        .is_empty());
+    fs::remove_file(repo.path().join(".git/refs/heads/audit-lock.lock")).unwrap();
+    assert_success(&run_real_json(&repo, &args));
+    let first = git(repo.path(), &["rev-parse", "audit-lock"]);
+    assert_success(&run_real_json(&repo, &args));
+    assert_eq!(first, git(repo.path(), &["rev-parse", "audit-lock"]));
+    assert_eq!(
+        RealRepoState::load(repo.path()).unwrap().export_maps.len(),
+        1
+    );
+}
+
+#[test]
+fn native_export_conflicting_handoff_rejects_before_any_git_write() {
+    let repo = TestRepo::new("export-preflight-conflict");
+    init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+    let checkpoint = create_real_base_checkpoint(&repo);
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "git",
+            "export",
+            "--checkpoint",
+            &checkpoint,
+            "--branch",
+            "first",
+            "--execute-local",
+        ],
+    ));
+    let state = RealRepoState::load(repo.path()).unwrap();
+    let objects = git(repo.path(), &["count-objects", "-v"]);
+    let output = run_real_json(
+        &repo,
+        &[
+            "git",
+            "export",
+            "--checkpoint",
+            &checkpoint,
+            "--branch",
+            "second",
+            "--execute-local",
+        ],
+    );
+    assert_failure(&output);
+    assert!(stdout(&output).contains("export_map_conflict"));
+    assert!(git(repo.path(), &["for-each-ref", "refs/heads/second"])
+        .trim()
+        .is_empty());
+    assert_eq!(objects, git(repo.path(), &["count-objects", "-v"]));
+    assert_eq!(
+        state.export_maps,
+        RealRepoState::load(repo.path()).unwrap().export_maps
+    );
+    git(repo.path(), &["update-ref", "refs/heads/first", "HEAD"]);
+    let output = run_real_json(
+        &repo,
+        &[
+            "git",
+            "export",
+            "--checkpoint",
+            &checkpoint,
+            "--branch",
+            "first",
+            "--execute-local",
+        ],
+    );
+    assert_failure(&output);
+    assert!(stdout(&output).contains("export_target_ref_conflict"));
+    assert_eq!(
+        git(repo.path(), &["rev-parse", "first"]),
+        git(repo.path(), &["rev-parse", "HEAD"])
+    );
+}
+
+#[test]
+fn execution_classifies_large_ignored_output_without_pipe_deadlock() {
+    let repo = TestRepo::new("execution-ignore-pipe-capacity");
+    init_local_git_repo(&repo);
+    repo.write_file(".gitignore", "scratch-output/\n");
+    assert_success(&run_real_json(&repo, &["init"]));
+    let output_path = repo.path().join("run-result.json");
+    let mut child = sun()
+        .args(["run", "--view", "view_base_0001", "--json", "--", PYTHON, "-c",
+            "from pathlib import Path; p=Path('scratch-output'); p.mkdir(); [(p/(str(i)+'x'*100)).write_text('x') for i in range(3000)]"])
+        .current_dir(repo.path())
+        .stdout(fs::File::create(&output_path).unwrap())
+        .stderr(Stdio::null())
+        .spawn().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "{}",
+                fs::read_to_string(&output_path).unwrap()
+            );
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("execution did not finish classifying generated output");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let executions = load_native_executions(repo.path());
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].status, "pass");
+    assert_eq!(executions[0].outputs.len(), 3000);
+    assert!(executions[0]
+        .outputs
+        .iter()
+        .all(|output| output.classification == "ignored"));
 }
 
 #[test]

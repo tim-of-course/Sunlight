@@ -103,7 +103,8 @@ server entry for each repository; a running server cannot switch roots.
 The server exposes these typed tools:
 
 - `repository_init`, `repository_status`
-- `topic_create`, `topic_complete`, `topic_wait`, `session_start`, `session_refresh`
+- `topic_create`, `topic_complete`, `topic_abandon`, `topic_wait`, `session_start`,
+  `session_refresh`
 - `artifact_read`, `artifact_list`, `artifact_search`
 - `artifact_patch`, `artifact_write`, `artifact_move`, `artifact_delete`,
   `artifact_metadata_set`
@@ -133,6 +134,10 @@ from the canonical frontier. Use `side_checkpoint` only for an intentionally
 isolated or alternative snapshot. It never changes the recommended start.
 Completed topics not selected for integration remain independent pending
 candidates and do not block a canonical advance.
+Use `topic_abandon` with the owning session, exact expected head, and a factual
+reason when a noncanonical topic is genuinely obsolete. Abandonment preserves
+its history but removes it from current integration candidates. A failed edit
+alone is not a reason to abandon a topic; correct it in the same pinned session.
 `checkpoint_create` returns `handoff.exact_ids` with the exact checkpoint, view,
 tree, and execution IDs to report or pass to the next agent.
 `compat_diff` re-echoes the projection's `session_generation_id`, and MCP
@@ -157,6 +162,21 @@ When a target ref points to a prior Sunlight export on that same ref, a later
 checkpoint export appends to the mapped commit and writes a new export map.
 Unrecognized ref tips still fail closed. A Git handoff is complete when export
 returns the new `export_map_id` for that checkpoint and ref.
+
+The first export uses the Git commit recorded at repository initialization,
+even if Git `HEAD` has since advanced. Source bytes still come only from the
+selected checkpoint. A repository without a recorded Git base can append to a
+recognized prior export, but otherwise returns `export_parent_not_found`; it
+never infers the original base from today's `HEAD`.
+
+Each checkpoint has one Git handoff. Repeating that handoff is a no-op while
+the branch still points at its recorded commit. A different target ref, or a
+branch that has moved away from its recorded handoff, fails before Git writes.
+If commit creation succeeds but the ref update fails, export returns
+`export_ref_update_failed` with the created commit ID and no successful export
+map. If native map publication fails after the branch update, it returns
+`export_map_write_failed` with `ref_updated: true`. Preserve those partial
+handoff facts when reporting failure.
 
 Every successful or native command-error result includes both MCP text content
 and `structuredContent` containing the existing `sun --json` envelope. Native

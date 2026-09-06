@@ -2,13 +2,13 @@
 
 This list records the clearest next steps from the current Sunlight evaluations.
 
-## 1. Reduce runtime dependency preparation time
+## 1. Reduce protected runtime binding time
 
-Preparing a private `node_modules` tree remains the largest execution cost. In
-the latest TasGrid run, Bun reported 206 ms for 104 tests, while the full
-Sunlight execution took 14.61 seconds. Runtime dependency preparation accounted
-for 9.03 seconds. Preserve private execution isolation while avoiding a full
-per-execution dependency-tree preparation.
+Runtime layers now reuse one protected dependency snapshot, and execution
+records no longer rewrite canonical repository state. The protected TasGrid
+path now spends a 2.599-second median making each private dependency clone
+writable. Optimize that phase without making shared cache content writable or
+package-manager-specific.
 
 ## 2. Validate project binding and bounded writer waits under load
 
@@ -20,16 +20,17 @@ authoring call exposes writer contention.
 
 ## 3. Keep agent guidance easy to follow
 
-Agents still make occasional incorrect tool-argument and patch-format attempts
-before recovering from schema errors. Continue simplifying tool descriptions,
-examples, and recovery messages where real evaluations show repeated friction.
+Patch failures now explain how to recover in the same pinned session, and
+artifact search accepts a bounded `limit`. Confirm in blind evaluations that
+agents correct ordinary mistakes without creating replacement topics. Simplify
+guidance further only where evaluations show repeated friction.
 
 ## 4. Make long-lived repository status less noisy
 
-Historical failed validation attempts and duplicate checkpoints accumulate in
-status output. Keep the durable evidence, but make current actionable state
-clear without making agents reason through old expected failures or equivalent
-checkpoint records.
+Abandoned topic attempts and their stale conflicts no longer appear as current
+work. Historical failed validation attempts and equivalent checkpoints can
+still accumulate. Keep the evidence inspectable while making the current
+actionable state obvious.
 
 ## 5. Continue blind shared-repository evaluations
 

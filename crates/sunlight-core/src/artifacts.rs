@@ -168,6 +168,9 @@ pub struct SearchResponse {
     pub repository_id: String,
     pub session_id: String,
     pub view: SessionView,
+    pub returned: usize,
+    pub limit: usize,
+    pub truncated: bool,
     pub matches: Vec<SearchMatch>,
 }
 
@@ -178,6 +181,29 @@ pub struct SearchMatch {
     pub content_hash: String,
     pub line: usize,
     pub snippet: String,
+    pub snippet_truncated: bool,
+}
+
+pub const DEFAULT_ARTIFACT_SEARCH_LIMIT: usize = 50;
+pub const MAX_ARTIFACT_SEARCH_LIMIT: usize = 200;
+pub const MAX_ARTIFACT_SEARCH_SNIPPET_BYTES: usize = 512;
+
+pub fn bounded_search_snippet(line: &str, query: &str) -> (String, bool) {
+    if line.len() <= MAX_ARTIFACT_SEARCH_SNIPPET_BYTES {
+        return (line.to_string(), false);
+    }
+
+    let match_start = line.find(query).unwrap_or(0);
+    let preferred_start = match_start.saturating_sub(MAX_ARTIFACT_SEARCH_SNIPPET_BYTES / 2);
+    let mut start = preferred_start.min(line.len() - MAX_ARTIFACT_SEARCH_SNIPPET_BYTES);
+    while start > 0 && !line.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + MAX_ARTIFACT_SEARCH_SNIPPET_BYTES).min(line.len());
+    while end > start && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    (line[start..end].to_string(), true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -761,12 +787,19 @@ impl InMemoryArtifactStore {
         })
     }
 
-    pub fn search(&self, session_id: &str, query: &str) -> Result<SearchResponse, ArtifactIoError> {
+    pub fn search(
+        &self,
+        session_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<SearchResponse, ArtifactIoError> {
         self.ensure_session(session_id)?;
         let mut matches = Vec::new();
 
         if !query.is_empty() {
-            for entry in &self.tree.entries {
+            let mut entries = self.tree.entries.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.path.cmp(&right.path));
+            'entries: for entry in entries {
                 if entry.tombstone {
                     continue;
                 }
@@ -778,23 +811,34 @@ impl InMemoryArtifactStore {
                 })?;
                 for (line_index, line) in text.lines().enumerate() {
                     if line.contains(query) {
+                        let (snippet, snippet_truncated) = bounded_search_snippet(line, query);
                         matches.push(SearchMatch {
                             artifact_id: entry.artifact_id.clone(),
                             path: entry.path.clone(),
                             content_hash: entry.content_ref.clone(),
                             line: line_index + 1,
-                            snippet: line.to_string(),
+                            snippet,
+                            snippet_truncated,
                         });
+                        if matches.len() > limit {
+                            break 'entries;
+                        }
                     }
                 }
             }
         }
+
+        let truncated = matches.len() > limit;
+        matches.truncate(limit);
 
         Ok(SearchResponse {
             command: "artifact.search",
             repository_id: self.repository_id.clone(),
             session_id: session_id.to_string(),
             view: self.view.clone(),
+            returned: matches.len(),
+            limit,
+            truncated,
             matches,
         })
     }
@@ -1910,7 +1954,11 @@ mod tests {
     fn searches_literal_text_by_path_then_line_order() {
         let store = InMemoryArtifactStore::fixture_basic_app();
 
-        let response = store.search(FIXTURE_SESSION_ID, "User.email").unwrap();
+        let response = store.search(FIXTURE_SESSION_ID, "User.email", 50).unwrap();
+
+        assert_eq!(response.returned, 3);
+        assert_eq!(response.limit, 50);
+        assert!(!response.truncated);
 
         let matches = response
             .matches
@@ -1951,6 +1999,18 @@ mod tests {
                 ),
             ]
         );
+        assert!(response.matches.iter().all(|item| !item.snippet_truncated));
+    }
+
+    #[test]
+    fn bounds_search_snippets_without_splitting_utf8() {
+        let line = format!("{}needle{}", "é".repeat(300), "z".repeat(300));
+
+        let (snippet, truncated) = bounded_search_snippet(&line, "needle");
+
+        assert!(truncated);
+        assert!(snippet.len() <= MAX_ARTIFACT_SEARCH_SNIPPET_BYTES);
+        assert!(snippet.contains("needle"));
     }
 
     #[test]

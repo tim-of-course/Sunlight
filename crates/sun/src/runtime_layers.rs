@@ -3,8 +3,6 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +22,7 @@ const PROVIDER_SEMANTICS: &str =
     "bun_single_root:root_package_json:text_bun_lock:hoisted:frozen:private_environment:exact_content_manifest:source_immutable:private_cow_binding:truthful_construction_policy";
 const RUNTIME_LAYER_ROOT: &str = ".runtime-layers";
 const CACHE_MANIFEST: &str = "manifest.json";
+const BINDING_LAYOUT: &str = "protected_content_private_repermission_v1";
 const TARGET_PATH: &str = "node_modules";
 const LOCK_POLL: Duration = Duration::from_millis(10);
 
@@ -881,7 +880,7 @@ fn build_and_publish_layer(
             }],
         };
         write_cache_manifest(&staged_entry, &layer, &content_manifest)?;
-        make_tree_contents_readonly(&staged_entry)?;
+        protect_cache_entry_layout(&staged_entry, &staged_target)?;
         ensure_acquisition_active(cancellation, deadline)?;
         fs::create_dir_all(entry_root.parent().expect("entry has parent")).map_err(|error| {
             runtime_io_error(
@@ -1036,15 +1035,8 @@ fn materialize_private_layer_binding(
     #[cfg(target_os = "macos")]
     {
         let cloned = clone_directory_cow(source, destination).is_ok();
-        if cloned {
-            let writable = Command::new("/bin/chmod")
-                .args(["-R", "u+w"])
-                .arg(destination)
-                .status()
-                .is_ok_and(|status| status.success());
-            if writable {
-                return Ok("recursive_cow".to_string());
-            }
+        if cloned && make_private_tree_writable(destination).is_ok() {
+            return Ok("recursive_cow".to_string());
         }
         let _ = make_private_tree_writable(destination);
         let _ = fs::remove_dir_all(destination);
@@ -1344,6 +1336,11 @@ fn read_valid_cache_entry(
             CacheReadError::new(format!("cache manifest read failed: {error}"))
         })?)
         .map_err(|error| CacheReadError::new(format!("cache manifest JSON is invalid: {error}")))?;
+    if manifest.get("binding_layout").and_then(Value::as_str) != Some(BINDING_LAYOUT) {
+        return Err(CacheReadError::new(
+            "cache manifest uses an unsupported private-binding layout",
+        ));
+    }
     let content_manifest = manifest
         .get("content_manifest")
         .ok_or_else(|| CacheReadError::new("cache manifest has no content manifest"))?;
@@ -1400,6 +1397,7 @@ fn write_cache_manifest(
 ) -> Result<(), CliError> {
     let manifest = json!({
         "record_type": "runtime_layer_manifest",
+        "binding_layout": BINDING_LAYOUT,
         "layer": layer_json(layer),
         "content_manifest": content_manifest,
     });
@@ -1568,50 +1566,53 @@ fn json_string_from_map(
         .ok_or_else(|| CacheReadError::new(format!("cache field `{field}` must be a string")))
 }
 
-fn make_tree_contents_readonly(root: &Path) -> Result<(), CliError> {
-    for item in fs::read_dir(root).map_err(|error| {
-        runtime_io_error(
-            "runtime_layer_publication_failed",
-            root,
-            "failed to read staged runtime layer",
-            error,
-        )
-    })? {
-        let path = item
-            .map_err(|error| {
-                runtime_io_error(
-                    "runtime_layer_publication_failed",
-                    root,
-                    "failed to read staged runtime layer entry",
-                    error,
-                )
-            })?
-            .path();
-        let metadata = fs::symlink_metadata(&path).map_err(|error| {
-            runtime_io_error(
-                "runtime_layer_publication_failed",
-                &path,
-                "failed to inspect staged runtime layer entry",
-                error,
-            )
-        })?;
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            make_tree_contents_readonly(&path)?;
-        }
-        if !metadata.file_type().is_symlink() {
-            let mut permissions = metadata.permissions();
-            permissions.set_readonly(true);
-            fs::set_permissions(&path, permissions).map_err(|error| {
-                runtime_io_error(
-                    "runtime_layer_publication_failed",
-                    &path,
-                    "failed to protect staged runtime layer entry",
-                    error,
-                )
-            })?;
+fn protect_cache_entry_layout(entry_root: &Path, target_root: &Path) -> Result<(), CliError> {
+    protect_cache_content_tree(target_root)?;
+    make_path_readonly(&entry_root.join(CACHE_MANIFEST))?;
+    if let Some(target_parent) = target_root.parent() {
+        make_path_readonly(target_parent)?;
+        if let Some(targets_root) = target_parent.parent() {
+            make_path_readonly(targets_root)?;
         }
     }
     Ok(())
+}
+
+fn protect_cache_content_tree(root: &Path) -> Result<(), CliError> {
+    let metadata = fs::symlink_metadata(root).map_err(|error| {
+        runtime_io_error(
+            "runtime_layer_publication_failed",
+            root,
+            "failed to inspect staged runtime layer content",
+            error,
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        for item in fs::read_dir(root).map_err(|error| {
+            runtime_io_error(
+                "runtime_layer_publication_failed",
+                root,
+                "failed to read staged runtime layer content",
+                error,
+            )
+        })? {
+            let path = item
+                .map_err(|error| {
+                    runtime_io_error(
+                        "runtime_layer_publication_failed",
+                        root,
+                        "failed to read staged runtime layer entry",
+                        error,
+                    )
+                })?
+                .path();
+            protect_cache_content_tree(&path)?;
+        }
+    }
+    make_path_readonly(root)
 }
 
 fn make_path_readonly(path: &Path) -> Result<(), CliError> {

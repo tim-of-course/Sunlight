@@ -245,12 +245,17 @@ no separately published key mapping. Timestamps, ACLs, extended attributes, and
 platform-specific metadata are normalized or omitted; paths, bytes, executable
 bits, and supported relative links are preserved.
 
-Published entries are made read-only and are never exposed directly to a
-writable command. This protects them from normal execution writes. It is not a
-claim that files owned by the same operating-system user are adversarially
-immutable. If Sunlight detects manual corruption, it quarantines the entry and
-rebuilds or returns a stable error. Warm execution does not perform a complete
-content reread because that would restore the current latency problem.
+Published entry roots, manifests, target parents, target roots, and target
+descendants are read-only and are never exposed directly to a writable command.
+After a filesystem copy-on-write clone, Sunlight grants write permission only
+inside that execution's private tree. This requires a metadata walk, but it
+prevents ordinary command writes from poisoning dependency bytes later reused
+under the original content ID. It is not a claim that files owned by the same
+operating-system user are adversarially immutable.
+If Sunlight detects structural or manifest corruption, it quarantines the entry
+and rebuilds or returns a stable error. Warm execution does not perform a
+complete content or permission reread because that would restore the latency
+problem.
 
 Runtime-layer caches are disposable. The cutover ignores the previous runtime
 dependency cache and does not migrate it. Cache garbage collection and a public
@@ -273,10 +278,11 @@ For one key:
    entry. Every regular file is copied or safely copy-on-write cloned into a new
    file identity. The publisher never renames the provider-created target into
    the cache and never preserves an external hardlink.
-4. The builder computes and verifies the staged manifest, makes the complete
-   staged entry read-only, then atomically renames it to
-   `entries/<lookup-key>` with create-if-absent behavior. Manifest and targets
-   therefore become visible together, already sealed.
+4. The builder computes and verifies the staged manifest, recursively protects
+   the complete cached target, and records
+   `binding_layout: protected_content_private_repermission_v1`. It then atomically
+   renames the entry to `entries/<lookup-key>` with create-if-absent behavior.
+   Manifest and targets therefore become visible together.
 5. Waiters validate the published marker and manifest identity, then bind the
    same object.
 6. A canceled builder or attempt-local failure publishes nothing and releases
@@ -369,9 +375,11 @@ Every execution receives its own writable binding. Topics and views retain only
 references to shared immutable objects and never receive persistent directory
 copies.
 
-The materializer reuses the existing projection cache's cloning, permission,
-path, staging, and stale-recovery helpers. It selects a strategy from measured
-capabilities of the managed projection filesystem:
+The materializer reuses the existing projection cache's cloning, path, staging,
+and stale-recovery helpers. On macOS, it recursively copy-on-write clones the
+protected entry, then makes that private tree writable without changing cached
+bytes. It selects a strategy from measured capabilities of the managed
+projection filesystem:
 
 - a filesystem-supported recursive copy-on-write clone is preferred;
 - a safe per-file copy-on-write clone may be used when recursive cloning is not
@@ -570,7 +578,8 @@ Construction argv uses stable path tokens such as `PRIVATE_PACKAGE_CACHE`.
 Sunlight substitutes the private local path only when launching the builder and
 does not persist or expose that machine-specific path.
 
-The `execution_run` response adds response-only timing for:
+The durable execution record stores disjoint timing phases completed before
+terminal publication, including a `prepublication_total`. Those phases cover:
 
 - provider discovery and key calculation;
 - cache lookup;
@@ -579,10 +588,12 @@ The `execution_run` response adds response-only timing for:
 - private binding; and
 - the target command.
 
-These timings are diagnostic observations and are not durable identity fields.
-Status and inspect show durable layer identities, construction, acquisition,
-target, strategy, and policy facts. They do not expose machine-specific cache
-paths by default.
+The response also reports terminal publication and end-to-end time, which
+cannot be included in the record being published. Timings are durable
+diagnostic observations but are not content, checkpoint, cache, or policy
+identity fields. Status and inspect show them with durable layer identities,
+construction, acquisition, target, strategy, and policy facts. They do not
+expose machine-specific cache paths by default.
 
 No public schema version, cache migration, or dual-write period is required.
 Newly written records use only `runtime_layers`, and old local runtime cache
@@ -797,6 +808,19 @@ about 9.03 seconds, so the runtime-layer portion improved by about 4x. Median
 full warm execution time was 6.367 seconds. Full execution includes resolved
 view projection, command startup, output scanning, and durable publication, so
 those costs remain separate from runtime-layer timing.
+
+The initial clone-ready layout and standalone execution-store follow-up was
+measured on the same Mac and TasGrid repository with release-build
+`/usr/bin/true` runs. It reached a 2.001-second median and 2.524-second p95
+end-to-end time, with 0.800-second median private binding. A later review found
+that writable cached descendants were reachable when filesystem isolation was
+unenforced, so those results are superseded.
+
+After recursively protecting cached content, 20 warm runs had a 3.991-second
+median and 5.092-second p95 end-to-end time. Median private binding was 2.599
+seconds. With more than 150 historical executions, p95 combined execution start
+and terminal record publication was 105 ms. Private binding is again the
+largest remaining warm-path cost.
 
 ## Explicit non-goals
 

@@ -83,6 +83,7 @@ pub struct RealRepoState {
     pub publication_sequence: u64,
     pub repository_id: String,
     pub base_checkpoint_id: String,
+    pub imported_base_git_commit_id: Option<String>,
     pub canonical_checkpoint_id: String,
     pub base_resolved_view_id: String,
     pub resolved_view_id: String,
@@ -141,7 +142,17 @@ pub struct RealTopicRecord {
     pub base_checkpoint_id: String,
     pub head_revision_id: Option<String>,
     pub completed_revision_id: Option<String>,
+    pub abandonment: Option<RealTopicAbandonmentRecord>,
     pub revision_number: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealTopicAbandonmentRecord {
+    pub actor_id: String,
+    pub session_id: String,
+    pub expected_head_revision_id: Option<String>,
+    pub reason: String,
+    pub abandoned_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +393,7 @@ pub struct RealExecutionSnapshot {
     pub status: String,
     pub runner_process_id: Option<u32>,
     pub command_started: bool,
+    pub command_outcome: String,
     pub timed_out: bool,
     pub termination_reason: Option<String>,
     pub termination_failed: bool,
@@ -418,10 +430,31 @@ pub struct RealExecutionSnapshot {
     pub preexisting_runtime_dependency_paths: Vec<String>,
     pub runtime_dependency_bindings: Vec<RealExecutionRuntimeDependencyBinding>,
     pub runtime_dependency_strategy: String,
+    pub timings: RealExecutionTimings,
     pub outputs: Vec<RealExecutionOutputSnapshot>,
     pub started_at: String,
     pub finished_at: String,
     pub privacy_class: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RealExecutionTimings {
+    pub cache_build_ms: u64,
+    pub cache_validation_ms: u64,
+    pub projection_materialization_ms: u64,
+    pub projection_overhead_ms: u64,
+    pub runtime_provider_discovery_ms: u64,
+    pub runtime_cache_lookup_ms: u64,
+    pub runtime_cache_wait_ms: u64,
+    pub runtime_provider_preparation_ms: u64,
+    pub runtime_private_binding_ms: u64,
+    pub runtime_overhead_ms: u64,
+    pub command_start_publication_ms: u64,
+    pub command_ms: u64,
+    pub output_scan_and_classification_ms: u64,
+    pub cleanup_ms: u64,
+    pub other_prepublication_ms: u64,
+    pub prepublication_total_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -712,6 +745,13 @@ impl From<RecordError> for RepoStateError {
 
 impl RealRepoState {
     pub fn ingest(repo_root: &Path, repository_id: &str) -> Result<Self, RepoStateError> {
+        let imported_base_git_commit_id = Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD^{commit}"])
+            .current_dir(repo_root)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
         let mut entries = Vec::new();
         scan_real_repo_files(repo_root, repo_root, &mut entries)?;
         entries.sort_by(|left, right| left.path.cmp(&right.path));
@@ -744,6 +784,7 @@ impl RealRepoState {
             repository_id: repository_id.to_string(),
             canonical_checkpoint_id: base_checkpoint_id.clone(),
             base_checkpoint_id,
+            imported_base_git_commit_id,
             base_resolved_view_id: base_resolved_view_id.clone(),
             resolved_view_id: base_resolved_view_id,
             tree_hash,
@@ -996,6 +1037,7 @@ impl RealRepoState {
                     base_checkpoint_id: required_string(&object, "base_checkpoint_id", &path)?,
                     head_revision_id: head_revision_id.clone(),
                     completed_revision_id: None,
+                    abandonment: None,
                     revision_number,
                 };
                 validate_topic_metadata(
@@ -1087,6 +1129,11 @@ impl RealRepoState {
                 .unwrap_or(0),
             repository_id: required_string(&object, "repository_id", &path)?,
             base_checkpoint_id: base_checkpoint_id.clone(),
+            imported_base_git_commit_id: optional_string(
+                &object,
+                "imported_base_git_commit_id",
+                &path,
+            )?,
             canonical_checkpoint_id: persisted_canonical_checkpoint_id
                 .clone()
                 .unwrap_or(base_checkpoint_id),
@@ -1544,6 +1591,10 @@ impl RealRepoState {
             JsonValue::String(self.canonical_checkpoint_id.clone()),
         );
         object.insert(
+            "imported_base_git_commit_id".to_string(),
+            optional_json(&self.imported_base_git_commit_id),
+        );
+        object.insert(
             "base_resolved_view_id".to_string(),
             JsonValue::String(self.base_resolved_view_id.clone()),
         );
@@ -1724,6 +1775,7 @@ impl RealRepoState {
         let frontier = self
             .topics
             .iter()
+            .filter(|topic| topic.abandonment.is_none())
             .filter_map(|topic| {
                 topic
                     .head_revision_id
@@ -4456,10 +4508,6 @@ pub fn durable_publish_json_bytes(
     trigger_failpoint(failpoint, final_path)?;
     atomic_replace_file(&staged, final_path, Some(&backup))?;
     remove_file_if_exists(&backup)?;
-    remove_dir_if_empty(&root)?;
-    if let Some(local_root) = root.parent() {
-        remove_dir_if_empty(local_root)?;
-    }
     Ok(())
 }
 
@@ -6571,6 +6619,23 @@ fn parse_topic(value: &JsonValue, state_path: &Path) -> Result<RealTopicRecord, 
         base_checkpoint_id: required_string(object, "base_checkpoint_id", state_path)?,
         head_revision_id: optional_string(object, "head_revision_id", state_path)?,
         completed_revision_id: optional_string(object, "completed_revision_id", state_path)?,
+        abandonment: optional_object(object, "abandonment", state_path)?
+            .map(
+                |abandonment| -> Result<RealTopicAbandonmentRecord, RepoStateError> {
+                    Ok(RealTopicAbandonmentRecord {
+                        actor_id: required_string(abandonment, "actor_id", state_path)?,
+                        session_id: required_string(abandonment, "session_id", state_path)?,
+                        expected_head_revision_id: optional_string(
+                            abandonment,
+                            "expected_head_revision_id",
+                            state_path,
+                        )?,
+                        reason: required_string(abandonment, "reason", state_path)?,
+                        abandoned_at: required_string(abandonment, "abandoned_at", state_path)?,
+                    })
+                },
+            )
+            .transpose()?,
         revision_number: required_u64(object, "revision_number", state_path)?,
     };
     validate_topic_metadata(
@@ -7027,6 +7092,31 @@ fn parse_execution_snapshot(
         runner_process_id: optional_u64(object, "runner_process_id", state_path)?
             .and_then(|value| u32::try_from(value).ok()),
         command_started: optional_bool(object, "command_started", state_path)?.unwrap_or(true),
+        command_outcome: optional_string(object, "command_outcome", state_path)?.unwrap_or_else(
+            || {
+                if object
+                    .get("status")
+                    .and_then(|value| match value {
+                        JsonValue::String(value) => Some(value.as_str()),
+                        _ => None,
+                    })
+                    .is_some_and(|status| status == "running")
+                {
+                    "pending".to_string()
+                } else if object
+                    .get("status")
+                    .and_then(|value| match value {
+                        JsonValue::String(value) => Some(value.as_str()),
+                        _ => None,
+                    })
+                    .is_some_and(|status| status == "interrupted")
+                {
+                    "unknown".to_string()
+                } else {
+                    "known".to_string()
+                }
+            },
+        ),
         timed_out: optional_bool(object, "timed_out", state_path)?.unwrap_or_else(|| {
             required_string(object, "status", state_path).is_ok_and(|value| value == "timeout")
         }),
@@ -7145,10 +7235,61 @@ fn parse_execution_snapshot(
             optional_string(object, "runtime_dependency_strategy", state_path)?
                 .unwrap_or_else(|| "legacy_unrecorded".to_string())
         },
+        timings: parse_execution_timings(object, state_path)?,
         outputs,
         started_at: required_string(object, "started_at", state_path)?,
         finished_at: required_string(object, "finished_at", state_path)?,
         privacy_class: required_string(object, "privacy_class", state_path)?,
+    })
+}
+
+pub fn parse_real_execution_snapshot_value(
+    value: &JsonValue,
+    record_path: &Path,
+) -> Result<RealExecutionSnapshot, RepoStateError> {
+    parse_execution_snapshot(value, record_path)
+}
+
+pub fn parse_real_projection_snapshot_value(
+    repo_root: &Path,
+    value: &JsonValue,
+    record_path: &Path,
+) -> Result<RealProjectionSnapshot, RepoStateError> {
+    let mut blob_cache = BlobReadCache::new(true);
+    parse_projection_snapshot(repo_root, value, record_path, &mut blob_cache)
+}
+
+fn parse_execution_timings(
+    object: &BTreeMap<String, JsonValue>,
+    state_path: &Path,
+) -> Result<RealExecutionTimings, RepoStateError> {
+    let Some(value) = object.get("timings") else {
+        return Ok(RealExecutionTimings::default());
+    };
+    let JsonValue::Object(timings) = value else {
+        return Err(invalid_state(
+            state_path,
+            "execution timings must be a JSON object",
+        ));
+    };
+    let timing = |field| optional_u64(timings, field, state_path).map(|value| value.unwrap_or(0));
+    Ok(RealExecutionTimings {
+        cache_build_ms: timing("cache_build_ms")?,
+        cache_validation_ms: timing("cache_validation_ms")?,
+        projection_materialization_ms: timing("projection_materialization_ms")?,
+        projection_overhead_ms: timing("projection_overhead_ms")?,
+        runtime_provider_discovery_ms: timing("runtime_provider_discovery_ms")?,
+        runtime_cache_lookup_ms: timing("runtime_cache_lookup_ms")?,
+        runtime_cache_wait_ms: timing("runtime_cache_wait_ms")?,
+        runtime_provider_preparation_ms: timing("runtime_provider_preparation_ms")?,
+        runtime_private_binding_ms: timing("runtime_private_binding_ms")?,
+        runtime_overhead_ms: timing("runtime_overhead_ms")?,
+        command_start_publication_ms: timing("command_start_publication_ms")?,
+        command_ms: timing("command_ms")?,
+        output_scan_and_classification_ms: timing("output_scan_and_classification_ms")?,
+        cleanup_ms: timing("cleanup_ms")?,
+        other_prepublication_ms: timing("other_prepublication_ms")?,
+        prepublication_total_ms: timing("prepublication_total_ms")?,
     })
 }
 
@@ -7804,6 +7945,10 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
         JsonValue::Bool(execution.command_started),
     );
     object.insert(
+        "command_outcome".to_string(),
+        JsonValue::String(execution.command_outcome.clone()),
+    );
+    object.insert(
         "timed_out".to_string(),
         JsonValue::Bool(execution.timed_out),
     );
@@ -8003,6 +8148,10 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
         );
     }
     object.insert(
+        "timings".to_string(),
+        execution_timings_json(&execution.timings),
+    );
+    object.insert(
         "outputs".to_string(),
         JsonValue::Array(
             execution
@@ -8025,6 +8174,83 @@ fn execution_snapshot_json(execution: &RealExecutionSnapshot) -> JsonValue {
         JsonValue::String(execution.privacy_class.clone()),
     );
     JsonValue::Object(object)
+}
+
+pub fn real_execution_snapshot_json_value(execution: &RealExecutionSnapshot) -> JsonValue {
+    execution_snapshot_json(execution)
+}
+
+pub fn real_projection_snapshot_json_value(projection: &RealProjectionSnapshot) -> JsonValue {
+    projection_snapshot_json(projection)
+}
+
+fn execution_timings_json(timings: &RealExecutionTimings) -> JsonValue {
+    JsonValue::Object(BTreeMap::from([
+        (
+            "cache_build_ms".to_string(),
+            JsonValue::Number(timings.cache_build_ms.to_string()),
+        ),
+        (
+            "cache_validation_ms".to_string(),
+            JsonValue::Number(timings.cache_validation_ms.to_string()),
+        ),
+        (
+            "projection_materialization_ms".to_string(),
+            JsonValue::Number(timings.projection_materialization_ms.to_string()),
+        ),
+        (
+            "projection_overhead_ms".to_string(),
+            JsonValue::Number(timings.projection_overhead_ms.to_string()),
+        ),
+        (
+            "runtime_provider_discovery_ms".to_string(),
+            JsonValue::Number(timings.runtime_provider_discovery_ms.to_string()),
+        ),
+        (
+            "runtime_cache_lookup_ms".to_string(),
+            JsonValue::Number(timings.runtime_cache_lookup_ms.to_string()),
+        ),
+        (
+            "runtime_cache_wait_ms".to_string(),
+            JsonValue::Number(timings.runtime_cache_wait_ms.to_string()),
+        ),
+        (
+            "runtime_provider_preparation_ms".to_string(),
+            JsonValue::Number(timings.runtime_provider_preparation_ms.to_string()),
+        ),
+        (
+            "runtime_private_binding_ms".to_string(),
+            JsonValue::Number(timings.runtime_private_binding_ms.to_string()),
+        ),
+        (
+            "runtime_overhead_ms".to_string(),
+            JsonValue::Number(timings.runtime_overhead_ms.to_string()),
+        ),
+        (
+            "command_start_publication_ms".to_string(),
+            JsonValue::Number(timings.command_start_publication_ms.to_string()),
+        ),
+        (
+            "command_ms".to_string(),
+            JsonValue::Number(timings.command_ms.to_string()),
+        ),
+        (
+            "output_scan_and_classification_ms".to_string(),
+            JsonValue::Number(timings.output_scan_and_classification_ms.to_string()),
+        ),
+        (
+            "cleanup_ms".to_string(),
+            JsonValue::Number(timings.cleanup_ms.to_string()),
+        ),
+        (
+            "other_prepublication_ms".to_string(),
+            JsonValue::Number(timings.other_prepublication_ms.to_string()),
+        ),
+        (
+            "prepublication_total_ms".to_string(),
+            JsonValue::Number(timings.prepublication_total_ms.to_string()),
+        ),
+    ]))
 }
 
 fn execution_runtime_layer_json(layer: &RealExecutionRuntimeLayer) -> JsonValue {
@@ -8572,6 +8798,37 @@ fn topic_json(topic: &RealTopicRecord) -> JsonValue {
         optional_json(&topic.completed_revision_id),
     );
     object.insert(
+        "abandonment".to_string(),
+        topic
+            .abandonment
+            .as_ref()
+            .map(|abandonment| {
+                JsonValue::Object(BTreeMap::from([
+                    (
+                        "actor_id".to_string(),
+                        JsonValue::String(abandonment.actor_id.clone()),
+                    ),
+                    (
+                        "session_id".to_string(),
+                        JsonValue::String(abandonment.session_id.clone()),
+                    ),
+                    (
+                        "expected_head_revision_id".to_string(),
+                        optional_json(&abandonment.expected_head_revision_id),
+                    ),
+                    (
+                        "reason".to_string(),
+                        JsonValue::String(abandonment.reason.clone()),
+                    ),
+                    (
+                        "abandoned_at".to_string(),
+                        JsonValue::String(abandonment.abandoned_at.clone()),
+                    ),
+                ]))
+            })
+            .unwrap_or(JsonValue::Null),
+    );
+    object.insert(
         "revision_number".to_string(),
         JsonValue::Number(topic.revision_number.to_string()),
     );
@@ -8865,6 +9122,21 @@ fn optional_array_field<'a>(
     }
 }
 
+fn optional_object<'a>(
+    object: &'a BTreeMap<String, JsonValue>,
+    field: &'static str,
+    path: &Path,
+) -> Result<Option<&'a BTreeMap<String, JsonValue>>, RepoStateError> {
+    match object.get(field) {
+        Some(JsonValue::Object(value)) => Ok(Some(value)),
+        Some(JsonValue::Null) | None => Ok(None),
+        _ => Err(invalid_state(
+            path,
+            format!("field `{field}` must be an object or null"),
+        )),
+    }
+}
+
 fn invalid_state(path: impl AsRef<Path>, message: impl Into<String>) -> RepoStateError {
     RepoStateError::InvalidState {
         path: path.as_ref().to_path_buf(),
@@ -9028,6 +9300,7 @@ mod tests {
             base_checkpoint_id: metadata.base_checkpoint_id.clone(),
             head_revision_id: None,
             completed_revision_id: None,
+            abandonment: None,
             revision_number: 0,
         });
         metadata.save(&repo).unwrap();
@@ -10084,6 +10357,7 @@ mod tests {
             base_checkpoint_id: state.base_checkpoint_id.clone(),
             head_revision_id: Some("rev_legacy_0001".to_string()),
             completed_revision_id: None,
+            abandonment: None,
             revision_number: 1,
         });
         state.sessions.push(RealSessionRecord {
@@ -10157,6 +10431,7 @@ mod tests {
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             head_revision_id: None,
             completed_revision_id: None,
+            abandonment: None,
             revision_number: 0,
         }
     }
@@ -10182,6 +10457,7 @@ mod tests {
                 base_checkpoint_id: state.base_checkpoint_id.clone(),
                 head_revision_id: None,
                 completed_revision_id: None,
+                abandonment: None,
                 revision_number: 0,
             });
         }
@@ -10503,6 +10779,7 @@ mod tests {
         let state = RealRepoState {
             publication_sequence: 0,
             repository_id: "repo_paths".to_string(),
+            imported_base_git_commit_id: None,
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             canonical_checkpoint_id: "checkpoint_base_0001".to_string(),
             base_resolved_view_id: "view_base_0001".to_string(),
@@ -10552,6 +10829,7 @@ mod tests {
         let mut state = RealRepoState {
             publication_sequence: 0,
             repository_id: "repo_resolve".to_string(),
+            imported_base_git_commit_id: None,
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             canonical_checkpoint_id: "checkpoint_base_0001".to_string(),
             base_resolved_view_id: "view_base_0001".to_string(),
@@ -10578,6 +10856,7 @@ mod tests {
                     base_checkpoint_id: "checkpoint_base_0001".to_string(),
                     head_revision_id: Some("rev_docs_0001".to_string()),
                     completed_revision_id: None,
+                    abandonment: None,
                     revision_number: 1,
                 },
                 RealTopicRecord {
@@ -10590,6 +10869,7 @@ mod tests {
                     base_checkpoint_id: "checkpoint_base_0001".to_string(),
                     head_revision_id: Some("rev_code_0001".to_string()),
                     completed_revision_id: None,
+                    abandonment: None,
                     revision_number: 1,
                 },
             ],
@@ -10656,6 +10936,7 @@ mod tests {
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             head_revision_id: Some("rev_docs_cleanup_0001".to_string()),
             completed_revision_id: None,
+            abandonment: None,
             revision_number: 1,
         });
         let docs_result = artifact_entry("README.md", b"# Base\n\nDocs\n");
@@ -10714,6 +10995,7 @@ mod tests {
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             head_revision_id: Some("rev_code_adapter_0001".to_string()),
             completed_revision_id: None,
+            abandonment: None,
             revision_number: 1,
         });
         let code_result = artifact_entry("src/lib.rs", b"pub fn value() -> u32 { 2 }\n");
@@ -10755,6 +11037,7 @@ mod tests {
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             head_revision_id: Some("rev_alt_code_0001".to_string()),
             completed_revision_id: None,
+            abandonment: None,
             revision_number: 1,
         });
         state.operations.push(operation(

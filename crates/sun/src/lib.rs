@@ -1600,7 +1600,7 @@ fn checkpoint_create(ctx: &CommandContext) -> Result<(), CliError> {
         outputln!(
             ctx,
             "{}",
-            checkpoint_create_success_envelope(&checkpoint, None)
+            checkpoint_create_success_envelope(&checkpoint, None, true)
         );
     } else {
         outputln!(ctx, "{} {}", checkpoint.id, checkpoint.resolved_view_id);
@@ -6805,6 +6805,13 @@ fn real_checkpoint_create(
                     advanced: canonical_advanced,
                     side_checkpoint: options.side_checkpoint,
                 }),
+                real_checkpoint_topics_exportable(
+                    &state,
+                    checkpoint
+                        .topic_frontier
+                        .iter()
+                        .map(|entry| entry.topic_id.as_str()),
+                ),
             )
         );
     } else {
@@ -7261,8 +7268,15 @@ fn real_status(ctx: &CommandContext) -> Result<bool, CliError> {
                         .any(|map| map.checkpoint_id == checkpoint.checkpoint_id);
                     outputln!(
                         ctx,
-                        "checkpoint {} export_ready=true exported={exported} view={}",
+                        "checkpoint {} export_ready={} exported={exported} view={}",
                         checkpoint.checkpoint_id,
+                        real_checkpoint_topics_exportable(
+                            &state,
+                            checkpoint
+                                .topic_frontier
+                                .iter()
+                                .map(|(topic, _)| topic.as_str()),
+                        ),
                         checkpoint.resolved_view_id
                     );
                 }
@@ -10857,16 +10871,32 @@ fn real_checkpoint_snapshot_json(
     )
 }
 
+fn real_checkpoint_topics_exportable<'a>(
+    state: &RealRepoState,
+    topic_ids: impl Iterator<Item = &'a str>,
+) -> bool {
+    topic_ids.into_iter().all(|topic_id| {
+        state
+            .topics
+            .iter()
+            .any(|topic| topic.topic_id == topic_id && topic.visibility == "local")
+    })
+}
+
 fn real_checkpoint_status_envelope(
     state: &RealRepoState,
     checkpoint: &RealCheckpointSnapshot,
 ) -> String {
     format!(
-        "{{\"ok\":true,\"data\":{{\"command\":\"status.checkpoint\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"checkpoint_id\":\"{}\",\"export_ready\":true,\"checkpoint\":{}}},\"warnings\":[]}}",
+        "{{\"ok\":true,\"data\":{{\"command\":\"status.checkpoint\",\"repository_id\":\"{}\",\"ids\":{{\"checkpoint_id\":\"{}\",\"resolved_view_id\":\"{}\"}},\"checkpoint_id\":\"{}\",\"export_ready\":{},\"export_validation_required\":true,\"checkpoint\":{}}},\"warnings\":[]}}",
         json_escape(&state.repository_id),
         json_escape(&checkpoint.checkpoint_id),
         json_escape(&checkpoint.resolved_view_id),
         json_escape(&checkpoint.checkpoint_id),
+        real_checkpoint_topics_exportable(
+            state,
+            checkpoint.topic_frontier.iter().map(|(topic, _)| topic.as_str()),
+        ),
         real_checkpoint_snapshot_json(state, checkpoint),
     )
 }
@@ -17353,6 +17383,7 @@ struct CheckpointCanonicalOutcome<'a> {
 fn checkpoint_create_success_envelope(
     checkpoint: &CheckpointRecord,
     canonical: Option<CheckpointCanonicalOutcome<'_>>,
+    export_ready: bool,
 ) -> String {
     let execution_id = checkpoint
         .evidence_refs
@@ -17386,7 +17417,8 @@ fn checkpoint_create_success_envelope(
             "\"canonical\":{},",
             "\"evidence_refs\":[{}],",
             "\"export_refs\":{},",
-            "\"export_ready\":true,",
+            "\"export_ready\":{},",
+            "\"export_validation_required\":true,",
             "\"handoff\":{}",
             "}},",
             "\"warnings\":[]",
@@ -17424,11 +17456,12 @@ fn checkpoint_create_success_envelope(
             .collect::<Vec<_>>()
             .join(","),
         export_refs_json(checkpoint),
-        checkpoint_handoff_json(checkpoint),
+        export_ready,
+        checkpoint_handoff_json(checkpoint, export_ready),
     )
 }
 
-fn checkpoint_handoff_json(checkpoint: &CheckpointRecord) -> String {
+fn checkpoint_handoff_json(checkpoint: &CheckpointRecord, export_ready: bool) -> String {
     let execution_ids = checkpoint
         .evidence_refs
         .iter()
@@ -17450,10 +17483,11 @@ fn checkpoint_handoff_json(checkpoint: &CheckpointRecord) -> String {
     .to_json();
     let copy_report = format!("Sunlight handoff exact IDs: {exact_ids}");
     format!(
-        "{{\"exact_ids\":{},\"copy_report\":\"{}\",\"topic_frontier\":{},\"export_ready\":true}}",
+        "{{\"exact_ids\":{},\"copy_report\":\"{}\",\"topic_frontier\":{},\"export_ready\":{},\"export_validation_required\":true}}",
         exact_ids,
         json_escape(&copy_report),
         topic_frontier,
+        export_ready,
     )
 }
 

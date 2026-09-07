@@ -138,6 +138,14 @@ Use `topic_abandon` with the owning session, exact expected head, and a factual
 reason when a noncanonical topic is genuinely obsolete. Abandonment preserves
 its history but removes it from current integration candidates. A failed edit
 alone is not a reason to abandon a topic; correct it in the same pinned session.
+Checkpoint creation and checkpoint status report `export_ready: false` when
+the frontier contains private topics or lacks exportable topic metadata.
+`export_ready: true` is preliminary readiness, not a successful export policy
+check: `export_validation_required: true` makes that distinction explicit.
+Use `policy_check_export` or `git_export` to validate the complete export.
+Private topics remain usable in native checkpoints; these status fields do not
+change their visibility or authorize disclosure through Git.
+
 `checkpoint_create` returns `handoff.exact_ids` with the exact checkpoint, view,
 tree, and execution IDs to report or pass to the next agent.
 `compat_diff` re-echoes the projection's `session_generation_id`, and MCP

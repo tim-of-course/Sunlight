@@ -361,6 +361,21 @@ fn no_fixture_topic_intent_metadata_is_durable_inspectable_validated_and_export_
     let checkpoint = run_real_json(&repo, &["checkpoint", "create", "--view", &view]);
     assert_success(&checkpoint);
     let checkpoint_id = json_string_field(&stdout(&checkpoint), "checkpoint_id");
+    let checkpoint_json: serde_json::Value = serde_json::from_str(&stdout(&checkpoint)).unwrap();
+    assert_eq!(checkpoint_json["data"]["export_ready"], false);
+    assert_eq!(checkpoint_json["data"]["handoff"]["export_ready"], false);
+    let status = run_real_json(&repo, &["status", "--checkpoint", &checkpoint_id]);
+    assert_success(&status);
+    let status_json: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(status_json["data"]["export_ready"], false);
+    assert_eq!(status_json["data"]["export_validation_required"], true);
+    let human_status = sun()
+        .args(["status", "--checkpoint", &checkpoint_id])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_success(&human_status);
+    assert!(stdout(&human_status).contains("export_ready=false"));
     let policy = run_real_json(
         &repo,
         &[

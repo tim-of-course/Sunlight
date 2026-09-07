@@ -253,6 +253,10 @@ two minutes and runs after fifteen minutes. Malformed messages produce a
 JSON-RPC error without stopping the server where recovery is possible.
 Cancellation, stdin EOF, and server shutdown terminate the active contained
 process tree, discard queued calls, and remove staged files.
+On stdin EOF, the server leaves the request loop immediately and joins the
+canceled worker before exiting, allowing cleanup and durable execution status
+publication to finish. It does not poll the disconnected input channel or send
+a final tool reply to the disconnected client.
 
 This slice has no network listener, background service manager, subscriptions,
 or dashboard. The client owns the stdio server process lifetime.

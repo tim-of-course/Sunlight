@@ -13,6 +13,121 @@ const PYTHON: &str = "python";
 const PYTHON: &str = "python3";
 
 #[test]
+fn stdio_mcp_disconnect_idle_exits_without_a_reply() {
+    let temp = TempDir::new("sun-mcp-disconnect-idle");
+    let mut mcp = initialized_mcp(temp.path());
+    mcp.disconnect_and_wait();
+}
+
+#[test]
+fn stdio_mcp_disconnect_cancels_execution_and_preserves_acknowledged_work() {
+    let temp = TempDir::new("sun-mcp-disconnect-execution");
+    let repo = temp.path();
+    let mut mcp = initialized_mcp(repo);
+    mcp.call(2, "repository_init", json!({}));
+    mcp.call(
+        3,
+        "topic_create",
+        json!({"slug":"preserved","display_name":"Preserved"}),
+    );
+    mcp.call(
+        4,
+        "session_start",
+        json!({"topic":"preserved","view":"view_base_0001","actor":"disconnect-test"}),
+    );
+    let written = mcp.call(
+        5,
+        "artifact_write",
+        json!({
+            "session":"session_disconnect_test", "path":"preserved.txt",
+            "expect_hash":"new", "classification":"source", "content":"acknowledged\n"
+        }),
+    );
+    let view = written["data"]["view"]["resolved_view_id"]
+        .as_str()
+        .unwrap();
+    mcp.start_call(
+        6,
+        "execution_run",
+        json!({
+            "view":view,"program":PYTHON,"args":["-c","import os, pathlib, time; pathlib.Path('child-started.txt').write_text(str(os.getpid()) + '\\n'); time.sleep(60)"],
+            "network":"not_enforced"
+        }),
+    );
+    let execution = wait_for_running_execution(repo);
+    let record: Value = serde_json::from_slice(
+        &fs::read(repo.join(format!(".sunlight/executions/{execution}.json"))).unwrap(),
+    )
+    .unwrap();
+    let projection = record["projection_id"].as_str().unwrap();
+    let started = repo
+        .join(".sunlight/projections")
+        .join(projection)
+        .join("root/child-started.txt");
+    wait_for_file_line_count(&started, 1);
+    mcp.disconnect_and_wait();
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        let child_pid: i32 = fs::read_to_string(started).unwrap().trim().parse().unwrap();
+        assert_ne!(
+            unsafe { kill(child_pid, 0) },
+            0,
+            "execution child survived disconnect"
+        );
+    }
+
+    let mut recovered = initialized_mcp(repo);
+    let status = recovered.call(
+        3,
+        "repository_status",
+        json!({"scope":"execution","id":execution}),
+    );
+    assert_eq!(status["data"]["result"]["status"], "canceled");
+    assert_eq!(
+        status["data"]["result"]["termination_reason"],
+        "request_cancelled"
+    );
+    let read = recovered.call(
+        4,
+        "artifact_read",
+        json!({"view":view,"path":"preserved.txt"}),
+    );
+    assert_eq!(read["data"]["content"]["bytes"], "acknowledged\n");
+    recovered.disconnect_and_wait();
+}
+
+#[test]
+fn stdio_mcp_disconnect_cancels_writer_wait_and_discards_queued_mutations() {
+    let temp = TempDir::new("sun-mcp-disconnect-writer");
+    let repo = temp.path();
+    let mut mcp = initialized_mcp(repo);
+    mcp.call(2, "repository_init", json!({}));
+    let before = fs::read(repo.join(".sunlight/records/native-state.json")).unwrap();
+    let writer_lock = TestWriterLock::acquire(repo);
+    mcp.start_call(
+        3,
+        "topic_create",
+        json!({"slug":"blocked","display_name":"Blocked"}),
+    );
+    mcp.start_call(
+        4,
+        "topic_create",
+        json!({"slug":"queued","display_name":"Queued"}),
+    );
+    // Ping proves both tool requests reached the server while publication is blocked.
+    assert_eq!(mcp.request(5, "ping", json!({}))["result"], json!({}));
+    mcp.disconnect_and_wait();
+    assert_eq!(
+        fs::read(repo.join(".sunlight/records/native-state.json")).unwrap(),
+        before
+    );
+    drop(writer_lock);
+}
+
+#[test]
 fn stdio_mcp_topic_create_matches_cli_durable_intent_metadata() {
     let temp = TempDir::new("sun-mcp-topic-metadata");
     let cli_repo = temp.path().join("cli");
@@ -2363,6 +2478,30 @@ impl Mcp {
         self.stdin.take();
         let status = self.child.as_mut().unwrap().wait().unwrap();
         assert!(status.success());
+    }
+    fn disconnect_and_wait(&mut self) {
+        self.stdin.take();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "server failed during disconnect: {status}"
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                self.terminate();
+                panic!("server did not exit promptly after stdin closed");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut trailing = String::new();
+        self.stdout.read_line(&mut trailing).unwrap();
+        assert!(
+            trailing.is_empty(),
+            "server replied after client disconnect: {trailing}"
+        );
     }
     fn terminate(&mut self) {
         self.stdin.take();

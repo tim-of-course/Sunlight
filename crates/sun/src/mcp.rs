@@ -189,7 +189,6 @@ fn serve(repo: PathBuf, engine: EngineContext, temp: Arc<PrivateTemp>) -> Result
     let mut pending: VecDeque<(Value, Instant)> = VecDeque::new();
     let mut active: Option<ActiveCall> = None;
     let mut initialized = false;
-    let mut input_closed = false;
 
     loop {
         if let Some(call) = active.as_ref() {
@@ -228,9 +227,6 @@ fn serve(repo: PathBuf, engine: EngineContext, temp: Arc<PrivateTemp>) -> Result
                     &mut stdout,
                 )?;
                 continue;
-            }
-            if input_closed {
-                break;
             }
         }
 
@@ -289,19 +285,18 @@ fn serve(repo: PathBuf, engine: EngineContext, temp: Arc<PrivateTemp>) -> Result
                 ),
             )?,
             Ok(Inbound::Eof) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                input_closed = true;
-                pending.clear();
-                if let Some(call) = active.as_ref() {
-                    call.cancel.store(true, Ordering::Release);
-                }
+                // A disconnected receiver returns immediately, even with a timeout.
+                // Leave the dispatch loop and cancel/join the active worker below
+                // instead of spinning on that receiver or replying to a gone client.
+                break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 
-    if let Some(call) = active {
-        call.cancel.store(true, Ordering::Release);
-    }
+    // ActiveCall::drop requests cancellation and joins the worker so execution
+    // cleanup and durable terminal publication finish before the server exits.
+    drop(active);
     let _ = reader.join();
     Ok(())
 }

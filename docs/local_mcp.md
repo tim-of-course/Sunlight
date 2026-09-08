@@ -160,6 +160,10 @@ automatically to recover from an export rejection.
 
 Artifact listings report byte lengths from blob filesystem metadata, including
 in metadata-only views and sessions; listing does not load blob contents.
+Artifact read metadata is in `data.artifacts[0]`; decoded text is in
+`data.content.bytes`. Artifact mutations also return a `data.artifacts` array,
+which may contain multiple entries for an atomic patch. There is no singular
+`data.artifact` field in these responses.
 
 `checkpoint_create` returns `handoff.exact_ids` with the exact checkpoint, view,
 tree, and execution IDs to report or pass to the next agent.

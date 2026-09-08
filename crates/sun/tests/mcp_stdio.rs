@@ -416,6 +416,18 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
     );
     assert_eq!(direct_read["data"]["access_mode"], "read_only_view");
     assert_eq!(direct_read["data"]["ids"]["resolved_view_id"], view);
+    for (name, response) in [
+        ("artifact_read", &read),
+        ("artifact_read", &direct_read),
+        ("artifact_write", &write),
+    ] {
+        let advertised = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        let properties = &advertised["outputSchema"]["properties"]["data"]["properties"];
+        assert_eq!(properties["artifacts"]["type"], "array");
+        assert!(properties.get("artifact").is_none());
+        assert!(response["data"]["artifacts"].is_array());
+        assert!(response["data"].get("artifact").is_none());
+    }
     assert_eq!(
         direct_read["data"]["content"]["bytes"],
         "written through typed MCP content\n"

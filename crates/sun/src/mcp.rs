@@ -2130,7 +2130,7 @@ fn tools() -> Vec<Value> {
         ),
         scoped_read_tool(
             "artifact_read",
-            "Read persisted artifact content and identity from either an authoring session or an exact resolved view. View reads are read-only and create no session.",
+            "Read persisted artifact content and identity from either an authoring session or an exact resolved view. View reads are read-only and create no session. Returns metadata in data.artifacts[0] and text in data.content.bytes.",
             json!({"path":path_schema(),"session":id_schema("Exact session_id for session-scoped reading."),"view":id_schema("Exact resolved_view_id for session-free read-only access.")}),
             &["path"],
         ),
@@ -2383,6 +2383,12 @@ fn output_schema(name: &str) -> Value {
             field.to_string(),
             if *field == "handoff" {
                 handoff_output_schema(description)
+            } else if *field == "artifacts" {
+                json!({"type":"array","items":{"type":"object"},"description":description})
+            } else if name == "artifact_read" && *field == "content" {
+                json!({"type":"object","required":["encoding","bytes"],"properties":{
+                    "encoding":{"type":"string"},"bytes":{"type":"string","description":"Decoded UTF-8 text, not a byte array."}
+                },"description":description})
             } else {
                 json!({"description":description})
             },
@@ -2522,8 +2528,8 @@ fn output_payloads(name: &str) -> &'static [(&'static str, &'static str)] {
         ],
         "artifact_read" => &[
             (
-                "artifact",
-                "Persisted artifact identity, hash, classification, and content.",
+                "artifacts",
+                "One-element array containing the artifact identity, hash, byte length, and classification.",
             ),
             ("content", "UTF-8 artifact content when readable."),
         ],
@@ -2535,7 +2541,7 @@ fn output_payloads(name: &str) -> &'static [(&'static str, &'static str)] {
         | "artifact_delete"
         | "artifact_metadata_set" => &[
             ("operation", "Atomic topic-owned operation transaction."),
-            ("artifact", "Before and after artifact facts."),
+            ("artifacts", "Array of before and after artifact facts for every affected artifact."),
             ("view", "Exact post-operation session view."),
         ],
         "view_resolve" => &[

@@ -2012,7 +2012,16 @@ pub fn resolve_real_repo_view(
         .map(real_operation_revision_ref)
         .collect::<Vec<_>>();
     let mut result = resolve_fixture_view(input, base_tree_entries, revision_refs);
-    if result.records.is_empty() {
+    // The fixture projection carries only one effect per topic head. Native
+    // conflicts must be recomputed below from every effect and prior revision.
+    // Preserve all diagnostics when dependency/frontier validation failed;
+    // only a valid frontier can be checked against expanded native history.
+    if result
+        .records
+        .iter()
+        .all(|record| record.kind == ResolverRecordKind::SameArtifactConflict)
+    {
+        result.records.clear();
         result.resolver_order = DeterministicResolverOrder {
             operation_ids: expanded_operation_order(state, &result.topic_frontier),
         };
@@ -2130,8 +2139,8 @@ fn expanded_same_artifact_conflicts(
     state: &RealRepoState,
     result: &ResolvedViewResult,
 ) -> Vec<ResolverConflictOrStalenessRecord> {
-    let mut latest_by_topic_artifact =
-        BTreeMap::<(String, String), (&RealOperationRecord, RealOperationEffect)>::new();
+    let mut by_artifact =
+        BTreeMap::<String, Vec<(&RealOperationRecord, RealOperationEffect)>>::new();
     for operation_id in &result.resolver_order.operation_ids {
         let Some(operation) = state
             .operations
@@ -2141,20 +2150,11 @@ fn expanded_same_artifact_conflicts(
             continue;
         };
         for effect in operation.artifact_effects() {
-            latest_by_topic_artifact.insert(
-                (operation.topic_id.clone(), effect.artifact_id.clone()),
-                (operation, effect),
-            );
+            by_artifact
+                .entry(effect.artifact_id.clone())
+                .or_default()
+                .push((operation, effect));
         }
-    }
-
-    let mut by_artifact =
-        BTreeMap::<String, Vec<(&RealOperationRecord, RealOperationEffect)>>::new();
-    for ((_topic_id, artifact_id), operation_effect) in latest_by_topic_artifact {
-        by_artifact
-            .entry(artifact_id)
-            .or_default()
-            .push(operation_effect);
     }
 
     by_artifact
@@ -2163,6 +2163,13 @@ fn expanded_same_artifact_conflicts(
             if operations.len() <= 1 || real_operations_form_dependency_chain(state, &operations) {
                 return None;
             }
+            // Keep the existing convergence rule: identical final results across
+            // topics are compatible even when their intermediate edits differ.
+            let mut latest_by_topic = BTreeMap::new();
+            for (operation, effect) in operations {
+                latest_by_topic.insert(operation.topic_id.clone(), (operation, effect));
+            }
+            let operations = latest_by_topic.into_values().collect::<Vec<_>>();
             let candidate_hashes = operations
                 .iter()
                 .map(|(_, effect)| effect.result_content_hash.clone())
@@ -2240,21 +2247,14 @@ fn real_operations_form_dependency_chain(
             .filter(|(_, (operation, _))| {
                 !remaining.iter().any(|(candidate, _)| {
                     candidate.topic_revision_id != operation.topic_revision_id
-                        && real_revision_reachable_from_dependencies(
-                            state,
-                            &candidate.topic_revision_id,
-                            &operation.dependency_revision_ids,
-                        )
+                        && real_operation_depends_on(state, operation, candidate)
                 })
             })
             .filter(|(_, (operation, effect))| match &previous {
                 Some((previous_operation, previous_effect)) => {
-                    real_revision_reachable_from_dependencies(
-                        state,
-                        &previous_operation.topic_revision_id,
-                        &operation.dependency_revision_ids,
-                    ) && effect.base_content_hash.as_deref()
-                        == Some(previous_effect.result_content_hash.as_str())
+                    real_operation_depends_on(state, operation, previous_operation)
+                        && effect.base_content_hash.as_deref()
+                            == Some(previous_effect.result_content_hash.as_str())
                 }
                 None => true,
             })
@@ -2267,6 +2267,28 @@ fn real_operations_form_dependency_chain(
     }
 
     true
+}
+
+fn real_operation_depends_on(
+    state: &RealRepoState,
+    operation: &RealOperationRecord,
+    prerequisite: &RealOperationRecord,
+) -> bool {
+    if operation.topic_id == prerequisite.topic_id {
+        operation.topic_revision_id != prerequisite.topic_revision_id
+            && real_topic_revision_is_same_or_descendant(
+                state,
+                &operation.topic_id,
+                &operation.topic_revision_id,
+                &prerequisite.topic_revision_id,
+            )
+    } else {
+        real_revision_reachable_from_dependencies(
+            state,
+            &prerequisite.topic_revision_id,
+            &operation.dependency_revision_ids,
+        )
+    }
 }
 
 fn real_revision_reachable_from_dependencies(

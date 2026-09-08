@@ -596,6 +596,81 @@ fn sequential_edit_after_move_preserves_identity_and_conflicts() {
         "--classification",
         "source",
     ]);
+    // A batch's secondary artifact must remain editable in a later topic.
+    let batch = repo.write_file("batch.json", &serde_json::json!([
+        {"path":"new.txt", "expect_hash":sunlight_core::repo_state::real_content_hash(b"edited\n"), "patch":"@@\n-edited\n+batch edited\n"},
+        {"path":"other.txt", "expect_hash":sunlight_core::repo_state::real_content_hash(b"another file\n"), "patch":"@@\n-another file\n+batch other\n"}
+    ]).to_string());
+    let batch_result = run(&[
+        "patch",
+        "--session",
+        "session_editor",
+        "--batch-file",
+        batch.to_str().unwrap(),
+    ]);
+    let batch_view = batch_result["data"]["view"]["resolved_view_id"]
+        .as_str()
+        .unwrap();
+    run(&["topic", "create", "followup", "--display-name", "Followup"]);
+    run(&[
+        "session", "start", "--topic", "followup", "--view", batch_view, "--actor", "followup",
+    ]);
+    repo.write_file("followup.tmp", "followup other\n");
+    run(&[
+        "write",
+        "other.txt",
+        "--session",
+        "session_followup",
+        "--expect-hash",
+        &sunlight_core::repo_state::real_content_hash(b"batch other\n"),
+        "--content-file",
+        repo.path().join("followup.tmp").to_str().unwrap(),
+        "--classification",
+        "source",
+    ]);
+    let followup = run(&["read", "other.txt", "--session", "session_followup"]);
+    assert!(followup.to_string().contains("followup other\\n"));
+    run(&[
+        "topic",
+        "create",
+        "secondary",
+        "--display-name",
+        "Secondary competitor",
+    ]);
+    run(&[
+        "session",
+        "start",
+        "--topic",
+        "secondary",
+        "--view",
+        batch_view,
+        "--actor",
+        "secondary",
+    ]);
+    repo.write_file("followup.tmp", "competing other\n");
+    run(&[
+        "write",
+        "other.txt",
+        "--session",
+        "session_secondary",
+        "--expect-hash",
+        &sunlight_core::repo_state::real_content_hash(b"batch other\n"),
+        "--content-file",
+        repo.path().join("followup.tmp").to_str().unwrap(),
+        "--classification",
+        "source",
+    ]);
+    let state = sunlight_core::repo_state::RealRepoState::load(repo.path()).unwrap();
+    assert!(state
+        .resolve_head_view()
+        .result
+        .records
+        .iter()
+        .any(|record| record.kind
+            == sunlight_core::resolver::ResolverRecordKind::SameArtifactConflict
+            && record
+                .artifact_ids
+                .contains(&"artifact_other_txt".to_string())));
     let edited_view = edited["data"]["view"]["resolved_view_id"].as_str().unwrap();
     let read = run(&["read", "new.txt", "--view", edited_view]);
     assert!(read.to_string().contains("edited\\n"));
@@ -617,7 +692,7 @@ fn sequential_edit_after_move_preserves_identity_and_conflicts() {
         .iter()
         .find(|artifact| artifact["path"] == "new.txt")
         .unwrap();
-    assert_eq!(listed["byte_length"], 7);
+    assert_eq!(listed["byte_length"], 13);
     assert_eq!(listed["artifact_id"], "artifact_old_txt");
     let baseline = run(&["read", "new.txt", "--view", view]);
     assert!(baseline.to_string().contains("original\\n"));

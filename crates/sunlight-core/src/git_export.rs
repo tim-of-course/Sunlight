@@ -3974,6 +3974,7 @@ mod tests {
                 display_name: (*topic_id).to_string(),
                 owner_actor_id: "agent-a".to_string(),
                 visibility: (*visibility).to_string(),
+                declassification: None,
                 acceptance_criteria: Vec::new(),
                 base_checkpoint_id: FIXTURE_BASE_CHECKPOINT_ID.to_string(),
                 head_revision_id: checkpoint

@@ -103,7 +103,7 @@ server entry for each repository; a running server cannot switch roots.
 The server exposes these typed tools:
 
 - `repository_init`, `repository_status`
-- `topic_create`, `topic_complete`, `topic_abandon`, `topic_wait`, `session_start`,
+- `topic_create`, `topic_complete`, `topic_declassify`, `topic_abandon`, `topic_wait`, `session_start`,
   `session_refresh`
 - `artifact_read`, `artifact_list`, `artifact_search`
 - `artifact_patch`, `artifact_write`, `artifact_move`, `artifact_delete`,
@@ -145,6 +145,21 @@ check: `export_validation_required: true` makes that distinction explicit.
 Use `policy_check_export` or `git_export` to validate the complete export.
 Private topics remain usable in native checkpoints; these status fields do not
 change their visibility or authorize disclosure through Git.
+
+When the user explicitly authorizes release of a private topic, use
+`topic_declassify` with its exact `topic` and completed `revision`, plus the
+authorizing `actor` and a factual `reason`. The CLI equivalent is
+`sun topic declassify --topic <id> --revision <completed-revision> --actor <actor> --reason <text>`.
+Complete the topic first: release is tied to a sealed revision, so future edits
+cannot inherit the decision. Identical retries are no-ops. Status and inspection
+retain the actor, revision, reason, and release time; native source operations and
+checkpoint identities remain unchanged. Existing checkpoints containing that
+topic can then be validated for export under the recorded release decision.
+Other private topics and every other export check still apply. Never declassify
+automatically to recover from an export rejection.
+
+Artifact listings report byte lengths from blob filesystem metadata, including
+in metadata-only views and sessions; listing does not load blob contents.
 
 `checkpoint_create` returns `handoff.exact_ids` with the exact checkpoint, view,
 tree, and execution IDs to report or pass to the next agent.

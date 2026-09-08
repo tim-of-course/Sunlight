@@ -138,12 +138,21 @@ pub struct RealTopicRecord {
     pub display_name: String,
     pub owner_actor_id: String,
     pub visibility: String,
+    pub declassification: Option<RealTopicDeclassificationRecord>,
     pub acceptance_criteria: Vec<String>,
     pub base_checkpoint_id: String,
     pub head_revision_id: Option<String>,
     pub completed_revision_id: Option<String>,
     pub abandonment: Option<RealTopicAbandonmentRecord>,
     pub revision_number: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealTopicDeclassificationRecord {
+    pub actor_id: String,
+    pub revision_id: String,
+    pub reason: String,
+    pub released_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1033,6 +1042,7 @@ impl RealRepoState {
                     display_name: topic_display_name.clone().unwrap_or_default(),
                     owner_actor_id: actor_id.clone().unwrap_or_else(|| "local".to_string()),
                     visibility: "local".to_string(),
+                    declassification: None,
                     acceptance_criteria: Vec::new(),
                     base_checkpoint_id: required_string(&object, "base_checkpoint_id", &path)?,
                     head_revision_id: head_revision_id.clone(),
@@ -2227,6 +2237,16 @@ fn real_operations_form_dependency_chain(
         let candidates = remaining
             .iter()
             .enumerate()
+            .filter(|(_, (operation, _))| {
+                !remaining.iter().any(|(candidate, _)| {
+                    candidate.topic_revision_id != operation.topic_revision_id
+                        && real_revision_reachable_from_dependencies(
+                            state,
+                            &candidate.topic_revision_id,
+                            &operation.dependency_revision_ids,
+                        )
+                })
+            })
             .filter(|(_, (operation, effect))| match &previous {
                 Some((previous_operation, previous_effect)) => {
                     real_revision_reachable_from_dependencies(
@@ -2236,14 +2256,7 @@ fn real_operations_form_dependency_chain(
                     ) && effect.base_content_hash.as_deref()
                         == Some(previous_effect.result_content_hash.as_str())
                 }
-                None => !remaining.iter().any(|(candidate, _)| {
-                    candidate.topic_revision_id != operation.topic_revision_id
-                        && real_revision_reachable_from_dependencies(
-                            state,
-                            &candidate.topic_revision_id,
-                            &operation.dependency_revision_ids,
-                        )
-                }),
+                None => true,
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
@@ -6606,6 +6619,18 @@ fn parse_topic(value: &JsonValue, state_path: &Path) -> Result<RealTopicRecord, 
         owner_actor_id: required_string(object, "owner_actor_id", state_path)?,
         visibility: optional_string(object, "visibility", state_path)?
             .unwrap_or_else(|| "local".to_string()),
+        declassification: optional_object(object, "declassification", state_path)?
+            .map(
+                |record| -> Result<RealTopicDeclassificationRecord, RepoStateError> {
+                    Ok(RealTopicDeclassificationRecord {
+                        actor_id: required_string(record, "actor_id", state_path)?,
+                        revision_id: required_string(record, "revision_id", state_path)?,
+                        reason: required_string(record, "reason", state_path)?,
+                        released_at: required_string(record, "released_at", state_path)?,
+                    })
+                },
+            )
+            .transpose()?,
         acceptance_criteria: optional_array(object, "acceptance_criteria", state_path)?
             .iter()
             .map(|value| match value {
@@ -6644,6 +6669,21 @@ fn parse_topic(value: &JsonValue, state_path: &Path) -> Result<RealTopicRecord, 
         &topic.acceptance_criteria,
     )
     .map_err(|error| invalid_state(state_path, format!("invalid topic metadata: {error}")))?;
+    if let Some(record) = &topic.declassification {
+        if topic.visibility != "local"
+            || topic.completed_revision_id.as_deref() != Some(record.revision_id.as_str())
+            || topic.head_revision_id != topic.completed_revision_id
+            || record.reason.trim().is_empty()
+            || record.released_at.is_empty()
+        {
+            return Err(invalid_state(
+                state_path,
+                "declassification must identify the completed local topic revision",
+            ));
+        }
+        validate_topic_metadata(&record.actor_id, "local", &[])
+            .map_err(|error| invalid_state(state_path, error.to_string()))?;
+    }
     Ok(topic)
 }
 
@@ -8758,6 +8798,32 @@ fn operation_effect_json(effect: &RealOperationEffect) -> JsonValue {
 fn topic_json(topic: &RealTopicRecord) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert(
+        "declassification".to_string(),
+        topic
+            .declassification
+            .as_ref()
+            .map_or(JsonValue::Null, |record| {
+                JsonValue::Object(BTreeMap::from([
+                    (
+                        "actor_id".to_string(),
+                        JsonValue::String(record.actor_id.clone()),
+                    ),
+                    (
+                        "revision_id".to_string(),
+                        JsonValue::String(record.revision_id.clone()),
+                    ),
+                    (
+                        "reason".to_string(),
+                        JsonValue::String(record.reason.clone()),
+                    ),
+                    (
+                        "released_at".to_string(),
+                        JsonValue::String(record.released_at.clone()),
+                    ),
+                ]))
+            }),
+    );
+    object.insert(
         "topic_id".to_string(),
         JsonValue::String(topic.topic_id.clone()),
     );
@@ -9296,6 +9362,7 @@ mod tests {
             display_name: "Metadata only".to_string(),
             owner_actor_id: "test".to_string(),
             visibility: "local".to_string(),
+            declassification: None,
             acceptance_criteria: Vec::new(),
             base_checkpoint_id: metadata.base_checkpoint_id.clone(),
             head_revision_id: None,
@@ -10353,6 +10420,7 @@ mod tests {
             display_name: "Legacy".to_string(),
             owner_actor_id: "legacy-agent".to_string(),
             visibility: "local".to_string(),
+            declassification: None,
             acceptance_criteria: Vec::new(),
             base_checkpoint_id: state.base_checkpoint_id.clone(),
             head_revision_id: Some("rev_legacy_0001".to_string()),
@@ -10427,6 +10495,7 @@ mod tests {
             display_name: "Validation".to_string(),
             owner_actor_id: "agent-a".to_string(),
             visibility: visibility.to_string(),
+            declassification: None,
             acceptance_criteria: vec!["focused behavior is verified".to_string()],
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             head_revision_id: None,
@@ -10453,6 +10522,7 @@ mod tests {
                 display_name: topic_id.to_string(),
                 owner_actor_id: "shared-agent".to_string(),
                 visibility: "local".to_string(),
+                declassification: None,
                 acceptance_criteria: Vec::new(),
                 base_checkpoint_id: state.base_checkpoint_id.clone(),
                 head_revision_id: None,
@@ -10852,6 +10922,7 @@ mod tests {
                     display_name: "Docs".to_string(),
                     owner_actor_id: "agent-a".to_string(),
                     visibility: "local".to_string(),
+                    declassification: None,
                     acceptance_criteria: Vec::new(),
                     base_checkpoint_id: "checkpoint_base_0001".to_string(),
                     head_revision_id: Some("rev_docs_0001".to_string()),
@@ -10865,6 +10936,7 @@ mod tests {
                     display_name: "Code".to_string(),
                     owner_actor_id: "agent-b".to_string(),
                     visibility: "local".to_string(),
+                    declassification: None,
                     acceptance_criteria: Vec::new(),
                     base_checkpoint_id: "checkpoint_base_0001".to_string(),
                     head_revision_id: Some("rev_code_0001".to_string()),
@@ -10932,6 +11004,7 @@ mod tests {
             display_name: "Docs cleanup".to_string(),
             owner_actor_id: "agent-cleanup".to_string(),
             visibility: "local".to_string(),
+            declassification: None,
             acceptance_criteria: Vec::new(),
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             head_revision_id: Some("rev_docs_cleanup_0001".to_string()),
@@ -10991,6 +11064,7 @@ mod tests {
             display_name: "Code adapter".to_string(),
             owner_actor_id: "agent-adapter".to_string(),
             visibility: "local".to_string(),
+            declassification: None,
             acceptance_criteria: Vec::new(),
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             head_revision_id: Some("rev_code_adapter_0001".to_string()),
@@ -11033,6 +11107,7 @@ mod tests {
             display_name: "Alt Code".to_string(),
             owner_actor_id: "agent-c".to_string(),
             visibility: "local".to_string(),
+            declassification: None,
             acceptance_criteria: Vec::new(),
             base_checkpoint_id: "checkpoint_base_0001".to_string(),
             head_revision_id: Some("rev_alt_code_0001".to_string()),

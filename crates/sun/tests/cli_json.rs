@@ -408,6 +408,239 @@ fn no_fixture_topic_intent_metadata_is_durable_inspectable_validated_and_export_
     );
     assert_failure(&export);
     assert!(stdout(&export).contains("\"code\":\"private_topic\""));
+
+    let revision = json_string_field(&stdout(&write), "topic_revision_id");
+    let release_args = [
+        "topic",
+        "declassify",
+        "--topic",
+        "topic_private_intent",
+        "--revision",
+        &revision,
+        "--actor",
+        "human",
+        "--reason",
+        "Approved disposable test export",
+    ];
+    let denied = run_real_json(&repo, &release_args);
+    assert_failure(&denied);
+    assert!(stdout(&denied).contains("topic_declassification_revision_mismatch"));
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "topic",
+            "complete",
+            "--topic",
+            "topic_private_intent",
+            "--revision",
+            &revision,
+            "--session",
+            "session_private_writer",
+        ],
+    ));
+    let before = sunlight_core::repo_state::RealRepoState::load(repo.path()).unwrap();
+    let released = run_real_json(&repo, &release_args);
+    assert_success(&released);
+    let released: serde_json::Value = serde_json::from_str(&stdout(&released)).unwrap();
+    assert_eq!(released["data"]["changed"], true);
+    assert_eq!(released["data"]["topic"]["visibility"], "local");
+    let after = sunlight_core::repo_state::RealRepoState::load(repo.path()).unwrap();
+    assert_eq!(after.operations, before.operations);
+    assert_eq!(after.checkpoints, before.checkpoints);
+    assert_eq!(
+        after.canonical_checkpoint_id,
+        before.canonical_checkpoint_id
+    );
+    let decision = after
+        .topic_by_id_or_slug("private-intent")
+        .unwrap()
+        .declassification
+        .as_ref()
+        .unwrap();
+    assert_eq!(decision.actor_id, "human");
+    assert_eq!(decision.revision_id, revision);
+    let repeated = run_real_json(&repo, &release_args);
+    assert_success(&repeated);
+    assert!(stdout(&repeated).contains("\"changed\":false"));
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "policy",
+            "check-export",
+            "--checkpoint",
+            &checkpoint_id,
+            "--branch",
+            "refs/heads/private-intent",
+        ],
+    ));
+    assert_success(&run_real_json(
+        &repo,
+        &[
+            "git",
+            "export",
+            "--checkpoint",
+            &checkpoint_id,
+            "--branch",
+            "refs/heads/private-intent",
+            "--write-plan",
+        ],
+    ));
+    let status = run_real_json(&repo, &["status", "--topic", "private-intent"]);
+    assert_success(&status);
+    assert!(stdout(&status).contains("Approved disposable test export"));
+}
+
+#[test]
+fn sequential_edit_after_move_preserves_identity_and_conflicts() {
+    let repo = TestRepo::new("sequential-move-edit");
+    init_local_git_repo(&repo);
+    assert_success(&run_real_json(&repo, &["init"]));
+    let hash = sunlight_core::repo_state::real_content_hash(b"original\n");
+    let run = |args: &[&str]| {
+        let output = run_real_json(&repo, args);
+        assert_success(&output);
+        serde_json::from_str::<serde_json::Value>(&stdout(&output)).unwrap()
+    };
+    run(&["topic", "create", "origin", "--display-name", "Origin"]);
+    run(&[
+        "session",
+        "start",
+        "--topic",
+        "origin",
+        "--view",
+        "view_base_0001",
+        "--actor",
+        "origin",
+    ]);
+    let payload = repo.write_file("content.tmp", "original\n");
+    let payload = payload.to_str().unwrap();
+    run(&[
+        "write",
+        "old.txt",
+        "--session",
+        "session_origin",
+        "--expect-hash",
+        "new",
+        "--content-file",
+        payload,
+        "--classification",
+        "source",
+    ]);
+    let origin = run(&[
+        "write",
+        "other.txt",
+        "--session",
+        "session_origin",
+        "--expect-hash",
+        "new",
+        "--content-file",
+        payload,
+        "--classification",
+        "source",
+    ]);
+    let origin_view = origin["data"]["view"]["resolved_view_id"].as_str().unwrap();
+    run(&["checkpoint", "create", "--view", origin_view]);
+    run(&["topic", "create", "move", "--display-name", "Move"]);
+    run(&[
+        "session",
+        "start",
+        "--topic",
+        "move",
+        "--view",
+        origin_view,
+        "--actor",
+        "mover",
+    ]);
+    run(&[
+        "move",
+        "old.txt",
+        "new.txt",
+        "--session",
+        "session_mover",
+        "--expect-hash",
+        &hash,
+    ]);
+    let content = repo.write_file("content.tmp", "another file\n");
+    let content = content.to_str().unwrap();
+    let other = run(&[
+        "write",
+        "other.txt",
+        "--session",
+        "session_mover",
+        "--expect-hash",
+        &hash,
+        "--content-file",
+        content,
+        "--classification",
+        "source",
+    ]);
+    let view = other["data"]["view"]["resolved_view_id"].as_str().unwrap();
+    let checkpoint = run(&["checkpoint", "create", "--view", view]);
+    let checkpoint_id = checkpoint["data"]["checkpoint_id"].as_str().unwrap();
+    for actor in ["editor", "competitor"] {
+        run(&["topic", "create", actor, "--display-name", actor]);
+        run(&[
+            "session", "start", "--topic", actor, "--view", view, "--actor", actor,
+        ]);
+    }
+    repo.write_file("content.tmp", "edited\n");
+    let edited = run(&[
+        "write",
+        "new.txt",
+        "--session",
+        "session_editor",
+        "--expect-hash",
+        &hash,
+        "--content-file",
+        content,
+        "--classification",
+        "source",
+    ]);
+    let edited_view = edited["data"]["view"]["resolved_view_id"].as_str().unwrap();
+    let read = run(&["read", "new.txt", "--view", edited_view]);
+    assert!(read.to_string().contains("edited\\n"));
+    let old = run_real_json(&repo, &["read", "old.txt", "--view", edited_view]);
+    assert_failure(&old);
+    let listing = run(&["list", "--view", edited_view]);
+    let listed = listing["data"]["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["path"] == "new.txt")
+        .unwrap();
+    assert_eq!(listed["byte_length"], 7);
+    assert_eq!(listed["artifact_id"], "artifact_old_txt");
+    let listing = run(&["list", "--session", "session_editor"]);
+    let listed = listing["data"]["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["path"] == "new.txt")
+        .unwrap();
+    assert_eq!(listed["byte_length"], 7);
+    assert_eq!(listed["artifact_id"], "artifact_old_txt");
+    let baseline = run(&["read", "new.txt", "--view", view]);
+    assert!(baseline.to_string().contains("original\\n"));
+    assert_success(&run_real_json(
+        &repo,
+        &["status", "--checkpoint", checkpoint_id],
+    ));
+    repo.write_file("content.tmp", "competing\n");
+    run(&[
+        "write",
+        "new.txt",
+        "--session",
+        "session_competitor",
+        "--expect-hash",
+        &hash,
+        "--content-file",
+        content,
+        "--classification",
+        "source",
+    ]);
+    let state = sunlight_core::repo_state::RealRepoState::load(repo.path()).unwrap();
+    let combined = state.resolve_head_view();
+    assert!(!combined.result.conflict_free());
 }
 
 #[test]

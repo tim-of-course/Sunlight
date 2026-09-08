@@ -715,6 +715,7 @@ fn tool_uses_repository_mutation_queue(name: &str) -> bool {
             | "topic_create"
             | "topic_complete"
             | "topic_abandon"
+            | "topic_declassify"
             | "session_start"
             | "session_refresh"
             | "artifact_patch"
@@ -1092,6 +1093,18 @@ fn build_invocation(
             }
             v
         }
+        "topic_declassify" => vec![
+            "topic".into(),
+            "declassify".into(),
+            "--topic".into(),
+            identifier(args, "topic")?,
+            "--revision".into(),
+            identifier(args, "revision")?,
+            "--actor".into(),
+            identifier(args, "actor")?,
+            "--reason".into(),
+            text(args, "reason")?,
+        ],
         "topic_complete" => {
             let mut v = vec![
                 "topic".into(),
@@ -1869,6 +1882,11 @@ const TOOL_CONTRACTS: &[ToolContract] = &[
         required: &["slug", "display_name"],
     },
     ToolContract {
+        name: "topic_declassify",
+        allowed: &["topic", "revision", "actor", "reason"],
+        required: &["topic", "revision", "actor", "reason"],
+    },
+    ToolContract {
         name: "topic_complete",
         allowed: &["topic", "revision", "session", "summary"],
         required: &["topic", "revision", "session"],
@@ -2066,6 +2084,13 @@ fn tools() -> Vec<Value> {
             "Create a durable authoring topic.",
             json!({"slug":s(),"display_name":s(),"owner":s(),"visibility":{"type":"string","enum":["local","private"],"default":"local"},"acceptance_criteria":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":1024}}}),
             &["slug", "display_name"],
+            true,
+        ),
+        tool(
+            "topic_declassify",
+            "Explicitly release a private, completed topic for Git export at its exact completed revision. Use only with user authorization to disclose that topic; never call automatically to bypass an export rejection. Records an immutable actor/reason decision, preserves source history, and changes visibility to local. Repeating the identical decision is a no-op. All normal Git export validation still applies.",
+            json!({"topic":id_schema("Exact private topic_id approved for release."),"revision":id_schema("Exact completed topic revision approved for release."),"actor":s(),"reason":{"type":"string","minLength":1,"maxLength":512}}),
+            &["topic", "revision", "actor", "reason"],
             true,
         ),
         tool(
@@ -2293,7 +2318,7 @@ fn tool(
 ) -> Value {
     let contract = tool_contract(name).expect("every advertised tool has one contract row");
     debug_assert_eq!(required, contract.required);
-    json!({"name":name,"description":description,"inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":contract.required},"outputSchema":output_schema(name),"annotations":{"readOnlyHint":!mutating,"destructiveHint":matches!(name,"artifact_delete"|"git_export"),"idempotentHint":matches!(name,"repository_init"|"repository_status"|"topic_complete"|"topic_abandon"|"topic_wait"|"artifact_read"|"artifact_list"|"artifact_search"|"compat_diff"|"worktree_diff"|"policy_check_export"|"policy_check_commit"|"policy_explain"|"inspect")}})
+    json!({"name":name,"description":description,"inputSchema":{"type":"object","additionalProperties":false,"properties":properties,"required":contract.required},"outputSchema":output_schema(name),"annotations":{"readOnlyHint":!mutating,"destructiveHint":matches!(name,"artifact_delete"|"git_export"),"idempotentHint":matches!(name,"repository_init"|"repository_status"|"topic_complete"|"topic_abandon"|"topic_declassify"|"topic_wait"|"artifact_read"|"artifact_list"|"artifact_search"|"compat_diff"|"worktree_diff"|"policy_check_export"|"policy_check_commit"|"policy_explain"|"inspect")}})
 }
 
 fn output_schema(name: &str) -> Value {
@@ -2412,6 +2437,7 @@ fn output_ids(name: &str) -> &'static [&'static str] {
         "repository_init" => &["repository_id", "checkpoint_id", "resolved_view_id"],
         "repository_status" => &["repository_id"],
         "topic_create" => &["topic_id", "topic_revision_id"],
+        "topic_declassify" => &["topic_id", "topic_revision_id"],
         "topic_complete" | "topic_abandon" | "topic_wait" => {
             &["topic_id", "topic_revision_id", "session_id"]
         }
@@ -2473,6 +2499,10 @@ fn output_payloads(name: &str) -> &'static [(&'static str, &'static str)] {
         "topic_complete" => &[
             ("topic", "Completed topic record."),
             ("handoff", "Immutable factual completion handoff."),
+        ],
+        "topic_declassify" => &[
+            ("topic", "Released topic metadata."),
+            ("declassification", "Immutable release decision."),
         ],
         "topic_abandon" => &[
             ("topic", "Abandoned topic with preserved completion facts."),
@@ -2822,6 +2852,7 @@ mod tests {
             "topic_create",
             "topic_complete",
             "topic_abandon",
+            "topic_declassify",
             "session_start",
             "session_refresh",
             "artifact_patch",

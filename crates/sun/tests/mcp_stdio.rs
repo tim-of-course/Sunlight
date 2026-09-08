@@ -313,13 +313,14 @@ fn stdio_mcp_real_repository_journey_and_recovery() {
 
     let listed = mcp.request(2, "tools/list", json!({}));
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 31);
+    assert_eq!(tools.len(), 32);
     let advertised = serde_json::to_string(tools).unwrap();
     assert!(!advertised.to_ascii_lowercase().contains("fixture"));
     for required in [
         "repository_init",
         "repository_status",
         "topic_create",
+        "topic_declassify",
         "topic_wait",
         "session_start",
         "session_refresh",

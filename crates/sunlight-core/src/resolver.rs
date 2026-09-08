@@ -534,6 +534,13 @@ fn revisions_form_dependency_chain(revisions: &[&TopicRevisionRef]) -> bool {
         let candidates = remaining
             .iter()
             .enumerate()
+            .filter(|(_, revision)| {
+                !revision.dependency_revision_ids.iter().any(|dependency| {
+                    remaining
+                        .iter()
+                        .any(|candidate| candidate.revision_id == *dependency)
+                })
+            })
             .filter(|(_, revision)| match previous {
                 Some(previous) => {
                     revision
@@ -542,11 +549,7 @@ fn revisions_form_dependency_chain(revisions: &[&TopicRevisionRef]) -> bool {
                         && revision.operation.base_content_hash.as_deref()
                             == Some(previous.operation.result_content_hash.as_str())
                 }
-                None => !revision.dependency_revision_ids.iter().any(|dependency| {
-                    remaining
-                        .iter()
-                        .any(|candidate| candidate.revision_id == *dependency)
-                }),
+                None => true,
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();

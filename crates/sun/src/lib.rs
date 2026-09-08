@@ -487,6 +487,9 @@ fn run(ctx: &CommandContext) -> Result<(), CliError> {
         [scope, command, ..] if scope == "topic" && command == "create" => topic_create(&ctx),
         [scope, command, ..] if scope == "topic" && command == "complete" => topic_complete(&ctx),
         [scope, command, ..] if scope == "topic" && command == "abandon" => topic_abandon(&ctx),
+        [scope, command, ..] if scope == "topic" && command == "declassify" => {
+            real_topic_declassify(&ctx)
+        }
         [scope, command, ..] if scope == "session" && command == "start" => session_start(&ctx),
         [scope, command, ..] if scope == "session" && command == "refresh" => session_refresh(&ctx),
         [scope, command, ..] if scope == "view" && command == "resolve" => view_resolve(&ctx),
@@ -2288,6 +2291,7 @@ fn real_worktree_capture(
         display_name: format!("Worktree capture: {}", options.topic_slug),
         owner_actor_id: options.actor_id.clone(),
         visibility: "local".to_string(),
+        declassification: None,
         acceptance_criteria: Vec::new(),
         base_checkpoint_id: anchor_before
             .base_checkpoint_ids
@@ -3474,6 +3478,7 @@ fn real_topic_create(ctx: &CommandContext, options: TopicCreateOptions) -> Resul
         display_name: options.display_name.clone(),
         owner_actor_id: options.owner_actor_id.clone(),
         visibility: options.visibility.clone(),
+        declassification: None,
         acceptance_criteria: options.acceptance_criteria.clone(),
         base_checkpoint_id: state.base_checkpoint_id.clone(),
         head_revision_id: None,
@@ -3647,6 +3652,154 @@ fn real_topic_complete(
         );
     }
     Ok(())
+}
+
+fn real_topic_declassify(ctx: &CommandContext) -> Result<(), CliError> {
+    let mut options = BTreeMap::new();
+    let mut args = ctx.args.iter().skip(2);
+    while let Some(flag) = args.next() {
+        if !matches!(
+            flag.as_str(),
+            "--topic" | "--revision" | "--actor" | "--reason"
+        ) {
+            return Err(invalid_request(format!(
+                "unknown topic declassify argument `{flag}`"
+            )));
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| invalid_request(format!("{flag} requires a value")))?;
+        if options.insert(flag.as_str(), value.as_str()).is_some() {
+            return Err(invalid_request(format!("duplicate argument `{flag}`")));
+        }
+    }
+    let required = |flag| {
+        options
+            .get(flag)
+            .copied()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| invalid_request(format!("sun topic declassify requires {flag}")))
+    };
+    let topic_id = required("--topic")?;
+    let revision_id = required("--revision")?;
+    let actor_id = required("--actor")?;
+    let reason = required("--reason")?;
+    if reason.len() > 512 || reason.chars().any(char::is_control) {
+        return Err(invalid_request(
+            "declassification reason must be at most 512 printable characters",
+        ));
+    }
+    validate_topic_metadata(actor_id, "local", &[])
+        .map_err(|error| invalid_request(error.to_string()))?;
+    for _ in 0..16 {
+        let mut state = RealRepoState::load_metadata(&ctx.repo_root)?;
+        let index = state
+            .topics
+            .iter()
+            .position(|topic| topic.topic_id == topic_id)
+            .ok_or_else(|| object_not_found("topic", topic_id))?;
+        let topic = &state.topics[index];
+        if topic.head_revision_id.as_deref() != Some(revision_id)
+            || topic.completed_revision_id.as_deref() != Some(revision_id)
+        {
+            return Err(CliError::new(
+                "topic_declassification_revision_mismatch",
+                "declassification requires the exact completed topic head",
+            )
+            .with_detail("topic_id", topic_id)
+            .with_detail("revision_id", revision_id));
+        }
+        let changed = if let Some(record) = &topic.declassification {
+            if record.revision_id != revision_id
+                || record.actor_id != actor_id
+                || record.reason != reason
+            {
+                return Err(CliError::new(
+                    "topic_already_declassified",
+                    "the topic already has an immutable declassification decision",
+                ));
+            }
+            false
+        } else {
+            if topic.visibility != "private" {
+                return Err(CliError::new(
+                    "topic_not_private",
+                    "only private topics require declassification",
+                ));
+            }
+            state.topics[index].declassification =
+                Some(sunlight_core::repo_state::RealTopicDeclassificationRecord {
+                    actor_id: actor_id.to_string(),
+                    revision_id: revision_id.to_string(),
+                    reason: reason.to_string(),
+                    released_at: real_now_id(),
+                });
+            state.topics[index].visibility = "local".to_string();
+            true
+        };
+        let topic = &state.topics[index];
+        let decision = real_topic_declassification_json(topic);
+        if changed {
+            let decision_id = format!("declassification_{}", topic.topic_id);
+            let mut topic_record: serde_json::Value =
+                serde_json::from_str(&real_topic_metadata_json(topic))
+                    .expect("generated topic JSON");
+            topic_record["record_type"] = serde_json::json!("topic");
+            topic_record["id"] = serde_json::json!(topic.topic_id);
+            topic_record["repository_id"] = serde_json::json!(state.repository_id);
+            let records = vec![
+                state.record_publication("topics", &topic.topic_id, &format!("{topic_record}\n"))?,
+                state.record_publication("topics", &decision_id, &format!("{}\n", serde_json::json!({
+                    "record_type":"topic_declassification", "id":decision_id,
+                    "repository_id":state.repository_id, "topic_id":topic.topic_id,
+                    "decision":serde_json::from_str::<serde_json::Value>(&decision).expect("generated decision JSON"),
+                    "immutable":true,
+                })))?,
+            ];
+            match state.save_with_records(&ctx.repo_root, &records) {
+                Ok(()) => {}
+                Err(RepoStateError::ConcurrentStateUpdate { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if ctx.json {
+            outputln!(
+                ctx,
+                "{}",
+                serde_json::json!({"ok":true,"data":{
+                "command":"topic.declassify","repository_id":state.repository_id,
+                "ids":{"topic_id":topic.topic_id,"topic_revision_id":revision_id},
+                "changed":changed,"declassification":serde_json::from_str::<serde_json::Value>(&decision).expect("generated decision JSON"),
+                "topic":serde_json::from_str::<serde_json::Value>(&real_topic_metadata_json(topic)).expect("generated topic JSON"),
+                "export_validation_required":true
+            },"warnings":[]})
+            );
+        } else {
+            outputln!(
+                ctx,
+                "topic {} declassified at {}; Git export still requires validation",
+                topic_id,
+                revision_id
+            );
+        }
+        return Ok(());
+    }
+    Err(CliError::new(
+        "concurrent_state_update",
+        "repository kept changing during declassification",
+    ))
+}
+
+fn real_topic_declassification_json(topic: &RealTopicRecord) -> String {
+    topic.declassification.as_ref().map_or_else(
+        || "null".to_string(),
+        |record| {
+            serde_json::json!({"actor_id":record.actor_id,"revision_id":record.revision_id,
+            "reason":record.reason,"released_at":record.released_at,
+            "previous_visibility":"private","visibility":"local"})
+            .to_string()
+        },
+    )
 }
 
 fn real_topic_abandon(ctx: &CommandContext, options: TopicAbandonOptions) -> Result<(), CliError> {
@@ -4166,8 +4319,8 @@ fn real_artifact_list(
                         || entry.path == prefix
                         || entry.path.starts_with(&format!("{prefix}/")))
             })
-            .map(real_artifact_view)
-            .collect(),
+            .map(|entry| real_list_artifact_view(&ctx.repo_root, entry))
+            .collect::<Result<Vec<_>, CliError>>()?,
     };
     if ctx.json {
         outputln!(ctx, "{}", list_success_envelope(&response));
@@ -4342,8 +4495,8 @@ fn real_artifact_list_view(
                     || entry.path == prefix
                     || entry.path.starts_with(&format!("{prefix}/")))
         })
-        .map(real_artifact_view)
-        .collect::<Vec<_>>();
+        .map(|entry| real_list_artifact_view(&ctx.repo_root, entry))
+        .collect::<Result<Vec<_>, CliError>>()?;
     if ctx.json {
         outputln!(
             ctx,
@@ -7689,6 +7842,18 @@ fn real_accept_mutation(
             )
             .with_detail("resolved_view_id", resolved_view_id.clone())
             .with_detail("session_id", session_id.to_string())
+            .with_raw_details_json(
+                serde_json::json!({
+                    "resolved_view_id": resolved_view_id,
+                    "session_id": session_id,
+                    "candidate_view_persisted": false,
+                    "conflicts": session_resolved.result.records.iter().map(|record| {
+                        serde_json::from_str::<serde_json::Value>(&resolver_record_json(record))
+                            .expect("generated resolver record JSON")
+                    }).collect::<Vec<_>>()
+                })
+                .to_string(),
+            )
         })?;
     state.resolved_view_id = resolved_view_id.clone();
     state.current_topic_frontier = session_resolved.result.topic_frontier.clone();
@@ -8291,6 +8456,24 @@ fn real_now_id() -> String {
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
     format!("unix_ms_{millis}")
+}
+
+fn real_list_artifact_view(
+    repo_root: &Path,
+    entry: &RealArtifactEntry,
+) -> Result<SessionVisibleArtifactView, CliError> {
+    let path = sunlight_core::repo_state::real_blob_path(repo_root, &entry.content_hash);
+    let metadata = fs::metadata(&path).map_err(|error| {
+        CliError::new(
+            "artifact_metadata_unavailable",
+            "could not read artifact blob metadata",
+        )
+        .with_detail("path", entry.path.clone())
+        .with_detail("source", error.to_string())
+    })?;
+    let mut artifact = real_artifact_view(entry);
+    artifact.byte_length = metadata.len() as usize;
+    Ok(artifact)
 }
 
 fn real_artifact_view(entry: &RealArtifactEntry) -> SessionVisibleArtifactView {
@@ -9311,7 +9494,7 @@ fn real_topic_metadata_json(topic: &RealTopicRecord) -> String {
         "open"
     };
     format!(
-        "{{\"topic_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"status\":\"{}\",\"lifecycle\":\"{}\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":{},\"completed_revision_id\":{},\"abandonment\":{},\"owner_actor_id\":\"{}\",\"visibility\":\"{}\",\"acceptance_criteria\":{}}}",
+        "{{\"topic_id\":\"{}\",\"slug\":\"{}\",\"display_name\":\"{}\",\"status\":\"{}\",\"lifecycle\":\"{}\",\"base_checkpoint_id\":\"{}\",\"head_revision_id\":{},\"completed_revision_id\":{},\"abandonment\":{},\"owner_actor_id\":\"{}\",\"visibility\":\"{}\",\"acceptance_criteria\":{},\"declassification\":{}}}",
         json_escape(&topic.topic_id),
         json_escape(&topic.slug),
         json_escape(&topic.display_name),
@@ -9328,6 +9511,7 @@ fn real_topic_metadata_json(topic: &RealTopicRecord) -> String {
         json_escape(&topic.owner_actor_id),
         json_escape(&topic.visibility),
         string_array_json(topic.acceptance_criteria.iter().map(String::as_str)),
+        real_topic_declassification_json(topic),
     )
 }
 
@@ -22177,6 +22361,7 @@ Usage:
   sun agent doctor --client generic|codex|cursor [--repo <path>] [--json]
   sun topic create <slug> --display-name <name> [--owner <actor>] [--visibility local|private] [--acceptance-criterion <text>...] [--json]
   sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]
+  sun topic declassify --topic <topic> --revision <completed-revision> --actor <actor> --reason <text> [--json]
   sun topic abandon --topic <topic> --session <session> --expected-head <revision|none> --reason <text> [--json]
   sun session start --topic <topic> --view <view> --actor <actor-id> [--json]
   sun session refresh <session> --policy manual|follow|none [--json]
@@ -22252,9 +22437,10 @@ fn print_command_help(ctx: &CommandContext, command: &str) {
         "agent doctor" => outputln!(ctx, "sun agent doctor\n\nUsage:\n  sun agent doctor --client generic|codex|cursor [--repo <path>] [--json]\n\nVerifies the portable skill and, for Codex or Cursor, the selected client MCP entry. Generic doctor does not inspect client transport or live tool visibility. Setup is complete when repository_status and artifact tools are visible in the client."),
         "status" => outputln!(ctx, "sun status\n\nUsage:\n  sun status [--json]\n  sun status --topic <topic> [--json]\n  sun status --session <session> [--json]\n  sun status --view <view> [--json]\n  sun status --projection <projection> [--json]\n  sun status --execution <execution> [--json]\n  sun status --checkpoint <checkpoint> [--json]\n  sun status --export <export-map> [--json]\n\nRepository status reports native state plus direct worktree differences relative to Sunlight's durable anchor. Git state remains a separate diagnostic."),
         "inspect" => outputln!(ctx, "sun inspect\n\nUsage:\n  sun inspect repository [--json]\n  sun inspect topic:<topic>|session:<session>|view:<view> [--json]\n  sun inspect artifact:<path>|operation:<id>|conflict:<id> [--json]\n  sun inspect projection:<id>|execution:<id>|checkpoint:<id>|export:<id> [--json]"),
-        "topic" => outputln!(ctx, "sun topic\n\nUsage:\n  sun topic create <slug> --display-name <name> [options] [--json]\n  sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]\n  sun topic abandon --topic <topic> --session <session> --expected-head <revision|none> --reason <text> [--json]"),
+        "topic" => outputln!(ctx, "sun topic\n\nUsage:\n  sun topic create <slug> --display-name <name> [options] [--json]\n  sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]\n  sun topic declassify --topic <topic> --revision <completed-revision> --actor <actor> --reason <text> [--json]\n  sun topic abandon --topic <topic> --session <session> --expected-head <revision|none> --reason <text> [--json]"),
         "topic create" => outputln!(ctx, "sun topic create\n\nUsage:\n  sun topic create <slug> --display-name <name> [--owner <actor>] [--visibility local|private] [--acceptance-criterion <text>...] [--json]\n\nCreates a durable topic in the initialized repository. Defaults: owner=local, visibility=local."),
         "topic complete" => outputln!(ctx, "sun topic complete\n\nUsage:\n  sun topic complete --topic <topic> --revision <revision> --session <session> [--summary <text>] [--json]\n\nRecords an idempotent durable completion fact for the exact current topic revision; it does not assert review or quality."),
+        "topic declassify" => outputln!(ctx, "sun topic declassify\n\nUsage:\n  sun topic declassify --topic <topic> --revision <completed-revision> --actor <actor> --reason <text> [--json]\n\nExplicitly release an exact completed private topic for Git export. Requires user authorization. Records an immutable release decision; normal export validation still applies."),
         "topic abandon" => outputln!(ctx, "sun topic abandon\n\nUsage:\n  sun topic abandon --topic <topic> --session <session> --expected-head <revision|none> --reason <text> [--json]\n\nRecords an immutable disposition for obsolete work without deleting its history. Canonical topics cannot be abandoned."),
         "session" => outputln!(ctx, "sun session\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]\n  sun session refresh <session> --policy manual|follow|none [--json]"),
         "session start" => outputln!(ctx, "sun session start\n\nUsage:\n  sun session start --topic <topic> --view <view> --actor <actor-id> [--json]\n\nThe exact view may be the repository base, current head, or a persisted checkpoint view."),
